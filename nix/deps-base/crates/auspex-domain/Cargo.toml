@@ -1,0 +1,23 @@
+[package]
+name = "auspex-domain"
+version = "0.1.0"
+description = "auspex's pure rules: inventory, targets, probe parsing, eval results, status badges and the --json contract"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Flip to true only if this crate is genuinely meant for a registry.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+# The eval cache key. Already in the graph (Cargo.lock carries 0.10.9 transitively), so this
+# adds no third-party code. A hash is needed at all because the key must be a fixed-length
+# file name, and the inputs (a whole `git diff`) are unbounded.
+sha2 = "0.10"

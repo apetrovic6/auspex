@@ -200,6 +200,12 @@ let
     # not hardcoded, so `rename app` rewrites it.
     ++ map maybe (map (m: "/" + m.dir + "/src/testing")
       (lib.filter (m: lib.hasSuffix "/client" m.dir) disc.members))
+    # Golden fixtures a crate's tests read at run time through CARGO_MANIFEST_DIR (probe
+    # output, JSON lines, expected snapshots). None of them is `.rs` or `.toml`, so without
+    # this they are absent in the sandbox and the tests fail with "No such file or
+    # directory", while passing in every checkout. Derived from the members, not listed per
+    # crate, so the next crate with fixtures needs no edit here.
+    ++ map maybe (map (m: "/" + m.dir + "/tests/fixtures") disc.members)
     ++ [
       (maybe "/just")
       (maybe "/docs")

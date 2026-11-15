@@ -1,0 +1,7 @@
+{"attr":"terra","attrPath":["terra"],"drvPath":"/nix/store/6123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.05.drv","inputDrvs":{},"name":"nixos-system-terra-25.05","outputs":{"out":"/nix/store/7123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.05"},"system":"x86_64-linux"}
+{"attr":"mars","attrPath":["mars"],"error":"\u001b[31;1merror:\u001b[0m\n       … while calling the 'head' builtin\n         at /nix/store/8123456789abcdfghijklmnpqrsvwxyz-source/lib/lists.nix:1:1:\n\n       … while evaluating the attribute 'config.system.build.toplevel'\n\n       error: attribute 'k3sToken' missing\n       at /nix/store/9123456789abcdfghijklmnpqrsvwxyz-source/machines/mars/configuration.nix:12:5:\n"}
+{"attr":"genetor","attrPath":["genetor"],"drvPath":"/nix/store/a123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05.drv","outputs":{"out":"/nix/store/b123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05"},"system":"aarch64-darwin"}
+{"attr":"luna","attrPath":["luna"],"drvPath":"/nix/store/c123456789abcdfghijklmnpqrsvwxyz-nixos-system-luna.drv","outputs":{"out":"/nix/sto
+warning: unknown setting 'eval-cores'
+{"attr":"sol","attrPath":["sol"],"drvPath":"/tmp/not-a-store-path.drv","outputs":{"out":"/nix/store/d123456789abcdfghijklmnpqrsvwxyz-nixos-system-sol"}}
+{"attr":"cerberus","attrPath":["cerberus"],"drvPath":"/nix/store/e123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus.drv","outputs":{}}

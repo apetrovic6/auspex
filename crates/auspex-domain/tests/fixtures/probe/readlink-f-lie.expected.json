@@ -1,0 +1,25 @@
+{
+  "booted_initrd": null,
+  "booted_kernel": null,
+  "class": "nixos",
+  "configuration_revision": null,
+  "current_initrd": null,
+  "current_kernel": null,
+  "current_system": null,
+  "failed_units": [],
+  "kind": "observed",
+  "ssh_health": {
+    "load": {
+      "fifteen": 0.0,
+      "five": 0.02,
+      "one": 0.01
+    },
+    "root_disk": {
+      "available_bytes": 18874368000,
+      "total_bytes": 20971520000,
+      "used_bytes": 1048576000
+    },
+    "uptime_seconds": 120
+  },
+  "system_state": "running"
+}

@@ -1,0 +1,25 @@
+{
+  "booted_initrd": null,
+  "booted_kernel": null,
+  "class": "darwin",
+  "configuration_revision": null,
+  "current_initrd": null,
+  "current_kernel": null,
+  "current_system": "/nix/store/5123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05.abcdef0",
+  "failed_units": null,
+  "kind": "observed",
+  "ssh_health": {
+    "load": {
+      "fifteen": 2.1,
+      "five": 2.01,
+      "one": 1.84
+    },
+    "root_disk": {
+      "available_bytes": 572658647040,
+      "total_bytes": 994662584320,
+      "used_bytes": 422003937280
+    },
+    "uptime_seconds": 302400
+  },
+  "system_state": null
+}

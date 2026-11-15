@@ -1,0 +1,14 @@
+auspex_probe=1
+probe=nixos
+current_system=
+booted_kernel=
+booted_initrd=
+current_kernel=
+current_initrd=
+configuration_revision=
+system_state=running
+failed_units=[]
+uptime_seconds=120.01
+load=0.01 0.02 0.00
+root_disk_kb=20480000 1024000 18432000
+auspex_end=1

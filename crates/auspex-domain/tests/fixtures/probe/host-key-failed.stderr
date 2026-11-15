@@ -1,0 +1,7 @@
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+Offending ED25519 key in /home/user/.ssh/known_hosts:12
+Host key for 192.168.1.10 has changed and you have requested strict checking.
+Host key verification failed.
+
