@@ -1,7 +1,7 @@
 [package]
 name = "auspex-core"
 version = "0.1.0"
-description = "Crux core for the auspex app"
+description = "Crux core for auspex: what to ask the fleet, and what the answers mean"
 authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,46 +10,26 @@ license.workspace = true
 # Application code, never published to a registry.
 publish = false
 
-# Discovered by the CI pipeline. `wasm` marks the crate as part of the wasm32 closure.
+# Discovered by the CI pipeline. No `wasm = true`: auspex has one shell, the terminal, and
+# will never have a web one, so a wasm32 pass over this crate would check a target nothing
+# builds. The template's skeleton sets it because a scaffolded core might grow a web shell.
 [package.metadata.app]
 kind = "core"
-wasm = true
 
 [lints]
 workspace = true
 
+# A plain `lib`, not the template's `cdylib`/`staticlib`: those exist for the Kotlin and Swift
+# shells' FFI, and auspex's only shell is Rust, linking this crate directly. So there is also
+# no `Facet` derive, no typegen `codegen` binary, no `ffi.rs` and no `boltffi.toml`: the core's
+# types are `auspex-domain`'s own, unwrapped, and a type that never crosses an FFI boundary
+# needs no second description of itself.
 [lib]
-# Explicit, because this name leaks a long way: the cdylib becomes libauspex_core.so /
-# auspex_core.wasm, the generated Kotlin calls System.loadLibrary("auspex_core"), and
-# the generated C header is auspex_core.h. Two apps in one monorepo must not both ship
-# "libshared.so".
 name = "auspex_core"
-crate-type = ["cdylib", "lib", "staticlib"]
-
-[[bin]]
-name = "codegen"
-required-features = ["codegen"]
-
-[features]
-facet_typegen = ["crux_core/facet_typegen"]
-codegen = [
-    "dep:anyhow",
-    "dep:clap",
-    "dep:log",
-    "dep:pretty_env_logger",
-    "facet_typegen",
-]
 
 [dependencies]
-facet = { workspace = true, features = ["chrono"] }
-boltffi.workspace = true
+auspex-domain = { path = "../../../crates/auspex-domain" }
 crux_core.workspace = true
-# Unused here: holds `textwrap` on 0.16.2 (see the workspace manifest).
-textwrap.workspace = true
-serde = { workspace = true, features = ["derive"] }
 
-# optional dependencies
-anyhow = { workspace = true, optional = true }
-clap = { workspace = true, optional = true }
-log = { version = "0.4.33", optional = true }
-pretty_env_logger = { version = "0.5.0", optional = true }
+[dev-dependencies]
+serde_json.workspace = true
