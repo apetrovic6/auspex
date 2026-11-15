@@ -196,7 +196,9 @@ struct Row {
 }
 
 impl Row {
-    const fn facts(&self) -> MachineFacts<'_> {
+    /// The domain's facts for this row. `prometheus_out` is whether the fleet-wide
+    /// Prometheus query that feeds its health is still outstanding.
+    const fn facts(&self, prometheus_out: bool) -> MachineFacts<'_> {
         MachineFacts {
             probe: self.probe.as_ref(),
             eval: self.eval.as_ref(),
@@ -204,7 +206,8 @@ impl Row {
             frozen: false,
             alerts_firing: 0,
             outstanding: Outstanding {
-                prometheus: false,
+                prometheus: prometheus_out,
+                // No Alertmanager query until step 3.
                 alerts: false,
             },
             target_error: None, // machine_report derives it from `target`
@@ -216,7 +219,7 @@ impl Row {
         let error = self.target.as_ref().err().map(|e| e.error.to_string());
         let facts = MachineFacts {
             target_error: error.as_deref(),
-            ..self.facts()
+            ..self.facts(false)
         };
         machine_status(&facts).badges.iter().any(|b| b.is_spinner())
     }
@@ -274,6 +277,20 @@ impl Model {
         if self.prometheus == PrometheusStatus::Pending {
             self.prometheus = PrometheusStatus::NotAsked;
         }
+    }
+
+    /// Every fleet-wide request is back: the machine list, the evaluator's `Finished`, the
+    /// Prometheus query and address resolution. Per-machine answers (probes, cache
+    /// lookups) are the rows' own business. After the deadline nothing is outstanding, so
+    /// this is true and `timed_out` says why the report is not settled.
+    fn scan_complete(&self) -> bool {
+        matches!(self.inventory, Inventory::Loaded | Inventory::Failed)
+            && !self.outstanding.values().any(|p| {
+                matches!(
+                    p,
+                    Pending::Inventory | Pending::Eval | Pending::Prometheus | Pending::Resolve(_)
+                )
+            })
     }
 
     fn names(&self) -> Vec<&str> {
@@ -389,7 +406,12 @@ impl App for Auspex {
             } => match model.accept(generation, id, |p| matches!(p, Pending::Cache(_))) {
                 Some(Pending::Cache(name)) => {
                     if let Some(row) = model.row_mut(&name) {
-                        row.cache = cache;
+                        // `Pending` or `NotApplicable` from the shell is not an answer; read
+                        // either as a failed lookup so the row cannot wait forever.
+                        row.cache = match cache {
+                            NarCache::Pending | NarCache::NotApplicable => NarCache::Failed,
+                            answered => answered,
+                        };
                     }
                     render()
                 }
@@ -425,10 +447,22 @@ impl App for Auspex {
 
     fn view(&self, model: &Model) -> ViewModel {
         let shared = shared_ips(&model.addresses);
+        let prometheus_out = model
+            .outstanding
+            .values()
+            .any(|p| *p == Pending::Prometheus);
         let machines = model
             .rows
             .iter()
-            .map(|r| machine_report(&r.machine, &r.target, &r.facts(), model.health(r), &shared))
+            .map(|r| {
+                machine_report(
+                    &r.machine,
+                    &r.target,
+                    &r.facts(prometheus_out),
+                    model.health(r),
+                    &shared,
+                )
+            })
             .collect();
         // The fleet errors and the timed-out flag go into the report, which is what `--json`
         // prints: a failed list must not read as a settled, empty fleet. `report.settled`
@@ -438,9 +472,7 @@ impl App for Auspex {
             machines,
             shared,
             FleetFacts {
-                // Wired to the real progress by the next commit; until then, as before the
-                // domain grew this field, `settled` is judged on the rows and errors alone.
-                scan_complete: true,
+                scan_complete: model.scan_complete(),
                 timed_out: model.timed_out,
                 errors: model.fleet_errors.clone(),
             },
@@ -771,6 +803,8 @@ fn ask_cache(model: &mut Model, name: &str) -> Command<Effect, Event> {
         return Command::done();
     }
     let store_path = eval.out_path.clone();
+    // Outstanding until it answers: the domain keeps the row unsettled meanwhile.
+    row.cache = NarCache::Pending;
     let generation = model.generation;
     let id = model.issue(Pending::Cache(name.to_owned()));
     Command::request_from_shell(CacheRequest {
@@ -822,10 +856,15 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
                     reason: PROMETHEUS_TIMED_OUT.to_owned(),
                 };
             }
-            // A cache question left unanswered stays `NotApplicable`, as before the rename. An
-            // unresolved hostname simply cannot collide. Rows are marked below, whatever was
-            // outstanding: after a quit nothing is, and the rows still spin.
-            Pending::Cache(_) | Pending::Resolve(_) | Pending::Probe(_) | Pending::Eval => {}
+            // A lookup that did not answer in time failed, as far as the badge goes.
+            Pending::Cache(name) => {
+                if let Some(row) = model.row_mut(&name) {
+                    row.cache = NarCache::Failed;
+                }
+            }
+            // An unresolved hostname simply cannot collide. Rows are marked below, whatever
+            // was outstanding: after a quit nothing is, and the rows still spin.
+            Pending::Resolve(_) | Pending::Probe(_) | Pending::Eval => {}
         }
     }
     for row in &mut model.rows {

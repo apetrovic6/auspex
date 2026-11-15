@@ -15,9 +15,12 @@ pub struct ViewModel {
     /// (`auspex_domain::report::machine_report`), sorted by name, plus the shared-IP list.
     /// `--json` prints exactly this. Fleet-level failures (the machine list failed or timed
     /// out, the evaluator could not run) are its `errors`; there is no second copy of them
-    /// here. Its `settled` is the domain's: the scan completed cleanly, which is `false`
-    /// when the deadline cut it short or any fleet error is present. What headless mode
-    /// waits for is [`RefreshView::settled`], not this.
+    /// here. Its `settled` is the domain's, "the scan completed cleanly": the core tells it
+    /// which fleet-wide requests (list, evaluator, Prometheus, address resolution) and which
+    /// per-machine ones (cache lookups, Prometheus for the row's health) are still out. It
+    /// therefore equals [`RefreshView::settled`] at every step, except that it stays `false`
+    /// when the deadline cut the scan short or a fleet error is present. Headless mode waits
+    /// for [`RefreshView::settled`].
     ///
     /// [`MachineReport`]: auspex_domain::report::MachineReport
     pub report: FleetReport,

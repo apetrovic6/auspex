@@ -1355,12 +1355,20 @@ fn secondary_requests_hold_the_fleet_unsettled() {
         }
         assert_eq!(shell.view().refresh.pending_machines, 0, "{held}");
         assert!(!shell.view().refresh.settled, "{held} still out");
+        agree(&shell, held);
+        if held == "prometheus" {
+            assert!(
+                shell.view().report.machines.iter().all(|m| !m.settled),
+                "a row whose health Prometheus feeds is not settled while it is out"
+            );
+        }
         match held {
             "prometheus" => shell.resolve(&mut prom, Ok(BTreeMap::new())),
             "cache" => shell.resolve(&mut cache, NarCache::NotCached),
             _ => shell.resolve(&mut dns, BTreeMap::new()),
         }
         assert!(shell.view().refresh.settled, "{held} answered");
+        agree(&shell, held);
     }
 }
 
@@ -1415,4 +1423,189 @@ fn close_help_never_opens_it() {
     shell.send(Event::CloseHelp);
     shell.send(Event::CloseHelp);
     assert!(!shell.view().help_open);
+}
+
+// ---------------------------------------------------------------------------------------
+// Review round 2: the report's `settled` agrees with the refresh's
+// ---------------------------------------------------------------------------------------
+
+/// The report's `settled` equals the refresh's, except that a deadline or a fleet error
+/// keeps the report's false.
+fn agree(shell: &Shell, step: &str) {
+    let view = shell.view();
+    let report_should =
+        view.refresh.settled && !view.refresh.timed_out && view.report.errors.is_empty();
+    assert_eq!(view.report.settled, report_should, "{step}");
+}
+
+/// Re-review finding 2, first case: right after `Start`, with the list out.
+#[test]
+fn the_report_is_not_settled_while_the_list_is_out() {
+    let mut shell = Shell::new();
+    shell.send(Event::Start(bare_config()));
+    assert!(!shell.view().refresh.settled);
+    assert!(!shell.view().report.settled);
+}
+
+/// Re-review finding 2, second case: every row answered, the evaluator's `Finished` not.
+#[test]
+fn the_report_is_not_settled_before_the_evaluator_finishes() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config(), THREE);
+    let mut eval = shell.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        let sys = path('0', m);
+        shell.probe(m, observed(&sys, ""));
+        shell.eval_item(&mut eval, m, evaluated(m, &sys));
+    }
+    assert!(!shell.view().refresh.settled);
+    assert!(shell.view().report.machines.iter().all(|m| m.settled));
+    assert!(!shell.view().report.settled);
+    shell.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    assert!(shell.view().refresh.settled);
+    assert!(shell.view().report.settled);
+}
+
+/// A pending toplevel's cache lookup keeps its row, and the fleet, unsettled.
+#[test]
+fn an_outstanding_cache_lookup_keeps_the_row_unsettled() {
+    let mut shell = Shell::new();
+    shell.start_with(
+        bare_config_with_cache(),
+        r#"{"terra": {"deploy": {"targetHost": "192.168.1.10"}}}"#,
+    );
+    let mut eval = shell.take_eval();
+    shell.probe("terra", observed(&path('0', "a"), ""));
+    shell.eval_item(&mut eval, "terra", evaluated("terra", &path('1', "b")));
+    shell.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    let mut lookup = shell.take_cache("terra");
+    let row = shell.row("terra");
+    assert_eq!(row.status, Badge::UpdatePending);
+    assert!(!row.settled, "the lookup is out");
+    assert!(!shell.view().report.settled);
+    assert!(!shell.view().refresh.settled);
+
+    shell.resolve(&mut lookup, NarCache::Cached);
+    let row = shell.row("terra");
+    assert!(row.settled);
+    assert_eq!(row.badges, [Badge::UpdatePending, Badge::Cached]);
+    assert!(shell.view().report.settled);
+    assert!(shell.view().refresh.settled);
+}
+
+/// The two `settled` flags, checked after every step of a scan: they agree except where
+/// the report is deliberately stricter (a deadline cut the scan short, or a fleet error).
+#[test]
+fn the_two_settled_flags_agree_at_every_step() {
+    fn agree(shell: &Shell, step: &str) {
+        let view = shell.view();
+        let report_should =
+            view.refresh.settled && !view.refresh.timed_out && view.report.errors.is_empty();
+        assert_eq!(view.report.settled, report_should, "{step}");
+    }
+    let fleet = r#"{
+      "terra": {"deploy": {"targetHost": "root@192.168.1.10"}},
+      "luna":  {"deploy": {"targetHost": "root@luna.example"}}
+    }"#;
+    let mut shell = Shell::new();
+    agree(&shell, "before start");
+    shell.send(Event::Start(full_config()));
+    agree(&shell, "list out");
+    let mut list = shell.take_inventory();
+    shell.resolve(&mut list, Ok(inventory(fleet)));
+    agree(&shell, "list in");
+    let mut eval = shell.take_eval();
+    for m in ["luna", "terra"] {
+        shell.probe(m, observed(&path('0', m), ""));
+        agree(&shell, &format!("{m} probed"));
+        let out = if m == "terra" {
+            path('1', m)
+        } else {
+            path('0', m)
+        };
+        shell.eval_item(&mut eval, m, evaluated(m, &out));
+        agree(&shell, &format!("{m} evaluated"));
+    }
+    shell.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    agree(&shell, "evaluator finished");
+    let mut prom = shell.take_prometheus();
+    shell.resolve(&mut prom, Ok(BTreeMap::new()));
+    agree(&shell, "prometheus in");
+    let mut dns = shell.resolves.remove(0);
+    shell.resolve(&mut dns, BTreeMap::new());
+    agree(&shell, "dns in");
+    let mut cache = shell.take_cache("terra");
+    shell.resolve(&mut cache, NarCache::Failed);
+    agree(&shell, "cache in");
+    assert!(shell.view().report.settled);
+
+    // And a deadline mid-scan.
+    shell.send(Event::Refresh);
+    shell.drop_cancelled();
+    let mut list = shell.take_inventory();
+    shell.resolve(&mut list, Ok(inventory(fleet)));
+    deadline(&mut shell);
+    agree(&shell, "after the deadline");
+}
+
+/// The deadline settles a cache lookup that never answered, as failed.
+#[test]
+fn the_deadline_settles_an_outstanding_cache_lookup() {
+    let mut shell = Shell::new();
+    shell.start_with(
+        bare_config_with_cache(),
+        r#"{"terra": {"deploy": {"targetHost": "192.168.1.10"}}}"#,
+    );
+    let mut eval = shell.take_eval();
+    shell.probe("terra", observed(&path('0', "a"), ""));
+    shell.eval_item(&mut eval, "terra", evaluated("terra", &path('1', "b")));
+    shell.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    deadline(&mut shell);
+    let row = shell.row("terra");
+    assert!(row.settled);
+    assert_eq!(row.badges, [Badge::UpdatePending], "no cached badge");
+    assert!(shell.view().refresh.settled);
+    assert!(!shell.view().report.settled, "cut short by the deadline");
+}
+
+/// Re-review N06: the list timing out leaves configured Prometheus `NotAsked`, not `Pending`.
+#[test]
+fn a_list_timeout_leaves_prometheus_not_asked() {
+    let mut shell = Shell::new();
+    shell.send(Event::Start(full_config()));
+    assert_eq!(shell.view().prometheus, PrometheusStatus::Pending);
+    deadline(&mut shell);
+    assert!(shell.view().refresh.settled);
+    assert_eq!(shell.view().prometheus, PrometheusStatus::NotAsked);
+}
+
+/// Re-review N09: without Prometheus configured, a failed list leaves it `NotConfigured`.
+#[test]
+fn a_failed_list_leaves_unconfigured_prometheus_unconfigured() {
+    let mut shell = Shell::new();
+    shell.send(Event::Start(bare_config()));
+    let mut list = shell.take_inventory();
+    shell.resolve(&mut list, Err("boom".to_owned()));
+    assert_eq!(shell.view().prometheus, PrometheusStatus::NotConfigured);
+}
+
+/// A lookup answered `Pending` (an adapter bug) is read as failed, so the row settles.
+#[test]
+fn a_pending_cache_answer_settles_as_failed() {
+    let mut shell = Shell::new();
+    shell.start_with(
+        bare_config_with_cache(),
+        r#"{"terra": {"deploy": {"targetHost": "192.168.1.10"}}}"#,
+    );
+    let mut eval = shell.take_eval();
+    shell.probe("terra", observed(&path('0', "a"), ""));
+    shell.eval_item(&mut eval, "terra", evaluated("terra", &path('1', "b")));
+    shell.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    let mut lookup = shell.take_cache("terra");
+    shell.resolve(&mut lookup, NarCache::Pending);
+    let row = shell.row("terra");
+    assert!(row.settled);
+    assert_eq!(row.badges, [Badge::UpdatePending]);
+    assert!(shell.view().refresh.settled);
+    assert!(shell.view().report.settled);
 }

@@ -193,7 +193,10 @@ pub struct CacheRequest {
 }
 
 impl Operation for CacheRequest {
-    /// [`NarCache::Failed`] when the lookup failed.
+    /// [`NarCache::Cached`], [`NarCache::NotCached`], or [`NarCache::Failed`] when the lookup
+    /// failed. While it is out the row is [`NarCache::Pending`] and not settled; an answer of
+    /// `Pending` or `NotApplicable` is read as `Failed`, so a confused adapter cannot hold the
+    /// row open until the deadline. At the deadline an unanswered lookup becomes `Failed`.
     type Output = NarCache;
 }
 

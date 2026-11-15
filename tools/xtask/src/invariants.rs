@@ -123,6 +123,12 @@ const DEPENDENCY_TABLES: &[&str] = &["dependencies", "dev-dependencies", "build-
 /// Where a core lives: every app's, and the one `just add crux-app` renders.
 const CORE_GLOBS: &[&str] = &["apps/*/core", "templates/crux-app/apps/__name__/core"];
 
+/// The workspace crates a core is built on, held to [`CORE_FORBIDDEN_DEPENDENCIES`] too:
+/// a forbidden crate one of them pulls in reaches the core as surely as a direct one. For
+/// auspex that is the domain crate, which the plan defines as "pure rules, no I/O, no
+/// async". A path that does not exist is skipped, so a product without it is unaffected.
+const CORE_FOUNDATION_CRATES: &[&str] = &["crates/auspex-domain"];
+
 pub struct Report {
     pub checked: usize,
     pub problems: Vec<String>,
@@ -666,16 +672,22 @@ fn applications_are_not_publishable(
 /// lets five shells share one set of decisions. The transport lives in `apps/<app>/client`
 /// and the platform clients, which is where a credential belongs too.
 ///
-/// Stated limit: this reads the three dependency tables and nothing else, so a
-/// `[target.'cfg(..)'.dependencies]` entry would slip past. No core in this repository uses
-/// one, and a scan that pretended to cover them would be guessing at a TOML shape it does not
-/// parse.
+/// What it reads, per manifest in [`CORE_GLOBS`] and [`CORE_FOUNDATION_CRATES`]: the three
+/// dependency tables, the same three under every `[target.<cfg>]`, and for an entry that says
+/// `workspace = true`, the root `[workspace.dependencies]` entry it inherits (whose `package`
+/// may rename it). A dependency is named by its package, never by its key.
+///
+/// Stated limit: it reads manifests, not the resolved graph, so a forbidden crate reached
+/// through a third-party dependency, or through a workspace crate not listed above, still
+/// passes. The listed crates are the ones the core is built on; `cargo tree` is the full
+/// answer, and needs a lockfile and a network this check does not assume.
 fn cores_stay_domain_level(
     root: &Path,
     checked: &mut usize,
     problems: &mut Vec<String>,
 ) -> Result<()> {
-    for glob in CORE_GLOBS {
+    let workspace_dependencies = workspace_dependencies(root)?;
+    for glob in CORE_GLOBS.iter().chain(CORE_FOUNDATION_CRATES) {
         for dir in repo::expand(root, glob) {
             let manifest_path = dir.join("Cargo.toml");
             if !manifest_path.is_file() {
@@ -686,33 +698,77 @@ fn cores_stay_domain_level(
             let manifest: toml::Value = toml::from_str(&source)
                 .with_context(|| format!("parsing {}", repo::rel(root, &manifest_path)))?;
 
-            for table in DEPENDENCY_TABLES {
-                let Some(dependencies) = manifest.get(table).and_then(toml::Value::as_table) else {
-                    continue;
-                };
-                for (key, spec) in dependencies {
-                    *checked += 1;
-                    // The package, not the key: `fx = { package = "auspex-effects" }` is the
-                    // same dependency under another name.
-                    let dependency = spec
-                        .get("package")
-                        .and_then(toml::Value::as_str)
-                        .unwrap_or(key);
-                    if CORE_FORBIDDEN_DEPENDENCIES.contains(&dependency) {
-                        problems.push(format!(
-                            "{}: a Crux core must not depend on `{dependency}` — the core stays \
-                             domain-level (ADR 0002) and the wire lives in apps/<app>/client. \
-                             A credential, a path and an encoding are all transport; if the core \
-                             needs to know who is logged in, it needs an operation that says so \
-                             in its own vocabulary, fulfilled by each shell.",
-                            repo::rel(root, &manifest_path)
-                        ));
-                    }
+            for (key, spec) in dependency_entries(&manifest) {
+                *checked += 1;
+                let dependency = package_name(key, spec, &workspace_dependencies);
+                if CORE_FORBIDDEN_DEPENDENCIES.contains(&dependency) {
+                    problems.push(format!(
+                        "{}: a Crux core, and a crate it is built on, must not depend on \
+                         `{dependency}` — the core stays domain-level (ADR 0002) and the wire \
+                         lives in apps/<app>/client. A credential, a path and an encoding are \
+                         all transport; if the core needs to know who is logged in, it needs an \
+                         operation that says so in its own vocabulary, fulfilled by each shell.",
+                        repo::rel(root, &manifest_path)
+                    ));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// The root manifest's `[workspace.dependencies]`, or an empty table without one.
+fn workspace_dependencies(root: &Path) -> Result<toml::map::Map<String, toml::Value>> {
+    let path = root.join("Cargo.toml");
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return Ok(toml::map::Map::new());
+    };
+    let manifest: toml::Value =
+        toml::from_str(&source).with_context(|| format!("parsing {}", repo::rel(root, &path)))?;
+    Ok(manifest
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(toml::Value::as_table)
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Every `(key, spec)` in a manifest's dependency tables, the `[target.<cfg>]` ones included.
+fn dependency_entries(manifest: &toml::Value) -> Vec<(&str, &toml::Value)> {
+    let targets = manifest
+        .get("target")
+        .and_then(toml::Value::as_table)
+        .into_iter()
+        .flat_map(|t| t.values());
+    std::iter::once(manifest)
+        .chain(targets)
+        .flat_map(|scope| {
+            DEPENDENCY_TABLES
+                .iter()
+                .filter_map(|table| scope.get(table).and_then(toml::Value::as_table))
+        })
+        .flat_map(|table| table.iter().map(|(k, v)| (k.as_str(), v)))
+        .collect()
+}
+
+/// The package a dependency entry names: its `package`, else (for `workspace = true`) the
+/// inherited entry's `package`, else its key. `fx = { package = "auspex-effects" }` and
+/// `fx.workspace = true` over `fx = { package = "auspex-effects" }` are both that crate.
+fn package_name<'a>(
+    key: &'a str,
+    spec: &'a toml::Value,
+    workspace: &'a toml::map::Map<String, toml::Value>,
+) -> &'a str {
+    let own = |v: &'a toml::Value| v.get("package").and_then(toml::Value::as_str);
+    if let Some(package) = own(spec) {
+        return package;
+    }
+    if spec.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+        && let Some(package) = workspace.get(key).and_then(own)
+    {
+        return package;
+    }
+    key
 }
 
 /// Gradle's build cache is on, in every Android project and in the skeleton.
@@ -3002,6 +3058,60 @@ mod tests {
         let problems = core_dependency_problems(&fixture);
         assert_eq!(problems.len(), 1, "{problems:#?}");
         assert!(problems[0].contains("`auspex-effects`"), "{problems:#?}");
+    }
+
+    #[test]
+    fn a_forbidden_dependency_in_a_target_table_is_refused() {
+        let fixture = Fixture::new("core-target-table");
+        fixture.file(
+            "apps/fleet/core/Cargo.toml",
+            "[package]\nname = \"fleet-core\"\n\n\
+             [target.'cfg(unix)'.dependencies]\ntokio.workspace = true\n",
+        );
+        let problems = core_dependency_problems(&fixture);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("`tokio`"), "{problems:#?}");
+    }
+
+    #[test]
+    fn a_workspace_dependency_renamed_at_the_root_is_refused() {
+        let fixture = Fixture::new("core-workspace-rename");
+        fixture
+            .file(
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"apps/*/core\"]\n\n[workspace.dependencies]\n\
+                 review-runtime = { package = \"tokio\", version = \"1\" }\n",
+            )
+            .file(
+                "apps/fleet/core/Cargo.toml",
+                "[package]\nname = \"fleet-core\"\n\n[dependencies]\n\
+                 review-runtime.workspace = true\n",
+            );
+        let problems = core_dependency_problems(&fixture);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("`tokio`"), "{problems:#?}");
+    }
+
+    #[test]
+    fn the_domain_crate_the_core_is_built_on_is_held_to_the_same_list() {
+        let fixture = Fixture::new("core-via-domain");
+        fixture
+            .file(
+                "apps/fleet/core/Cargo.toml",
+                "[package]\nname = \"fleet-core\"\n\n[dependencies]\n\
+                 auspex-domain = { path = \"../../../crates/auspex-domain\" }\n",
+            )
+            .file(
+                "crates/auspex-domain/Cargo.toml",
+                "[package]\nname = \"auspex-domain\"\n\n[dependencies]\ntokio.workspace = true\n",
+            );
+        let problems = core_dependency_problems(&fixture);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(
+            problems[0].contains("crates/auspex-domain/Cargo.toml")
+                && problems[0].contains("`tokio`"),
+            "{problems:#?}"
+        );
     }
 
     #[test]
