@@ -1272,3 +1272,147 @@ fn a_search_that_matches_the_selection_stays_there() {
     shell.send(Event::Search("a".to_owned()));
     assert_eq!(selected(&shell), "mars");
 }
+
+// ---------------------------------------------------------------------------------------
+// Review round 1b: the Sol review's surviving mutations
+// ---------------------------------------------------------------------------------------
+
+/// M02: an answer of the wrong kind for a live request id changes nothing, and the request
+/// it named is still answerable afterwards.
+#[test]
+fn a_wrong_kind_answer_for_a_live_id_changes_nothing() {
+    let mut shell = Shell::new();
+    shell.start_with(full_config(), THREE);
+    let generation = shell.view().refresh.generation;
+    let probe = shell.probes[0].operation.id;
+    let prom = shell.prometheus[0].operation.id;
+    let before = shell.view();
+    shell.send(Event::CacheAnswered {
+        generation,
+        id: probe,
+        cache: NarCache::Cached,
+    });
+    shell.send(Event::InventoryAnswered {
+        generation,
+        id: prom,
+        answer: Ok(inventory("{}")),
+    });
+    shell.send(Event::PrometheusAnswered {
+        generation,
+        id: probe,
+        answer: Err("wrong kind".to_owned()),
+    });
+    assert_eq!(shell.view(), before);
+
+    // The named requests are still outstanding: their real answers land.
+    let name = shell.probes[0].operation.machine.clone();
+    shell.probe(&name, unreachable("down"));
+    assert_eq!(shell.row(&name).status, Badge::Unreachable);
+    let mut p = shell.take_prometheus();
+    shell.resolve(&mut p, Err("down".to_owned()));
+    assert_eq!(
+        shell.view().prometheus,
+        PrometheusStatus::Unavailable {
+            reason: "down".to_owned()
+        }
+    );
+}
+
+/// M03: once every probe and evaluation is in, each of Prometheus, the cache question and
+/// address resolution still holds the fleet unsettled until it answers.
+#[test]
+fn secondary_requests_hold_the_fleet_unsettled() {
+    let fleet = r#"{
+      "terra": {"deploy": {"targetHost": "root@192.168.1.10"}},
+      "luna":  {"deploy": {"targetHost": "root@luna.example"}}
+    }"#;
+    for held in ["prometheus", "cache", "resolve"] {
+        let mut shell = Shell::new();
+        shell.start_with(full_config(), fleet);
+        let mut eval = shell.take_eval();
+        for m in ["luna", "terra"] {
+            shell.probe(m, observed(&path('0', m), ""));
+            // terra's toplevel differs, so its cache question goes out.
+            let out = if m == "terra" {
+                path('1', m)
+            } else {
+                path('0', m)
+            };
+            shell.eval_item(&mut eval, m, evaluated(m, &out));
+        }
+        shell.resolve(&mut eval, EvalAnswer::Finished { error: None });
+        let mut prom = shell.take_prometheus();
+        let mut cache = shell.take_cache("terra");
+        let mut dns = shell.resolves.remove(0);
+        if held != "prometheus" {
+            shell.resolve(&mut prom, Ok(BTreeMap::new()));
+        }
+        if held != "cache" {
+            shell.resolve(&mut cache, NarCache::NotCached);
+        }
+        if held != "resolve" {
+            shell.resolve(&mut dns, BTreeMap::new());
+        }
+        assert_eq!(shell.view().refresh.pending_machines, 0, "{held}");
+        assert!(!shell.view().refresh.settled, "{held} still out");
+        match held {
+            "prometheus" => shell.resolve(&mut prom, Ok(BTreeMap::new())),
+            "cache" => shell.resolve(&mut cache, NarCache::NotCached),
+            _ => shell.resolve(&mut dns, BTreeMap::new()),
+        }
+        assert!(shell.view().refresh.settled, "{held} answered");
+    }
+}
+
+/// M04: a cache answer updates its own machine's row and no other.
+#[test]
+fn a_cache_answer_updates_only_its_own_row() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config_with_cache(), THREE);
+    let mut eval = shell.take_eval();
+    for m in ["luna", "terra"] {
+        shell.probe(m, observed(&path('0', m), ""));
+        shell.eval_item(&mut eval, m, evaluated(m, &path('1', m)));
+    }
+    assert_eq!(shell.caches.len(), 2);
+    let mut terra = shell.take_cache("terra");
+    shell.resolve(&mut terra, NarCache::Cached);
+    assert_eq!(
+        shell.row("terra").badges,
+        [Badge::UpdatePending, Badge::Cached]
+    );
+    assert_eq!(shell.row("luna").badges, [Badge::UpdatePending]);
+}
+
+fn bare_config_with_cache() -> Config {
+    Config {
+        binary_cache: true,
+        ..bare_config()
+    }
+}
+
+/// M05: a count of zero moves nothing, either way.
+#[test]
+fn a_zero_count_moves_nothing() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config(), THREE);
+    shell.send(Event::MoveDown(1));
+    let at = selected(&shell);
+    shell.send(Event::MoveDown(0));
+    assert_eq!(selected(&shell), at);
+    shell.send(Event::MoveUp(0));
+    assert_eq!(selected(&shell), at);
+}
+
+/// M06: `CloseHelp` closes the overlay, and on a closed one does nothing.
+#[test]
+fn close_help_never_opens_it() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config(), THREE);
+    shell.send(Event::CloseHelp);
+    assert!(!shell.view().help_open);
+    shell.send(Event::ToggleHelp);
+    shell.send(Event::CloseHelp);
+    shell.send(Event::CloseHelp);
+    assert!(!shell.view().help_open);
+}
