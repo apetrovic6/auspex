@@ -1,0 +1,254 @@
+{
+  "version": 1,
+  "settled": false,
+  "machines": [
+    {
+      "name": "broken",
+      "class": "nixos",
+      "tags": [],
+      "target": null,
+      "target_source": "inventory",
+      "target_error": "invalid host \"-oProxyCommand=sh\"",
+      "build_host": null,
+      "status": "unreachable",
+      "badges": [
+        "unreachable"
+      ],
+      "reason": "invalid target: invalid host \"-oProxyCommand=sh\"",
+      "current_system": null,
+      "pending_system": null,
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "cerberus",
+      "class": "nixos",
+      "tags": [
+        "server"
+      ],
+      "target": "root@192.168.1.2",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync",
+        "frozen"
+      ],
+      "reason": null,
+      "current_system": "/nix/store/3123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus",
+      "pending_system": "/nix/store/3123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus",
+      "deployed_revision": null,
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [
+        {
+          "kind": "shared_ip",
+          "ip": "192.168.1.2",
+          "with": [
+            "mars"
+          ]
+        }
+      ],
+      "frozen": true
+    },
+    {
+      "name": "genetor",
+      "class": "darwin",
+      "tags": [
+        "workstation"
+      ],
+      "target": "admin@192.168.1.109",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "reason": null,
+      "current_system": "/nix/store/2123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05",
+      "pending_system": "/nix/store/2123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05",
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": {
+          "value": 5000,
+          "source": "ssh"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 2048000,
+            "used_bytes": 1024000,
+            "available_bytes": 1024000
+          },
+          "source": "ssh"
+        },
+        "load": {
+          "value": {
+            "one": 1.5,
+            "five": 1.25,
+            "fifteen": 1.0
+          },
+          "source": "ssh"
+        },
+        "memory": null
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "luna",
+      "class": "nixos",
+      "tags": [
+        "k8s-server"
+      ],
+      "target": "root@192.168.1.12",
+      "target_source": "override",
+      "target_error": null,
+      "build_host": null,
+      "status": "eval_error",
+      "badges": [
+        "checking",
+        "eval_error"
+      ],
+      "reason": "error: attribute 'k3sToken' missing",
+      "current_system": null,
+      "pending_system": null,
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "mars",
+      "class": "nixos",
+      "tags": [
+        "k8s-master"
+      ],
+      "target": "root@mars.ugalabugala.org",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "unreachable",
+      "badges": [
+        "unreachable"
+      ],
+      "reason": "ssh: connect to host mars.ugalabugala.org port 22: Connection timed out",
+      "current_system": null,
+      "pending_system": null,
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [
+        {
+          "kind": "hostname_target",
+          "host": "mars.ugalabugala.org"
+        },
+        {
+          "kind": "shared_ip",
+          "ip": "192.168.1.2",
+          "with": [
+            "cerberus"
+          ]
+        }
+      ],
+      "frozen": false
+    },
+    {
+      "name": "terra",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "k8s-base"
+      ],
+      "target": "root@192.168.1.10",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": "localhost",
+      "status": "update_pending",
+      "badges": [
+        "update_pending",
+        "cached",
+        "failed_units"
+      ],
+      "reason": "pending nixos-system-terra-b",
+      "current_system": "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-a",
+      "pending_system": "/nix/store/1123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-b",
+      "deployed_revision": "c68e00a",
+      "system_state": "degraded",
+      "failed_units": [
+        "k3s.service"
+      ],
+      "health": {
+        "uptime_seconds": {
+          "value": 1010,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 1024000,
+            "used_bytes": 409600,
+            "available_bytes": 512000
+          },
+          "source": "ssh"
+        },
+        "load": {
+          "value": {
+            "one": 0.25,
+            "five": 0.5,
+            "fifteen": 0.75
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 8589934592,
+            "available_bytes": 4294967296
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    }
+  ],
+  "shared_ips": [
+    {
+      "ip": "192.168.1.2",
+      "machines": [
+        "cerberus",
+        "mars"
+      ]
+    }
+  ]
+}

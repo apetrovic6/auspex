@@ -1,0 +1,31 @@
+{
+  "terra": {
+    "deploy": { "targetHost": "root@192.168.1.10", "buildHost": "localhost" },
+    "tags": ["base", "server", "k8s", "k8s-base"],
+    "machineClass": "nixos",
+    "description": null,
+    "installedAt": 1730000000
+  },
+  "genetor": {
+    "deploy": { "targetHost": "admin@192.168.1.109", "buildHost": null },
+    "tags": ["base", "workstation"],
+    "machineClass": "darwin"
+  },
+  "alfrost": {
+    "deploy": { "targetHost": "root@[2001:db8::7]:2222?ProxyJump=bastion" },
+    "tags": ["base", "server"]
+  },
+  "cerberus": {
+    "deploy": { "targetHost": null, "buildHost": "localhost" },
+    "tags": ["base", "server"],
+    "machineClass": null
+  },
+  "luna": {
+    "tags": ["base", "k8s", "k8s-server"],
+    "machineClass": "nixos"
+  },
+  "sol": {
+    "deploy": {},
+    "tags": null
+  }
+}

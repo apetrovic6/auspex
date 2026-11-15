@@ -1,0 +1,8 @@
+auspex_probe=1
+probe=darwin
+current_system=/nix/store/5123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05.abcdef0
+configuration_revision=null
+uptime_seconds=302400
+load= 1.84 2.01 2.10 
+root_disk_kb=971350180 412113220 559236960
+auspex_end=1

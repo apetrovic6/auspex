@@ -1,0 +1,14 @@
+auspex_probe=1
+probe=nixos
+current_system=/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.05.20261101.abcdef0
+booted_kernel=/nix/store/1123456789abcdfghijklmnpqrsvwxyz-linux-6.12.1/bzImage
+booted_initrd=/nix/store/3123456789abcdfghijklmnpqrsvwxyz-initrd-linux-6.12.1/initrd
+current_kernel=/nix/store/2123456789abcdfghijklmnpqrsvwxyz-linux-6.12.4/bzImage
+current_initrd=/nix/store/4123456789abcdfghijklmnpqrsvwxyz-initrd-linux-6.12.4/initrd
+configuration_revision=c68e00a1b2c3d4e5f60718293a4b5c6d7e8f9012
+system_state=running
+failed_units=[]
+uptime_seconds=864123.45
+load=0.15 0.22 0.30
+root_disk_kb=488281250 122070312 341796875
+auspex_end=1

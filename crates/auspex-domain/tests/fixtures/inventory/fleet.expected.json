@@ -1,0 +1,62 @@
+[
+  {
+    "build_host": null,
+    "class": "nixos",
+    "name": "alfrost",
+    "tags": [
+      "base",
+      "server"
+    ],
+    "target_host": "root@[2001:db8::7]:2222?ProxyJump=bastion"
+  },
+  {
+    "build_host": "localhost",
+    "class": "nixos",
+    "name": "cerberus",
+    "tags": [
+      "base",
+      "server"
+    ],
+    "target_host": null
+  },
+  {
+    "build_host": null,
+    "class": "darwin",
+    "name": "genetor",
+    "tags": [
+      "base",
+      "workstation"
+    ],
+    "target_host": "admin@192.168.1.109"
+  },
+  {
+    "build_host": null,
+    "class": "nixos",
+    "name": "luna",
+    "tags": [
+      "base",
+      "k8s",
+      "k8s-server"
+    ],
+    "target_host": null
+  },
+  {
+    "build_host": null,
+    "class": "nixos",
+    "name": "sol",
+    "tags": [],
+    "target_host": null
+  },
+  {
+    "build_host": "localhost",
+    "class": "nixos",
+    "name": "terra",
+    "tags": [
+      "base",
+      "server",
+      "k8s",
+      "k8s-base"
+    ],
+    "target_host": "root@192.168.1.10"
+  }
+]

@@ -13,3 +13,7 @@ drop_example = true
 [[step]]
 tool = "cli"
 args = ["add", "crux-app", "auspex", "--shells", "tui"]
+
+[[step]]
+tool = "cli"
+args = ["add", "lib-crate", "auspex-domain"]
