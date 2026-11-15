@@ -127,9 +127,9 @@ let
     programs.auspex = { enable = false; stylix.enable = true; settings.flake = "/ignored"; };
   }).config;
   installedPackages = map (p: p.drvPath) full.config.home.packages;
-  otherPkgs = import pkgs.path { system = "aarch64-linux"; };
-  otherOverlayPackage = (exports.overlays.default otherPkgs otherPkgs).auspex;
   defaultPackage = exports.packages.${system}.default;
+  # Another system's package set can force source-patching IFD on that architecture.
+  # Keep CI checks native to the package set supplied by the caller.
   overlayPackage = (exports.overlays.default pkgs pkgs).auspex;
 in {
   auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
@@ -175,8 +175,7 @@ in {
     && revision (exports.lib.mkConfigurationRevisionModule { rev = "abc"; }) { }
       { system.configurationRevision = "consumer"; } == "consumer");
   auspex-package = assert lib.assertMsg (defaultPackage.drvPath == exportedPackage.drvPath
-    && overlayPackage.drvPath == exportedPackage.drvPath
-    && otherOverlayPackage.drvPath == exports.packages.aarch64-linux.auspex.drvPath)
+    && overlayPackage.drvPath == exportedPackage.drvPath)
     "auspex-package: default and overlay must export their system's auspex";
     assert lib.assertMsg (installedPackages == [ exportedPackage.drvPath ] && disabled.home.packages == [ ])
       "auspex-package: home-manager must install exactly auspex only when enabled";
