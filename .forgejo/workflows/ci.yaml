@@ -1,14 +1,12 @@
-# The CI pipeline, split into three jobs so the derivation stages, the impure host
-# steps, and the heavy Android build run on different runners.
+# The CI pipeline, split into two jobs so the derivation stages and the impure host steps
+# run on different runners. auspex is a terminal app with no Android or Apple platform
+# project, so the template's ci-android job was removed (add it back with a platform).
 #
 #   ci-pure    — derivation stages (`devenv build outputs.ci-<stage>`), which share one
 #                evaluation of devenv and one set of cargo artifacts.
 #   ci-impure  — host steps (`devenv shell -- just <recipe>`) for wire compatibility, the
 #                advisory database and the template round trips. Each needs `.git` history or
 #                the network.
-#   ci-android — Android native libraries and Gradle lint/build/test. The generated tree is a
-#                derivation (`outputs.ci-android-generated`); Gradle runs on the host inside
-#                `devenv shell` for the SDK and Java.
 #
 # Runner prerequisites, all provided via hostPackages on the NixOS runners:
 # `nix`, `devenv`, `git`, `bash`, coreutils, `cargo`/`rustc`, `cacert`. Four runners
@@ -84,87 +82,3 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: devenv shell -- just publish::push
-
-  # Android: typegen + boltffi native libraries, then Gradle lint, build, and unit
-  # Android: the generated tree Gradle compiles against, then Gradle's lint, build and unit
-  # tests. Each Gradle step is its own recipe so a failure names the stage. They run inside
-  # `devenv shell` for the Android SDK and Java.
-  #
-  # Gradle is configured with `-Xmx2048m` (JVM heap). Measured on the runners rather than
-  # estimated: the job ran on luna, the tightest cap at 3 GiB, and its CI slice peaked at
-  # 2.69 GB with no OOM kill in the kernel log or the cgroup's memory.events. It stays on the
-  # generic `nix` label.
-  ci-android:
-    runs-on: nix
-
-    steps:
-      - uses: actions/checkout@v4
-
-      # The generated tree — Kotlin bindings, the four ABIs' native libraries, the C header,
-      # the localized resources — built as a derivation and copied in, rather than generated on
-      # the host. Cross-compiling four ABIs is the most expensive thing this pipeline does
-      # outside a Gradle build (2m56s cold against 2.8s warm at two cores), and on a host step
-      # it is cold every time because the checkout dies with the task; as a derivation it is
-      # built once per commit and substituted from ncps everywhere else.
-      #
-      # `--no-preserve=mode` is load-bearing rather than tidy: store paths are read-only, and a
-      # plain `cp -r` carries 444 into the checkout, where the next `boltffi pack` or Gradle task
-      # that rewrites a generated file fails on a permission error that names neither the copy
-      # nor the reason.
-      # Every app with an Android project, discovered rather than listed — the shape the
-      # pipeline had before and lost, which matters because `gates.toml` claims these gates for
-      # `apps/*`, not for one app. A product with a second app inherits a manifest that says its
-      # Android gates run, and a hardcoded path here is how that claim quietly stops being true.
-      # `gates.rs` reads `$app` as a wildcard, so the loop is what makes the claim checkable.
-      - name: android generate
-        run: |
-          set -euo pipefail
-          # `devenv build` prints JSON — {"outputs.ci-android-generated": "/nix/store/…"} — so
-          # the path is read by key rather than pattern-matched out of the stream.
-          GEN="$(devenv build outputs.ci-android-generated | jq -r '."outputs.ci-android-generated"')"
-          test -n "$GEN" && test "$GEN" != null
-          for project in apps/*/platforms/android; do
-            [ -d "$project" ] || continue
-            app="${project#apps/}"; app="${app%%/*}"
-            # The derivation covers the apps `nix/ci.nix` builds — today one, the example's —
-            # and its tree is a store hit. Any other app is generated here, which is slower and
-            # still correct; the alternative is an app whose bindings nothing produces.
-            if [ -d "$GEN/$project/generated" ]; then
-              mkdir -p "$project/generated"
-              # `--no-preserve=mode` is load-bearing rather than tidy: store paths are read-only,
-              # and a plain `cp -r` carries 444 into the checkout, where the next Gradle task
-              # that rewrites a generated file fails on a permission error naming neither the
-              # copy nor the reason.
-              cp -r --no-preserve=mode,ownership "$GEN/$project/generated/." "$project/generated/"
-            else
-              devenv shell -- just "apps/$app/generate-android"
-            fi
-          done
-
-      - name: android lint
-        run: |
-          set -euo pipefail
-          for project in apps/*/platforms/android; do
-            [ -d "$project" ] || continue
-            app="${project#apps/}"; app="${app%%/*}"
-            devenv shell -- just "apps/$app/platforms/android/check"
-          done
-
-      - name: android build
-        run: |
-          set -euo pipefail
-          for project in apps/*/platforms/android; do
-            [ -d "$project" ] || continue
-            app="${project#apps/}"; app="${app%%/*}"
-            devenv shell -- just "apps/$app/platforms/android/build"
-          done
-
-      - name: android test
-        run: |
-          set -euo pipefail
-          for project in apps/*/platforms/android; do
-            [ -d "$project" ] || continue
-            app="${project#apps/}"; app="${app%%/*}"
-            devenv shell -- just "apps/$app/platforms/android/test"
-          done
-

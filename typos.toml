@@ -41,6 +41,8 @@ extend-ignore-re = [
 # Crate and product names that typos would otherwise "correct"
 Ratatui = "Ratatui"
 ratatui = "ratatui"
+# Warhammer 40k: the Adeptus Mechanicus, whose naming omnissiah and auspex follow.
+Mechanicus = "Mechanicus"
 # Serialization abbreviations used throughout the generated bincode/serde code
 ser = "ser"
 de = "de"

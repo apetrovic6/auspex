@@ -46,7 +46,7 @@ crates/
                     serde types here are the --json contract (versioned).
   auspex-effects/   adapters: ssh, nix, clan, prometheus, k8s, cache (fs),
                     deploylog (SQLite), ntfy, notify. tokio lives here and nowhere else.
-apps/auspex/
+apps/ (the auspex Crux app)/
   core/             Crux: Model, Event, Effect (the ports), update(), view().
                     Orchestration only, calling domain functions.
   shells/tui/       ratatui rendering, key mapping, and wiring Effect → auspex-effects.

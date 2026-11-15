@@ -20,6 +20,8 @@ members = [
     "crates/*",
     "services/*",
     "tools/*",
+    "apps/*/core",
+    "apps/*/shells/*",
 ]
 
 # A bare `cargo build` / `cargo test` at the root skips the heavy shells: gpui pulls in a
@@ -29,6 +31,7 @@ default-members = [
     "crates/*",
     "services/*",
     "tools/*",
+    "apps/*/core",
 ]
 
 # Skeletons for `cargo xtask new`. They contain Cargo.toml files that are deliberately not

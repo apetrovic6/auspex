@@ -200,16 +200,6 @@ ci = ["ci-pure"]
 # --- end app-gates: apple ---
 
 # --- app-gates: generate-android ---
-# Typegen and the `.so`: not a check, but CI runs it and the manifest covers every recipe CI
-# runs, so a job gaining a step has to be thought about here.
-#
-# `ci-android` reaches it through `outputs.ci-android-generated`, the derivation that
-# cross-compiles all four ABIs.
-[[gate]]
-path = ["apps/*/generate-android"]
-local = false
-ci = ["ci-android"]
-reason = "it produces the bindings and the native library rather than validating anything, and needs the NDK. ci-android builds it as a derivation so the cross-compile is shared through the binary cache"
 # --- end app-gates: generate-android ---
 
 # Wire compatibility against a base ref: the question is asked of a pull request, not of the
