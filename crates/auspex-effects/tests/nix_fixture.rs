@@ -1,9 +1,10 @@
 //! The plan's step-1 effects integration test: the real `nix eval` and `nix-eval-jobs`
 //! against a fixture flake with no inputs (`tests/fixtures/flake`).
 //!
-//! The fixture is copied into a fresh git repository in a temporary directory and referred
-//! to with a `path:` flake ref, so it works untracked ("Flakes only see tracked files") and
-//! the cache key comes from a clean tree of known state.
+//! The fixture is copied into a fresh git repository in a temporary directory and committed
+//! ("Flakes only see tracked files"), and referred to by its plain path, which nix reads as
+//! `git+file` and which is the only kind of reference the cache keys. The cache key comes
+//! from a clean tree of known state.
 //!
 //! Skipped, with a message, when `nix`, `nix-eval-jobs` or `git` is not on `PATH`, which is
 //! the case inside the `ci-pure` sandbox: there is no Nix daemon to evaluate against there.
@@ -44,6 +45,7 @@ fn git(dir: &Path, args: &[&str]) {
 
 async fn run(flake: &FlakeRef, machines: &[EvalMachine], cache: &CacheParams<'_>) -> Vec<EvalItem> {
     let mut eval = EvalParams::new();
+    eval.runtime_dir = Some(common::runtime_dir());
     eval.workers = 2;
     eval.max_memory_mib = 1024;
     eval.timeout = Duration::from_secs(120);

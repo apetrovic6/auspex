@@ -101,7 +101,7 @@ pub fn kind(dir: impl AsFd, name: &[u8]) -> Result<FileType, ReadError> {
 }
 
 /// The regular file `name` in `dir`, read in chunks into `sink`, at most `cap` bytes.
-/// `stop` is asked between chunks. Returns whether the file is executable.
+/// `stop` is asked between chunks. Returns whether the file is executable by its owner.
 pub fn read_file(
     dir: impl AsFd,
     name: &[u8],
@@ -126,7 +126,8 @@ pub fn read_file(
             Err(e) => return Err(e.into()),
         };
         if n == 0 {
-            return Ok(st.st_mode & 0o111 != 0);
+            // The owner bit only, as git and nix use it (review finding N2a).
+            return Ok(st.st_mode & 0o100 != 0);
         }
         total += n as u64;
         if total > cap {

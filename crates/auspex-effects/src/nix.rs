@@ -7,10 +7,11 @@
 //!   argv element after `--`, the attribute path is a constant, and nix parses both itself.
 //! - The evaluation runs a constant expression, [`EVAL_EXPR`], a function of two strings:
 //!   `flake` (the flake reference, `--argstr`) and `machines` (a JSON list of
-//!   `{name, class}` written by `serde_json` into a private temporary file, read with
-//!   `--arg-from-file`, so a large fleet is not limited by the 128 KiB a single argument
-//!   may hold). A name nix would
-//!   refuse in the list as a whole (a NUL) gets its own error and is left out. The expression selects each configuration
+//!   `{name, class}` written by `serde_json` into a 0600 file in the per-user runtime
+//!   directory, read with `--arg-from-file`, so a large fleet is not limited by the
+//!   128 KiB a single argument may hold). A name nix would refuse in the list as a whole
+//!   (a NUL, an empty or oversized one) gets its own error and is left out. The expression
+//!   selects each configuration
 //!   with `${m.name}`, a dynamic attribute *lookup* by a string value, so a name such as
 //!   `x"; builtins.abort "pwned` is just an attribute that does not exist.
 //!
@@ -38,6 +39,7 @@ use crate::process::{
     End, Limits, Line, Lines, OnExit, PIPE_GRACE, Spawned, Tail, command, describe_status, run,
     spawn, spawn_error,
 };
+use crate::ssh::ControlDir;
 use crate::text::{lossy, reason};
 
 /// The default `nix` program, looked up on `PATH`.
@@ -148,13 +150,21 @@ impl FlakeRef {
         &self.0
     }
 
-    /// Whether nix will read this through git: a plain path (nix uses git when it is in a
-    /// repository) or `git+file:`. Only these are cached: any other reference either sees
+    /// Whether nix will read this through git, from the worktree: a plain path (nix uses git
+    /// when it is in a repository) or `git+file:`, without a query. Only these are cached: any other reference either sees
     /// files whose contents the key does not cover (`path:` reads untracked and ignored
     /// files) or is not the flake directory at all (`github:`).
     #[must_use]
     pub fn is_git(&self) -> bool {
-        !has_scheme(&self.0) || self.0.starts_with("git+file:")
+        (!has_scheme(&self.0) || self.0.starts_with("git+file:")) && !self.has_query()
+    }
+
+    /// Whether it carries a query (`?ref=`, `?rev=`, `?dir=`, `?submodules=`): each makes
+    /// nix read something other than the worktree, so such a reference is not cached
+    /// (review finding N2d).
+    #[must_use]
+    pub fn has_query(&self) -> bool {
+        self.0.contains('?')
     }
 
     /// The scheme (`path`, `github`), or `path` for a plain path, for messages.
@@ -214,6 +224,7 @@ pub async fn inventory(
     let limits = Limits {
         stdout: INVENTORY_STDOUT_CAP,
         stderr: STDERR_CAP,
+        memory: None,
     };
     let deadline = Instant::now() + timeout;
     let ran = match run(cmd, None, OnExit::KillGroup, limits, deadline, cancel).await {
@@ -262,6 +273,9 @@ pub struct EvalParams<'a> {
     /// The whole evaluation's deadline. Past it the process group is killed, and the
     /// final item says so.
     pub timeout: Duration,
+    /// Where the machine list file goes: a directory checked like ssh's control directory
+    /// (0700, ours, no symlink). `None` is [`ControlDir::default_path`], the same directory.
+    pub runtime_dir: Option<std::path::PathBuf>,
 }
 
 impl EvalParams<'_> {
@@ -274,6 +288,7 @@ impl EvalParams<'_> {
             workers: 4,
             max_memory_mib: 4096,
             timeout: Duration::from_secs(300),
+            runtime_dir: None,
         }
     }
 }
@@ -348,19 +363,45 @@ struct ListFile(std::path::PathBuf);
 
 static LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The list files' name: `machines-<pid>-<n>.json`.
+fn list_file_pid(name: &str) -> Option<i32> {
+    let rest = name.strip_prefix("machines-")?.strip_suffix(".json")?;
+    let (pid, n) = rest.split_once('-')?;
+    n.bytes().all(|b| b.is_ascii_digit()).then_some(())?;
+    pid.parse().ok()
+}
+
 impl ListFile {
-    /// Creates it in the system temporary directory, exclusively (`O_EXCL`, which also
-    /// refuses a planted symlink) and readable only by us. Only names and classes are in it.
-    fn create(contents: &str) -> std::io::Result<Self> {
+    /// Creates it in `dir` (the per-user runtime directory, checked 0700 and ours by
+    /// [`ControlDir::prepare`]), exclusively (`O_EXCL`, which also refuses a planted
+    /// symlink) and readable only by us. Only names and classes are in it.
+    ///
+    /// A crash or `SIGKILL` leaves the file behind (review finding N7), so each call first
+    /// removes the list files whose creating process is gone: the pid in the name no
+    /// longer exists (`kill(pid, 0)` answers `ESRCH`). A pid reused since then only keeps a
+    /// stale file longer; it never makes a live call's file look stale.
+    fn create(dir: &ControlDir, contents: &str) -> std::io::Result<Self> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
+        let dir = Path::new(dir.as_str());
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for e in entries.flatten() {
+                let name = e.file_name();
+                let Some(pid) = name.to_str().and_then(list_file_pid) else {
+                    continue;
+                };
+                let gone = rustix::process::Pid::from_raw(pid).is_none_or(|p| {
+                    rustix::process::test_kill_process(p) == Err(rustix::io::Errno::SRCH)
+                });
+                if gone {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
         let mut last = None;
         for _ in 0..8 {
-            let path = std::env::temp_dir().join(format!(
-                "auspex-machines-{}-{}-{nanos}.json",
+            let path = dir.join(format!(
+                "machines-{}-{}.json",
                 std::process::id(),
                 LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
@@ -379,7 +420,7 @@ impl ListFile {
                 Err(e) => return Err(e),
             }
         }
-        Err(last.unwrap_or_else(|| std::io::Error::other("no temporary file")))
+        Err(last.unwrap_or_else(|| std::io::Error::other("no list file")))
     }
 }
 
@@ -570,7 +611,14 @@ pub async fn evaluate(
         let _ = tx.send(EvalItem::Finished { error: None });
         return Ok(());
     }
-    let list = match ListFile::create(&eval_machines_json(&unique)) {
+    let dir = params
+        .runtime_dir
+        .clone()
+        .unwrap_or_else(ControlDir::default_path);
+    let list = match ControlDir::prepare(&dir)
+        .map_err(|e| std::io::Error::other(e.0))
+        .and_then(|d| ListFile::create(&d, &eval_machines_json(&unique)))
+    {
         Ok(l) => l,
         Err(e) => {
             let _ = tx.send(EvalItem::Finished {
@@ -583,7 +631,7 @@ pub async fn evaluate(
     };
     let spawned = command(params.program).and_then(|mut cmd| {
         cmd.args(eval_argv(flake, &list.0, params));
-        spawn(cmd, false, OnExit::KillGroup)
+        spawn(cmd, false, OnExit::KillGroup, None)
     });
     let mut sp = match spawned {
         Ok(s) => s,

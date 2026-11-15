@@ -42,14 +42,30 @@
 //! reach it, and nothing here runs if auspex itself is killed by a signal: no destructor,
 //! no group guard (review finding F4). Killing children on the parent's death needs
 //! `PR_SET_PDEATHSIG` in the child, which needs `pre_exec`, which is `unsafe`. So the
-//! shell must handle `SIGHUP`, `SIGTERM`, `SIGINT` and `SIGQUIT` by cancelling every
-//! token and dropping the runtime before it exits. [`termination`] is that wait:
+//! shell must handle `SIGHUP`, `SIGTERM`, `SIGINT` and `SIGQUIT`, with a [`Termination`]:
+//!
+//! 1. **create it once, before the first child is spawned** (from then on those four
+//!    signals no longer kill the process by default: the `Termination` is what notices
+//!    them);
+//! 2. **keep it for the whole run**, and **never recreate it in a loop**: it is the value
+//!    that remembers a signal arriving while nobody is waiting, so `recv` can be called
+//!    again and again from a `select!` without losing one (review finding N4);
+//! 3. **when it fires, cancel every token, drop the runtime, and exit.**
 //!
 //! ```no_run
 //! # async fn shell(all: auspex_effects::CancellationToken) -> std::io::Result<()> {
-//! let signal = auspex_effects::termination().await?;
-//! all.cancel(); // every call returns `Err(Cancelled)` after killing its group
-//! # let _ = signal; Ok(()) }
+//! let mut term = auspex_effects::Termination::new()?; // before the first spawn
+//! loop {
+//!     tokio::select! {
+//!         signal = term.recv() => {
+//!             all.cancel(); // every call returns `Err(Cancelled)` after killing its group
+//!             # let _ = signal;
+//!             break; // then drop the runtime and exit
+//!         }
+//!         // … keys, frame timer, effects …
+//!     }
+//! }
+//! # Ok(()) }
 //! ```
 //!
 //! `SIGKILL` cannot be handled; after one, children are left to finish on their own.
@@ -107,26 +123,46 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
-/// Waits for `SIGHUP`, `SIGTERM`, `SIGINT` or `SIGQUIT` and returns its name.
+/// The process's termination signals (`SIGHUP`, `SIGTERM`, `SIGINT`, `SIGQUIT`), caught.
 ///
-/// The shell awaits this beside its main loop, then cancels every token and drops the
-/// runtime, so children are killed even when the terminal closes or the operator presses
-/// Ctrl-C in `--plain`. Registering replaces the default action (dying) for those four
-/// signals for the whole process, which is the point.
-///
-/// # Errors
-///
-/// When a handler cannot be registered (no tokio signal driver).
-pub async fn termination() -> std::io::Result<&'static str> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut hup = signal(SignalKind::hangup())?;
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    let mut quit = signal(SignalKind::quit())?;
-    Ok(tokio::select! {
-        _ = hup.recv() => "SIGHUP",
-        _ = term.recv() => "SIGTERM",
-        _ = int.recv() => "SIGINT",
-        _ = quit.recv() => "SIGQUIT",
-    })
+/// Created once, before the first child is spawned, and kept for the whole run (see the
+/// crate documentation for the full duty). All four handlers are registered by
+/// [`Termination::new`], and each remembers a signal that arrives while nobody is in
+/// [`Termination::recv`], so a signal between two `recv` calls is not lost. Creating one
+/// replaces the default action (dying) of those four signals for the whole process for
+/// good, which is why it must not be created and dropped casually.
+#[derive(Debug)]
+pub struct Termination {
+    hup: tokio::signal::unix::Signal,
+    term: tokio::signal::unix::Signal,
+    int: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+}
+
+impl Termination {
+    /// Registers all four handlers now. Must be called inside a tokio runtime.
+    ///
+    /// # Errors
+    ///
+    /// When a handler cannot be registered (no tokio signal driver).
+    pub fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            hup: signal(SignalKind::hangup())?,
+            term: signal(SignalKind::terminate())?,
+            int: signal(SignalKind::interrupt())?,
+            quit: signal(SignalKind::quit())?,
+        })
+    }
+
+    /// Waits for the next of the four (or returns at once if one arrived since the last
+    /// call) and returns its name. Cancel-safe: use it in a `select!` loop.
+    pub async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.hup.recv() => "SIGHUP",
+            _ = self.term.recv() => "SIGTERM",
+            _ = self.int.recv() => "SIGINT",
+            _ = self.quit.recv() => "SIGQUIT",
+        }
+    }
 }

@@ -8,7 +8,8 @@
 //! - on a timeout or a cancellation, [`kill_and_reap`] sends `SIGKILL` to the whole group,
 //!   then waits for the leader, so the call returns only once it is gone;
 //! - when the future is dropped mid-run, the [`Group`] guard's `Drop` kills the group, and
-//!   tokio reaps the leader in the background (`kill_on_drop`);
+//!   only then does tokio reap the leader in the background (`kill_on_drop`): `Spawned`
+//!   declares `group` before `child`, so it is dropped first;
 //! - when it exits on its own ([`Spawned::exited`]), what is left of its group is killed
 //!   too ([`OnExit::KillGroup`]): `nix-eval-jobs` workers outlive a crashed leader
 //!   otherwise (review finding F3). ssh is the exception ([`OnExit::LeaveGroup`]); see
@@ -136,8 +137,12 @@ impl ExitWatch {
 /// A spawned process, its group guard, and how it is waited for.
 #[derive(Debug)]
 pub struct Spawned {
-    pub child: Child,
+    // `group` is declared before `child`, so it is dropped first: on the drop path the group
+    // is killed while the leader is still unreaped, and only then does `child`'s
+    // `kill_on_drop` hand the leader to tokio's reaper (review finding N3; fields drop in
+    // declaration order).
     pub group: Group,
+    pub child: Child,
     watch: ExitWatch,
     on_exit: OnExit,
 }
@@ -222,7 +227,12 @@ fn resolve_in(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
 ///
 /// The command is run directly (`execve` of `cmd`'s program): never through a shell. Build
 /// `cmd` with [`command`].
-pub fn spawn(mut cmd: Command, with_stdin: bool, on_exit: OnExit) -> io::Result<Spawned> {
+pub fn spawn(
+    mut cmd: Command,
+    with_stdin: bool,
+    on_exit: OnExit,
+    memory: Option<u64>,
+) -> io::Result<Spawned> {
     // A new session: `setsid()` in the child, which makes it the leader of a new session
     // AND of a new process group whose id is its pid (so no separate `process_group(0)`:
     // a process that is already a group leader cannot call setsid). A new session has no
@@ -249,12 +259,49 @@ pub fn spawn(mut cmd: Command, with_stdin: bool, on_exit: OnExit) -> io::Result<
         .and_then(|id| i32::try_from(id).ok())
         .and_then(Pid::from_raw);
     watch.pid = pgid;
-    Ok(Spawned {
-        child,
+    let sp = Spawned {
         group: Group(pgid),
+        child,
         watch,
         on_exit,
-    })
+    };
+    if let Some(bytes) = memory
+        && let Err(e) = limit_memory(pgid, bytes)
+    {
+        // Never run a command whose bound could not be set. Killed by the guard and reaped
+        // by tokio when `sp` drops.
+        sp.group.kill();
+        return Err(e);
+    }
+    Ok(sp)
+}
+
+/// Caps a just-spawned child's address space (`RLIMIT_AS`) at `bytes`, with `prlimit(2)`
+/// from the parent: safe, unlike `setrlimit` in `pre_exec`. It applies a few microseconds
+/// after the exec, before the program has read anything (git takes milliseconds to start).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn limit_memory(pid: Option<Pid>, bytes: u64) -> io::Result<()> {
+    use rustix::process::{Resource, Rlimit, prlimit};
+    let pid = pid.ok_or_else(|| io::Error::other("no pid to limit"))?;
+    prlimit(
+        Some(pid),
+        Resource::As,
+        Rlimit {
+            current: Some(bytes),
+            maximum: Some(bytes),
+        },
+    )
+    .map(drop)
+    .map_err(Into::into)
+}
+
+/// Elsewhere another process's limit cannot be set safely, so a bounded command is not run.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn limit_memory(_: Option<Pid>, _: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this platform cannot limit a child's memory",
+    ))
 }
 
 /// The first `cap` bytes of a stream.
@@ -434,6 +481,8 @@ pub struct Limits {
     pub stdout: usize,
     /// Bytes of stderr kept (the tail).
     pub stderr: usize,
+    /// An address-space limit for the process, in bytes; `None` for none.
+    pub memory: Option<u64>,
 }
 
 /// What [`run`] collected.
@@ -465,7 +514,7 @@ pub async fn run(
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> io::Result<Ran> {
-    let mut sp = spawn(cmd, stdin.is_some(), on_exit)?;
+    let mut sp = spawn(cmd, stdin.is_some(), on_exit, limits.memory)?;
     let mut out_pipe: Option<ChildStdout> = sp.child.stdout.take();
     let mut err_pipe: Option<ChildStderr> = sp.child.stderr.take();
     let stdin_pipe = sp.child.stdin.take();

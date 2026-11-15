@@ -156,3 +156,11 @@ pub fn pid_exists(pid: i32) -> bool {
     rustix::process::Pid::from_raw(pid)
         .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
 }
+
+/// A private runtime directory for the machine-list files the evaluator tests create, so
+/// they never touch the operator's own `$XDG_RUNTIME_DIR/auspex`. Short, for the socket-path
+/// limit `ControlDir::prepare` checks; one per test process.
+pub fn runtime_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(tempdir).path().join("rt")
+}

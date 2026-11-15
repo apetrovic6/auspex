@@ -6,36 +6,52 @@
 //!
 //! # The key, and why git compares nothing
 //!
-//! The fleet repository's own git configuration is not trusted (review finding F1): a
-//! `.git/config` that came with an unpacked archive or a synced folder can name filter
-//! drivers (`filter.<x>.clean`, `filter.<x>.process`) that `git status` and `git diff` run
-//! on any stat-dirty file, and `core.attributesFile = /dev/zero` makes them read an endless
-//! line into memory. So git is asked only for things it answers from the index and refs,
-//! without reading file contents through attributes:
+//! The fleet repository's own git configuration and files are not trusted (review findings
+//! F1 and N1): a `.git/` that came with an unpacked archive or a synced folder can name
+//! filter drivers that `git status` and `git diff` run on any stat-dirty file, and files
+//! that git reads whole (an attributes or exclude file, a `.gitignore`, the index, `HEAD`,
+//! `packed-refs`) can be gigabytes, or FIFOs that never answer. So:
 //!
-//! - `git rev-parse --show-toplevel` and `git rev-parse --verify HEAD`;
-//! - `git ls-files -z`: the tracked paths, from the index;
-//! - `git ls-files --others --exclude-standard -z`: the untracked names, from a directory
-//!   walk that reads `.gitignore` files and nothing else (no filters, no attributes).
+//! - git is asked only for what it answers from the index and refs, without reading file
+//!   contents: `git rev-parse --show-toplevel`, `git rev-parse --verify HEAD` and
+//!   `git ls-files -s -z` (mode, blob id, stage and path of every index entry);
+//! - every git command runs under an address-space limit of [`GIT_MEMORY_LIMIT`]
+//!   (`prlimit(2)` right after spawn; measured: `ls-files -s` on nixpkgs, about 40,000
+//!   files, peaks at 25 MB and needs about 37 MB of address space), so an oversized index,
+//!   `HEAD` or `packed-refs` makes git fail fast, which is "no caching" with a note. On a
+//!   platform without `prlimit` for another process, git is not run and there is no
+//!   caching;
+//! - each git command has a short timeout (2 s by default; those three take at most 22 ms
+//!   on nixpkgs), and the first one that fails ends the key, so a FIFO in git's config
+//!   path costs one short timeout per refresh. That is not remembered across refreshes:
+//!   doing so would need state outside the arguments, which this crate does not keep;
+//! - git gets `-c core.fsmonitor=false` ([`GIT_HARDENING`]), `GIT_OPTIONAL_LOCKS=0`, and
+//!   none of the inherited variables that would point it at another repository or index.
 //!
-//! Every git command also gets [`GIT_HARDENING`] (no fsmonitor, no attributes or excludes
-//! file, no hooks, no untracked cache), no pager, no optional locks, and none of the
-//! inherited `GIT_DIR`-style variables.
+//! **Untracked and ignored files are not in the key**, and no exclude file or `.gitignore`
+//! is read: a git flake never sees them (nix builds a `git+file` source from tracked files
+//! only, and they leave `self.rev` clean), and a `path:` reference, which does see them,
+//! gets no caching at all. The domain's untracked list is passed empty.
 //!
-//! The worktree is then hashed **in Rust**, from the bytes nix would read for a dirty
-//! `git+file` flake: every tracked path, walked from the top level without following
-//! symlinks (a tracked symlink contributes its target text), regular files only (opened
-//! non-blocking, so a FIFO cannot hang it), at most [`MAX_WORKTREE_BYTES`] in all. That
-//! digest goes into the domain's `Tree::Dirty { diff, .. }` slot, whose name says "diff":
-//! the slot is a byte string to hash, and a digest of the worktree is a stricter input than
-//! `git diff HEAD` was. `Tree::Clean` is never used, because telling clean from dirty is
-//! exactly the comparison that runs filters; a clean tree still gets a stable key, it is
-//! only spelled the dirty way. `flake.lock` is read the same safe way (review finding F5).
+//! **What the key covers**, exactly: the cache format version; `HEAD`'s commit id; the
+//! bytes of `flake.lock` in the flake directory (or its absence); and a digest of the
+//! flake directory's path relative to the repository top level, the index as `ls-files -s`
+//! prints it (so a staged change, even one whose worktree bytes equal the commit, is a
+//! different key: nix evaluates such a tree with `self.dirtyRev`), and, for every index
+//! path, its worktree state as nix would read it for a dirty `git+file` flake: a regular
+//! file's bytes and its owner exec bit, a symlink's target text, or that it is missing or
+//! not a regular file. Paths are walked from the top level without following symlinks,
+//! regular files are opened non-blocking, at most [`MAX_WORKTREE_BYTES`] are read in all,
+//! under [`GitParams::read_timeout`]. That digest goes into the domain's
+//! `Tree::Dirty { diff, .. }` slot (a byte string to hash; the domain's key has no slot for
+//! the flake directory, which is why it rides in the digest). `Tree::Clean` is never used.
 //!
-//! No caching at all, rather than a key that could be wrong, when: the directory is not a
-//! git repository with a commit; git fails or times out; the worktree is over the cap; or
-//! the flake reference is not a git one (`path:` sees untracked and ignored files, whose
-//! contents are not in the key; review finding F11). Each is a note the caller can log.
+//! No caching at all, rather than a key that could be wrong, when: the flake reference is
+//! not a plain path or a `git+file:` reference without a query (review findings F11 and
+//! N2d); the directory is not a git repository with a commit; git fails, times out or
+//! hits its memory limit; the index tracks a submodule (gitlink mode 160000), whose
+//! worktree the key does not cover (N2c); `flake.lock` is not a regular file or is over
+//! [`MAX_LOCK_BYTES`]; or the worktree is over its cap. Each is a note the caller can log.
 //!
 //! # Entries
 //!
@@ -79,6 +95,9 @@ pub const DEFAULT_GIT: &str = "git";
 /// of Nix; past the cap there is no caching for that run.
 pub const MAX_WORKTREE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// The address-space limit put on every git command, in bytes: 512 MiB.
+pub const GIT_MEMORY_LIMIT: u64 = 512 << 20;
+
 /// The largest `flake.lock` that is keyed: 16 MiB.
 pub const MAX_LOCK_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -88,32 +107,17 @@ const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
 /// A cache file larger than this is not an entry (a real one is under a kilobyte).
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
 
-/// Repository configuration overridden for every git command here, because each can run a
-/// program or read an arbitrary path:
+/// Repository configuration overridden for every git command here: `core.fsmonitor`, a
+/// hook command that `ls-files` would run to list changed files (a test plants one).
 ///
-/// - `core.fsmonitor`: a hook command run to list changed files;
-/// - `core.attributesFile`: read in full (`/dev/zero` is an endless line);
-/// - `core.excludesFile`: read by the untracked listing (a FIFO there hangs until the
-///   timeout). This also drops the operator's global excludes from the untracked list,
-///   which can only add names to the key;
-/// - `core.hooksPath`: where hooks are looked up;
-/// - `core.untrackedCache`: written into the index otherwise.
-///
-/// Filter drivers need no override: none of the remaining commands reads file contents.
-pub const GIT_HARDENING: &[&str] = &[
-    "-c",
-    "core.fsmonitor=false",
-    "-c",
-    "core.attributesFile=/dev/null",
-    "-c",
-    "core.excludesFile=/dev/null",
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "core.untrackedCache=false",
-];
+/// That is all the remaining commands need. Round 1 also overrode `core.attributesFile`,
+/// `core.excludesFile`, `core.hooksPath` and `core.untrackedCache`; none of `rev-parse` and
+/// `ls-files -s` reads attributes or exclude files, runs hooks, or writes the index, so
+/// those overrides guarded nothing and no test could fail without them (review round 2).
+pub const GIT_HARDENING: &[&str] = &["-c", "core.fsmonitor=false"];
 
-/// Inherited variables that would point git at another repository, index or object store.
+/// Inherited variables that would point git at another repository, index or object
+/// store. `GIT_CEILING_DIRECTORIES` is kept: it is the operator's own limit on discovery.
 const GIT_ENV_REMOVED: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -121,8 +125,6 @@ const GIT_ENV_REMOVED: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_EXTERNAL_DIFF",
 ];
 
 /// The cache directory from the environment: `$XDG_CACHE_HOME/auspex` when that is an
@@ -138,22 +140,25 @@ pub fn default_dir() -> Option<PathBuf> {
         .map(|h| Path::new(&h).join(".cache").join("auspex"))
 }
 
-/// How to run git for the key.
+/// How to compute the key.
 #[derive(Debug, Clone, Copy)]
 pub struct GitParams<'a> {
     /// The program: [`DEFAULT_GIT`] (resolved on `PATH`) or an absolute path.
     pub program: &'a OsStr,
-    /// Each git command's own timeout, and the worktree hash's.
+    /// Each git command's own timeout.
     pub timeout: Duration,
+    /// The worktree hash's timeout (reading up to [`MAX_WORKTREE_BYTES`]).
+    pub read_timeout: Duration,
 }
 
 impl GitParams<'_> {
-    /// `git` from `PATH`, 10 s per command.
+    /// `git` from `PATH`, 2 s per command, 30 s for reading the worktree.
     #[must_use]
     pub fn new() -> Self {
         Self {
             program: OsStr::new(DEFAULT_GIT),
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -162,6 +167,15 @@ impl Default for GitParams<'_> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether a failed git looks like it ran into [`GIT_MEMORY_LIMIT`]: git's own "Out of
+/// memory" or `ENOMEM` messages, or a crash (a failed `mmap` of a stack or library).
+fn out_of_memory(stderr: &str, status: std::process::ExitStatus) -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+    stderr.contains("Out of memory")
+        || stderr.contains("Cannot allocate memory")
+        || matches!(status.signal(), Some(6 | 7 | 11))
 }
 
 async fn git(
@@ -176,11 +190,12 @@ async fn git(
         Ok(c) => c,
         Err(e) => return Ok(Err(spawn_error(&what, params.program, &e))),
     };
+    // `GIT_OPTIONAL_LOCKS=0` guards nothing today (none of these commands refreshes or
+    // writes the index, and no test can tell); it is kept because it is free and because a
+    // git that one day refreshes the index during `ls-files` would otherwise write into the
+    // operator's repository.
     cmd.current_dir(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .arg("--no-pager")
         .args(GIT_HARDENING)
         .args(args);
     for v in GIT_ENV_REMOVED {
@@ -189,6 +204,7 @@ async fn git(
     let limits = Limits {
         stdout: cap,
         stderr: 16 * 1024,
+        memory: Some(GIT_MEMORY_LIMIT),
     };
     let deadline = Instant::now() + params.timeout;
     let ran = match run(cmd, None, OnExit::KillGroup, limits, deadline, cancel).await {
@@ -197,17 +213,46 @@ async fn git(
     };
     Ok(match ran.end {
         End::Cancelled => return Err(Cancelled),
-        End::TimedOut => Err(format!("{what} timed out")),
+        End::TimedOut => Err(format!("{what} timed out after {:?}", params.timeout)),
         End::Overflow => Err(format!("{what} printed more than {cap} bytes")),
         End::Exited(s) if s.success() => Ok(ran.stdout),
         End::Exited(s) => {
-            let why = last_line(&lossy(&ran.stderr)).unwrap_or_default();
-            Err(format!("{what} {}: {why}", describe_status(Some(s))))
+            let stderr = lossy(&ran.stderr);
+            let why = last_line(&stderr).unwrap_or_default();
+            if out_of_memory(&stderr, s) {
+                Err(format!(
+                    "{what} ran into auspex's memory limit for git ({} MiB): {why}",
+                    GIT_MEMORY_LIMIT >> 20
+                ))
+            } else {
+                Err(format!("{what} {}: {why}", describe_status(Some(s))))
+            }
         }
     })
 }
 
-/// Gathers the key's inputs for the flake in `flake_dir` and computes the key.
+/// The paths of `git ls-files -s -z` output, or why the index cannot be keyed.
+fn index_paths(index: &[u8]) -> Result<Vec<&[u8]>, String> {
+    let mut paths = Vec::new();
+    for rec in index.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
+            return Err("git ls-files -s printed a record without a path".to_owned());
+        };
+        let (meta, path) = (&rec[..tab], &rec[tab + 1..]);
+        if meta.starts_with(b"160000 ") {
+            return Err(format!(
+                "the repository tracks a submodule ({}), whose worktree the cache key does \
+                 not cover",
+                last_line(&lossy(path)).unwrap_or_default()
+            ));
+        }
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+/// Gathers the key's inputs for the flake in `flake_dir` and computes the key. The module
+/// documentation says exactly what it covers.
 ///
 /// The result's inner `Err` is the reason there is no caching for this run.
 ///
@@ -248,36 +293,43 @@ pub async fn key_for(
         Ok(h) => lossy(&h),
         Err(e) => return Ok(Err(format!("not a git repository with a commit ({e})"))),
     };
-    let tracked = match git(params, &top, &["ls-files", "-z"], MAX_LIST_BYTES, cancel).await? {
-        Ok(t) => t,
-        Err(e) => return Ok(Err(e)),
-    };
-    let untracked = match git(
+    let index = match git(
         params,
         &top,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
+        &["ls-files", "-s", "-z"],
         MAX_LIST_BYTES,
         cancel,
     )
     .await?
     {
-        Ok(u) => u,
+        Ok(t) => t,
         Err(e) => return Ok(Err(e)),
     };
-    let untracked: Vec<String> = untracked
-        .split(|&b| b == 0)
-        .filter(|f| !f.is_empty())
-        .map(lossy)
-        .collect();
+    // Two flakes in one repository must not share a key (review finding N2e).
+    let rel = match (
+        std::fs::canonicalize(flake_dir),
+        std::fs::canonicalize(&top),
+    ) {
+        (Ok(f), Ok(t)) => match f.strip_prefix(&t) {
+            Ok(r) => r.to_path_buf(),
+            Err(_) => {
+                return Ok(Err(
+                    "the flake directory is outside its repository".to_owned()
+                ));
+            }
+        },
+        _ => return Ok(Err("cannot resolve the flake directory".to_owned())),
+    };
 
     // The reads: off the async threads, stopped by the token or the deadline.
     let token = cancel.clone();
-    let deadline = std::time::Instant::now() + params.timeout;
+    let deadline = std::time::Instant::now() + params.read_timeout;
     let flake_dir = flake_dir.to_path_buf();
     let job = tokio::task::spawn_blocking(move || {
         let stop = || token.is_cancelled() || std::time::Instant::now() > deadline;
+        let paths = index_paths(&index).map_err(Stop::NoCache)?;
         let lock = read_lock(&flake_dir, &stop)?;
-        let digest = worktree_digest(&top, &tracked, &stop)?;
+        let digest = worktree_digest(&top, &rel, &index, &paths, &stop)?;
         Ok::<_, Stop>((lock, digest))
     });
     let (lock, digest) = tokio::select! {
@@ -285,7 +337,7 @@ pub async fn key_for(
         () = cancel.cancelled() => return Err(Cancelled),
         // The job checks the deadline between reads; this covers a read or open(2) that
         // never returns. The job is abandoned (its thread finishes when the call does).
-        () = tokio::time::sleep(params.timeout + Duration::from_millis(500)) => {
+        () = tokio::time::sleep(params.read_timeout + Duration::from_millis(500)) => {
             return Ok(Err("reading the worktree timed out".to_owned()));
         }
         r = job => match r {
@@ -303,7 +355,8 @@ pub async fn key_for(
         flake_lock: lock.as_deref(),
         tree: Tree::Dirty {
             diff: &digest,
-            untracked: &untracked,
+            // Untracked names are not in the key: see the module documentation.
+            untracked: &[],
         },
     })))
 }
@@ -340,18 +393,26 @@ fn field(h: &mut Sha256, tag: u8, bytes: &[u8]) {
 }
 
 /// The digest of every tracked path's worktree state under `top`.
-fn worktree_digest(top: &Path, tracked: &[u8], stop: &dyn Fn() -> bool) -> Result<Vec<u8>, Stop> {
+fn worktree_digest(
+    top: &Path,
+    rel: &Path,
+    index: &[u8],
+    paths: &[&[u8]],
+    stop: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, Stop> {
+    use std::os::unix::ffi::OsStrExt as _;
     let root =
         open_root(top).map_err(|e| Stop::NoCache(format!("cannot open the worktree: {e:?}")))?;
-    let mut paths: Vec<&[u8]> = tracked
-        .split(|&b| b == 0)
-        .filter(|p| !p.is_empty())
-        .collect();
+    let mut paths = paths.to_vec();
     // Unmerged entries are listed once per stage.
     paths.sort_unstable();
     paths.dedup();
     let mut h = Sha256::new();
-    h.update(b"auspex worktree digest v1\0");
+    h.update(b"auspex worktree digest v2\0");
+    // Which flake in the repository (N2e), and the index itself, staged state included
+    // (N2b).
+    field(&mut h, b'r', rel.as_os_str().as_bytes());
+    field(&mut h, b'i', &Sha256::digest(index));
     let mut left = MAX_WORKTREE_BYTES;
     for p in paths {
         if stop() {
@@ -549,20 +610,7 @@ pub async fn evaluate_cached(
     cancel: &CancellationToken,
     tx: UnboundedSender<EvalItem>,
 ) -> Result<(), Cancelled> {
-    let keyed = match cache.cache_dir {
-        None => Err("no cache directory".to_owned()),
-        Some(_) if !flake.is_git() => Err(format!(
-            "a `{}:` flake reference is not a git one, so untracked and ignored files \
-             reach the evaluation and their contents are not in the cache key",
-            flake.scheme()
-        )),
-        Some(dir) => tokio::select! {
-            biased;
-            () = tx.closed() => return Err(Cancelled),
-            k = key_for(cache.flake_dir, &cache.git, cancel) => k?.map(|k| (dir, k)),
-        },
-    };
-    let keyed = match keyed {
+    let keyed = match cache_key_or_why(flake, cache, cancel, &tx).await? {
         Ok(k) => Some(k),
         Err(why) => {
             let _ = tx.send(EvalItem::Note(format!(
@@ -571,7 +619,58 @@ pub async fn evaluate_cached(
             None
         }
     };
+    evaluate_with(flake, machines, eval, cancel, tx, keyed).await
+}
 
+/// The key and the cache directory, or why there is no caching for this run.
+async fn cache_key_or_why<'c>(
+    flake: &FlakeRef,
+    cache: &CacheParams<'c>,
+    cancel: &CancellationToken,
+    tx: &UnboundedSender<EvalItem>,
+) -> Result<Result<(&'c Path, CacheKey), String>, Cancelled> {
+    Ok(match cache.cache_dir {
+        None => Err("no cache directory".to_owned()),
+        Some(_) if flake.has_query() => Err(
+            "the flake reference has a query (?ref=, ?rev=, ?dir=), so nix reads something \
+             other than the worktree the cache key covers"
+                .to_owned(),
+        ),
+        Some(_) if !flake.is_git() => Err(format!(
+            "a `{}:` flake reference is not a git one, so untracked and ignored files \
+             reach the evaluation and their contents are not in the cache key",
+            flake.scheme()
+        )),
+        Some(dir) => {
+            // A child token, so a dropped receiver cancels the key the same way a cancel
+            // does: git killed and reaped, the hashing stopped, and only then a return
+            // (review finding N6). Dropping the `key_for` future instead would leave the
+            // reaping to tokio's background reaper.
+            let key_cancel = cancel.child_token();
+            let keying = key_for(cache.flake_dir, &cache.git, &key_cancel);
+            tokio::pin!(keying);
+            tokio::select! {
+                biased;
+                () = tx.closed() => {
+                    key_cancel.cancel();
+                    let _ = keying.await;
+                    return Err(Cancelled);
+                }
+                k = &mut keying => k?.map(|k| (dir, k)),
+            }
+        }
+    })
+}
+
+/// The lookups, then [`evaluate`] for the misses with every success written through.
+async fn evaluate_with(
+    flake: &FlakeRef,
+    machines: &[EvalMachine],
+    eval: &EvalParams<'_>,
+    cancel: &CancellationToken,
+    tx: UnboundedSender<EvalItem>,
+    keyed: Option<(&Path, CacheKey)>,
+) -> Result<(), Cancelled> {
     let mut misses = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for m in machines {

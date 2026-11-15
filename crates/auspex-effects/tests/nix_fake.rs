@@ -7,6 +7,7 @@
 mod common;
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,7 @@ fn machines(names: &[&str]) -> Vec<EvalMachine> {
 
 fn params(program: &Path, timeout: Duration) -> EvalParams<'_> {
     let mut p = EvalParams::new();
+    p.runtime_dir = Some(common::runtime_dir());
     p.program = program.as_os_str();
     p.timeout = timeout;
     p
@@ -415,6 +417,7 @@ async fn unusable_lines_are_notes_and_strangers_are_ignored() {
 async fn a_missing_evaluator_is_a_finished_error() {
     let (tx, mut rx) = unbounded_channel();
     let mut p = EvalParams::new();
+    p.runtime_dir = Some(common::runtime_dir());
     p.program = std::ffi::OsStr::new("auspex-test-no-such-nix-eval-jobs");
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
@@ -439,6 +442,7 @@ async fn a_missing_evaluator_is_a_finished_error() {
 async fn nothing_to_evaluate_runs_nothing() {
     let (tx, mut rx) = unbounded_channel();
     let mut p = EvalParams::new();
+    p.runtime_dir = Some(common::runtime_dir());
     p.program = std::ffi::OsStr::new("/nonexistent");
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
@@ -637,13 +641,23 @@ async fn one_unusable_name_does_not_fail_the_others() {
     assert_eq!(items.last(), Some(&EvalItem::Finished { error: None }));
 }
 
-/// The machine list goes to the evaluator on stdin, so its size is not bounded by
-/// `MAX_ARG_STRLEN` (128 KiB per argument): 3000 machines of 63 characters.
+/// The fake's prelude that finds the `--arg-from-file machines <path>` argument.
+const FIND_LIST: &str = "for a in \"$@\"; do if [ \"$p\" = machines ] && [ \"$pp\" = --arg-from-file ]; then list=\"$a\"; fi; pp=\"$p\"; p=\"$a\"; done\n";
+
+/// The machine list goes to the evaluator in a file, so its size is not bounded by
+/// `MAX_ARG_STRLEN` (128 KiB per argument): 3000 machines of 63 characters, all of them
+/// read back by the fake.
 #[tokio::test]
 async fn a_large_fleet_fits() {
     let Some(t) = tools(&[]) else { return };
     let dir = tempdir();
-    let prog = t.script(dir.path(), "nix-eval-jobs", "exit 0");
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        &format!(
+            "{FIND_LIST}IFS= read -r m < \"$list\" || true\nprintf '%s' \"$m\" > '@dir@/list'"
+        ),
+    );
     let names: Vec<String> = (0..3000).map(|i| format!("{i:063}")).collect();
     let ms: Vec<EvalMachine> = names
         .iter()
@@ -663,6 +677,93 @@ async fn a_large_fleet_fits() {
     .await
     .unwrap();
     assert_eq!(collect(&mut rx).await, [EvalItem::Finished { error: None }]);
+    let list: Vec<serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("list")).unwrap()).unwrap();
+    let got: Vec<&str> = list.iter().map(|m| m["name"].as_str().unwrap()).collect();
+    assert_eq!(got, names);
+}
+
+/// Review mutations R18 and R19: an empty name and one over 1 KiB get their own error.
+#[tokio::test]
+async fn empty_and_oversized_names_get_their_own_error() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let prog = t.script(dir.path(), "nix-eval-jobs", "exit 0");
+    let long = "x".repeat(auspex_effects::nix::MAX_NAME_BYTES + 1);
+    let (tx, mut rx) = unbounded_channel();
+    evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["", &long]),
+        &params(&prog, Duration::from_secs(10)),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let items = collect(&mut rx).await;
+    let errors: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            EvalItem::Machine {
+                machine,
+                outcome: EvalOutcome::Error(_),
+                ..
+            } => Some(machine.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(errors, ["", long.as_str()], "{items:?}");
+}
+
+/// Review findings N7 and mutation R20: the list file is 0600, in the private runtime
+/// directory (0700), and a stale one left by a process that is gone is removed.
+#[tokio::test]
+async fn the_list_file_is_private_and_stale_ones_are_removed() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let rt = dir.path().join("rt");
+    auspex_effects::ssh::ControlDir::prepare(&rt).unwrap();
+    // pid_max is at most 2^22 on Linux, so this pid cannot exist.
+    let stale = rt.join("machines-4194305-0.json");
+    fs::write(&stale, "[]").unwrap();
+    // One of ours (a live pid) must be kept.
+    let live = rt.join(format!("machines-{}-999999.json", std::process::id()));
+    fs::write(&live, "[]").unwrap();
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        &format!(
+            "{FIND_LIST}printf '%s' \"$list\" > '@dir@/path'\nwhile [ ! -e '@dir@/go' ]; do @sleep@ 0.02; done"
+        ),
+    );
+    let mut p = params(&prog, Duration::from_secs(10));
+    p.runtime_dir = Some(rt.clone());
+    let (tx, _rx) = unbounded_channel();
+    let (flake, ms, cancel) = (
+        FlakeRef::new("path:/x").unwrap(),
+        machines(&["a"]),
+        CancellationToken::new(),
+    );
+    let run = evaluate(&flake, &ms, &p, &cancel, tx);
+    let check = async {
+        let path_file = dir.path().join("path");
+        let start = std::time::Instant::now();
+        while !path_file.exists() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let list = std::path::PathBuf::from(fs::read_to_string(&path_file).unwrap());
+        let mode = fs::metadata(&list).unwrap().permissions().mode() & 0o777;
+        fs::write(dir.path().join("go"), "").unwrap();
+        (list, mode)
+    };
+    let (r, (list, mode)) = tokio::join!(run, check);
+    r.unwrap();
+    assert_eq!(list.parent(), Some(rt.as_path()), "{list:?}");
+    assert_eq!(mode, 0o600);
+    assert!(!stale.exists(), "the stale list file was kept");
+    assert!(live.exists(), "a live process's list file was removed");
+    assert!(!list.exists(), "this call's list file was left behind");
 }
 
 #[tokio::test]
@@ -731,4 +832,63 @@ async fn a_cancelled_evaluation_has_reaped_its_leader_on_return() {
         !present,
         "the leader {leader} was not reaped before returning"
     );
+}
+
+/// Review mutation R21: the list file is created exclusively, so a symlink planted at its
+/// name is never followed. Run in a child process, whose list-file counter starts at 0, so
+/// the names are known: `machines-<pid>-0.json` and on.
+#[test]
+fn a_planted_symlink_at_the_list_name_is_not_followed() {
+    if std::env::var_os("AUSPEX_TEST_LIST_INNER").is_some() {
+        return;
+    }
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "planted_list_inner",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("AUSPEX_TEST_LIST_INNER", "1")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
+}
+
+#[tokio::test]
+async fn planted_list_inner() {
+    if std::env::var_os("AUSPEX_TEST_LIST_INNER").is_none() {
+        return;
+    }
+    let dir = tempdir();
+    let rt = dir.path().join("rt");
+    auspex_effects::ssh::ControlDir::prepare(&rt).unwrap();
+    let target = dir.path().join("victim");
+    fs::write(&target, "untouched").unwrap();
+    for n in 0..16 {
+        std::os::unix::fs::symlink(
+            &target,
+            rt.join(format!("machines-{}-{n}.json", std::process::id())),
+        )
+        .unwrap();
+    }
+    let mut p = EvalParams::new();
+    p.runtime_dir = Some(rt);
+    p.program = std::ffi::OsStr::new("/nonexistent");
+    let (tx, _rx) = unbounded_channel();
+    let _ = evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["a"]),
+        &p,
+        &CancellationToken::new(),
+        tx,
+    )
+    .await;
+    assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
 }

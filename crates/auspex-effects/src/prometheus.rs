@@ -27,11 +27,21 @@ use crate::text::last_line;
 
 /// The largest answer read: 2 MiB.
 ///
-/// A real one is eleven series of about 250 bytes per
-/// instance, so 100 instances are under 300 KiB. With typed deserialisation (no JSON tree)
-/// parsing costs about the label and value strings kept on top of the body, so an answer
-/// costs at most a few MiB.
+/// A real one is eleven series of about 250 bytes per instance, so 100 instances are under
+/// 300 KiB. What an answer costs on top of its body is the parsed series: about 70 bytes
+/// each plus the label and value strings kept, so [`MAX_SERIES`] bounds it. Measured as the
+/// growth of peak RSS in a fresh process for each worst shape just under the cap, body
+/// included (`tests/http.rs::the_worst_answer_is_bounded`, which also counts the test
+/// server's own 2 MiB copy): 5.6 MB for empty series (refused at [`MAX_SERIES`]), 4.4 MB for
+/// the most realistic series that fit, 4.2 MB for one 2 MiB label. So an answer costs at
+/// most about 6 MB.
 pub const BODY_CAP: usize = 2 * 1024 * 1024;
+
+/// The most series an answer may hold: 20,000.
+///
+/// That is eleven per instance for over 1,800 instances. Past it the answer is an error. Without it, 2 MiB of `{},` is 700,000 empty
+/// series and cost 24 times the body (review finding N5).
+pub const MAX_SERIES: usize = 20_000;
 
 /// The query.
 ///
@@ -119,7 +129,39 @@ struct Answer {
 struct Data {
     #[serde(rename = "resultType")]
     result_type: Option<String>,
+    #[serde(default, deserialize_with = "capped_series")]
     result: Option<Vec<Series>>,
+}
+
+/// The series list, refused (as malformed) past [`MAX_SERIES`] while it is read, so an
+/// answer of many tiny series cannot be built first and counted later.
+fn capped_series<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Vec<Series>>, D::Error> {
+    struct Capped;
+    impl<'de> serde::de::Visitor<'de> for Capped {
+        type Value = Option<Vec<Series>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a list of at most {MAX_SERIES} series")
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(s) = seq.next_element::<Series>()? {
+                if v.len() == MAX_SERIES {
+                    return Err(serde::de::Error::custom(format!(
+                        "more than {MAX_SERIES} series"
+                    )));
+                }
+                v.push(s);
+            }
+            Ok(Some(v))
+        }
+    }
+    d.deserialize_any(Capped)
 }
 
 #[derive(Deserialize)]

@@ -164,33 +164,6 @@ async fn repository_hooks_and_fsmonitor_never_run() {
     );
 }
 
-/// `core.attributesFile = /dev/zero` is an endless line that git reads into memory. Run git
-/// under a 1.5 GB address-space limit (`ulimit -v` in a wrapper) so a regression costs a
-/// failed command, not the machine's memory.
-#[tokio::test]
-async fn an_endless_attributes_file_costs_nothing() {
-    let Some(t) = tools(&["git"]) else { return };
-    let Some(r) = repo() else { return };
-    let side = tempdir();
-    let wrapper = t.script(side.path(), "git", "ulimit -v 1500000\nexec @git@ \"$@\"");
-    git(r.path(), &["config", "core.attributesFile", "/dev/zero"]);
-    git(r.path(), &["config", "core.excludesFile", "/dev/zero"]);
-    fs::write(r.path().join("flake.nix"), "{ outputs = _: { y = 2; }; }\n").unwrap();
-    let mut g = GitParams::new();
-    g.program = wrapper.as_os_str();
-    g.timeout = Duration::from_secs(10);
-    let start = Instant::now();
-    let k = key_for(r.path(), &g, &CancellationToken::new())
-        .await
-        .unwrap();
-    assert!(k.is_ok(), "{k:?}");
-    assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "{:?}",
-        start.elapsed()
-    );
-}
-
 /// The key reads the worktree's bytes: an edit of the same length, with the mtime put back,
 /// still changes it.
 #[tokio::test]
@@ -447,7 +420,7 @@ async fn dropping_the_receiver_of_evaluate_cached_cancels() {
         "@sleep@ 30 &\necho $! >> '@dir@/pids'\necho $$ >> '@dir@/pids'\nwait",
     );
     let cache = tempdir();
-    let (tx, rx) = unbounded_channel();
+    let (tx, mut rx) = unbounded_channel();
     let (repo_path, cache_path, prog_path) = (
         r.path().to_path_buf(),
         cache.path().to_path_buf(),
@@ -455,6 +428,7 @@ async fn dropping_the_receiver_of_evaluate_cached_cancels() {
     );
     let task = tokio::spawn(async move {
         let mut eval = EvalParams::new();
+        eval.runtime_dir = Some(common::runtime_dir());
         eval.program = prog_path.as_os_str();
         eval.timeout = Duration::from_secs(60);
         let cache = CacheParams {
@@ -477,6 +451,13 @@ async fn dropping_the_receiver_of_evaluate_cached_cancels() {
     let pids = tokio::task::spawn_blocking(move || wait_for_pids(&pids_file, 2))
         .await
         .unwrap();
+    // Caching was on (else this would only test plain `evaluate`): no "cache off" note.
+    while let Ok(i) = rx.try_recv() {
+        assert!(
+            !matches!(&i, EvalItem::Note(n) if n.contains("cache off")),
+            "caching was off: {i:?}"
+        );
+    }
     drop(rx);
     let r = tokio::time::timeout(Duration::from_secs(3), task).await;
     let left = still_alive_after_wait(&pids);
@@ -503,6 +484,7 @@ async fn a_path_flake_reference_gets_no_caching() {
     );
     let cache = tempdir();
     let mut eval = EvalParams::new();
+    eval.runtime_dir = Some(common::runtime_dir());
     eval.program = prog.as_os_str();
     let params = CacheParams {
         cache_dir: Some(cache.path()),

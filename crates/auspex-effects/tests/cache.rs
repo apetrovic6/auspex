@@ -131,10 +131,10 @@ async fn dirty_and_clean_trees_give_different_keys() {
     let modified = key(d).await.unwrap();
     assert_ne!(modified, clean);
 
+    // An untracked file changes nothing: a git flake never sees it (round 2 dropped the
+    // untracked listing, which read exclude files whole).
     fs::write(d.join("new.nix"), "{}\n").unwrap();
-    let untracked = key(d).await.unwrap();
-    assert_ne!(untracked, modified);
-    assert_ne!(untracked, clean);
+    assert_eq!(key(d).await.unwrap(), modified);
 
     // Back to the commit: the clean key again.
     fs::remove_file(d.join("new.nix")).unwrap();
@@ -239,7 +239,7 @@ async fn evaluate_cached_reads_hits_and_evaluates_misses() {
     let dir = tempdir();
     let drv = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-a.drv";
     let out = "/nix/store/zyxwvsrqpnmlkjihgfdcba9876543210-nixos-system-a";
-    // Records each invocation's machine list (read from stdin) and prints a success for `a`
+    // Records each invocation's machine list (read from the `--arg-from-file` file) and prints a success for `a`
     // and for `1odd` (quoted in `attr`, as nix-eval-jobs prints a name that is not a bare
     // identifier) and an error for `b`, when asked for them.
     let prog = t.script(
@@ -261,6 +261,7 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
         git: GitParams::new(),
     };
     let mut eval = EvalParams::new();
+    eval.runtime_dir = Some(common::runtime_dir());
     eval.program = prog.as_os_str();
     eval.timeout = Duration::from_secs(10);
     // A plain path: git+file, so cached (a `path:` reference is not).

@@ -259,6 +259,7 @@ pub async fn probe(
     let limits = Limits {
         stdout: STDOUT_CAP,
         stderr: STDERR_CAP,
+        memory: None,
     };
     // When ssh exits on its own, the rest of its process group is left alone, unlike
     // every other program here. The reason first given (that a `ControlPersist` master

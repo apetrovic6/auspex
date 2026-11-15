@@ -495,3 +495,105 @@ async fn an_untrusted_certificate_is_refused() {
         NarCache::Failed
     );
 }
+
+fn vm_hwm_kb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("VmHWM:"))
+                .and_then(|v| v.trim().trim_end_matches(" kB").trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+/// The answers that cost the most, each just under the 2 MiB body cap.
+fn worst_route(_method: &str, target: &str) -> Reply {
+    let cap = auspex_effects::prometheus::BODY_CAP - 1024;
+    let body = match target.split('?').next().unwrap_or("") {
+        // Empty series, as many as fit: refused at MAX_SERIES while reading.
+        "/empty/api/v1/query" => {
+            let n = (cap - 80) / 3;
+            format!(
+                r#"{{"status":"success","data":{{"resultType":"vector","result":[{}{{}}]}}}}"#,
+                "{},".repeat(n - 1)
+            )
+        }
+        // MAX_SERIES realistic series, each with label and value strings.
+        "/many/api/v1/query" => {
+            let one = r#"{"metric":{"instance":"host-00000:9100","auspex_metric":"load1"},"value":[1,"0.5"]}"#;
+            let n = auspex_effects::prometheus::MAX_SERIES.min((cap - 80) / (one.len() + 1));
+            let list = vec![one; n].join(",");
+            format!(r#"{{"status":"success","data":{{"resultType":"vector","result":[{list}]}}}}"#)
+        }
+        // One series with a 2 MiB label.
+        "/long/api/v1/query" => format!(
+            r#"{{"status":"success","data":{{"resultType":"vector","result":[{{"metric":{{"instance":"{}"}},"value":[0,"1"]}}]}}}}"#,
+            "x".repeat(cap - 200)
+        ),
+        _ => String::new(),
+    };
+    Reply::Status(200, body)
+}
+
+/// Review finding N5: what the worst answers cost, measured as peak RSS in a fresh child
+/// process (this binary, re-run on the inner test). The figure is printed and bounded.
+#[test]
+fn the_worst_answer_is_bounded() {
+    if std::env::var_os("AUSPEX_TEST_PROM_INNER").is_some() {
+        return;
+    }
+    // One process per shape: peak RSS is a high-water mark, so one shape would hide the next.
+    for shape in ["empty", "many", "long"] {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "worst_answer_inner",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AUSPEX_TEST_PROM_INNER", shape)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        println!("{text}");
+        assert!(out.status.success(), "{text}");
+        assert!(text.contains("1 passed"), "{text}");
+    }
+}
+
+#[tokio::test]
+async fn worst_answer_inner() {
+    let Ok(shape) = std::env::var("AUSPEX_TEST_PROM_INNER") else {
+        return;
+    };
+    let Some(s) = serve(worst_route).await else {
+        return;
+    };
+    let client = HttpClient::new().unwrap();
+    // Warm up the client and the allocator on a small answer first.
+    let _ = ask(
+        &client,
+        &format!("http://{}/none", s.addr),
+        Duration::from_secs(5),
+    )
+    .await;
+    let before = vm_hwm_kb();
+    let r = ask(
+        &client,
+        &format!("http://{}/{shape}", s.addr),
+        Duration::from_secs(10),
+    )
+    .await;
+    let grew = vm_hwm_kb().saturating_sub(before);
+    println!(
+        "auspex-measure {shape}: peak RSS grew by {grew} kB ({:?})",
+        r.as_ref().map(BTreeMap::len)
+    );
+    // The body is held twice (the server's copy and the client's), 2 MiB each.
+    assert!(grew < 16 * 1024, "{shape}: {grew} kB");
+}
