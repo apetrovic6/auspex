@@ -344,10 +344,26 @@ Acceptance:
   confirmation.
 - **"N commits behind",** and how many of those commits touch files that machine imports.
 - **The Forgejo CI badge.**
+- **A CI runners view** (a tab, plus a summary line in the status bar), one row per runner:
+  - **From the Forgejo API of each forge** (forge.ugalabugala.org and forge.noosphere.uk; both
+    have the runners cerberus, terra, luna and sol registered by default): registered and
+    online or offline, idle or busy, the job and repository it's running, and its labels.
+  - **Per forge:** the number of queued jobs and the oldest one's age.
+  - **From Prometheus:** the runner host's CPU and memory against its cap (terra and sol run 2
+    CPUs / 4 GiB, luna 3 GiB; cerberus is capped at 3 CPUs / 8 GiB), so a job close to an
+    OOM kill or a thrashing host shows before it fails.
+  - **From the SSH probe:** the state of the `forgejo-runner-*` systemd units on that host. A
+    runner the forge calls offline usually shows up here as a failed or inactive unit.
+  - **Badges:** offline, or forge-online with the unit down (`✗`); a job running longer than a
+    configurable limit; memory near the cap (`⚠`).
+  - **Config / home-manager options:** each forge's URL and a read-only API token
+    (`token_file`), never inline.
 
 Acceptance:
 - [ ] A unit forced to fail shows `⚠`, and its journal opens with `j`.
 - [ ] genetor probes without errors (no systemd fields).
+- [ ] The runners view lists every runner on both forges with its online/busy state and
+  current job. Stopping one runner's unit turns its row red within one refresh.
 
 ### Step 4: Clan vars tab
 
