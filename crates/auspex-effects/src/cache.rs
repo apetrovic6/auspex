@@ -4,54 +4,68 @@
 //! `auspex_domain::eval::cache_key` over inputs gathered here, each under a timeout and the
 //! cancellation token.
 //!
-//! # The key, and why git compares nothing
+//! # What is evaluated, and what the key covers
 //!
-//! The fleet repository's own git configuration and files are not trusted (review findings
-//! F1 and N1): a `.git/` that came with an unpacked archive or a synced folder can name
-//! filter drivers that `git status` and `git diff` run on any stat-dirty file, and files
-//! that git reads whole (an attributes or exclude file, a `.gitignore`, the index, `HEAD`,
-//! `packed-refs`) can be gigabytes, or FIFOs that never answer. So:
+//! **The reference.** [`FlakeRef::new`] turns a plain path inside a git repository into
+//! `git+file://<top>/` (with `?dir=<flake directory relative to top>` for a nested flake),
+//! and the same reference goes to the machine list (`nix eval`) and to the evaluation
+//! (`builtins.getFlake` in nix-eval-jobs). That matters (review finding B1): handed a plain
+//! path, `getFlake` builds a `path:` source, which sees untracked files, ignored files and
+//! `.git/` and has no `rev`, while the CLI builds a `git+file` one. Now both read the tracked
+//! files with their uncommitted worktree changes, and `self.rev`/`self.dirtyRev` are set.
+//! A plain path outside any repository becomes `path:`, which is never cached, nor is any
+//! other non-git reference or a reference with a query the operator wrote.
 //!
-//! - git is asked only for what it answers from the index and refs, without reading file
-//!   contents: `git rev-parse --show-toplevel`, `git rev-parse --verify HEAD` and
-//!   `git ls-files -s -z` (mode, blob id, stage and path of every index entry);
-//! - every git command runs under an address-space limit of [`GIT_MEMORY_LIMIT`]
-//!   (`prlimit(2)` right after spawn; measured: `ls-files -s` on nixpkgs, about 40,000
-//!   files, peaks at 25 MB and needs about 37 MB of address space), so an oversized index,
-//!   `HEAD` or `packed-refs` makes git fail fast, which is "no caching" with a note. On a
-//!   platform without `prlimit` for another process, git is not run and there is no
-//!   caching;
-//! - each git command has a short timeout (2 s by default; those three take at most 22 ms
-//!   on nixpkgs), and the first one that fails ends the key, so a FIFO in git's config
-//!   path costs one short timeout per refresh. That is not remembered across refreshes:
-//!   doing so would need state outside the arguments, which this crate does not keep;
-//! - git gets `-c core.fsmonitor=false` ([`GIT_HARDENING`]), `GIT_OPTIONAL_LOCKS=0`, and
-//!   none of the inherited variables that would point it at another repository or index.
+//! **The key** is computed from git's view of the same tree, and only when it matches the
+//! reference: the flake directory must be the reference's, and git's top level
+//! (`rev-parse --show-toplevel`) the one `FlakeRef` found (they can differ: a discovery
+//! ceiling, a `.git` that is not a repository). It covers exactly: the cache format version;
+//! `HEAD`'s commit id; the bytes of `flake.lock` in the flake directory (or its absence); and,
+//! in the domain's `Tree::Dirty { diff }` slot, a digest of the flake directory's path
+//! relative to the top level, of the index as `git ls-files -s -v -z` prints it (mode, blob
+//! id, stage, path, and the tag that marks assume-unchanged and skip-worktree entries, which
+//! change what nix reads; review finding F3), and of every index path's worktree state as
+//! nix reads it for a dirty `git+file` flake: a regular file's bytes and owner exec bit, a
+//! symlink's target text, or that it is missing or not a regular file. Paths are walked
+//! from the top level without following symlinks, regular files are opened non-blocking,
+//! at most [`MAX_WORKTREE_BYTES`] are read in all, under [`GitParams::read_timeout`].
+//! Untracked and ignored files are not in the key, because nix no longer sees them; the
+//! domain's untracked list is passed empty and `Tree::Clean` is never used. What an
+//! `--impure` evaluation reads from the environment or from outside the flake is not in
+//! the key either: that is the fleet's own choice, and no key can cover it.
 //!
-//! **Untracked and ignored files are not in the key**, and no exclude file or `.gitignore`
-//! is read: a git flake never sees them (nix builds a `git+file` source from tracked files
-//! only, and they leave `self.rev` clean), and a `path:` reference, which does see them,
-//! gets no caching at all. The domain's untracked list is passed empty.
+//! **A changed tree during a scan** (review finding B2). Every nix-eval-jobs worker reads
+//! the tree again when it starts, and workers restart on their memory cap, so a file saved
+//! mid-scan can be evaluated under the key of the tree before it. Results are therefore
+//! streamed to the caller at once (they are right for the tree nix read) but stored only
+//! after the evaluator has exited and a second key, computed then, equals the first;
+//! otherwise none of the run's results is stored, with a note. An edit made and undone
+//! between the two keys is not seen; that needs a save and a revert within one scan, a
+//! window of seconds to a minute, and would need an immutable source (`?rev=` of a clean
+//! tree) to close.
 //!
-//! **What the key covers**, exactly: the cache format version; `HEAD`'s commit id; the
-//! bytes of `flake.lock` in the flake directory (or its absence); and a digest of the
-//! flake directory's path relative to the repository top level, the index as `ls-files -s`
-//! prints it (so a staged change, even one whose worktree bytes equal the commit, is a
-//! different key: nix evaluates such a tree with `self.dirtyRev`), and, for every index
-//! path, its worktree state as nix would read it for a dirty `git+file` flake: a regular
-//! file's bytes and its owner exec bit, a symlink's target text, or that it is missing or
-//! not a regular file. Paths are walked from the top level without following symlinks,
-//! regular files are opened non-blocking, at most [`MAX_WORKTREE_BYTES`] are read in all,
-//! under [`GitParams::read_timeout`]. That digest goes into the domain's
-//! `Tree::Dirty { diff, .. }` slot (a byte string to hash; the domain's key has no slot for
-//! the flake directory, which is why it rides in the digest). `Tree::Clean` is never used.
+//! # Running git safely
 //!
-//! No caching at all, rather than a key that could be wrong, when: the flake reference is
-//! not a plain path or a `git+file:` reference without a query (review findings F11 and
-//! N2d); the directory is not a git repository with a commit; git fails, times out or
-//! hits its memory limit; the index tracks a submodule (gitlink mode 160000), whose
-//! worktree the key does not cover (N2c); `flake.lock` is not a regular file or is over
-//! [`MAX_LOCK_BYTES`]; or the worktree is over its cap. Each is a note the caller can log.
+//! The repository's own configuration and files are not trusted (review findings F1 and
+//! N1). git is asked only what it answers from the index and refs, without reading file
+//! contents: the two `rev-parse` commands and `ls-files -s -v -z`; no status, diff, filters,
+//! attributes, ignore or exclude files. Every git command runs:
+//!
+//! - under an address-space limit of [`GIT_MEMORY_LIMIT`], set by util-linux `prlimit`
+//!   before it execs git, so the limit holds from git's first instruction (review finding
+//!   F4; measured: `ls-files -s` on nixpkgs, about 40,000 files, peaks at 25 MB and needs
+//!   about 37 MB of address space). Without `prlimit` on an absolute `PATH` entry, or on
+//!   another platform, git is not run and there is no caching;
+//! - with a short timeout (2 s by default; the three commands take at most 22 ms on
+//!   nixpkgs), and the first failure ends the key;
+//! - with `-c core.fsmonitor=false` ([`GIT_HARDENING`]), `GIT_OPTIONAL_LOCKS=0`, and none
+//!   of the inherited variables that would point it at another repository or index. The
+//!   operator's own global and system configuration apply as usual.
+//!
+//! What a hostile `.git/` can still cost per refresh is bounded by those two limits
+//! (review finding F5): an oversized `HEAD` grows git to the limit (about 417 MB, 0.3 s)
+//! before it fails, and a FIFO or endless file in git's config include path costs one
+//! timeout. Either way there is no caching, with a note.
 //!
 //! # Entries
 //!
@@ -101,8 +115,8 @@ pub const GIT_MEMORY_LIMIT: u64 = 512 << 20;
 /// The largest `flake.lock` that is keyed: 16 MiB.
 pub const MAX_LOCK_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The largest tracked or untracked path list read from git: 16 MiB.
-const MAX_LIST_BYTES: usize = 16 * 1024 * 1024;
+/// The largest index listing read from git: 64 MiB, including stage and flag metadata.
+const MAX_LIST_BYTES: usize = 64 * 1024 * 1024;
 
 /// A cache file larger than this is not an entry (a real one is under a kilobyte).
 const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
@@ -190,6 +204,7 @@ async fn git(
         Ok(c) => c,
         Err(e) => return Ok(Err(spawn_error(&what, params.program, &e))),
     };
+    let deadline = Instant::now() + params.timeout;
     // `GIT_OPTIONAL_LOCKS=0` guards nothing today (none of these commands refreshes or
     // writes the index, and no test can tell); it is kept because it is free and because a
     // git that one day refreshes the index during `ls-files` would otherwise write into the
@@ -206,7 +221,6 @@ async fn git(
         stderr: 16 * 1024,
         memory: Some(GIT_MEMORY_LIMIT),
     };
-    let deadline = Instant::now() + params.timeout;
     let ran = match run(cmd, None, OnExit::KillGroup, limits, deadline, cancel).await {
         Ok(r) => r,
         Err(e) => return Ok(Err(spawn_error(&what, params.program, &e))),
@@ -231,14 +245,20 @@ async fn git(
     })
 }
 
-/// The paths of `git ls-files -s -z` output, or why the index cannot be keyed.
+/// The paths of `git ls-files -s -v -z` output, or why the index cannot be keyed.
 fn index_paths(index: &[u8]) -> Result<Vec<&[u8]>, String> {
     let mut paths = Vec::new();
     for rec in index.split(|&b| b == 0).filter(|r| !r.is_empty()) {
         let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
-            return Err("git ls-files -s printed a record without a path".to_owned());
+            return Err("git ls-files printed a record without a path".to_owned());
         };
-        let (meta, path) = (&rec[..tab], &rec[tab + 1..]);
+        // `-v` prefixes the stage record with its status letter and a space. The raw
+        // record is hashed too: assume-unchanged and skip-worktree affect Nix's dirty
+        // decision even when every worktree byte and blob id stays the same.
+        let Some(meta) = rec[..tab].get(2..) else {
+            return Err("git ls-files printed invalid index metadata".to_owned());
+        };
+        let path = &rec[tab + 1..];
         if meta.starts_with(b"160000 ") {
             return Err(format!(
                 "the repository tracks a submodule ({}), whose worktree the cache key does \
@@ -265,6 +285,18 @@ pub async fn key_for(
     params: &GitParams<'_>,
     cancel: &CancellationToken,
 ) -> Result<Result<CacheKey, String>, Cancelled> {
+    Ok(key_and_top(flake_dir, params, cancel)
+        .await?
+        .map(|(key, _)| key))
+}
+
+/// [`key_for`], also returning the repository top level git reported, so the caller can
+/// check that the reference nix evaluates names the same repository.
+async fn key_and_top(
+    flake_dir: &Path,
+    params: &GitParams<'_>,
+    cancel: &CancellationToken,
+) -> Result<Result<(CacheKey, PathBuf), String>, Cancelled> {
     let top = match git(
         params,
         flake_dir,
@@ -296,7 +328,7 @@ pub async fn key_for(
     let index = match git(
         params,
         &top,
-        &["ls-files", "-s", "-z"],
+        &["ls-files", "-s", "-v", "-z"],
         MAX_LIST_BYTES,
         cancel,
     )
@@ -325,6 +357,7 @@ pub async fn key_for(
     let token = cancel.clone();
     let deadline = std::time::Instant::now() + params.read_timeout;
     let flake_dir = flake_dir.to_path_buf();
+    let reported_top = top.clone();
     let job = tokio::task::spawn_blocking(move || {
         let stop = || token.is_cancelled() || std::time::Instant::now() > deadline;
         let paths = index_paths(&index).map_err(Stop::NoCache)?;
@@ -350,7 +383,7 @@ pub async fn key_for(
             Err(e) => return Ok(Err(format!("reading the worktree failed: {e}"))),
         },
     };
-    Ok(Ok(cache_key(&CacheKeyInputs {
+    let key = cache_key(&CacheKeyInputs {
         head: &head,
         flake_lock: lock.as_deref(),
         tree: Tree::Dirty {
@@ -358,7 +391,8 @@ pub async fn key_for(
             // Untracked names are not in the key: see the module documentation.
             untracked: &[],
         },
-    })))
+    });
+    Ok(Ok((key, reported_top)))
 }
 
 enum Stop {
@@ -582,7 +616,8 @@ fn write_atomically(dir: &Path, key: &CacheKey, name: &str, bytes: &[u8]) -> std
 pub struct CacheParams<'a> {
     /// The cache directory ([`default_dir`]), or `None` for no caching.
     pub cache_dir: Option<&'a Path>,
-    /// The flake's directory, where git runs and `flake.lock` is read.
+    /// The flake's directory, where git runs and `flake.lock` is read. Its canonical
+    /// path must match the evaluated local worktree; a mismatch disables caching.
     pub flake_dir: &'a Path,
     /// How to run git.
     pub git: GitParams<'a>,
@@ -592,8 +627,8 @@ pub struct CacheParams<'a> {
 ///
 /// Computes the key; looks each machine up; sends every hit at once as an
 /// [`EvalItem::Machine`] with `from_cache: true`; evaluates only the misses, sending each
-/// result as it arrives and writing each success through to the cache; and ends with the
-/// evaluator's [`EvalItem::Finished`] (or `Finished { error: None }` when everything hit).
+/// result as it arrives; keeps successes until a second key confirms the tree is unchanged;
+/// and ends with the evaluator's [`EvalItem::Finished`] (or no evaluation when all hit).
 /// When there is no caching (no directory, a non-git flake reference, not a git repository,
 /// git failed), one [`EvalItem::Note`] says why and every machine is evaluated. A failed
 /// cache write is a note too.
@@ -619,7 +654,7 @@ pub async fn evaluate_cached(
             None
         }
     };
-    evaluate_with(flake, machines, eval, cancel, tx, keyed).await
+    evaluate_with(flake, machines, eval, cache, cancel, tx, keyed).await
 }
 
 /// The key and the cache directory, or why there is no caching for this run.
@@ -641,13 +676,17 @@ async fn cache_key_or_why<'c>(
              reach the evaluation and their contents are not in the cache key",
             flake.scheme()
         )),
+        Some(_)
+            if flake.worktree_dir() != std::fs::canonicalize(cache.flake_dir).ok().as_deref() =>
+        {
+            Err("the cache flake directory does not match the evaluated worktree".to_owned())
+        }
         Some(dir) => {
-            // A child token, so a dropped receiver cancels the key the same way a cancel
-            // does: git killed and reaped, the hashing stopped, and only then a return
-            // (review finding N6). Dropping the `key_for` future instead would leave the
-            // reaping to tokio's background reaper.
+            // A child token also handles a dropped receiver: git is killed and reaped;
+            // blocking hashing notices cancellation at its next chunk. A filesystem
+            // call already in progress can outlive this future.
             let key_cancel = cancel.child_token();
-            let keying = key_for(cache.flake_dir, &cache.git, &key_cancel);
+            let keying = key_and_top(cache.flake_dir, &cache.git, &key_cancel);
             tokio::pin!(keying);
             tokio::select! {
                 biased;
@@ -656,17 +695,33 @@ async fn cache_key_or_why<'c>(
                     let _ = keying.await;
                     return Err(Cancelled);
                 }
-                k = &mut keying => k?.map(|k| (dir, k)),
+                k = &mut keying => match k? {
+                    // The reference nix evaluates was built by `FlakeRef::new` from the first
+                    // ancestor with a `.git`; the key from git's own discovery. Where they
+                    // disagree (a ceiling, a `.git` that is not a repository, `core.worktree`)
+                    // the two describe different trees, so there is no caching.
+                    Ok((key, top))
+                        if std::fs::canonicalize(&top).ok().as_deref() == flake.repo_top() =>
+                    {
+                        Ok((dir, key))
+                    }
+                    Ok(_) => Err(
+                        "git's repository top level is not the one the flake reference names"
+                            .to_owned(),
+                    ),
+                    Err(why) => Err(why),
+                },
             }
         }
     })
 }
 
-/// The lookups, then [`evaluate`] for the misses with every success written through.
+/// Streams misses immediately, but publishes cache entries only after rechecking the key.
 async fn evaluate_with(
     flake: &FlakeRef,
     machines: &[EvalMachine],
     eval: &EvalParams<'_>,
+    cache: &CacheParams<'_>,
     cancel: &CancellationToken,
     tx: UnboundedSender<EvalItem>,
     keyed: Option<(&Path, CacheKey)>,
@@ -704,7 +759,7 @@ async fn evaluate_with(
         let _ = tx.send(EvalItem::Finished { error: None });
         return Ok(());
     }
-    let Some((dir, key)) = keyed else {
+    let Some((_, key)) = keyed else {
         return evaluate(flake, &misses, eval, cancel, tx).await;
     };
 
@@ -713,30 +768,82 @@ async fn evaluate_with(
     // closing: it then kills the evaluator. The outer receiver is watched here directly
     // (review finding F2): waiting for the next `send` to fail would wait for nix-eval-jobs
     // to print, which a stuck worker never does.
+    let output = tx.clone();
     let forward = async move {
+        let mut pending = Vec::new();
+        let mut finished = None;
         loop {
             let item = tokio::select! {
                 biased;
-                () = tx.closed() => return,
+                () = output.closed() => return None,
                 item = inner_rx.recv() => match item {
                     Some(i) => i,
-                    None => return,
+                    None => return Some((pending, finished)),
                 },
             };
-            if let EvalItem::Machine {
-                machine,
-                outcome: EvalOutcome::Success(result),
-                from_cache: false,
-            } = &item
-                && let Err(e) = store(dir, &key, machine, result).await
-            {
-                let _ = tx.send(EvalItem::Note(format!("{machine}: {e}")));
-            }
-            if tx.send(item).is_err() {
-                return;
+            match item {
+                EvalItem::Finished { error } => finished = Some(EvalItem::Finished { error }),
+                item => {
+                    if let EvalItem::Machine {
+                        machine,
+                        outcome: EvalOutcome::Success(result),
+                        from_cache: false,
+                    } = &item
+                    {
+                        pending.push((machine.clone(), result.clone()));
+                    }
+                    if output.send(item).is_err() {
+                        return None;
+                    }
+                }
             }
         }
     };
-    let (result, ()) = tokio::join!(evaluate(flake, &misses, eval, cancel, inner_tx), forward);
-    result
+    let (result, forwarded) =
+        tokio::join!(evaluate(flake, &misses, eval, cancel, inner_tx), forward);
+    result?;
+    let Some((pending, finished)) = forwarded else {
+        return Err(Cancelled);
+    };
+    if cancel.is_cancelled() || tx.is_closed() {
+        return Err(Cancelled);
+    }
+    if !pending.is_empty() {
+        store_checked(flake, cache, cancel, &tx, &key, pending).await?;
+    }
+    if let Some(finished) = finished {
+        tx.send(finished).map_err(|_| Cancelled)?;
+    }
+    Ok(())
+}
+
+/// Publish only results whose before/after keys agree.
+async fn store_checked(
+    flake: &FlakeRef,
+    cache: &CacheParams<'_>,
+    cancel: &CancellationToken,
+    tx: &UnboundedSender<EvalItem>,
+    key: &CacheKey,
+    pending: Vec<(String, EvalSuccess)>,
+) -> Result<(), Cancelled> {
+    match cache_key_or_why(flake, cache, cancel, tx).await? {
+        Ok((dir, after)) if after == *key => {
+            for (machine, result) in pending {
+                if cancel.is_cancelled() || tx.is_closed() {
+                    return Err(Cancelled);
+                }
+                if let Err(e) = store(dir, key, &machine, &result).await {
+                    let _ = tx.send(EvalItem::Note(format!("{machine}: {e}")));
+                }
+            }
+        }
+        after => {
+            let why = match after {
+                Ok(_) => "the worktree changed during evaluation".to_owned(),
+                Err(why) => why,
+            };
+            let _ = tx.send(EvalItem::Note(format!("eval results not cached: {why}")));
+        }
+    }
+    Ok(())
 }

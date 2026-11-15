@@ -206,28 +206,35 @@ async fn a_fifo_include_costs_one_short_timeout() {
     );
 }
 
-/// The limit is really on git: a fake git reports its own address-space limit.
+/// The limit is on git from its first instruction: it is set by util-linux `prlimit`, which
+/// then execs git, so no window exists in which git runs unbounded (review finding F4).
+/// A wrapper reports the soft and hard limits before anything else, then execs git.
 #[tokio::test]
-async fn git_runs_under_the_memory_limit() {
-    let Some(t) = tools(&["sleep"]) else { return };
-    let dir = tempdir();
-    let fake = t.script(
-        dir.path(),
+async fn git_observes_both_limits_at_its_first_instruction() {
+    let Some(t) = tools(&["git", "prlimit"]) else {
+        return;
+    };
+    let Some(r) = repo() else { return };
+    let side = tempdir();
+    let program = t.script(
+        side.path(),
         "git",
-        "@sleep@ 0.1\nulimit -v > '@dir@/limit'\nexit 1",
+        "ulimit -Sv >> '@dir@/limits'\nulimit -Hv >> '@dir@/limits'\nexec @git@ \"$@\"",
     );
-    let mut g = GitParams::new();
-    g.program = fake.as_os_str();
-    let _ = key_for(dir.path(), &g, &CancellationToken::new()).await;
-    let limit: u64 = fs::read_to_string(dir.path().join("limit"))
+    let mut params = GitParams::new();
+    params.program = program.as_os_str();
+    key_for(r.path(), &params, &CancellationToken::new())
+        .await
         .unwrap()
-        .trim()
-        .parse()
         .unwrap();
-    assert_eq!(
-        limit * 1024,
-        auspex_effects::cache::GIT_MEMORY_LIMIT,
-        "ulimit -v is in KiB"
+    let observed = fs::read_to_string(side.path().join("limits")).unwrap();
+    let observed: Vec<u64> = observed.lines().map(|line| line.parse().unwrap()).collect();
+    assert!(observed.len() >= 2, "{observed:?}");
+    assert!(
+        observed
+            .iter()
+            .all(|&kib| kib * 1024 == auspex_effects::cache::GIT_MEMORY_LIMIT),
+        "{observed:?}"
     );
 }
 
@@ -235,6 +242,7 @@ async fn git_runs_under_the_memory_limit() {
 #[tokio::test]
 async fn a_finished_git_leaves_no_children() {
     let Some(t) = tools(&["sleep"]) else { return };
+    let Some(r) = repo() else { return };
     let dir = tempdir();
     let fake = t.script(
         dir.path(),
@@ -243,7 +251,7 @@ async fn a_finished_git_leaves_no_children() {
     );
     let mut g = GitParams::new();
     g.program = fake.as_os_str();
-    let _ = key_for(dir.path(), &g, &CancellationToken::new()).await;
+    let _ = key_for(r.path(), &g, &CancellationToken::new()).await;
     let pids = common::wait_for_pids(&dir.path().join("pids"), 1);
     let left = still_alive_after_wait(&pids);
     common::cleanup(&pids);
@@ -500,13 +508,14 @@ async fn a_git_reference_with_a_query_gets_no_caching() {
 /// git is reaped, and nothing more runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_receiver_during_the_key_kills_git_first() {
-    let Some(t) = tools(&["git"]) else { return };
+    let Some(t) = tools(&["sleep"]) else { return };
     let Some(r) = repo() else { return };
     let side = tempdir();
-    let f = side.path().join("inc");
-    fifo(&f);
-    git(r.path(), &["config", "include.path", f.to_str().unwrap()]);
-    let w = wrapped_git(&t, side.path());
+    let w = t.script(
+        side.path(),
+        "git",
+        "echo $$ >> '@dir@/pids'\nexec @sleep@ 30",
+    );
     let cache = tempdir();
     let (tx, rx) = unbounded_channel();
     let (rp, cp, wp) = (
@@ -549,15 +558,163 @@ async fn dropping_the_receiver_during_the_key_kills_git_first() {
     let r = tokio::time::timeout(Duration::from_secs(3), task).await;
     let present = common::pid_exists(pids[0]);
     common::cleanup(&pids);
-    // Release a git stuck opening the FIFO, whatever happened.
-    let _ = rustix::fs::open(
-        &f,
-        rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::NONBLOCK,
-        rustix::fs::Mode::empty(),
-    );
     assert_eq!(
         r.expect("the dropped receiver was ignored").unwrap(),
         Err(Cancelled)
     );
     assert!(!present, "git was not reaped before the call returned");
+}
+
+/// Nix can change its dirty-tree decision when these flags change, independently
+/// of the blob ids and worktree bytes.
+#[tokio::test]
+async fn index_stat_flags_are_part_of_the_key() {
+    let Some(r) = repo() else { return };
+    fs::write(
+        r.path().join("flake.nix"),
+        "{ outputs = _: { changed = true; }; }\n",
+    )
+    .unwrap();
+    let ordinary = key(r.path()).await.unwrap();
+    git(
+        r.path(),
+        &["update-index", "--assume-unchanged", "flake.nix"],
+    );
+    let assumed = key(r.path()).await.unwrap();
+    assert_ne!(ordinary, assumed);
+    git(
+        r.path(),
+        &["update-index", "--no-assume-unchanged", "flake.nix"],
+    );
+    assert_eq!(key(r.path()).await.unwrap(), ordinary);
+    git(r.path(), &["update-index", "--skip-worktree", "flake.nix"]);
+    assert_ne!(key(r.path()).await.unwrap(), ordinary);
+    git(
+        r.path(),
+        &["update-index", "--no-skip-worktree", "flake.nix"],
+    );
+    assert_eq!(key(r.path()).await.unwrap(), ordinary);
+}
+
+#[tokio::test]
+async fn linked_worktrees_are_keyed_from_their_own_index_and_files() {
+    let Some(r) = repo() else { return };
+    let side = tempdir();
+    let tree = side.path().join("checkout");
+    git(
+        r.path(),
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            tree.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let original = key(r.path()).await.unwrap();
+    assert_eq!(key(&tree).await.unwrap(), original);
+    fs::write(
+        tree.join("flake.nix"),
+        "{ outputs = _: { changed = true; }; }\n",
+    )
+    .unwrap();
+    assert_ne!(key(&tree).await.unwrap(), original);
+    assert_eq!(key(r.path()).await.unwrap(), original);
+}
+
+/// Review finding B1 and F9: the reference nix evaluates (built from the nearest ancestor
+/// with a `.git`) and the key (from git's own discovery) must name the same repository. A
+/// `sub/.git` that is not a repository makes them differ: git looks past it, `FlakeRef`
+/// does not. That is no caching, never a key for one tree serving the other.
+#[tokio::test]
+async fn a_reference_and_a_key_for_different_repositories_get_no_caching() {
+    let Some(r) = repo() else { return };
+    let sub = r.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+    git(r.path(), &["add", "sub/flake.nix"]);
+    git(r.path(), &["commit", "-q", "-m", "sub"]);
+    fs::create_dir(sub.join(".git")).unwrap();
+    let flake = FlakeRef::new(sub.to_str().unwrap()).unwrap();
+    assert!(flake.is_git(), "{flake:?}");
+    // git itself still finds the outer repository.
+    assert!(key(&sub).await.is_ok());
+    let cache = tempdir();
+    let mut eval = EvalParams::new();
+    eval.runtime_dir = Some(common::runtime_dir());
+    eval.program = std::ffi::OsStr::new("/nonexistent");
+    let params = CacheParams {
+        cache_dir: Some(cache.path()),
+        flake_dir: &sub,
+        git: GitParams::new(),
+    };
+    let (tx, mut rx) = unbounded_channel();
+    evaluate_cached(
+        &flake,
+        &[EvalMachine {
+            name: "a".to_owned(),
+            class: MachineClass::Nixos,
+        }],
+        &eval,
+        &params,
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let items = collect(&mut rx).await;
+    assert!(
+        matches!(&items[0], EvalItem::Note(n) if n.contains("top level")),
+        "{items:?}"
+    );
+}
+
+/// Without util-linux `prlimit` on `PATH`, git is never run (it would run unbounded): no
+/// caching, with a note naming the launcher. In a child process whose `PATH` holds only a
+/// recording `git`.
+#[test]
+fn without_prlimit_git_never_runs() {
+    if std::env::var_os("AUSPEX_TEST_NO_PRLIMIT").is_some() {
+        return;
+    }
+    let Some(t) = tools(&["git"]) else { return };
+    let bin = tempdir();
+    t.script(
+        bin.path(),
+        "git",
+        "echo ran >> '@dir@/ran'\nexec @git@ \"$@\"",
+    );
+    let Some(r) = repo() else { return };
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "no_prlimit_inner",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("AUSPEX_TEST_NO_PRLIMIT", r.path())
+        .env("PATH", bin.path())
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
+    assert!(
+        !bin.path().join("ran").exists(),
+        "git ran without its memory limit"
+    );
+}
+
+#[tokio::test]
+async fn no_prlimit_inner() {
+    let Some(repo) = std::env::var_os("AUSPEX_TEST_NO_PRLIMIT") else {
+        return;
+    };
+    let e = key(Path::new(&repo)).await.unwrap_err();
+    assert!(e.contains("prlimit"), "{e}");
 }

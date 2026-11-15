@@ -563,3 +563,131 @@ async fn tracked_symlinks_are_keyed_by_target_and_not_followed() {
     );
     assert_ne!(k1, base);
 }
+
+/// Review finding B2, without nix: the tree is edited while the evaluator runs. The
+/// results still reach the caller, but none is stored (the second key differs), a note
+/// says so, and after the edit is undone nothing is served from the cache.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario: the edited run, the undo, the clean run"
+)]
+async fn an_edit_during_the_evaluation_stores_nothing() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let Some(r) = repo() else { return };
+    let dir = tempdir();
+    let line = |m: &str| {
+        format!(
+            r#"{{"attr":"{m}","attrPath":["{m}"],"drvPath":"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-{m}.drv","outputs":{{"out":"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-{m}"}}}}"#
+        )
+    };
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        &format!(
+            "printf '%s\\n' '{}'\nwhile [ ! -e '@dir@/go' ]; do @sleep@ 0.02; done\nprintf '%s\\n' '{}'",
+            line("a"),
+            line("b")
+        ),
+    );
+    let cache = tempdir();
+    let mut eval = EvalParams::new();
+    eval.runtime_dir = Some(common::runtime_dir());
+    eval.program = prog.as_os_str();
+    eval.timeout = Duration::from_secs(10);
+    let params = CacheParams {
+        cache_dir: Some(cache.path()),
+        flake_dir: r.path(),
+        git: GitParams::new(),
+    };
+    let flake = FlakeRef::new(r.path().to_str().unwrap()).unwrap();
+    let ms = machines(&["a", "b"]);
+    let committed = fs::read(r.path().join("flake.nix")).unwrap();
+
+    let (tx, mut rx) = unbounded_channel();
+    let cancel = CancellationToken::new();
+    let run = evaluate_cached(&flake, &ms, &eval, &params, &cancel, tx);
+    let edit = async {
+        let mut items = Vec::new();
+        while let Some(i) = rx.recv().await {
+            if matches!(&i, EvalItem::Machine { machine, .. } if machine == "a") {
+                // An operator saving a file mid-scan.
+                fs::write(
+                    r.path().join("flake.nix"),
+                    "{ outputs = _: { edited = 1; }; }\n",
+                )
+                .unwrap();
+                fs::write(dir.path().join("go"), "").unwrap();
+            }
+            items.push(i);
+        }
+        items
+    };
+    let (res, items) = tokio::join!(run, edit);
+    res.unwrap();
+    let results = items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i,
+                EvalItem::Machine {
+                    from_cache: false,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(results, 2, "both results reach the caller: {items:?}");
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(i, EvalItem::Note(n) if n.contains("changed during evaluation"))),
+        "{items:?}"
+    );
+    assert_eq!(items.last(), Some(&EvalItem::Finished { error: None }));
+
+    // Undo the edit: the tree is the one the run started from, and nothing was stored.
+    fs::write(r.path().join("flake.nix"), committed).unwrap();
+    fs::remove_file(dir.path().join("go")).unwrap();
+    fs::write(dir.path().join("go"), "").unwrap();
+    let (tx, mut rx) = unbounded_channel();
+    evaluate_cached(&flake, &ms, &eval, &params, &CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    let mut again = Vec::new();
+    while let Some(i) = rx.recv().await {
+        again.push(i);
+    }
+    assert!(
+        !again.iter().any(|i| matches!(
+            i,
+            EvalItem::Machine {
+                from_cache: true,
+                ..
+            }
+        )),
+        "a result of the edited run was served from the cache: {again:?}"
+    );
+    // And an undisturbed run is stored: the third run hits.
+    let (tx, mut rx) = unbounded_channel();
+    evaluate_cached(&flake, &ms, &eval, &params, &CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    let mut third = Vec::new();
+    while let Some(i) = rx.recv().await {
+        third.push(i);
+    }
+    let hits = third
+        .iter()
+        .filter(|i| {
+            matches!(
+                i,
+                EvalItem::Machine {
+                    from_cache: true,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(hits, 2, "{third:?}");
+}

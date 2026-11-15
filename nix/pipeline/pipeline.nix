@@ -1035,7 +1035,8 @@ let
         # adds it only when `doCheck` runs, and nothing in the build itself spawns git. No other
         # test in the workspace needs it — `repo::tests` and the rename tests write `.git` FILES
         # as fixtures and never execute git.
-        nativeCheckInputs = [ pkgs.git ];
+        # `util-linux` (auspex-effects): its `prlimit` puts git under a memory limit before exec.
+        nativeCheckInputs = [ pkgs.git ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.util-linux ];
         env = lib.optionalAttrs (disc.services != [ ]) {
           APP_CONFIG_DIR = (builtins.head disc.services).dir + "/config";
         };

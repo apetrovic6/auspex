@@ -1,4 +1,4 @@
-{ craneLib, hostArgs, src, discovery, ... }:
+{ craneLib, hostArgs, src, discovery, pkgs, ... }:
 craneLib.buildPackage (hostArgs // {
   pname = "auspex";
   version =
@@ -10,6 +10,10 @@ craneLib.buildPackage (hostArgs // {
   CARGO_PROFILE = "release";
   cargoExtraArgs = "--locked -p auspex-tui --bin auspex-tui";
   doCheck = false;
+  # auspex-effects runs git through util-linux `prlimit`, which sets git's memory limit before
+  # exec. The absolute path is compiled in (`option_env!`), so the installed program needs no
+  # `prlimit` on PATH, and no wrapper changes the PATH of anything it starts.
+  AUSPEX_PRLIMIT = "${pkgs.util-linux}/bin/prlimit";
   installPhaseCommand = ''
     install -Dm755 target/release/auspex-tui "$out/bin/auspex"
   '';

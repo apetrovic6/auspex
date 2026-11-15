@@ -30,6 +30,7 @@
 
 use std::ffi::OsStr;
 use std::io;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -225,21 +226,25 @@ fn resolve_in(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
 /// Spawns `cmd` in a new session, with stdout and stderr piped, stdin piped when
 /// `with_stdin` and `/dev/null` otherwise.
 ///
-/// The command is run directly (`execve` of `cmd`'s program): never through a shell. Build
-/// `cmd` with [`command`].
+/// The command is never run through a shell. With `memory`, an absolute-resolved
+/// util-linux `prlimit` sets both address-space limits before execing the target; failure
+/// to find the launcher or set the limit never runs the target. Build `cmd` with
+/// [`command`], configuring only arguments, environment overrides and working directory.
 pub fn spawn(
     mut cmd: Command,
     with_stdin: bool,
     on_exit: OnExit,
     memory: Option<u64>,
 ) -> io::Result<Spawned> {
+    if let Some(bytes) = memory {
+        cmd = limited_command(&cmd, bytes)?;
+    }
     // A new session: `setsid()` in the child, which makes it the leader of a new session
     // AND of a new process group whose id is its pid (so no separate `process_group(0)`:
     // a process that is already a group leader cannot call setsid). A new session has no
     // controlling terminal, so opening `/dev/tty` fails (ENXIO) and nothing it runs, ssh
     // or a ProxyJump hop from ~/.ssh/config, can prompt on the operator's terminal or
     // read keystrokes meant for the TUI.
-    use std::os::unix::process::CommandExt as _;
     cmd.as_std_mut().setsid(true);
     cmd.kill_on_drop(true)
         .stdin(if with_stdin {
@@ -259,48 +264,66 @@ pub fn spawn(
         .and_then(|id| i32::try_from(id).ok())
         .and_then(Pid::from_raw);
     watch.pid = pgid;
-    let sp = Spawned {
+    Ok(Spawned {
         group: Group(pgid),
         child,
         watch,
         on_exit,
-    };
-    if let Some(bytes) = memory
-        && let Err(e) = limit_memory(pgid, bytes)
-    {
-        // Never run a command whose bound could not be set. Killed by the guard and reaped
-        // by tokio when `sp` drops.
-        sp.group.kill();
-        return Err(e);
+    })
+}
+
+/// Launching through `prlimit` closes the post-spawn race: the target's loader and first
+/// instruction already have the limit. It execs, so sessions, group guards and exit
+/// watching still refer to the same leader.
+#[cfg(target_os = "linux")]
+fn limited_command(cmd: &Command, bytes: u64) -> io::Result<Command> {
+    let original = cmd.as_std();
+    if !Path::new(original.get_program()).is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a bounded command needs an absolute program path",
+        ));
     }
-    Ok(sp)
+    // A packaged build names util-linux's `prlimit` by its absolute store path at compile
+    // time (`AUSPEX_PRLIMIT`, set in nix/auspex/package.nix), so the installed program needs
+    // nothing on `PATH` and changes no child's `PATH`. Elsewhere (dev shell, CI) it is found
+    // on `PATH` like every other program here.
+    //
+    // Not `NotFound` on failure: `spawn_error` would report that as the *target* missing
+    // ("git not found on PATH"), which sends the operator after the wrong program.
+    let launcher = match option_env!("AUSPEX_PRLIMIT") {
+        Some(p) if Path::new(p).is_absolute() => Ok(Command::new(p)),
+        _ => command(OsStr::new("prlimit")),
+    };
+    let mut limited = launcher.map_err(|e| {
+        io::Error::other(format!(
+            "the util-linux prlimit memory-limit launcher is {e}; git is not run without it"
+        ))
+    })?;
+    limited
+        .arg(format!("--as={bytes}:{bytes}"))
+        .arg("--")
+        .arg(original.get_program())
+        .args(original.get_args());
+    if let Some(dir) = original.get_current_dir() {
+        limited.current_dir(dir);
+    }
+    for (name, value) in original.get_envs() {
+        if let Some(value) = value {
+            limited.env(name, value);
+        } else {
+            limited.env_remove(name);
+        }
+    }
+    Ok(limited)
 }
 
-/// Caps a just-spawned child's address space (`RLIMIT_AS`) at `bytes`, with `prlimit(2)`
-/// from the parent: safe, unlike `setrlimit` in `pre_exec`. It applies a few microseconds
-/// after the exec, before the program has read anything (git takes milliseconds to start).
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn limit_memory(pid: Option<Pid>, bytes: u64) -> io::Result<()> {
-    use rustix::process::{Resource, Rlimit, prlimit};
-    let pid = pid.ok_or_else(|| io::Error::other("no pid to limit"))?;
-    prlimit(
-        Some(pid),
-        Resource::As,
-        Rlimit {
-            current: Some(bytes),
-            maximum: Some(bytes),
-        },
-    )
-    .map(drop)
-    .map_err(Into::into)
-}
-
-/// Elsewhere another process's limit cannot be set safely, so a bounded command is not run.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn limit_memory(_: Option<Pid>, _: u64) -> io::Result<()> {
+/// Without the pre-exec launcher, fail closed instead of running an unbounded target.
+#[cfg(not(target_os = "linux"))]
+fn limited_command(_: &Command, _: u64) -> io::Result<Command> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "this platform cannot limit a child's memory",
+        "this platform cannot launch a memory-bounded command",
     ))
 }
 
@@ -619,6 +642,66 @@ pub fn describe_status(status: Option<ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unusable_limit_never_runs_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let mut cmd = command(OsStr::new("sh")).unwrap();
+        cmd.args(["-c", "printf ran > \"$1\"", "sh"]).arg(&marker);
+        let ran = run(
+            cmd,
+            None,
+            OnExit::KillGroup,
+            Limits {
+                stdout: 1024,
+                stderr: 1024,
+                memory: Some(0),
+            },
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(!matches!(ran.end, End::Exited(status) if status.success()));
+        assert!(
+            !marker.exists(),
+            "the target executed before its limit was installed"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_limiter_preserves_arguments_environment_and_working_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cmd = command(OsStr::new("sh")).unwrap();
+        cmd.current_dir(dir.path())
+            .env("AUSPEX_LIMIT_TEST", "retained")
+            .env_remove("AUSPEX_LIMIT_REMOVED")
+            .args([
+                "-c",
+                "test \"$AUSPEX_LIMIT_TEST\" = retained && test -z \"${AUSPEX_LIMIT_REMOVED+x}\" && test \"$1\" = 'two words' && printf '%s' \"$PWD\"",
+                "sh",
+                "two words",
+            ]);
+        let ran = run(
+            cmd,
+            None,
+            OnExit::KillGroup,
+            Limits {
+                stdout: 4096,
+                stderr: 1024,
+                memory: Some(64 << 20),
+            },
+            Instant::now() + Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(ran.end, End::Exited(status) if status.success()));
+        assert_eq!(ran.stdout, dir.path().as_os_str().as_encoded_bytes());
+    }
 
     /// Review finding F6: empty and relative `PATH` entries are never searched, so a
     /// program committed to the fleet repository (the child's working directory) cannot

@@ -172,7 +172,7 @@ async fn a_directory_that_is_not_a_git_repository_gets_no_caching() {
 
 #[tokio::test]
 async fn a_missing_git_gets_no_caching() {
-    let dir = tempdir();
+    let Some(dir) = repo() else { return };
     let mut g = GitParams::new();
     g.program = std::ffi::OsStr::new("auspex-test-no-such-git");
     let e = key_for(dir.path(), &g, &CancellationToken::new())
@@ -393,13 +393,38 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
         fs::set_permissions(ro.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
 
-    // Not a git repository: a note, and everything evaluated.
+    // Not a git repository: the plain path becomes a `path:` reference, which is never
+    // cached; a note says so, and everything is evaluated.
     let plain = tempdir();
+    let plain_flake = FlakeRef::new(plain.path().to_str().unwrap()).unwrap();
+    assert!(plain_flake.as_str().starts_with("path:"), "{plain_flake:?}");
     let cache = CacheParams {
         cache_dir: Some(cache_dir.path()),
         flake_dir: plain.path(),
         git: GitParams::new(),
     };
+    let (tx, mut rx) = unbounded_channel();
+    evaluate_cached(
+        &plain_flake,
+        only_a,
+        &eval,
+        &cache,
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let mut items = Vec::new();
+    while let Some(i) = rx.recv().await {
+        items.push(i);
+    }
+    assert!(
+        matches!(&items[0], EvalItem::Note(n) if n.starts_with("eval cache off for this run: a `path:` flake reference")),
+        "{items:?}"
+    );
+    assert_eq!(summary(&items), [("a".to_owned(), true, false)]);
+
+    // A flake directory that is not the one the reference names: no caching either.
     let (tx, mut rx) = unbounded_channel();
     evaluate_cached(&flake, only_a, &eval, &cache, &CancellationToken::new(), tx)
         .await
@@ -409,8 +434,7 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
         items.push(i);
     }
     assert!(
-        matches!(&items[0], EvalItem::Note(n) if n.starts_with("eval cache off for this run: not a git repository")),
+        matches!(&items[0], EvalItem::Note(n) if n.contains("does not match")),
         "{items:?}"
     );
-    assert_eq!(summary(&items), [("a".to_owned(), true, false)]);
 }

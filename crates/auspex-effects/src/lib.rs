@@ -144,7 +144,11 @@ impl Termination {
     ///
     /// # Errors
     ///
-    /// When a handler cannot be registered (no tokio signal driver).
+    /// When a signal handler cannot be registered with the operating system.
+    ///
+    /// # Panics
+    ///
+    /// When called outside a tokio runtime or without its signal driver enabled.
     pub fn new() -> std::io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self {

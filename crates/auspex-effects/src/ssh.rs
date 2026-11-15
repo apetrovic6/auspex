@@ -54,6 +54,49 @@ pub const STDERR_CAP: usize = 16 * 1024;
 /// it into place. So `<dir>` + 1 + 40 + 1 + 16 + NUL must fit in 104: 45 bytes.
 pub const MAX_CONTROL_DIR_LEN: usize = 104 - 1 - (1 + 40) - (1 + 16);
 
+/// The shared default for control sockets and evaluator machine-list files.
+pub(crate) fn default_runtime_path() -> PathBuf {
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(d) if Path::new(&d).is_absolute() => Path::new(&d).join("auspex"),
+        _ => std::env::temp_dir().join(format!("auspex-{}", rustix::process::getuid().as_raw())),
+    }
+}
+
+/// Creates a private directory without changing an existing directory's permissions.
+/// Socket-path restrictions belong to `ControlDir`, not to regular runtime files.
+pub(crate) fn prepare_private_dir(path: &Path, kind: &str) -> Result<(), String> {
+    let shown = path.display();
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("cannot create {kind} {shown}: {e}")),
+    }
+    // Inspect after creating too: creation does not guarantee what remains at this path.
+    let meta =
+        fs::symlink_metadata(path).map_err(|e| format!("cannot inspect {kind} {shown}: {e}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!("{kind} {shown} is a symlink; refusing to use it"));
+    }
+    if !meta.is_dir() {
+        return Err(format!("{kind} {shown} exists and is not a directory"));
+    }
+    let me = rustix::process::getuid().as_raw();
+    if meta.uid() != me {
+        return Err(format!(
+            "{kind} {shown} is owned by uid {}, not by this user (uid {me}); \
+             refusing to use it",
+            meta.uid()
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode != 0o700 {
+        return Err(format!(
+            "{kind} {shown} has mode {mode:04o}, expected 0700; refusing to use it"
+        ));
+    }
+    Ok(())
+}
+
 /// A control-socket directory that has passed [`ControlDir::prepare`]'s checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlDir {
@@ -83,12 +126,7 @@ impl ControlDir {
     /// F9, out of scope: auspex runs on a Linux desktop).
     #[must_use]
     pub fn default_path() -> PathBuf {
-        match std::env::var_os("XDG_RUNTIME_DIR") {
-            Some(d) if Path::new(&d).is_absolute() => Path::new(&d).join("auspex"),
-            _ => {
-                std::env::temp_dir().join(format!("auspex-{}", rustix::process::getuid().as_raw()))
-            }
-        }
+        default_runtime_path()
     }
 
     /// Creates `path` with mode 0700 if it is missing, and checks it either way.
@@ -115,44 +153,7 @@ impl ControlDir {
                 s.len()
             )));
         }
-        match fs::DirBuilder::new().mode(0o700).create(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => {
-                return Err(ControlDirError(format!(
-                    "cannot create control directory {s}: {e}"
-                )));
-            }
-        }
-        // Checked after creating too: `create` succeeding says nothing about what is there
-        // by the time ssh uses it, and the mode is subject to nothing (DirBuilder applies
-        // the umask, which can only remove bits).
-        let meta = fs::symlink_metadata(path)
-            .map_err(|e| ControlDirError(format!("cannot inspect control directory {s}: {e}")))?;
-        if meta.file_type().is_symlink() {
-            return Err(ControlDirError(format!(
-                "control directory {s} is a symlink; refusing to use it"
-            )));
-        }
-        if !meta.is_dir() {
-            return Err(ControlDirError(format!(
-                "control directory {s} exists and is not a directory"
-            )));
-        }
-        let me = rustix::process::getuid().as_raw();
-        if meta.uid() != me {
-            return Err(ControlDirError(format!(
-                "control directory {s} is owned by uid {}, not by this user (uid {me}); \
-                 refusing to use it",
-                meta.uid()
-            )));
-        }
-        let mode = meta.permissions().mode() & 0o7777;
-        if mode != 0o700 {
-            return Err(ControlDirError(format!(
-                "control directory {s} has mode {mode:04o}, expected 0700; refusing to use it"
-            )));
-        }
+        prepare_private_dir(path, "control directory").map_err(ControlDirError)?;
         // ssh_args refuses whitespace, control characters and '%'; asking it now turns that
         // into an error here rather than on every probe.
         let probe_target = Target::parse("x").map_err(|e| ControlDirError(e.to_string()))?;

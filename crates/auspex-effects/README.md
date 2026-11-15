@@ -23,6 +23,29 @@ how.
 runtime and exit. Children run in sessions of their own, so nothing else stops them if
 auspex is killed by a signal.
 
+Plain filesystem flake references are normalised to `git+file://<repository>?dir=<flake>`
+inside Git repositories. Inventory and evaluation receive the same reference: the Nix CLI
+and `builtins.getFlake` otherwise disagree about plain paths. Untracked, ignored and `.git`
+files are excluded, as for `nix build .#…`: a new machine module must be `git add`ed before
+auspex evaluates it. Explicit `path:` references retain path semantics and are not cached.
+
+The cache hashes HEAD, index records (including assume-unchanged/skip-worktree flags),
+tracked worktree contents and modes, the flake directory, and `flake.lock`. Results stream
+immediately, but successful results are written only after a second key matches the first.
+An edit during evaluation leaves that run uncached. This is a before/after consistency
+check, not an immutable snapshot; edits that are reverted before the second key are not
+detected.
+
+On Linux, git runs through util-linux `prlimit`, which sets the 512 MiB address-space limit
+**before exec**; the dev shell, pure CI and the installed package supply it (the package
+appends it to `PATH`, so the operator's own tools keep precedence). Without it, or on
+another platform, there is no caching. A hostile `.git/` costs at most that limit and a
+2-second git timeout per refresh. The index listing is capped at 64 MiB.
+
+Evaluator machine-list files require a private directory (0700, owned by this user, not
+a symlink), but have no SSH socket-path limit. SSH control directories still have the
+45-byte limit.
+
 Tests: `tests/ssh.rs` (fake `ssh` scripts, control-directory checks), `tests/nix_fake.rs`
 (fake `nix` and `nix-eval-jobs`), `tests/nix_fixture.rs` (the real tools against
 `tests/fixtures/flake`, skipped where `nix` or `nix-eval-jobs` is missing),

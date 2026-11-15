@@ -39,7 +39,7 @@ use crate::process::{
     End, Limits, Line, Lines, OnExit, PIPE_GRACE, Spawned, Tail, command, describe_status, run,
     spawn, spawn_error,
 };
-use crate::ssh::ControlDir;
+use crate::ssh::{default_runtime_path, prepare_private_dir};
 use crate::text::{lossy, reason};
 
 /// The default `nix` program, looked up on `PATH`.
@@ -92,7 +92,14 @@ builtins.listToAttrs (map (m: { name = m.name; value = select m; }) (builtins.fr
 
 /// A flake reference that is safe to hand to nix as one argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlakeRef(String);
+pub struct FlakeRef {
+    reference: String,
+    /// The flake directory, canonical, for a local git reference.
+    worktree: Option<std::path::PathBuf>,
+    /// The repository top level that reference names, canonical.
+    top: Option<std::path::PathBuf>,
+    queried: bool,
+}
 
 /// Why a flake reference was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,9 +114,11 @@ impl fmt::Display for FlakeRefError {
 impl std::error::Error for FlakeRefError {}
 
 impl FlakeRef {
-    /// A flake reference: either a URL-like reference (`path:/abs`, `git+file:///abs`,
-    /// `github:o/r`) or a filesystem path, which is made absolute (against the current
-    /// directory), because `builtins.getFlake` refuses relative paths.
+    /// A URL-like reference (`path:/abs`, `git+file:///abs`, `github:o/r`) or a
+    /// filesystem path. Paths inside a repository become an explicit `git+file://`
+    /// reference to its root, with `?dir=` for a nested flake. Both Nix entry points
+    /// therefore read tracked files: `builtins.getFlake "/abs"` alone reads a path
+    /// source, unlike the `nix eval /abs#…` CLI.
     ///
     /// # Errors
     ///
@@ -133,48 +142,107 @@ impl FlakeRef {
                 "flake reference contains a control character".to_owned(),
             ));
         }
-        if has_scheme(s) {
-            return Ok(Self(s.to_owned()));
+        let queried = has_scheme(s) && s.contains('?');
+        let local = if let Some(file) = s.strip_prefix("git+") {
+            (!queried)
+                .then(|| url::Url::parse(file).ok()?.to_file_path().ok())
+                .flatten()
+        } else if has_scheme(s) {
+            None
+        } else {
+            Some(
+                std::path::absolute(Path::new(s))
+                    .map_err(|e| FlakeRefError(format!("cannot make {s:?} absolute: {e}")))?,
+            )
+        };
+        if let Some(path) = local {
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if let Some(top) = path.ancestors().find(|p| p.join(".git").exists()) {
+                let rel = path
+                    .strip_prefix(top)
+                    .map_err(|e| FlakeRefError(e.to_string()))?;
+                let mut file = url::Url::from_directory_path(top)
+                    .map_err(|()| FlakeRefError("cannot encode the repository path".to_owned()))?;
+                if !rel.as_os_str().is_empty() {
+                    let rel = rel.to_str().ok_or_else(|| {
+                        FlakeRefError("the flake directory is not UTF-8".to_owned())
+                    })?;
+                    file.query_pairs_mut().append_pair("dir", rel);
+                    // Nix decodes URI escapes, not HTML form '+' escapes.
+                    if let Some(query) = file.query() {
+                        let query = query.replace('+', "%20");
+                        file.set_query(Some(&query));
+                    }
+                }
+                return Ok(Self {
+                    reference: format!("git+{file}"),
+                    top: Some(top.to_path_buf()),
+                    worktree: Some(path),
+                    queried,
+                });
+            }
+            if !has_scheme(s) {
+                let path = path
+                    .to_str()
+                    .ok_or_else(|| FlakeRefError(format!("flake path {s:?} is not UTF-8")))?;
+                // Explicit path syntax also prevents '?' and '%' in a filename from
+                // being mistaken for URL syntax.
+                let file = url::Url::from_file_path(path)
+                    .map_err(|()| FlakeRefError("cannot encode the flake path".to_owned()))?;
+                return Ok(Self {
+                    reference: format!("path:{}", file.path()),
+                    worktree: None,
+                    top: None,
+                    queried: false,
+                });
+            }
         }
-        let abs = std::path::absolute(Path::new(s))
-            .map_err(|e| FlakeRefError(format!("cannot make {s:?} absolute: {e}")))?;
-        let abs = abs
-            .to_str()
-            .ok_or_else(|| FlakeRefError(format!("flake path {s:?} is not UTF-8")))?;
-        Ok(Self(abs.to_owned()))
+        Ok(Self {
+            reference: s.to_owned(),
+            worktree: None,
+            top: None,
+            queried,
+        })
     }
 
     /// The reference as nix will see it.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.reference
     }
 
-    /// Whether nix will read this through git, from the worktree: a plain path (nix uses git
-    /// when it is in a repository) or `git+file:`, without a query. Only these are cached: any other reference either sees
-    /// files whose contents the key does not cover (`path:` reads untracked and ignored
-    /// files) or is not the flake directory at all (`github:`).
+    /// Whether this is an explicit git worktree reference eligible for caching.
+    /// Plain paths in repositories are normalised by [`Self::new`]; explicit `path:`
+    /// sources include untracked files and are never cached.
     #[must_use]
     pub fn is_git(&self) -> bool {
-        (!has_scheme(&self.0) || self.0.starts_with("git+file:")) && !self.has_query()
+        self.reference.starts_with("git+file:") && !self.queried
     }
 
-    /// Whether it carries a query (`?ref=`, `?rev=`, `?dir=`, `?submodules=`): each makes
-    /// nix read something other than the worktree, so such a reference is not cached
-    /// (review finding N2d).
+    /// Whether the input carried a query (`?ref=`, `?rev=`, `?dir=`, `?submodules=`).
+    /// Such inputs are not cached. A `dir` added by [`Self::new`] is different: it names
+    /// exactly the worktree directory recorded alongside the normalised reference.
     #[must_use]
-    pub fn has_query(&self) -> bool {
-        self.0.contains('?')
+    pub const fn has_query(&self) -> bool {
+        self.queried
     }
 
     /// The scheme (`path`, `github`), or `path` for a plain path, for messages.
     #[must_use]
     pub fn scheme(&self) -> &str {
-        if has_scheme(&self.0) {
-            self.0.split_once(':').map_or("", |(s, _)| s)
+        if has_scheme(&self.reference) {
+            self.reference.split_once(':').map_or("", |(s, _)| s)
         } else {
             "plain path"
         }
+    }
+
+    pub(crate) fn worktree_dir(&self) -> Option<&Path> {
+        self.worktree.as_deref()
+    }
+
+    pub(crate) fn repo_top(&self) -> Option<&Path> {
+        self.top.as_deref()
     }
 }
 
@@ -273,8 +341,9 @@ pub struct EvalParams<'a> {
     /// The whole evaluation's deadline. Past it the process group is killed, and the
     /// final item says so.
     pub timeout: Duration,
-    /// Where the machine list file goes: a directory checked like ssh's control directory
-    /// (0700, ours, no symlink). `None` is [`ControlDir::default_path`], the same directory.
+    /// Where the machine list file goes: a private directory (0700, ours, no symlink),
+    /// without a socket-path length limit. `None` uses `$XDG_RUNTIME_DIR/auspex`, or
+    /// `auspex-<uid>` under the system temporary directory if it is unset or relative.
     pub runtime_dir: Option<std::path::PathBuf>,
 }
 
@@ -372,18 +441,17 @@ fn list_file_pid(name: &str) -> Option<i32> {
 }
 
 impl ListFile {
-    /// Creates it in `dir` (the per-user runtime directory, checked 0700 and ours by
-    /// [`ControlDir::prepare`]), exclusively (`O_EXCL`, which also refuses a planted
-    /// symlink) and readable only by us. Only names and classes are in it.
+    /// Creates it in `dir` exclusively (`O_EXCL`, which also refuses a planted symlink)
+    /// and readable only by us. The directory must already be checked 0700 and ours.
+    /// Only names and classes are in it.
     ///
     /// A crash or `SIGKILL` leaves the file behind (review finding N7), so each call first
     /// removes the list files whose creating process is gone: the pid in the name no
     /// longer exists (`kill(pid, 0)` answers `ESRCH`). A pid reused since then only keeps a
     /// stale file longer; it never makes a live call's file look stale.
-    fn create(dir: &ControlDir, contents: &str) -> std::io::Result<Self> {
+    fn create(dir: &Path, contents: &str) -> std::io::Result<Self> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let dir = Path::new(dir.as_str());
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let name = e.file_name();
@@ -614,10 +682,10 @@ pub async fn evaluate(
     let dir = params
         .runtime_dir
         .clone()
-        .unwrap_or_else(ControlDir::default_path);
-    let list = match ControlDir::prepare(&dir)
-        .map_err(|e| std::io::Error::other(e.0))
-        .and_then(|d| ListFile::create(&d, &eval_machines_json(&unique)))
+        .unwrap_or_else(default_runtime_path);
+    let list = match prepare_private_dir(&dir, "runtime directory")
+        .map_err(std::io::Error::other)
+        .and_then(|()| ListFile::create(&dir, &eval_machines_json(&unique)))
     {
         Ok(l) => l,
         Err(e) => {
@@ -789,12 +857,64 @@ mod tests {
             FlakeRef::new("git+file:///x?dir=a").unwrap().as_str(),
             "git+file:///x?dir=a"
         );
+        // A query the operator wrote is kept, and disables caching.
+        let q = FlakeRef::new("git+file:///x?dir=a").unwrap();
+        assert!(q.has_query() && !q.is_git());
+        assert!(!FlakeRef::new("github:o/r").unwrap().is_git());
+    }
+
+    /// Review finding B1: a plain path is never handed to `builtins.getFlake` as a plain
+    /// path (which nix reads as `path:`, untracked files and `.git/` included). Inside a
+    /// repository it becomes `git+file://<top>` with `?dir=` for a nested flake; outside
+    /// one, an explicit `path:` that is never cached.
+    #[test]
+    fn plain_paths_become_explicit_references() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(top.join(".git")).unwrap();
+        let nested = top.join("fleet a+b");
+        std::fs::create_dir(&nested).unwrap();
+
+        let root = FlakeRef::new(top.to_str().unwrap()).unwrap();
+        assert_eq!(root.as_str(), format!("git+file://{}/", top.display()));
+        assert!(root.is_git() && !root.has_query());
+        assert_eq!(root.repo_top(), Some(top.as_path()));
+        assert_eq!(root.worktree_dir(), Some(top.as_path()));
+
+        let sub = FlakeRef::new(nested.to_str().unwrap()).unwrap();
+        assert_eq!(
+            sub.as_str(),
+            format!("git+file://{}/?dir=fleet%20a%2Bb", top.display())
+        );
+        assert!(
+            sub.is_git(),
+            "the crate's own dir= is not the operator's query"
+        );
+        assert_eq!(sub.worktree_dir(), Some(nested.as_path()));
+
+        // Through a symlink: the canonical repository, the same reference.
+        let link = top.join("link");
+        std::os::unix::fs::symlink(&nested, &link).unwrap();
+        assert_eq!(FlakeRef::new(link.to_str().unwrap()).unwrap(), sub);
+
+        // Outside any repository: `path:`, never cached.
+        let other = tempfile::tempdir().unwrap();
+        let plain = FlakeRef::new(other.path().to_str().unwrap()).unwrap();
+        assert!(plain.as_str().starts_with("path:/"), "{plain:?}");
+        assert!(!plain.is_git() && plain.repo_top().is_none());
+
+        // A relative path is made absolute against the current directory first.
         let rel = FlakeRef::new("some/dir").unwrap();
-        assert!(rel.as_str().starts_with('/'), "{rel:?}");
-        assert!(rel.as_str().ends_with("/some/dir"));
-        // A relative path that merely starts with a dash-free name but has a colon later
-        // is not a scheme unless the part before the colon is one.
-        assert!(FlakeRef::new("./a:b").unwrap().as_str().starts_with('/'));
+        let cwd = std::fs::canonicalize(".").unwrap();
+        assert!(
+            rel.as_str().starts_with("git+file:///") || rel.as_str().starts_with("path:/"),
+            "{rel:?}"
+        );
+        assert!(
+            rel.as_str().contains("some%2Fdir") || rel.as_str().ends_with("/some/dir"),
+            "{rel:?} under {}",
+            cwd.display()
+        );
     }
 
     #[test]

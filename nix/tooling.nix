@@ -31,5 +31,8 @@
     # than skipping for want of the binary. Not in the `ci-pure` sandbox: there is no Nix
     # daemon to evaluate against there, so the test skips itself.
     nix-eval-jobs
+  ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+    # Git's address-space cap must be installed before exec, not raced from the parent.
+    pkgs.util-linux
   ];
 }

@@ -7,7 +7,7 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -722,7 +722,7 @@ async fn the_list_file_is_private_and_stale_ones_are_removed() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
     let rt = dir.path().join("rt");
-    auspex_effects::ssh::ControlDir::prepare(&rt).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&rt).unwrap();
     // pid_max is at most 2^22 on Linux, so this pid cannot exist.
     let stale = rt.join("machines-4194305-0.json");
     fs::write(&stale, "[]").unwrap();
@@ -868,7 +868,7 @@ async fn planted_list_inner() {
     }
     let dir = tempdir();
     let rt = dir.path().join("rt");
-    auspex_effects::ssh::ControlDir::prepare(&rt).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&rt).unwrap();
     let target = dir.path().join("victim");
     fs::write(&target, "untouched").unwrap();
     for n in 0..16 {
@@ -891,4 +891,146 @@ async fn planted_list_inner() {
     )
     .await;
     assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+}
+
+#[test]
+fn test_runtime_directories_are_removed_when_their_thread_exits() {
+    let rt = std::thread::spawn(|| {
+        let rt = common::runtime_dir();
+        fs::create_dir(&rt).unwrap();
+        assert!(rt.is_dir());
+        rt
+    })
+    .join()
+    .unwrap();
+    assert!(!rt.parent().unwrap().exists(), "{rt:?} was left behind");
+}
+
+#[tokio::test]
+async fn evaluator_runtime_directories_are_not_limited_by_socket_paths() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let rt = dir.path().join("r".repeat(80));
+    let ssh_error = auspex_effects::ssh::ControlDir::prepare(&rt).unwrap_err();
+    assert!(ssh_error.0.contains("unix socket path"), "{ssh_error}");
+    assert!(
+        !rt.exists(),
+        "ssh must refuse before creating the directory"
+    );
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        &format!(
+            "{FIND_LIST}IFS= read -r m < \"$list\" || true\nprintf '%s\\n' '{}'",
+            ok_line(r#""a""#, r#""a""#)
+        ),
+    );
+    let mut p = params(&prog, Duration::from_secs(10));
+    p.runtime_dir = Some(rt.clone());
+    let (tx, mut rx) = unbounded_channel();
+    evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["a"]),
+        &p,
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let items = collect(&mut rx).await;
+    assert!(
+        matches!(&items[..], [EvalItem::Machine { machine, .. }, EvalItem::Finished { error: None }] if machine == "a"),
+        "{items:?}"
+    );
+    let meta = fs::symlink_metadata(&rt).unwrap();
+    assert!(meta.is_dir());
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+    assert_eq!(meta.uid(), rustix::process::getuid().as_raw());
+    assert_eq!(fs::read_dir(&rt).unwrap().count(), 0, "list file leaked");
+}
+
+#[tokio::test]
+async fn unsafe_evaluator_runtime_directories_are_refused_without_changing_them() {
+    let dir = tempdir();
+    let public = dir.path().join("public");
+    fs::create_dir(&public).unwrap();
+    fs::set_permissions(&public, fs::Permissions::from_mode(0o755)).unwrap();
+    let file = dir.path().join("file");
+    fs::write(&file, "untouched").unwrap();
+    let private = dir.path().join("private");
+    fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+    let link = dir.path().join("link");
+    symlink(&private, &link).unwrap();
+
+    for (rt, reason) in [
+        (&public, "has mode 0755, expected 0700"),
+        (&file, "is not a directory"),
+        (&link, "is a symlink"),
+    ] {
+        let mut p = EvalParams::new();
+        p.runtime_dir = Some(rt.clone());
+        p.program = std::ffi::OsStr::new("/nonexistent");
+        let (tx, mut rx) = unbounded_channel();
+        evaluate(
+            &FlakeRef::new("path:/x").unwrap(),
+            &machines(&["a"]),
+            &p,
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+        let items = collect(&mut rx).await;
+        let [EvalItem::Finished { error: Some(error) }] = &items[..] else {
+            panic!("expected a runtime-directory error, got {items:?}");
+        };
+        assert!(error.contains("runtime directory"), "{error}");
+        assert!(error.contains(reason), "{error}");
+        assert!(!error.contains("ssh"), "{error}");
+        assert!(!error.contains("control directory"), "{error}");
+    }
+    assert_eq!(
+        fs::metadata(&public).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), "untouched");
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_dir(&private).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn evaluator_runtime_directories_owned_by_another_user_are_refused() {
+    let me = rustix::process::getuid().as_raw();
+    let Some(theirs) = ["/", "/proc", "/dev", "/nix/store"]
+        .iter()
+        .map(Path::new)
+        .find(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && m.uid() != me))
+    else {
+        eprintln!("SKIPPED: no directory owned by another user to test with (running as root?)");
+        return;
+    };
+    let mut p = EvalParams::new();
+    p.runtime_dir = Some(theirs.to_path_buf());
+    p.program = std::ffi::OsStr::new("/nonexistent");
+    let (tx, mut rx) = unbounded_channel();
+    evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["a"]),
+        &p,
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let items = collect(&mut rx).await;
+    let [EvalItem::Finished { error: Some(error) }] = &items[..] else {
+        panic!("expected an ownership error, got {items:?}");
+    };
+    assert!(error.contains("runtime directory"), "{error}");
+    assert!(error.contains("not by this user"), "{error}");
 }
