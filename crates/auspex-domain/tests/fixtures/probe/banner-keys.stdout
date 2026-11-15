@@ -1,0 +1,16 @@
+Last login: Sat Nov 14 21:03:11 2026
+system_state=running
+failed_units=[]
+booted_kernel=/nix/store/7123456789abcdfghijklmnpqrsvwxyz-linux-6.12.4/bzImage
+current_system=/nix/store/8123456789abcdfghijklmnpqrsvwxyz-banner-system
+auspex_probe=1
+probe=darwin
+current_system=/nix/store/5123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05.abcdef0
+configuration_revision=null
+uptime_seconds=302400
+load= 1.84 2.01 2.10 
+root_disk_kb=971350180 412113220 559236960
+auspex_end=1
+current_system=/nix/store/9123456789abcdfghijklmnpqrsvwxyz-trailing-system
+configuration_revision=after-the-end
+system_state=degraded

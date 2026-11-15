@@ -11,7 +11,13 @@
 //!   change is not an addition.
 //!
 //! Conventions: field names are `snake_case`; enums are `snake_case` strings; a value that is
-//! unknown or not applicable is `null`, never omitted; lists are never `null`.
+//! unknown or not applicable is `null`, never omitted; lists are never `null`, with one
+//! documented exception, `failed_units`, where `null` means "unknown" and `[]` means
+//! "none".
+//!
+//! Every string that came from outside auspex (ssh's and nix's text, inventory tags and
+//! `buildHost`, fleet error reasons) has had escape sequences, control characters and
+//! Unicode format characters removed, so `--plain` and the TUI can print it as is.
 
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +28,7 @@ use crate::fleet::{
 };
 use crate::observe::{Health, ProbeOutcome};
 use crate::status::{Badge, MachineFacts, machine_status};
+use crate::text::sanitize_line;
 
 /// The version of this contract. Bumped on any change that is not a pure addition.
 pub const JSON_VERSION: u32 = 1;
@@ -31,15 +38,82 @@ pub const JSON_VERSION: u32 = 1;
 pub struct FleetReport {
     /// [`JSON_VERSION`]. Check it before reading anything else.
     pub version: u32,
-    /// `true` when no machine carries a spinner badge (`checking` or `evaluating`) among its
-    /// `badges`, not just as its `status`: a machine whose eval failed while its probe is still
-    /// out is not settled. `false` when the global timeout passed first.
+    /// `true` exactly when the scan is over and its result is final, which is all of:
+    ///
+    /// - every fleet-wide request is back: the machine list, the evaluator's final answer,
+    ///   and any query for the whole fleet (Prometheus, Alertmanager);
+    /// - the global deadline did not cut the scan short;
+    /// - `errors` is empty;
+    /// - every machine's `settled` is `true`.
+    ///
+    /// So a report built while the machine list is still being read (no machines yet) is not
+    /// settled, a report cut off by the deadline is not settled even when every row it has is,
+    /// and a fleet whose machine list could not be read never reads as a settled, empty fleet.
     pub settled: bool,
+    /// Fleet-level failures, each `{"kind": …, "reason": …}`: something that went wrong for
+    /// the whole scan rather than for one machine. `kind` is one of `"inventory_failed"`
+    /// (the machine list could not be read or parsed, so `machines` is empty or partial),
+    /// `"inventory_timed_out"` (reading it took longer than its timeout) and
+    /// `"evaluation_failed"` (the evaluator itself could not run, so no machine has an
+    /// evaluation). `reason` is one line. Always present; `[]` when there are none.
+    pub errors: Vec<FleetError>,
     /// One entry per inventory machine, sorted by name.
     pub machines: Vec<MachineReport>,
-    /// Addresses more than one machine's target resolves to. Deploying to any of these
-    /// machines is refused. Empty when there are none or resolution was not attempted.
+    /// Addresses more than one machine's target resolves to, each `{"ip": "<address>",
+    /// "machines": [names, sorted, at least two]}`, sorted by address. Deploying to any of
+    /// these machines is refused. Empty when there are none or resolution was not
+    /// attempted.
     pub shared_ips: Vec<SharedIp>,
+}
+
+/// What went wrong for the whole fleet; see [`FleetReport::errors`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetErrorKind {
+    /// The machine list could not be read or parsed.
+    InventoryFailed,
+    /// Reading the machine list took longer than its timeout.
+    InventoryTimedOut,
+    /// The evaluator could not run at all (not one machine's eval error: those stay on
+    /// that machine's row).
+    EvaluationFailed,
+}
+
+/// One fleet-level failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FleetError {
+    /// What failed.
+    pub kind: FleetErrorKind,
+    /// One line on why, sanitised for the terminal.
+    pub reason: String,
+}
+
+impl FleetError {
+    /// A fleet error with `reason` sanitised (it is usually a tool's stderr).
+    #[must_use]
+    pub fn new(kind: FleetErrorKind, reason: &str) -> Self {
+        Self {
+            kind,
+            reason: sanitize_line(reason),
+        }
+    }
+}
+
+/// Where the scan as a whole stands, for [`fleet_report`].
+///
+/// The default is "still in progress, no deadline, no fleet errors": a caller has to say the
+/// scan is complete before a report can read as settled, so forgetting to cannot produce a
+/// settled, empty fleet.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FleetFacts {
+    /// Every fleet-wide request is back: the machine list, the evaluator's final answer
+    /// (the process exited, so no more lines are coming), and any query for the whole fleet
+    /// (Prometheus, Alertmanager). `false` while any of them is outstanding.
+    pub scan_complete: bool,
+    /// The global deadline passed before every machine settled.
+    pub timed_out: bool,
+    /// Fleet-level failures.
+    pub errors: Vec<FleetError>,
 }
 
 /// One machine.
@@ -51,7 +125,7 @@ pub struct MachineReport {
     pub class: MachineClass,
     /// The inventory tags.
     pub tags: Vec<String>,
-    /// The resolved ssh target in canonical form (`root@[fd00::1]:2222?ProxyJump=j`), or
+    /// The resolved ssh target in canonical form (`root@[fd00::1]:2222?Compression=yes`), or
     /// `null` when the winning source did not parse (see `target_error`).
     pub target: Option<String>,
     /// Which source the target came from: `"override"` (auspex's config), `"inventory"`
@@ -68,10 +142,26 @@ pub struct MachineReport {
     pub status: Badge,
     /// Every badge that applies, `status` included, in the plan's table order. Adds to the
     /// above `"cached"`, `"failed_units"`, `"reboot_needed"` and `"frozen"`, which are never
-    /// the primary status.
+    /// the primary status. `"failed_units"` means a failed unit, systemd reporting
+    /// `degraded` or `maintenance`, or an alert firing.
     pub badges: Vec<Badge>,
-    /// One line on why `status` is what it is: ssh's last stderr line, nix's last error line,
-    /// or what is being waited for. `null` for `in_sync`.
+    /// `true` when nothing more is coming for this machine, so its entry can no longer
+    /// change: its probe is back (or its target was refused, so it is never probed), its
+    /// evaluation is back, its ncps lookup is not pending, and neither its Prometheus nor its
+    /// Alertmanager answer is outstanding. Computed from those facts, never from the badges,
+    /// so it does not depend on the order they arrive in: an unreachable machine whose
+    /// evaluation is still running is not settled, and nor is one with an update pending whose
+    /// `cached` lookup has not answered.
+    pub settled: bool,
+    /// One line on why `status` is what it is, **for people**: ssh's last stderr line, nix's
+    /// last error line, or what is being waited for. For `in_sync`, `update_pending` and
+    /// `evaluating` it is followed by health notes joined with `"; "`: the failed units,
+    /// `systemd reports degraded`, maintenance mode, alerts firing, a transitional systemd
+    /// state, or `health unknown: …` when a NixOS machine's systemd state or failed-unit list
+    /// could not be read (or systemd says `offline` or `unknown`). For `not_installed`, only
+    /// the notes behind a `failed_units` badge are added. `null` for `in_sync` with nothing
+    /// to note. Programs must read `badges`, `system_state` and `failed_units` instead, never
+    /// parse this text.
     pub reason: Option<String>,
     /// `/run/current-system`'s store path, or `null` when not observed or not installed.
     pub current_system: Option<String>,
@@ -80,11 +170,14 @@ pub struct MachineReport {
     /// The deployed `system.configurationRevision`, or `null` when the machine does not set
     /// it or was not observed.
     pub deployed_revision: Option<String>,
-    /// `systemctl is-system-running` (`"running"`, `"degraded"`, …), or `null` (darwin, or
-    /// not observed).
+    /// `systemctl is-system-running`: one of `"initializing"`, `"starting"`, `"running"`,
+    /// `"degraded"`, `"maintenance"`, `"stopping"`, `"offline"`, `"unknown"`; or `null`
+    /// (darwin, not observed, or the probe printed anything else).
     pub system_state: Option<String>,
-    /// Failed systemd units, or `null` when unknown (darwin, or not observed). `[]` means
-    /// systemd reported none.
+    /// Failed systemd units, each a systemd unit name (`[A-Za-z0-9:_.\@-]`, at most 255
+    /// characters), or `null` when unknown (darwin, not observed, not readable, or holding a
+    /// name outside that set). `[]` means systemd reported none. The one list in this
+    /// contract that can be `null`.
     pub failed_units: Option<Vec<String>>,
     /// Health values, each `null` or `{"value": …, "source": "prometheus" | "ssh"}`:
     /// `uptime_seconds` (integer), `root_disk` (`{total_bytes, used_bytes,
@@ -103,7 +196,8 @@ pub struct MachineReport {
 /// `shared` is the output of [`crate::fleet::shared_ips`] (empty when resolution was not
 /// attempted); `health` is the output of [`crate::observe::merge_health`]. A refused target
 /// makes the machine unreachable whatever `facts.target_error` says, so the report and the
-/// target cannot disagree.
+/// target cannot disagree. The name, tags and `buildHost` are sanitised here as well as in
+/// [`crate::fleet::parse_inventory`], for a [`Machine`] built some other way.
 #[must_use]
 pub fn machine_report(
     machine: &Machine,
@@ -129,16 +223,30 @@ pub fn machine_report(
         .collect();
     lints.extend(shared_ip_lints(&machine.name, shared));
     MachineReport {
-        name: machine.name.clone(),
+        name: sanitize_line(&machine.name),
         class: machine.class,
-        tags: machine.tags.clone(),
+        tags: machine
+            .tags
+            .iter()
+            .map(|t| sanitize_line(t))
+            .filter(|t| !t.is_empty())
+            .collect(),
         target: target.as_ref().ok().map(|t| t.target.to_string()),
         target_source: match target {
             Ok(t) => t.source,
             Err(e) => e.target_source,
         },
+        build_host: machine
+            .build_host
+            .as_deref()
+            .map(sanitize_line)
+            .filter(|b| !b.is_empty()),
+        settled: MachineFacts {
+            target_error: target_error.as_deref(),
+            ..*facts
+        }
+        .is_settled(),
         target_error,
-        build_host: machine.build_host.clone(),
         status: status.primary,
         badges: status.badges,
         reason: status.reason,
@@ -158,15 +266,27 @@ pub fn machine_report(
     }
 }
 
-/// Assembles the report, sorting machines by name and computing `settled`.
+/// Assembles the report: sorts machines by name, sanitises the fleet errors' reasons, and
+/// computes `settled` (see [`FleetReport::settled`]).
 #[must_use]
-pub fn fleet_report(mut machines: Vec<MachineReport>, shared_ips: Vec<SharedIp>) -> FleetReport {
+pub fn fleet_report(
+    mut machines: Vec<MachineReport>,
+    shared_ips: Vec<SharedIp>,
+    fleet: FleetFacts,
+) -> FleetReport {
     machines.sort_by(|a, b| a.name.cmp(&b.name));
+    let errors: Vec<FleetError> = fleet
+        .errors
+        .into_iter()
+        .map(|e| FleetError::new(e.kind, &e.reason))
+        .collect();
     FleetReport {
         version: JSON_VERSION,
-        settled: machines
-            .iter()
-            .all(|m| m.badges.iter().all(|b| b.is_settled())),
+        settled: fleet.scan_complete
+            && !fleet.timed_out
+            && errors.is_empty()
+            && machines.iter().all(|m| m.settled),
+        errors,
         machines,
         shared_ips,
     }

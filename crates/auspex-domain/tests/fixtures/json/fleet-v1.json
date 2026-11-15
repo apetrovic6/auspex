@@ -1,6 +1,7 @@
 {
   "version": 1,
   "settled": false,
+  "errors": [],
   "machines": [
     {
       "name": "broken",
@@ -14,6 +15,7 @@
       "badges": [
         "unreachable"
       ],
+      "settled": false,
       "reason": "invalid target: invalid host \"-oProxyCommand=sh\"",
       "current_system": null,
       "pending_system": null,
@@ -44,6 +46,7 @@
         "in_sync",
         "frozen"
       ],
+      "settled": true,
       "reason": null,
       "current_system": "/nix/store/3123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus",
       "pending_system": "/nix/store/3123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus",
@@ -81,6 +84,7 @@
       "badges": [
         "in_sync"
       ],
+      "settled": true,
       "reason": null,
       "current_system": "/nix/store/2123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05",
       "pending_system": "/nix/store/2123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05",
@@ -128,6 +132,7 @@
         "checking",
         "eval_error"
       ],
+      "settled": false,
       "reason": "error: attribute 'k3sToken' missing",
       "current_system": null,
       "pending_system": null,
@@ -157,6 +162,7 @@
       "badges": [
         "unreachable"
       ],
+      "settled": false,
       "reason": "ssh: connect to host mars.ugalabugala.org port 22: Connection timed out",
       "current_system": null,
       "pending_system": null,
@@ -201,7 +207,8 @@
         "cached",
         "failed_units"
       ],
-      "reason": "pending nixos-system-terra-b",
+      "settled": true,
+      "reason": "pending nixos-system-terra-b; failed units: k3s.service",
       "current_system": "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-a",
       "pending_system": "/nix/store/1123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-b",
       "deployed_revision": "c68e00a",

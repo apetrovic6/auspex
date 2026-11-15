@@ -45,9 +45,27 @@
     "err": "not a JSON object: expected value at line 1 column 1"
   },
   {
-    "err": "not a store path: \"/tmp/not-a-store-path.drv\""
+    "ok": {
+      "attr": "sol",
+      "attr_path": [
+        "sol"
+      ],
+      "error_tail": [
+        "error: nix-eval-jobs printed a malformed result for sol: drvPath: not a store path: \"/tmp/not-a-store-path.drv\""
+      ],
+      "kind": "error"
+    }
   },
   {
-    "err": "missing or invalid field outputs.out"
+    "ok": {
+      "attr": "cerberus",
+      "attr_path": [
+        "cerberus"
+      ],
+      "error_tail": [
+        "error: nix-eval-jobs printed a malformed result for cerberus: outputs.out is missing or null"
+      ],
+      "kind": "error"
+    }
   }
 ]
