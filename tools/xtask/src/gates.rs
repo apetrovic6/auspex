@@ -142,9 +142,16 @@ const DERIVATION_GATES: &[(&str, &[&str])] = &[
 /// `check-archetypes` is a template-only stage (stripped from a product's `nix/ci.nix` along
 /// with its recipe and its gate entry), so a product's `ci-pure` must not claim it: the mapping
 /// is checked against the recipe graph, and in a product that recipe is not there.
-fn derivation_gates(is_product: bool) -> Vec<(&'static str, Vec<&'static str>)> {
+fn derivation_gates(
+    is_product: bool,
+    android_apps: bool,
+) -> Vec<(&'static str, Vec<&'static str>)> {
     DERIVATION_GATES
         .iter()
+        // `ci-android-generated` exists only when some app has an Android project: the pipeline
+        // enables it on exactly that condition (`disc.androidApps != [ ]`), so a TUI-only product
+        // has no such stage for a workflow to build.
+        .filter(|(stage, _)| android_apps || *stage != "ci-android-generated")
         .map(|(stage, gates)| {
             let gates = gates
                 .iter()
@@ -1604,6 +1611,7 @@ fn nix_ci_reach(
     terminal: &BTreeSet<usize>,
     claimed: &BTreeMap<usize, Vec<usize>>,
     is_product: bool,
+    android_apps: bool,
     checked: &mut usize,
     problems: &mut Vec<String>,
 ) -> BTreeMap<String, BTreeSet<usize>> {
@@ -1613,7 +1621,7 @@ fn nix_ci_reach(
         .collect();
 
     // Every stage the mapping knows about must be built by some step, somewhere.
-    for (stage, gates) in derivation_gates(is_product) {
+    for (stage, gates) in derivation_gates(is_product, android_apps) {
         *checked += 1;
         if !built.contains(stage) {
             problems.push(format!(
@@ -1640,7 +1648,7 @@ fn nix_ci_reach(
     // so without this a manifest entry for any of them could be deleted and nothing would
     // notice, which is the exact hole the fifth direction of ADR 0022 was added to close.
     // Measured: deleting the `typos` entry passed the check before this was restored.
-    for (stage, gates) in derivation_gates(is_product) {
+    for (stage, gates) in derivation_gates(is_product, android_apps) {
         for gate in &gates {
             *checked += 1;
             let found = graph.matching(gate);
@@ -1712,7 +1720,7 @@ fn nix_ci_reach(
 
             // The stages this job builds, through the recipes they stand in for.
             for stage in workflow.derivations.get(job).into_iter().flatten() {
-                for (_, gates) in derivation_gates(is_product)
+                for (_, gates) in derivation_gates(is_product, android_apps)
                     .iter()
                     .filter(|(name, _)| *name == stage)
                 {
@@ -1794,6 +1802,7 @@ pub fn check(root: &Path, checked: &mut usize, problems: &mut Vec<String>) -> Re
         &terminal,
         &claimed,
         repo::is_product(root),
+        has_android_apps(root),
         checked,
         problems,
     );
@@ -1980,4 +1989,13 @@ fn list<T: std::fmt::Display>(items: &BTreeSet<T>) -> String {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Whether any app has an Android platform project (`apps/*/platforms/android`): the condition
+/// under which the pipeline defines `ci-android-generated` at all.
+fn has_android_apps(root: &std::path::Path) -> bool {
+    std::fs::read_dir(root.join("apps")).is_ok_and(|apps| {
+        apps.flatten()
+            .any(|app| app.path().join("platforms/android").is_dir())
+    })
 }
