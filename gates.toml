@@ -115,31 +115,6 @@ ci = []
 reason = "`ci-build` compiles the tui and desktop shells and `ci-trunk-build` builds a web shell, but no job invokes these recipes, and the trunk stage covers one app rather than every app this glob matches — see the comment"
 # --- end app-gates: shells ---
 
-# `check` is split from `build` because the archetype probes that used to reach a service's
-# check moved into `check-archetypes` (which scaffolds probes inside a generated product), so
-# no CI derivation invokes this recipe anymore. `ci-clippy` lints every service directly as a
-# workspace member.
-[[gate]]
-path = ["services/*/check"]
-local = true
-ci = []
-reason = "ci-clippy lints every service as a workspace member; nothing invokes this recipe in CI now that the archetype probes live in check-archetypes' generated product"
-
-[[gate]]
-path = ["services/*/build"]
-local = true
-ci = []
-reason = "`ci-build` compiles every service in the workspace, so the crate is built; no job invokes this recipe"
-
-# `test` is split from `check`/`build` above: the converted-probe suite that used to reach a
-# service's tests moved into `check-archetypes`' generated product, so no CI derivation invokes
-# this recipe anymore. `ci-test` runs the workspace suite directly.
-[[gate]]
-path = ["services/*/test"]
-local = true
-ci = []
-reason = "ci-test runs the workspace test suite; nothing invokes this recipe in CI now that the archetype probes live in check-archetypes' generated product"
-
 # The cargo invocations under every crate's thin delegation. Listed because they are gates,
 # and because it is the leaf of the build chain that the aggregate recipes reach: if
 # `rust::build` stopped being what `build` means, this is where the difference would show.

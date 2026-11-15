@@ -14,9 +14,10 @@ use crate::{adr, rename, repo, swift_keywords};
 
 /// Globs the root `Cargo.toml` must always contain.
 ///
-/// These are unconditional because their directories always exist: `crates/`, `services/`
-/// and `tools/` ship with a README that keeps the glob valid while empty, and `apps/*/core`
-/// is guaranteed by the example app.
+/// Most are unconditional because their directories always exist: `crates/` and `tools/`
+/// ship with a README that keeps the glob valid while empty. Two groups are not:
+/// [`APP_MEMBER_GLOBS`], required only while a Crux app exists, and
+/// [`SERVICE_MEMBER_GLOBS`], required only while `services/` does.
 /// `pub` rather than module-private because `versions` needs the same set: a version
 /// requirement can sit in any member manifest, and iterating the members is how it finds them
 /// all. (Plain `pub(crate)` here is a clippy error, not a style choice — `redundant_pub_crate`,
@@ -47,8 +48,46 @@ const APP_MEMBER_GLOBS: &[&str] = &["apps/*/core", "apps/*/shells/*"];
 /// apps will not have. It is in the manifest today because the counter app has one.
 const OPTIONAL_MEMBER_GLOBS: &[&str] = &["apps/*/app", "apps/*/client"];
 
+/// The members of [`MEMBER_GLOBS`] that exist only because `services/` does.
+///
+/// Required whenever the directory is there, and not otherwise. The template ships `services/`
+/// with a README guard so the glob is valid before the first service, but a product with no
+/// backend at all — one that talks to its machines over SSH, say — removes the directory and
+/// the glob together, because Cargo refuses a glob matching nothing. Keying on the directory
+/// rather than on a crate inside it keeps the template's own shape checked exactly as before:
+/// a `services/` holding only its README still needs the glob, and a crate dropped into a
+/// `services/` the manifest does not glob is still reported, rather than silently not being a
+/// workspace member.
+const SERVICE_MEMBER_GLOBS: &[&str] = &["services/*"];
+
 /// Directories whose `*` glob must always match something, guarded by a README.
+///
+/// `services` is conditional, for the reason on [`SERVICE_MEMBER_GLOBS`]: its guard is only
+/// demanded while the directory or its glob exists. See [`category_dirs_have_guards`].
 const CATEGORY_DIRS: &[&str] = &["crates", "services", "tools"];
+
+/// Whether this tree has a `services/` directory, and therefore needs [`SERVICE_MEMBER_GLOBS`].
+fn has_services_dir(root: &Path) -> bool {
+    root.join("services").is_dir()
+}
+
+/// The `[workspace].members` globs as written, or `None` when the manifest has none.
+fn manifest_member_globs(root: &Path) -> Result<Option<Vec<String>>> {
+    let manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("Cargo.toml")).context("reading Cargo.toml")?,
+    )?;
+    Ok(manifest
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(toml::Value::as_array)
+        .map(|members| {
+            members
+                .iter()
+                .filter_map(toml::Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        }))
+}
 
 /// Crates a Crux core must never depend on.
 ///
@@ -125,7 +164,7 @@ pub fn check() -> Result<Report> {
     }
 
     step!(fallible workspace_globs_match_manifest);
-    step!(category_dirs_have_guards);
+    step!(fallible category_dirs_have_guards);
     step!(fallible members_inherit_workspace_lints);
     step!(fallible app_metadata_is_valid);
     step!(platforms_contain_no_crates);
@@ -177,22 +216,19 @@ fn workspace_globs_match_manifest(
     problems: &mut Vec<String>,
 ) -> Result<()> {
     *checked += 1;
-    let manifest: toml::Value = toml::from_str(
-        &std::fs::read_to_string(root.join("Cargo.toml")).context("reading Cargo.toml")?,
-    )?;
-    let Some(members) = manifest
-        .get("workspace")
-        .and_then(|w| w.get("members"))
-        .and_then(toml::Value::as_array)
-    else {
+    let Some(members) = manifest_member_globs(root)? else {
         problems.push("Cargo.toml: [workspace].members is missing".to_owned());
         return Ok(());
     };
-    let actual: Vec<&str> = members.iter().filter_map(toml::Value::as_str).collect();
+    let actual: Vec<&str> = members.iter().map(String::as_str).collect();
 
     let has_apps = repo::has_crux_apps(root);
+    let has_services = has_services_dir(root);
     for required in MEMBER_GLOBS {
         if APP_MEMBER_GLOBS.contains(required) && !has_apps {
+            continue;
+        }
+        if SERVICE_MEMBER_GLOBS.contains(required) && !has_services {
             continue;
         }
         if !actual.contains(required) {
@@ -215,10 +251,27 @@ fn workspace_globs_match_manifest(
 
 /// A `members` glob that matches nothing is a hard Cargo error, so each category
 /// directory keeps a file for the glob to match while it holds no crates.
-fn category_dirs_have_guards(root: &Path, checked: &mut usize, problems: &mut Vec<String>) {
+///
+/// `services/` is the exception: a product with no backend has neither the directory nor its
+/// glob ([`SERVICE_MEMBER_GLOBS`]), and there is nothing to guard. It is skipped only when
+/// both are absent — a `services/*` glob with no directory behind it is the hard Cargo error
+/// this check exists to name, and is still reported.
+fn category_dirs_have_guards(
+    root: &Path,
+    checked: &mut usize,
+    problems: &mut Vec<String>,
+) -> Result<()> {
+    let globbed = manifest_member_globs(root)?.unwrap_or_default();
     for dir in CATEGORY_DIRS {
-        *checked += 1;
         let path = root.join(dir);
+        let glob = format!("{dir}/*");
+        if SERVICE_MEMBER_GLOBS.contains(&glob.as_str())
+            && !path.is_dir()
+            && !globbed.contains(&glob)
+        {
+            continue;
+        }
+        *checked += 1;
         if !path.is_dir() {
             problems.push(format!(
                 "{dir}/ is missing — the `{dir}/*` glob will not resolve"
@@ -230,6 +283,7 @@ fn category_dirs_have_guards(root: &Path, checked: &mut usize, problems: &mut Ve
             ));
         }
     }
+    Ok(())
 }
 
 /// Workspace members exempt from `[lints] workspace = true`, with the reason each one cannot
@@ -2756,6 +2810,73 @@ fn the_scheduled_checkout_persists_no_credentials(
 #[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
     use super::*;
+
+    /// The workspace-shape problems a tree with these `members` and `services/` contents has.
+    fn layout_problems(members: &str, services: Option<&str>) -> Vec<String> {
+        let fixture = Fixture::new("service-layout");
+        fixture
+            .file(
+                "Cargo.toml",
+                &format!("[workspace]\nmembers = [{members}]\n"),
+            )
+            .file("crates/README.md", "crates")
+            .file("tools/README.md", "tools");
+        if let Some(path) = services {
+            fixture.file(path, "");
+        }
+        let (mut checked, mut problems) = (0, Vec::new());
+        workspace_globs_match_manifest(&fixture.root, &mut checked, &mut problems)
+            .expect("the fixture manifest parses");
+        category_dirs_have_guards(&fixture.root, &mut checked, &mut problems)
+            .expect("the fixture manifest parses");
+        problems
+    }
+
+    #[test]
+    fn a_product_without_services_needs_neither_the_glob_nor_the_directory() {
+        let problems = layout_problems(r#""crates/*", "tools/*""#, None);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_services_directory_still_requires_its_glob_and_guard() {
+        // The template's own shape: the README is all there is, and the glob must be there.
+        let problems = layout_problems(r#""crates/*", "tools/*""#, Some("services/README.md"));
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("missing the required glob \"services/*\"")),
+            "{problems:?}"
+        );
+        // A crate dropped into an unglobbed `services/` would silently not be a member.
+        let problems = layout_problems(r#""crates/*", "tools/*""#, Some("services/x/Cargo.toml"));
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("missing the required glob \"services/*\"")),
+            "{problems:?}"
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("services/README.md is missing")),
+            "{problems:?}"
+        );
+        let problems = layout_problems(
+            r#""crates/*", "services/*", "tools/*""#,
+            Some("services/README.md"),
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_services_glob_without_its_directory_is_reported() {
+        let problems = layout_problems(r#""crates/*", "services/*", "tools/*""#, None);
+        assert!(
+            problems.iter().any(|p| p.contains("services/ is missing")),
+            "{problems:?}"
+        );
+    }
 
     #[test]
     fn web_shell_requires_a_trunk_workspace_member() {

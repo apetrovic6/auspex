@@ -14,11 +14,15 @@ resolver = "3"
 #   apps/<app>/platforms/*  Gradle / Xcode projects — built by their own toolchain,
 #                           never a Cargo member, never matched by a glob here
 #   crates/*                reusable libraries
-#   services/*              long-running binaries
 #   tools/*                 repo tooling (xtask)
+#
+# There is no `services/*` glob, in either list: auspex has no backend (it reaches machines
+# over SSH and through the `clan` CLI), and a glob that matches NOTHING is a hard error too —
+# it stops the whole workspace loading, `xtask` included, so no check here could say why.
+# The first `services/<name>` crate must add `"services/*"` back to both lists in the same
+# change.
 members = [
     "crates/*",
-    "services/*",
     "tools/*",
     "apps/*/core",
     "apps/*/shells/*",
@@ -29,7 +33,6 @@ members = [
 # with `-p`, or through `just apps/<app>/dev`. Globs are supported here too.
 default-members = [
     "crates/*",
-    "services/*",
     "tools/*",
     "apps/*/core",
 ]
@@ -62,7 +65,7 @@ buffa = { version = "0.9.2", features = ["json"] }
 # in generated output nobody edits.
 buffa-descriptor = { version = "0.9.2", features = ["reflect"] }
 # The wasm-safe minimum, because `proto` inherits this and the Leptos shell compiles it
-# for wasm32. `services/api` opts back into the axum and hyper pieces; nothing else in the
+# for wasm32. A service opts back into the axum and hyper pieces; nothing else in the
 # workspace needs them, and pulling them in here would break the wasm build.
 connectrpc = { version = "0.9.1", default-features = false, features = ["json"] }
 # Server reflection, for the schema-discovery half of the contract. Pinned in
@@ -121,7 +124,7 @@ sea-orm-migration = { version = "1.1", default-features = false, features = [
     "runtime-tokio-rustls",
     "sqlx-postgres",
 ] }
-# `time` is declared explicitly although services/api compiled without it: a transitive
+# `time` is declared explicitly although the example service compiled without it: a transitive
 # dependency happened to enable it, which is not a guarantee — drop that dependency and
 # every `tokio::time` call stops compiling for reasons unrelated to the change.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time"] }

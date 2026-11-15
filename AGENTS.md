@@ -64,7 +64,10 @@ Two consequences that bite:
 - A glob matching a directory **without** a `Cargo.toml` is a hard error, and `exclude`
   does not accept globs to undo it. That is why `platforms/` sits outside every glob.
 - A glob matching **nothing** is also a hard error. `apps/*/app` and `apps/*/client` are
-  therefore conditional: present because something matches them today. **Deleting the last
+  therefore conditional: present because something matches them today. So is `services/*`
+  in this product: auspex has no backend, so there is no `services/` directory and no glob
+  for it, and the first service has to add `"services/*"` back to `members` and
+  `default-members` (and its `services/*/{check,build,test}` entries to `gates.toml`). **Deleting the last
   crate of that kind stops the whole workspace loading** — including `xtask`, so no check
   in this repository can warn you. Remove the glob from `Cargo.toml` and it loads again.
 
