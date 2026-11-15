@@ -284,7 +284,7 @@ async fn a_name_that_is_not_a_bare_attribute() {
         dir.path(),
         "nix-eval-jobs",
         &format!(
-            "printf '%s\\0' \"$@\" > '@dir@/argv'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'",
+            "printf '%s\\0' \"$@\" > '@dir@/argv'\nfor a in \"$@\"; do if [ \"$p\" = machines ] && [ \"$pp\" = --arg-from-file ]; then cp_from=\"$a\"; fi; pp=\"$p\"; p=\"$a\"; done\nIFS= read -r m < \"$cp_from\" || true\nprintf '%s' \"$m\" > '@dir@/list'\nprintf '%s\\n' '{}'\nprintf '%s\\n' '{}'",
             ok_line(r#""\"1odd\"""#, r#""1odd""#),
             r#"{"attr":"\"x\\\"; builtins.abort \\\"pwned\"","attrPath":["x\"; builtins.abort \"pwned"],"error":"error: attribute missing"}"#
         ),
@@ -354,12 +354,23 @@ async fn a_name_that_is_not_a_bare_attribute() {
             "--argstr",
             "flake",
             "path:/the flake",
-            "--argstr",
+            "--arg-from-file",
             "machines",
-            &json,
+            &argv[10],
             "--expr",
             EVAL_EXPR,
         ]
+    );
+    // The names arrive only in the list file, as JSON, and the file is gone afterwards.
+    assert!(
+        !Path::new(&argv[10]).exists(),
+        "the list file was left behind"
+    );
+    let list: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(dir.path().join("list")).unwrap()).unwrap();
+    assert_eq!(
+        list,
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()
     );
 }
 
@@ -519,4 +530,205 @@ async fn the_machine_list_times_out_and_cancels() {
     let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     assert!(left.is_empty(), "still running: {left:?}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Review round 1: F3 (leftover children), F12 (one bad name), notes cap, reaping
+// ---------------------------------------------------------------------------------------
+
+/// F3: an evaluator that crashes on its own (the OOM killer, a segfault) must not leave
+/// its workers running.
+#[tokio::test]
+async fn a_crashed_evaluator_leaves_no_workers() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        "@sleep@ 30 &\necho $! >> '@dir@/pids'\nkill -SEGV $$",
+    );
+    let (tx, mut rx) = unbounded_channel();
+    evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["a"]),
+        &params(&prog, Duration::from_secs(10)),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let pids = wait_for_pids(&dir.path().join("pids"), 1);
+    let left = still_alive_after_wait(&pids);
+    cleanup(&pids);
+    let items = collect(&mut rx).await;
+    assert!(
+        matches!(items.last(), Some(EvalItem::Finished { error: Some(e) }) if e.contains("signal 11")),
+        "{items:?}"
+    );
+    assert!(
+        left.is_empty(),
+        "the worker outlived its evaluator: {left:?}"
+    );
+}
+
+/// F3, for `nix` (through the same runner as `git`): a background child left by a `nix`
+/// that exited 0 is killed too.
+#[tokio::test]
+async fn a_finished_nix_leaves_no_children() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let prog = t.script(
+        dir.path(),
+        "nix",
+        "@sleep@ 30 > /dev/null 2>&1 &\necho $! >> '@dir@/pids'\nprintf '{}'",
+    );
+    let r = inventory(
+        prog.as_os_str(),
+        &FlakeRef::new("path:/f").unwrap(),
+        Duration::from_secs(5),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let pids = wait_for_pids(&dir.path().join("pids"), 1);
+    let left = still_alive_after_wait(&pids);
+    cleanup(&pids);
+    assert_eq!(r, Ok(vec![]));
+    assert!(left.is_empty(), "nix's child outlived it: {left:?}");
+}
+
+/// F12: one machine whose name nix cannot take (a NUL) gets its own error; the others are
+/// evaluated.
+#[tokio::test]
+async fn one_unusable_name_does_not_fail_the_others() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        &format!("printf '%s\\n' '{}'", ok_line(r#""a""#, r#""a""#)),
+    );
+    let (tx, mut rx) = unbounded_channel();
+    evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["a", "b\0c"]),
+        &params(&prog, Duration::from_secs(10)),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let items = collect(&mut rx).await;
+    let mut by: Vec<(String, bool)> = items
+        .iter()
+        .filter_map(|i| match i {
+            EvalItem::Machine {
+                machine, outcome, ..
+            } => Some((machine.clone(), matches!(outcome, EvalOutcome::Success(_)))),
+            _ => None,
+        })
+        .collect();
+    by.sort();
+    assert_eq!(
+        by,
+        [("a".to_owned(), true), ("b\0c".to_owned(), false)],
+        "{items:?}"
+    );
+    assert_eq!(items.last(), Some(&EvalItem::Finished { error: None }));
+}
+
+/// The machine list goes to the evaluator on stdin, so its size is not bounded by
+/// `MAX_ARG_STRLEN` (128 KiB per argument): 3000 machines of 63 characters.
+#[tokio::test]
+async fn a_large_fleet_fits() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let prog = t.script(dir.path(), "nix-eval-jobs", "exit 0");
+    let names: Vec<String> = (0..3000).map(|i| format!("{i:063}")).collect();
+    let ms: Vec<EvalMachine> = names
+        .iter()
+        .map(|n| EvalMachine {
+            name: n.clone(),
+            class: MachineClass::Nixos,
+        })
+        .collect();
+    let (tx, mut rx) = unbounded_channel();
+    evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &ms,
+        &params(&prog, Duration::from_secs(10)),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    assert_eq!(collect(&mut rx).await, [EvalItem::Finished { error: None }]);
+}
+
+#[tokio::test]
+async fn notes_about_garbage_are_capped() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        "i=0\nwhile [ $i -lt 100 ]; do printf 'junk %s\\n' $i; i=$((i+1)); done",
+    );
+    let (tx, mut rx) = unbounded_channel();
+    evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["a"]),
+        &params(&prog, Duration::from_secs(10)),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let notes = collect(&mut rx)
+        .await
+        .iter()
+        .filter(|i| matches!(i, EvalItem::Note(_)))
+        .count();
+    assert_eq!(notes, auspex_effects::nix::MAX_LINE_NOTES);
+}
+
+/// A cancelled call returns only after reaping its child: at that moment the leader's pid
+/// is gone entirely, not a zombie waiting to be collected.
+#[tokio::test]
+async fn a_cancelled_evaluation_has_reaped_its_leader_on_return() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        "echo $$ >> '@dir@/pids'\nexec @sleep@ 30",
+    );
+    let cancel = CancellationToken::new();
+    let pids_file = dir.path().join("pids");
+    let canceller = {
+        let cancel = cancel.clone();
+        let pids_file = pids_file.clone();
+        tokio::task::spawn_blocking(move || {
+            wait_for_pids(&pids_file, 1);
+            cancel.cancel();
+        })
+    };
+    let (tx, _rx) = unbounded_channel();
+    let r = evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["a"]),
+        &params(&prog, Duration::from_secs(60)),
+        &cancel,
+        tx,
+    )
+    .await;
+    let leader = wait_for_pids(&pids_file, 1)[0];
+    let present = common::pid_exists(leader);
+    canceller.await.unwrap();
+    cleanup(&[leader]);
+    assert_eq!(r, Err(Cancelled));
+    assert!(
+        !present,
+        "the leader {leader} was not reaped before returning"
+    );
 }

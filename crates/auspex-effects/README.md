@@ -13,11 +13,19 @@ function here.
 
 Every function has a timeout and takes a `CancellationToken`. A cancelled call kills the
 whole process group of anything it spawned, reaps it, and returns `Err(Cancelled)`. No
-process is run through a shell, and no name or path is spliced into argv or Nix source:
-the crate rustdoc and each module say how.
+process is run through a shell, no program is found through a relative `PATH` entry, and
+no name or path is spliced into argv or Nix source: the crate rustdoc and each module say
+how.
+
+**The shell must handle `SIGHUP`, `SIGTERM`, `SIGINT` and `SIGQUIT`** (await
+`auspex_effects::termination()`, then cancel every token and drop the runtime): children
+run in sessions of their own, so nothing else stops them if auspex is killed by a signal.
 
 Tests: `tests/ssh.rs` (fake `ssh` scripts, control-directory checks), `tests/nix_fake.rs`
 (fake `nix` and `nix-eval-jobs`), `tests/nix_fixture.rs` (the real tools against
 `tests/fixtures/flake`, skipped where `nix` or `nix-eval-jobs` is missing),
-`tests/cache.rs` (temporary git repositories), and `tests/http.rs` (a server on 127.0.0.1).
+`tests/cache.rs` (temporary git repositories), `tests/cache_hostile.rs` (a fleet repository,
+cache directory or `flake.lock` prepared by someone else), `tests/signals.rs` (auspex itself
+signalled), and `tests/http.rs` (a server on 127.0.0.1, and TLS with an untrusted
+certificate from `tests/fixtures/tls`).
 None contacts a machine or the network beyond loopback.

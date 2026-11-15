@@ -33,13 +33,48 @@
 //! the operator sees, `NarCache::Failed`).
 //!
 //! Dropping a future instead of cancelling is still safe: the process group is killed from a
-//! drop guard, and tokio reaps the child in the background.
+//! drop guard, and tokio reaps the child in the background. A process that exits on its own
+//! has the rest of its group killed too (except ssh; see `ssh::probe`).
+//!
+//! # What the shell must do: handle termination signals
+//!
+//! Every child runs in a session of its own, so the terminal's `SIGHUP` and `SIGINT` never
+//! reach it, and nothing here runs if auspex itself is killed by a signal: no destructor,
+//! no group guard (review finding F4). Killing children on the parent's death needs
+//! `PR_SET_PDEATHSIG` in the child, which needs `pre_exec`, which is `unsafe`. So the
+//! shell must handle `SIGHUP`, `SIGTERM`, `SIGINT` and `SIGQUIT` by cancelling every
+//! token and dropping the runtime before it exits. [`termination`] is that wait:
+//!
+//! ```no_run
+//! # async fn shell(all: auspex_effects::CancellationToken) -> std::io::Result<()> {
+//! let signal = auspex_effects::termination().await?;
+//! all.cancel(); // every call returns `Err(Cancelled)` after killing its group
+//! # let _ = signal; Ok(()) }
+//! ```
+//!
+//! `SIGKILL` cannot be handled; after one, children are left to finish on their own.
+//!
+//! # Platform
+//!
+//! Linux is the target (auspex runs on the operator's desktop). On macOS the default ssh
+//! control directory is too long for a socket path (review finding F9, not addressed).
 
-// `CommandExt::setsid` (nightly `process_setsid`, rust-lang/rust#105376): spawning in a new
-// session is the only way to give a child no controlling terminal, and the stable route,
-// `pre_exec` calling `setsid(2)`, is `unsafe`, which the workspace forbids. The toolchain
-// is pinned nightly (versions.toml) and the gate is std's own code: if it changes, this
-// stops compiling rather than silently losing the guarantee. See `process::spawn`.
+// `CommandExt::setsid` (nightly `process_setsid`, rust-lang/rust#105376).
+//
+// Why: a new session is the only way to give a child no controlling terminal, which is
+// what makes "ssh, or a ProxyJump hop, can never prompt" true. The stable route, `pre_exec`
+// calling `setsid(2)`, is `unsafe`, and the workspace forbids `unsafe` outright
+// (`#[allow]` cannot lift `forbid`). The toolchain is pinned nightly for the workspace
+// already; this is the only `#![feature]` in auspex, so auspex itself now needs nightly.
+//
+// When it is stabilised: the `stable_features` lint fires and CI's `-D warnings` fails the
+// build. Delete this line; nothing else changes.
+//
+// Alternatives, in order of cost: `pre_exec` with `rustix::process::setsid` (one `unsafe`
+// block, needs a scoped exception to the workspace lint); a tiny helper binary that calls
+// the safe `rustix::process::setsid` and execs (stable, but must be installed beside
+// auspex); util-linux `setsid` (Linux only, one more program to find). `process_group(0)`
+// alone is not enough: the child keeps the terminal.
 #![feature(process_setsid)]
 
 pub mod cache;
@@ -51,6 +86,7 @@ pub mod prometheus;
 pub mod ssh;
 
 mod process;
+mod safe_fs;
 mod text;
 
 pub use tokio_util::sync::CancellationToken;
@@ -70,3 +106,27 @@ impl std::fmt::Display for Cancelled {
 }
 
 impl std::error::Error for Cancelled {}
+
+/// Waits for `SIGHUP`, `SIGTERM`, `SIGINT` or `SIGQUIT` and returns its name.
+///
+/// The shell awaits this beside its main loop, then cancels every token and drops the
+/// runtime, so children are killed even when the terminal closes or the operator presses
+/// Ctrl-C in `--plain`. Registering replaces the default action (dying) for those four
+/// signals for the whole process, which is the point.
+///
+/// # Errors
+///
+/// When a handler cannot be registered (no tokio signal driver).
+pub async fn termination() -> std::io::Result<&'static str> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hup = signal(SignalKind::hangup())?;
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    let mut quit = signal(SignalKind::quit())?;
+    Ok(tokio::select! {
+        _ = hup.recv() => "SIGHUP",
+        _ = term.recv() => "SIGTERM",
+        _ = int.recv() => "SIGINT",
+        _ = quit.recv() => "SIGQUIT",
+    })
+}

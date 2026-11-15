@@ -139,9 +139,20 @@ pub fn still_alive_after_wait(pids: &[i32]) -> Vec<i32> {
 
 /// Kills pids this test spawned, so a failing assertion leaves nothing behind.
 pub fn cleanup(pids: &[i32]) {
-    for &p in pids {
+    // Only those still alive: a pid that has exited may have been reused since.
+    for &p in pids.iter().filter(|&&p| alive(p)) {
         if let Some(pid) = rustix::process::Pid::from_raw(p) {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
     }
+}
+
+/// Whether `pid` exists at all, zombies included: a child that has exited but was never
+/// reaped still exists.
+pub fn pid_exists(pid: i32) -> bool {
+    if Path::new("/proc/self/stat").exists() {
+        return Path::new(&format!("/proc/{pid}")).exists();
+    }
+    rustix::process::Pid::from_raw(pid)
+        .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
 }

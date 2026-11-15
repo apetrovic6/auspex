@@ -239,17 +239,18 @@ async fn evaluate_cached_reads_hits_and_evaluates_misses() {
     let dir = tempdir();
     let drv = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-a.drv";
     let out = "/nix/store/zyxwvsrqpnmlkjihgfdcba9876543210-nixos-system-a";
-    // Records each invocation's machine list, prints a success for `a` and an error for `b`
-    // when asked for them.
+    // Records each invocation's machine list (read from stdin) and prints a success for `a`
+    // and for `1odd` (quoted in `attr`, as nix-eval-jobs prints a name that is not a bare
+    // identifier) and an error for `b`, when asked for them.
     let prog = t.script(
         dir.path(),
         "nix-eval-jobs",
         &format!(
-            r#"while [ $# -gt 0 ]; do
-  if [ "$1" = machines ]; then printf '%s\n' "$2" >> '@dir@/calls'; m="$2"; fi
-  shift
-done
+            r#"for a in "$@"; do if [ "$p" = machines ] && [ "$pp" = --arg-from-file ]; then f="$a"; fi; pp="$p"; p="$a"; done
+IFS= read -r m < "$f" || true
+printf '%s\n' "$m" >> '@dir@/calls'
 case "$m" in *'"a"'*) printf '%s\n' '{{"attr":"a","attrPath":["a"],"drvPath":"{drv}","outputs":{{"out":"{out}"}}}}';; esac
+case "$m" in *'"1odd"'*) printf '%s\n' '{{"attr":"\"1odd\"","attrPath":["1odd"],"drvPath":"{drv}","outputs":{{"out":"{out}"}}}}';; esac
 case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"error: b is broken"}}';; esac"#
         ),
     );
@@ -262,8 +263,9 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
     let mut eval = EvalParams::new();
     eval.program = prog.as_os_str();
     eval.timeout = Duration::from_secs(10);
-    let flake = FlakeRef::new("path:/x").unwrap();
-    let machines: Vec<EvalMachine> = ["a", "b", "a"]
+    // A plain path: git+file, so cached (a `path:` reference is not).
+    let flake = FlakeRef::new(r.path().to_str().unwrap()).unwrap();
+    let machines: Vec<EvalMachine> = ["a", "1odd", "b", "a"]
         .iter()
         .map(|n| EvalMachine {
             name: (*n).to_owned(),
@@ -312,6 +314,7 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
         summary(&first),
         [
             ("a".to_owned(), true, false),
+            ("1odd".to_owned(), true, false),
             ("b".to_owned(), false, false)
         ]
     );
@@ -320,8 +323,12 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
     let second = run().await;
     assert_eq!(
         summary(&second),
-        [("a".to_owned(), true, true), ("b".to_owned(), false, false)],
-        "a from the cache, b (an error, never cached) evaluated again"
+        [
+            ("a".to_owned(), true, true),
+            ("1odd".to_owned(), true, true),
+            ("b".to_owned(), false, false)
+        ],
+        "a and 1odd from the cache, b (an error, never cached) evaluated again"
     );
     let calls = fs::read_to_string(dir.path().join("calls")).unwrap();
     let calls: Vec<serde_json::Value> = calls
@@ -331,7 +338,11 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
     assert_eq!(
         calls,
         [
-            serde_json::json!([{"name": "a", "class": "nixos"}, {"name": "b", "class": "nixos"}]),
+            serde_json::json!([
+                {"name": "a", "class": "nixos"},
+                {"name": "1odd", "class": "nixos"},
+                {"name": "b", "class": "nixos"},
+            ]),
             serde_json::json!([{"name": "b", "class": "nixos"}]),
         ],
         "the second run asked the evaluator only for the miss"

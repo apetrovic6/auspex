@@ -52,3 +52,6 @@ unparented = "unparented"
 # A month name in a language this repository does not ship, named in ADR 0021 to show what a
 # sliced payload can no longer render. It is German, spelled correctly, and is not `december`.
 dezember = "dezember"
+# `O_WRONLY`, the POSIX open flag for write-only, as rustix spells it (`OFlags::WRONLY`).
+# typos reads it as a misspelt `WRONGLY`; it is the name of the flag, not a word.
+WRONLY = "WRONLY"

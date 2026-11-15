@@ -32,6 +32,9 @@ const NASTY: &str = r#"x"; builtins.abort "pwned"#;
 fn git(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
         .current_dir(dir)
+        // The developer's own config (commit signing, hooks) must not take part.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .args(["-c", "user.name=auspex", "-c", "user.email=auspex@invalid"])
         .args(args)
         .output()
@@ -93,7 +96,9 @@ async fn the_fixture_flake_with_real_nix() {
     git(repo.path(), &["init", "-q"]);
     git(repo.path(), &["add", "flake.nix"]);
     git(repo.path(), &["commit", "-q", "-m", "fixture"]);
-    let flake = FlakeRef::new(&format!("path:{}", repo.path().display())).unwrap();
+    // A plain path in a git repository: nix reads it as git+file (committed files only), and
+    // only git references are cached. A `path:` reference would get no caching.
+    let flake = FlakeRef::new(repo.path().to_str().unwrap()).unwrap();
 
     // The machine list.
     let list = inventory(
@@ -107,12 +112,12 @@ async fn the_fixture_flake_with_real_nix() {
     .unwrap();
     eprintln!("machine list: {list:#?}");
     let names: Vec<_> = list.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names, ["broken", "genetor", "luna", "terra"]);
-    let genetor = &list[1];
+    assert_eq!(names, ["1odd", "broken", "genetor", "luna", "terra"]);
+    let genetor = &list[2];
     assert_eq!(genetor.class, MachineClass::Darwin);
     assert_eq!(genetor.target_host.as_deref(), Some("admin@192.0.2.20"));
-    assert_eq!(list[3].tags, ["server", "k8s"]);
-    assert_eq!(list[2].build_host.as_deref(), Some("localhost"));
+    assert_eq!(list[4].tags, ["server", "k8s"]);
+    assert_eq!(list[3].build_host.as_deref(), Some("localhost"));
 
     // Every listed machine, plus one whose name is an attempt at Nix injection.
     let mut machines: Vec<EvalMachine> = list
@@ -138,8 +143,8 @@ async fn the_fixture_flake_with_real_nix() {
     eprintln!("first run: {first:#?}");
     let (by, error) = split(&first);
     assert_eq!(error, None, "nix-eval-jobs exited 0");
-    assert_eq!(by.len(), 5, "a result per machine: {by:#?}");
-    for ok in ["terra", "luna", "genetor"] {
+    assert_eq!(by.len(), 6, "a result per machine: {by:#?}");
+    for ok in ["terra", "luna", "genetor", "1odd"] {
         let (from_cache, outcome) = &by[ok];
         assert!(!from_cache);
         let EvalOutcome::Success(s) = outcome else {
@@ -173,7 +178,7 @@ async fn the_fixture_flake_with_real_nix() {
     eprintln!("second run: {second:#?}");
     let (by2, error) = split(&second);
     assert_eq!(error, None);
-    for ok in ["terra", "luna", "genetor"] {
+    for ok in ["terra", "luna", "genetor", "1odd"] {
         assert!(by2[ok].0, "{ok} read from the cache");
         assert_eq!(by2[ok].1, by[ok].1);
     }

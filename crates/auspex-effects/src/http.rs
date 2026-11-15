@@ -81,7 +81,15 @@ impl HttpClient {
             let body = Limited::new(resp.into_body(), body_cap)
                 .collect()
                 .await
-                .map_err(|e| format!("reading the answer: {e}"))?
+                .map_err(|e| {
+                    if e.downcast_ref::<http_body_util::LengthLimitError>()
+                        .is_some()
+                    {
+                        format!("the answer is larger than {body_cap} bytes")
+                    } else {
+                        format!("reading the answer: {e}")
+                    }
+                })?
                 .to_bytes();
             Ok((status, body))
         };
@@ -108,18 +116,31 @@ fn chain(e: &hyper_util::client::legacy::Error) -> String {
     s
 }
 
-/// A base URL from configuration: `http` or `https` only, with a host. Query and fragment
-/// are dropped; a path prefix is kept (`https://host/prometheus`).
+/// A base URL from configuration: `http` or `https` only, with a host, and without
+/// credentials. Query and fragment are dropped; a path prefix is kept
+/// (`https://host/prometheus`).
+///
+/// No error quotes the URL (review finding F8): a configured URL can carry a password, and
+/// these errors are shown on screen and in `--json`. Credentials are refused rather than
+/// silently dropped: hyper does not send `user:pass@` as basic auth, so such a URL would
+/// only ever fail with a 401.
 pub(crate) fn base_url(s: &str) -> Result<Url, String> {
-    let mut url = Url::parse(s).map_err(|e| format!("bad URL {s:?}: {e}"))?;
+    let mut url = Url::parse(s).map_err(|e| format!("bad URL: {e}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!(
-            "URL {s:?} must be http or https, not {}",
+            "the URL must be http or https, not {}",
             url.scheme()
         ));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "the URL contains credentials (user:password@), which auspex does not send; \
+             remove them"
+                .to_owned(),
+        );
+    }
     if url.host_str().is_none_or(str::is_empty) {
-        return Err(format!("URL {s:?} has no host"));
+        return Err("the URL has no host".to_owned());
     }
     url.set_query(None);
     url.set_fragment(None);

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -33,6 +34,11 @@ async fn serve(route: fn(&str, &str) -> Reply) -> Option<Server> {
     let listener = match TcpListener::bind("127.0.0.1:0").await {
         Ok(l) => l,
         Err(e) => {
+            // The Nix sandbox has loopback; a skip there would be a false green.
+            assert!(
+                std::env::var_os("NIX_BUILD_TOP").is_none(),
+                "cannot bind 127.0.0.1 inside the Nix build: {e}"
+            );
             eprintln!("SKIPPED: cannot bind 127.0.0.1 ({e}); no loopback here");
             return None;
         }
@@ -140,6 +146,22 @@ fn prom_route(_method: &str, target: &str) -> Reply {
             r#"{"status":"success","data":{"resultType":"matrix","result":[]}}"#.to_owned(),
         ),
         "/slow/api/v1/query" => Reply::Slow,
+        // A syntactically fine answer larger than the cap: one long label value.
+        "/huge/api/v1/query" => Reply::Status(
+            200,
+            format!(
+                r#"{{"status":"success","data":{{"resultType":"vector","result":[{{"metric":{{"instance":"{}"}},"value":[0,"1"]}}]}}}}"#,
+                "x".repeat(3 * 1024 * 1024)
+            ),
+        ),
+        // Amplification: tiny values that a JSON tree would make expensive.
+        "/zeros/api/v1/query" => Reply::Status(
+            200,
+            format!(
+                r#"{{"status":"success","data":{{"resultType":"vector","result":[{}0]}}}}"#,
+                "0,".repeat(700_000)
+            ),
+        ),
         _ => Reply::Status(404, String::new()),
     }
 }
@@ -353,6 +375,123 @@ async fn narinfo_200_404_500_and_timeout() {
         narinfo::lookup(&client, "gopher://x", &p, t, &c)
             .await
             .unwrap(),
+        NarCache::Failed
+    );
+}
+
+/// F7: an answer over the cap is an error, and one that is all tiny values is refused
+/// without being built into a tree.
+#[tokio::test]
+async fn prometheus_answers_are_bounded() {
+    let Some(s) = serve(prom_route).await else {
+        return;
+    };
+    let client = HttpClient::new().unwrap();
+    let t = Duration::from_secs(5);
+    let e = ask(&client, &format!("http://{}/huge", s.addr), t)
+        .await
+        .unwrap_err();
+    assert!(e.contains("larger than"), "{e}");
+    let e = ask(&client, &format!("http://{}/zeros", s.addr), t)
+        .await
+        .unwrap_err();
+    assert!(e.starts_with("prometheus: malformed"), "{e}");
+}
+
+/// F8: credentials in a URL are refused (they would not be sent), and never echoed.
+#[tokio::test]
+async fn urls_with_credentials_are_refused_and_never_shown() {
+    let client = HttpClient::new().unwrap();
+    let t = Duration::from_secs(1);
+    for url in [
+        "http://admin:s3cret@127.0.0.1:9/",
+        "http://admin:s3cret@[::1",
+        "http://admin:s3cret@/",
+        "https://admin:s3cret@exa mple.invalid/",
+    ] {
+        let e = ask(&client, url, t).await.unwrap_err();
+        assert!(!e.contains("s3cret") && !e.contains("admin"), "{url}: {e}");
+    }
+    let e = ask(&client, "http://admin:s3cret@127.0.0.1:9/", t)
+        .await
+        .unwrap_err();
+    assert!(e.contains("credentials"), "{e}");
+    let p = StorePath::new(HIT).unwrap();
+    assert_eq!(
+        narinfo::lookup(
+            &client,
+            "http://u:p@127.0.0.1:9/",
+            &p,
+            t,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap(),
+        NarCache::Failed
+    );
+}
+
+/// TLS verification is on: a server with a self-signed certificate (for 127.0.0.1, in
+/// `tests/fixtures/tls`, trusted by nobody) is refused. Run with verification disabled,
+/// this answers 200 and the test fails.
+#[tokio::test]
+async fn an_untrusted_certificate_is_refused() {
+    use std::sync::Arc;
+    let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+        assert!(std::env::var_os("NIX_BUILD_TOP").is_none());
+        eprintln!("SKIPPED: no loopback");
+        return;
+    };
+    let addr = listener.local_addr().unwrap();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tls");
+    let cert = rustls::pki_types::CertificateDer::from(
+        std::fs::read(dir.join("self-signed.crt.der")).unwrap(),
+    );
+    let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+        std::fs::read(dir.join("self-signed.key.der"))
+            .unwrap()
+            .into(),
+    );
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap(),
+    );
+    std::thread::spawn(move || {
+        for sock in listener.incoming().take(2) {
+            let Ok(sock) = sock else { return };
+            let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, sock);
+            let mut buf = [0u8; 1024];
+            if std::io::Read::read(&mut tls, &mut buf).is_ok() {
+                let _ = std::io::Write::write_all(
+                    &mut tls,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    let client = HttpClient::new().unwrap();
+    let p = StorePath::new(HIT).unwrap();
+    let t = Duration::from_secs(5);
+    let e = ask(&client, &format!("https://{addr}/"), t)
+        .await
+        .unwrap_err();
+    assert!(e.contains("certificate"), "{e}");
+    assert_eq!(
+        narinfo::lookup(
+            &client,
+            &format!("https://{addr}/"),
+            &p,
+            t,
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap(),
         NarCache::Failed
     );
 }

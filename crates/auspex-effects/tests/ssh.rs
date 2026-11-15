@@ -273,12 +273,19 @@ async fn cancelling_kills_ssh_and_its_children() {
     let r = probe(&target, MachineClass::Nixos, &params, &cancel).await;
     canceller.await.unwrap();
     let pids = wait_for_pids(&pids_file, 2);
-    // Checked at once, without waiting: the call reaps before returning, and the
-    // grandchild was SIGKILLed with its group.
+    // The leader (second line, ssh itself) is checked at once and must not exist at all,
+    // not even as a zombie: the call reaps before returning. The grandchild was SIGKILLed
+    // with the group; it is reparented, so its own reaping is someone else's and it is
+    // given the usual wait.
+    let leader_present = common::pid_exists(pids[1]);
     let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     assert_eq!(r, Err(Cancelled));
     assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(
+        !leader_present,
+        "ssh was not reaped before the call returned"
+    );
     assert!(left.is_empty(), "still running: {left:?}");
 }
 

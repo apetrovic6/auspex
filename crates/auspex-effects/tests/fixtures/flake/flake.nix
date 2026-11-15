@@ -30,12 +30,16 @@
         deploy.targetHost = "admin@192.0.2.20";
       };
       broken = {};
+      # Not a bare Nix identifier: nix-eval-jobs prints its attr quoted ("\"1odd\""), and the
+      # result must still be this machine's, through the cache too.
+      "1odd" = {};
     };
 
     nixosConfigurations = {
       terra.config.system.build.toplevel = toplevel "nixos-system-terra" "x86_64-linux";
       luna.config.system.build.toplevel = toplevel "nixos-system-luna" "x86_64-linux";
       broken.config.system.build.toplevel = throw "broken fails to evaluate, on purpose";
+      "1odd".config.system.build.toplevel = toplevel "nixos-system-1odd" "x86_64-linux";
     };
 
     darwinConfigurations.genetor.system = toplevel "darwin-system-genetor" "aarch64-darwin";

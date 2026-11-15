@@ -17,16 +17,21 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use auspex_domain::observe::{DiskUsage, Load, Memory, PromSample};
 use http::{Method, StatusCode};
-use serde_json::Value;
+use serde::Deserialize;
+use serde::de::IgnoredAny;
 use tokio_util::sync::CancellationToken;
 
 use crate::Cancelled;
 use crate::http::{HttpClient, base_url, join};
 use crate::text::last_line;
 
-/// The largest answer read: 16 MiB (eleven series for each of hundreds of instances is well
-/// under a megabyte).
-pub const BODY_CAP: usize = 16 * 1024 * 1024;
+/// The largest answer read: 2 MiB.
+///
+/// A real one is eleven series of about 250 bytes per
+/// instance, so 100 instances are under 300 KiB. With typed deserialisation (no JSON tree)
+/// parsing costs about the label and value strings kept on top of the body, so an answer
+/// costs at most a few MiB.
+pub const BODY_CAP: usize = 2 * 1024 * 1024;
 
 /// The query.
 ///
@@ -97,13 +102,45 @@ pub async fn query(
     })
 }
 
+/// An instant-query answer, typed: only the fields used are kept, and unknown fields are
+/// skipped without being built. Deserialising into these instead of a `serde_json::Value`
+/// tree is what bounds the memory an answer costs (review finding F7): a tree of tiny
+/// values costs about 18 times the body; this costs the label and value strings kept.
+#[derive(Deserialize)]
+struct Answer {
+    status: Option<String>,
+    error: Option<String>,
+    #[serde(rename = "errorType")]
+    error_type: Option<String>,
+    data: Option<Data>,
+}
+
+#[derive(Deserialize)]
+struct Data {
+    #[serde(rename = "resultType")]
+    result_type: Option<String>,
+    result: Option<Vec<Series>>,
+}
+
+#[derive(Deserialize)]
+struct Series {
+    #[serde(default)]
+    metric: Labels,
+    /// `[timestamp, "value"]`; the timestamp is the evaluation time and is not used.
+    value: Option<(IgnoredAny, String)>,
+}
+
+#[derive(Deserialize, Default)]
+struct Labels {
+    instance: Option<String>,
+    auspex_metric: Option<String>,
+}
+
 /// One series' instance, metric and value, or `None` for anything unusable.
-fn series(item: &Value) -> Option<(&str, &str, f64)> {
-    let metric = item.get("metric")?;
-    let instance = metric.get("instance")?.as_str()?;
-    let which = metric.get("auspex_metric")?.as_str()?;
-    let value = item.get("value")?.as_array()?;
-    let v: f64 = value.get(1)?.as_str()?.parse().ok()?;
+fn series(item: &Series) -> Option<(&str, &str, f64)> {
+    let instance = item.metric.instance.as_deref()?;
+    let which = item.metric.auspex_metric.as_deref()?;
+    let v: f64 = item.value.as_ref()?.1.parse().ok()?;
     v.is_finite().then_some((instance, which, v))
 }
 
@@ -123,13 +160,13 @@ pub(crate) fn parse(
     instances: &BTreeSet<String>,
     now: SystemTime,
 ) -> Result<BTreeMap<String, PromSample>, String> {
-    let doc: Value =
+    let doc: Answer =
         serde_json::from_slice(body).map_err(|e| format!("prometheus: malformed JSON: {e}"))?;
-    match doc.get("status").and_then(Value::as_str) {
+    match doc.status.as_deref() {
         Some("success") => {}
         Some("error") => {
-            let what = doc.get("error").and_then(Value::as_str).unwrap_or("");
-            let kind = doc.get("errorType").and_then(Value::as_str).unwrap_or("");
+            let what = doc.error.as_deref().unwrap_or("");
+            let kind = doc.error_type.as_deref().unwrap_or("");
             return Err(format!(
                 "prometheus error: {}",
                 last_line(&format!("{kind}: {what}")).unwrap_or_default()
@@ -137,19 +174,16 @@ pub(crate) fn parse(
         }
         _ => return Err("prometheus: answer has no status".to_owned()),
     }
-    let data = doc.get("data").ok_or("prometheus: answer has no data")?;
-    if data.get("resultType").and_then(Value::as_str) != Some("vector") {
+    let data = doc.data.ok_or("prometheus: answer has no data")?;
+    if data.result_type.as_deref() != Some("vector") {
         return Err("prometheus: answer is not an instant vector".to_owned());
     }
-    let result = data
-        .get("result")
-        .and_then(Value::as_array)
-        .ok_or("prometheus: answer has no result list")?;
+    let result = data.result.ok_or("prometheus: answer has no result list")?;
 
     // instance -> metric -> value. The first series for a pair wins (two exporters
     // scraping one instance would otherwise be averaged into nonsense).
     let mut by_instance: BTreeMap<&str, BTreeMap<&str, f64>> = BTreeMap::new();
-    for item in result {
+    for item in &result {
         let Some((instance, which, v)) = series(item) else {
             continue;
         };

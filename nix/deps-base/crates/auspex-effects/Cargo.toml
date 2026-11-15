@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 auspex-domain = { path = "../auspex-domain" }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 # The digest of a machine name in its cache file name (names are data, never path
 # components). Already in the graph through auspex-domain.
@@ -27,7 +28,7 @@ tokio-util = { version = "0.7", default-features = false }
 # Safe wrappers for the three syscalls std does not offer: kill a whole process group,
 # getuid (the control directory's owner check) and, in tests, probing a pid. The workspace
 # forbids `unsafe`, so libc is not an option. Already in the graph.
-rustix = { version = "1", default-features = false, features = ["std", "process"] }
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
 
 # --- HTTP (Prometheus and narinfo) ---
 #

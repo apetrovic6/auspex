@@ -9,18 +9,27 @@
 //!   then waits for the leader, so the call returns only once it is gone;
 //! - when the future is dropped mid-run, the [`Group`] guard's `Drop` kills the group, and
 //!   tokio reaps the leader in the background (`kill_on_drop`);
-//! - when it exits on its own, nothing is killed: the guard is disarmed as soon as the
-//!   leader is reaped. Killing the group then could hit an unrelated group that has reused
-//!   the id, and for ssh would kill a `ControlPersist` master that stayed in the group.
+//! - when it exits on its own ([`Spawned::exited`]), what is left of its group is killed
+//!   too ([`OnExit::KillGroup`]): `nix-eval-jobs` workers outlive a crashed leader
+//!   otherwise (review finding F3). ssh is the exception ([`OnExit::LeaveGroup`]); see
+//!   `ssh::probe`.
 //!
-//! The group is killed *before* the leader is reaped. While the leader is alive or a zombie
-//! its pid, and so the group id, cannot be reused, so the kill cannot reach anyone else.
+//! The group is always killed **before** the leader is reaped, so the group id cannot have
+//! been reused: the exit is detected with `waitid(WEXITED | WNOWAIT | WNOHANG)`, which
+//! leaves the leader a zombie (its pid, and so the group id, still taken), woken by
+//! `SIGCHLD` with a slow tick as a fallback; only then is it reaped.
+//!
+//! Programs are resolved to an absolute path by [`command`] before anything runs, skipping
+//! empty and relative `PATH` entries (review finding F6): with a child working directory
+//! inside the fleet repository, a relative entry would run a `git` committed to it.
 //!
 //! Output is read through capped readers whose state lives in a struct, not in a future,
 //! so a `select!` that drops a read keeps everything already read. Each read is one
 //! `read`/`fill_buf` call, which tokio documents as cancel-safe.
 
+use std::ffi::OsStr;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
@@ -66,18 +75,154 @@ impl Drop for Group {
     }
 }
 
-/// A spawned process and its group guard.
+/// What happens to the rest of a process group when its leader exits on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnExit {
+    /// Kill whatever is left of the group (`nix`, `nix-eval-jobs`, `git`).
+    KillGroup,
+    /// Leave it (ssh: see `ssh::probe`).
+    LeaveGroup,
+}
+
+/// Waits for a child's exit without reaping it.
+#[derive(Debug)]
+struct ExitWatch {
+    pid: Option<Pid>,
+    sigchld: Option<tokio::signal::unix::Signal>,
+    tick: tokio::time::Interval,
+}
+
+impl ExitWatch {
+    fn new(pid: Option<Pid>) -> Self {
+        // Registered before the first check, so a SIGCHLD in between is not lost. If the
+        // signal driver is unavailable the tick alone still finds the exit.
+        let sigchld = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok();
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self { pid, sigchld, tick }
+    }
+
+    /// Returns once the child has exited, leaving it a zombie. Cancel-safe: every await is
+    /// a signal or tick receive.
+    async fn exited(&mut self) -> io::Result<()> {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+        let Some(pid) = self.pid else {
+            return Ok(());
+        };
+        loop {
+            match waitid(
+                WaitId::Pid(pid),
+                WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+            ) {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) | Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(e.into()),
+            }
+            match &mut self.sigchld {
+                Some(s) => {
+                    tokio::select! {
+                        _ = s.recv() => {}
+                        _ = self.tick.tick() => {}
+                    }
+                }
+                None => {
+                    self.tick.tick().await;
+                }
+            }
+        }
+    }
+}
+
+/// A spawned process, its group guard, and how it is waited for.
 #[derive(Debug)]
 pub struct Spawned {
     pub child: Child,
     pub group: Group,
+    watch: ExitWatch,
+    on_exit: OnExit,
 }
 
-/// Spawns `cmd` in a new process group, with stdout and stderr piped, stdin piped when
+impl Spawned {
+    /// Waits for the leader to exit on its own, kills the rest of its group if
+    /// [`OnExit::KillGroup`], then reaps it. Cancel-safe.
+    pub async fn exited(&mut self) -> io::Result<ExitStatus> {
+        self.watch.exited().await?;
+        if self.on_exit == OnExit::KillGroup {
+            // The leader is a zombie: the group id is still taken.
+            self.group.kill();
+        }
+        let status = self.child.wait().await?;
+        self.group.disarm();
+        Ok(status)
+    }
+
+    /// Kills the group, then the leader, and reaps it. Returns its status when reaped in
+    /// time.
+    pub async fn kill_and_reap(&mut self) -> Option<ExitStatus> {
+        self.group.kill();
+        let _ = self.child.start_kill();
+        match tokio::time::timeout(REAP_LIMIT, self.child.wait()).await {
+            Ok(Ok(status)) => {
+                self.group.disarm();
+                Some(status)
+            }
+            // Left armed: the drop guard kills the group again, and tokio reaps the leader.
+            _ => None,
+        }
+    }
+}
+
+/// A [`Command`] for `program`, resolved to an absolute path now.
+///
+/// A program with a `/` must be an absolute path. A bare name is looked up in `PATH`,
+/// skipping empty and relative entries, which would otherwise be resolved against the
+/// child's working directory (inside the fleet repository, for git). This is the one place
+/// the crate reads `PATH`.
+///
+/// # Errors
+///
+/// `NotFound` when nothing on `PATH` matches, `InvalidInput` for a relative path.
+pub fn command(program: &OsStr) -> io::Result<Command> {
+    resolve_in(program, std::env::var_os("PATH").as_deref()).map(Command::new)
+}
+
+fn resolve_in(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
+    let p = Path::new(program);
+    if program.as_encoded_bytes().contains(&b'/') {
+        if p.is_absolute() {
+            return Ok(p.to_path_buf());
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a relative program path; give an absolute path or a bare name",
+        ));
+    }
+    if program.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "empty program name",
+        ));
+    }
+    let found = path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(program))
+        .find(|c| {
+            std::fs::metadata(c).is_ok_and(|m| {
+                m.is_file()
+                    && std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0
+            })
+        });
+    found.ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found on PATH"))
+}
+
+/// Spawns `cmd` in a new session, with stdout and stderr piped, stdin piped when
 /// `with_stdin` and `/dev/null` otherwise.
 ///
-/// The command is run directly (`execve` of `cmd`'s program): never through a shell.
-pub fn spawn(mut cmd: Command, with_stdin: bool) -> io::Result<Spawned> {
+/// The command is run directly (`execve` of `cmd`'s program): never through a shell. Build
+/// `cmd` with [`command`].
+pub fn spawn(mut cmd: Command, with_stdin: bool, on_exit: OnExit) -> io::Result<Spawned> {
     // A new session: `setsid()` in the child, which makes it the leader of a new session
     // AND of a new process group whose id is its pid (so no separate `process_group(0)`:
     // a process that is already a group leader cannot call setsid). A new session has no
@@ -94,6 +239,8 @@ pub fn spawn(mut cmd: Command, with_stdin: bool) -> io::Result<Spawned> {
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The exit watch registers for SIGCHLD before the child can exit.
+    let mut watch = ExitWatch::new(None);
     let child = cmd.spawn()?;
     // A pid that does not fit (impossible on every supported platform) leaves the guard
     // unarmed rather than killing group 0, which is *our* group.
@@ -101,24 +248,13 @@ pub fn spawn(mut cmd: Command, with_stdin: bool) -> io::Result<Spawned> {
         .id()
         .and_then(|id| i32::try_from(id).ok())
         .and_then(Pid::from_raw);
+    watch.pid = pgid;
     Ok(Spawned {
         child,
         group: Group(pgid),
+        watch,
+        on_exit,
     })
-}
-
-/// Kills the group, then the leader, and reaps it. Returns its status when reaped in time.
-pub async fn kill_and_reap(child: &mut Child, group: &mut Group) -> Option<ExitStatus> {
-    group.kill();
-    let _ = child.start_kill();
-    match tokio::time::timeout(REAP_LIMIT, child.wait()).await {
-        Ok(Ok(status)) => {
-            group.disarm();
-            Some(status)
-        }
-        // Left armed: the drop guard kills the group again, and tokio reaps the leader.
-        _ => None,
-    }
 }
 
 /// The first `cap` bytes of a stream.
@@ -324,17 +460,15 @@ pub struct Ran {
 pub async fn run(
     cmd: Command,
     stdin: Option<Vec<u8>>,
+    on_exit: OnExit,
     limits: Limits,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> io::Result<Ran> {
-    let Spawned {
-        mut child,
-        mut group,
-    } = spawn(cmd, stdin.is_some())?;
-    let mut out_pipe: Option<ChildStdout> = child.stdout.take();
-    let mut err_pipe: Option<ChildStderr> = child.stderr.take();
-    let stdin_pipe = child.stdin.take();
+    let mut sp = spawn(cmd, stdin.is_some(), on_exit)?;
+    let mut out_pipe: Option<ChildStdout> = sp.child.stdout.take();
+    let mut err_pipe: Option<ChildStderr> = sp.child.stderr.take();
+    let stdin_pipe = sp.child.stdin.take();
     let mut out = Head::new(limits.stdout);
     let mut err = Tail::new(limits.stderr);
 
@@ -353,12 +487,12 @@ pub async fn run(
     let end = loop {
         tokio::select! {
             biased;
-            status = child.wait() => match status {
+            status = sp.exited() => match status {
                 Ok(s) => break End::Exited(s),
                 // Waiting itself failed (it should not): stop as for a cancellation, but
                 // report it, so nothing is left running.
                 Err(e) => {
-                    kill_and_reap(&mut child, &mut group).await;
+                    sp.kill_and_reap().await;
                     return Err(e);
                 }
             },
@@ -375,13 +509,8 @@ pub async fn run(
     };
 
     let status = match end {
-        End::Exited(s) => {
-            group.disarm();
-            Some(s)
-        }
-        End::TimedOut | End::Cancelled | End::Overflow => {
-            kill_and_reap(&mut child, &mut group).await
-        }
+        End::Exited(s) => Some(s),
+        End::TimedOut | End::Cancelled | End::Overflow => sp.kill_and_reap().await,
     };
 
     if !matches!(end, End::Cancelled) {
@@ -441,6 +570,47 @@ pub fn describe_status(status: Option<ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review finding F6: empty and relative `PATH` entries are never searched, so a
+    /// program committed to the fleet repository (the child's working directory) cannot
+    /// be run in place of git.
+    #[test]
+    fn programs_resolve_only_through_absolute_path_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let exe = bin.join("tool");
+        std::fs::write(&exe, "").unwrap();
+        std::fs::set_permissions(&exe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let plain = bin.join("plain");
+        std::fs::write(&plain, "").unwrap();
+
+        let path = std::env::join_paths([bin.as_path()]).unwrap();
+        assert_eq!(resolve_in(OsStr::new("tool"), Some(&path)).unwrap(), exe);
+        // Not executable: not a match.
+        assert!(resolve_in(OsStr::new("plain"), Some(&path)).is_err());
+        // Only relative or empty entries: nothing, even though `bin/tool` exists relative
+        // to wherever the child would start.
+        for p in [":", "bin", ".:bin:", ""] {
+            let e = resolve_in(OsStr::new("tool"), Some(OsStr::new(p))).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::NotFound, "{p:?}");
+        }
+        assert!(resolve_in(OsStr::new("tool"), None).is_err());
+        // A relative entry that does lead to `bin` from the current directory (`../` up to
+        // the root, then the absolute path): still never searched.
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count());
+        let rel = format!("{up}{}", bin.display().to_string().trim_start_matches('/'));
+        assert!(std::path::Path::new(&rel).join("tool").exists(), "{rel}");
+        let e = resolve_in(OsStr::new("tool"), Some(OsStr::new(&rel))).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        // A path is used as given when absolute, refused when relative.
+        assert_eq!(resolve_in(exe.as_os_str(), None).unwrap(), exe);
+        let e = resolve_in(OsStr::new("bin/tool"), Some(&path)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(spawn_error("x", OsStr::new("bin/tool"), &e).contains("relative"));
+    }
 
     #[tokio::test]
     async fn lines_are_capped_and_split() {

@@ -138,10 +138,11 @@ mod tests {
         assert_eq!(out, Err(Cancelled));
     }
 
-    /// The real resolver, on names that never leave the machine: IP literals, which
-    /// `getaddrinfo` parses without asking anyone (so this runs in the Nix sandbox too).
+    /// `resolve` end to end on IP literals. tokio's `lookup_host` parses a literal itself, so
+    /// this does not reach `getaddrinfo` or the blocking pool: the system resolver path is
+    /// untested, because every name it would resolve could leave the machine.
     #[tokio::test]
-    async fn the_system_resolver_on_local_names() {
+    async fn ip_literals_resolve_to_themselves() {
         let cancel = CancellationToken::new();
         let h = hosts(&[("lit", "127.0.0.1"), ("v6", "::1")]);
         let out = resolve(&h, Duration::from_secs(5), &cancel).await.unwrap();

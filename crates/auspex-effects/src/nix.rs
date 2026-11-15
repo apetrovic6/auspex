@@ -5,9 +5,12 @@
 //! - The machine list is `nix eval --json --impure --no-write-lock-file --
 //!   <flake>#clanInternals.inventoryClass.inventory.machines`: the flake reference is one
 //!   argv element after `--`, the attribute path is a constant, and nix parses both itself.
-//! - The evaluation runs a constant expression, [`EVAL_EXPR`], a function of two strings
-//!   passed with `--argstr`: `flake` (the flake reference) and `machines` (a JSON list of
-//!   `{name, class}`, written by `serde_json`). The expression selects each configuration
+//! - The evaluation runs a constant expression, [`EVAL_EXPR`], a function of two strings:
+//!   `flake` (the flake reference, `--argstr`) and `machines` (a JSON list of
+//!   `{name, class}` written by `serde_json` into a private temporary file, read with
+//!   `--arg-from-file`, so a large fleet is not limited by the 128 KiB a single argument
+//!   may hold). A name nix would
+//!   refuse in the list as a whole (a NUL) gets its own error and is left out. The expression selects each configuration
 //!   with `${m.name}`, a dynamic attribute *lookup* by a string value, so a name such as
 //!   `x"; builtins.abort "pwned` is just an attribute that does not exist.
 //!
@@ -22,17 +25,17 @@ use std::path::Path;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use auspex_domain::eval::{EvalOutcome, parse_eval_line};
+use auspex_domain::eval::{EvalFailure, EvalOutcome, parse_eval_line};
 use auspex_domain::fleet::{Machine, MachineClass, parse_inventory};
+use auspex_domain::text::sanitize_line;
 use serde_json::json;
-use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 use crate::Cancelled;
 use crate::process::{
-    End, Limits, Line, Lines, PIPE_GRACE, Spawned, Tail, describe_status, kill_and_reap, run,
+    End, Limits, Line, Lines, OnExit, PIPE_GRACE, Spawned, Tail, command, describe_status, run,
     spawn, spawn_error,
 };
 use crate::text::{lossy, reason};
@@ -144,6 +147,25 @@ impl FlakeRef {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Whether nix will read this through git: a plain path (nix uses git when it is in a
+    /// repository) or `git+file:`. Only these are cached: any other reference either sees
+    /// files whose contents the key does not cover (`path:` reads untracked and ignored
+    /// files) or is not the flake directory at all (`github:`).
+    #[must_use]
+    pub fn is_git(&self) -> bool {
+        !has_scheme(&self.0) || self.0.starts_with("git+file:")
+    }
+
+    /// The scheme (`path`, `github`), or `path` for a plain path, for messages.
+    #[must_use]
+    pub fn scheme(&self) -> &str {
+        if has_scheme(&self.0) {
+            self.0.split_once(':').map_or("", |(s, _)| s)
+        } else {
+            "plain path"
+        }
+    }
 }
 
 /// `scheme:` at the start, as in a URL: a letter, then letters, digits, `+`, `-`, `.`.
@@ -184,13 +206,17 @@ pub async fn inventory(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<Result<Vec<Machine>, String>, Cancelled> {
-    let mut cmd = Command::new(nix);
+    let mut cmd = match command(nix) {
+        Ok(c) => c,
+        Err(e) => return Ok(Err(spawn_error("cannot list machines", nix, &e))),
+    };
     cmd.args(inventory_argv(flake));
     let limits = Limits {
         stdout: INVENTORY_STDOUT_CAP,
         stderr: STDERR_CAP,
     };
-    let ran = match run(cmd, None, limits, Instant::now() + timeout, cancel).await {
+    let deadline = Instant::now() + timeout;
+    let ran = match run(cmd, None, OnExit::KillGroup, limits, deadline, cancel).await {
         Ok(r) => r,
         Err(e) => return Ok(Err(spawn_error("cannot list machines", nix, &e))),
     };
@@ -284,12 +310,89 @@ pub enum EvalItem {
 }
 
 /// The exact argv (after the program) of an evaluation.
+///
+/// The machine list is not in it: it is
+/// read from `list`, a file holding [`eval_machines_json`] (`--arg-from-file machines`), so
+/// its size is not bounded by the kernel's 128 KiB limit on one argument. Not stdin:
+/// `--arg-from-stdin` is read again by every worker, and all but the first see it empty.
 #[must_use]
 pub fn eval_argv(
     flake: &FlakeRef,
-    machines: &[EvalMachine],
+    list: &Path,
     params: &EvalParams<'_>,
-) -> Vec<String> {
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "--impure".to_owned(),
+        "--workers".to_owned(),
+        params.workers.max(1).to_string(),
+        "--max-memory-size".to_owned(),
+        params.max_memory_mib.max(1).to_string(),
+        "--argstr".to_owned(),
+        "flake".to_owned(),
+        flake.as_str().to_owned(),
+        "--arg-from-file".to_owned(),
+        "machines".to_owned(),
+    ]
+    .into_iter()
+    .map(Into::into)
+    .chain([
+        list.as_os_str().to_owned(),
+        "--expr".into(),
+        EVAL_EXPR.into(),
+    ])
+    .collect()
+}
+
+/// The machine list file, private to this call and removed when dropped.
+struct ListFile(std::path::PathBuf);
+
+static LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl ListFile {
+    /// Creates it in the system temporary directory, exclusively (`O_EXCL`, which also
+    /// refuses a planted symlink) and readable only by us. Only names and classes are in it.
+    fn create(contents: &str) -> std::io::Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let mut last = None;
+        for _ in 0..8 {
+            let path = std::env::temp_dir().join(format!(
+                "auspex-machines-{}-{}-{nanos}.json",
+                std::process::id(),
+                LISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(mut f) => {
+                    let file = Self(path);
+                    f.write_all(contents.as_bytes())?;
+                    return Ok(file);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| std::io::Error::other("no temporary file")))
+    }
+}
+
+impl Drop for ListFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The machine list as the evaluator reads it: a JSON list of `{name, class}`, written by
+/// `serde_json`.
+#[must_use]
+pub fn eval_machines_json(machines: &[EvalMachine]) -> String {
     let list: Vec<_> = machines
         .iter()
         .map(|m| {
@@ -302,21 +405,35 @@ pub fn eval_argv(
             })
         })
         .collect();
-    vec![
-        "--impure".to_owned(),
-        "--workers".to_owned(),
-        params.workers.max(1).to_string(),
-        "--max-memory-size".to_owned(),
-        params.max_memory_mib.max(1).to_string(),
-        "--argstr".to_owned(),
-        "flake".to_owned(),
-        flake.as_str().to_owned(),
-        "--argstr".to_owned(),
-        "machines".to_owned(),
-        serde_json::Value::Array(list).to_string(),
-        "--expr".to_owned(),
-        EVAL_EXPR.to_owned(),
-    ]
+    serde_json::Value::Array(list).to_string()
+}
+
+/// The longest machine name passed to nix. Inventory names are at most 63 characters; this
+/// bound is only so one absurd name cannot make the list huge.
+pub const MAX_NAME_BYTES: usize = 1024;
+
+/// Why `name` cannot be evaluated, or `None` when it can. Names are data, so almost
+/// anything is fine; what is refused is what would make nix reject the *whole* list
+/// (review finding F12): `builtins.fromJSON` refuses a NUL anywhere in it.
+fn unusable(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("it is empty")
+    } else if name.contains('\0') {
+        Some("it contains a NUL byte")
+    } else if name.len() > MAX_NAME_BYTES {
+        Some("it is longer than 1024 bytes")
+    } else {
+        None
+    }
+}
+
+/// The error a machine with an unusable name gets, instead of failing the others.
+fn refused(name: &str, why: &str) -> EvalOutcome {
+    EvalOutcome::Error(EvalFailure {
+        attr: sanitize_line(name),
+        attr_path: vec![name.to_owned()],
+        error_tail: vec![format!("error: auspex cannot evaluate this machine: {why}")],
+    })
 }
 
 /// Which requested machine a result belongs to: the domain's rule, the one element of
@@ -436,20 +553,39 @@ pub async fn evaluate(
 ) -> Result<(), Cancelled> {
     let mut unique: Vec<EvalMachine> = Vec::with_capacity(machines.len());
     for m in machines {
-        if !unique.iter().any(|u| u.name == m.name) {
-            unique.push(m.clone());
+        if unique.iter().any(|u| u.name == m.name) {
+            continue;
         }
+        if let Some(why) = unusable(&m.name) {
+            let _ = tx.send(EvalItem::Machine {
+                machine: m.name.clone(),
+                outcome: refused(&m.name, why),
+                from_cache: false,
+            });
+            continue;
+        }
+        unique.push(m.clone());
     }
     if unique.is_empty() {
         let _ = tx.send(EvalItem::Finished { error: None });
         return Ok(());
     }
-    let mut cmd = Command::new(params.program);
-    cmd.args(eval_argv(flake, &unique, params));
-    let Spawned {
-        mut child,
-        mut group,
-    } = match spawn(cmd, false) {
+    let list = match ListFile::create(&eval_machines_json(&unique)) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = tx.send(EvalItem::Finished {
+                error: Some(format!(
+                    "cannot write the machine list for nix-eval-jobs: {e}"
+                )),
+            });
+            return Ok(());
+        }
+    };
+    let spawned = command(params.program).and_then(|mut cmd| {
+        cmd.args(eval_argv(flake, &list.0, params));
+        spawn(cmd, false, OnExit::KillGroup)
+    });
+    let mut sp = match spawned {
         Ok(s) => s,
         Err(e) => {
             let _ = tx.send(EvalItem::Finished {
@@ -459,8 +595,8 @@ pub async fn evaluate(
         }
     };
 
-    let mut lines = child.stdout.take().map(|o| Lines::new(o, EVAL_LINE_CAP));
-    let mut err_pipe = child.stderr.take();
+    let mut lines = sp.child.stdout.take().map(|o| Lines::new(o, EVAL_LINE_CAP));
+    let mut err_pipe = sp.child.stderr.take();
     let mut err = Tail::new(STDERR_CAP);
     let mut collect = Collector {
         requested: unique.iter().map(|m| m.name.as_str()).collect(),
@@ -470,8 +606,7 @@ pub async fn evaluate(
     };
     let deadline = Instant::now() + params.timeout;
     let stop = pump(
-        &mut child,
-        &mut group,
+        &mut sp,
         &mut lines,
         &mut collect,
         &mut err,
@@ -483,22 +618,23 @@ pub async fn evaluate(
 
     let error = match stop {
         Stop::Cancelled => {
-            kill_and_reap(&mut child, &mut group).await;
+            sp.kill_and_reap().await;
             return Err(Cancelled);
         }
         Stop::Exited(s) if s.success() => None,
         Stop::Exited(s) => Some(format!("nix-eval-jobs {}", describe_status(Some(s)))),
         Stop::TimedOut => {
-            kill_and_reap(&mut child, &mut group).await;
+            sp.kill_and_reap().await;
             // Results printed just before the deadline are still in the pipe.
             drain(&mut lines, &mut collect, &mut err, &mut err_pipe).await;
             Some(format!("evaluation timed out after {:?}", params.timeout))
         }
         Stop::WaitFailed(e) => {
-            kill_and_reap(&mut child, &mut group).await;
+            sp.kill_and_reap().await;
             Some(format!("waiting for nix-eval-jobs failed: {e}"))
         }
     };
+    drop(list);
     let error = error.map(|what| match reason(&lossy(&err.buf)) {
         Some(r) => format!("{what}: {r}"),
         None => what,
@@ -507,15 +643,11 @@ pub async fn evaluate(
     Ok(())
 }
 
-/// Reads the evaluator's output until it exits and its pipes are drained (or [`PIPE_GRACE`]
-/// after exit), the deadline passes, or the call is cancelled.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the loop's whole state, borrowed from `evaluate`"
-)]
+/// Reads the evaluator's output until it exits and its pipes
+/// are drained (or [`PIPE_GRACE`] after exit), the deadline passes, or the call is
+/// cancelled. On exit the rest of the group has already been killed ([`Spawned::exited`]).
 async fn pump<R: tokio::io::AsyncRead + Unpin>(
-    child: &mut tokio::process::Child,
-    group: &mut crate::process::Group,
+    sp: &mut Spawned,
     lines: &mut Option<Lines<R>>,
     collect: &mut Collector<'_>,
     err: &mut Tail,
@@ -538,9 +670,8 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
             () = cancel.cancelled() => break Stop::Cancelled,
             () = collect.tx.closed() => break Stop::Cancelled,
             () = sleep_until(deadline), if exited.is_none() => break Stop::TimedOut,
-            status = child.wait(), if exited.is_none() => match status {
+            status = sp.exited(), if exited.is_none() => match status {
                 Ok(s) => {
-                    group.disarm();
                     exited = Some(s);
                     grace = Some(Instant::now() + PIPE_GRACE);
                 }
@@ -637,19 +768,18 @@ mod tests {
     fn eval_argv_passes_names_as_data() {
         let flake = FlakeRef::new("path:/f").unwrap();
         let nasty = r#"x"; builtins.abort "pwned"#;
-        let argv = eval_argv(
-            &flake,
-            &[EvalMachine {
-                name: nasty.to_owned(),
-                class: MachineClass::Darwin,
-            }],
-            &EvalParams::new(),
-        );
-        // The expression is the constant, untouched by any name.
+        let ms = [EvalMachine {
+            name: nasty.to_owned(),
+            class: MachineClass::Darwin,
+        }];
+        let argv = eval_argv(&flake, Path::new("/tmp/list.json"), &EvalParams::new());
+        // The expression is the constant, and no name is anywhere in argv.
         assert_eq!(argv.last().unwrap(), EVAL_EXPR);
-        assert!(!EVAL_EXPR.contains("pwned"));
-        let i = argv.iter().position(|a| a == "machines").unwrap();
-        let list: serde_json::Value = serde_json::from_str(&argv[i + 1]).unwrap();
+        assert!(argv.iter().all(|a| !a.to_string_lossy().contains("pwned")));
+        let i = argv.iter().position(|a| a == "--arg-from-file").unwrap();
+        assert_eq!(argv[i + 1], "machines");
+        assert_eq!(argv[i + 2], "/tmp/list.json");
+        let list: serde_json::Value = serde_json::from_str(&eval_machines_json(&ms)).unwrap();
         assert_eq!(list[0]["name"], nasty);
         assert_eq!(list[0]["class"], "darwin");
         let i = argv.iter().position(|a| a == "flake").unwrap();

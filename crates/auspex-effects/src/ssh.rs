@@ -21,12 +21,11 @@ use auspex_domain::fleet::{
     ConnectTimeout, MachineClass, PROBE_REMOTE_COMMAND, SshOptions, Target, ssh_args,
 };
 use auspex_domain::observe::{ProbeExit, ProbeOutcome, parse_probe, probe_script};
-use tokio::process::Command;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::Cancelled;
-use crate::process::{End, Limits, describe_status, run, spawn_error};
+use crate::process::{End, Limits, OnExit, command, describe_status, run, spawn_error};
 use crate::text::lossy;
 
 /// The default ssh program: `ssh`, looked up on `PATH`.
@@ -76,7 +75,12 @@ impl std::error::Error for ControlDirError {}
 impl ControlDir {
     /// The directory to use, from the environment: `$XDG_RUNTIME_DIR/auspex`, or, when
     /// `XDG_RUNTIME_DIR` is unset, empty or relative, `auspex-<uid>` under the system
-    /// temporary directory. This is the one place this module reads the environment.
+    /// temporary directory. This is the one place this module reads the environment
+    /// (besides `PATH`, which `process::command` reads to find ssh).
+    ///
+    /// On macOS, where `XDG_RUNTIME_DIR` is usually unset and `TMPDIR` is long, the fallback
+    /// is too long for a socket path and [`ControlDir::prepare`] refuses it (review finding
+    /// F9, out of scope: auspex runs on a Linux desktop).
     #[must_use]
     pub fn default_path() -> PathBuf {
         match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -236,7 +240,14 @@ pub async fn probe(
         Ok(a) => a,
         Err(reason) => return Ok(ProbeOutcome::Failed { reason }),
     };
-    let mut cmd = Command::new(params.ssh_program);
+    let mut cmd = match command(params.ssh_program) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(ProbeOutcome::Unreachable {
+                reason: spawn_error("cannot probe", params.ssh_program, &e),
+            });
+        }
+    };
     cmd.args(args.iter().map(OsString::from));
     // No prompt, anywhere: ssh runs in a session with no controlling terminal
     // (`process::spawn`), and with no askpass program it could open a window with instead.
@@ -249,7 +260,24 @@ pub async fn probe(
         stdout: STDOUT_CAP,
         stderr: STDERR_CAP,
     };
-    let ran = match run(cmd, Some(script), limits, deadline, cancel).await {
+    // When ssh exits on its own, the rest of its process group is left alone, unlike
+    // every other program here. The reason first given (that a `ControlPersist` master
+    // stays in the group) is wrong for OpenSSH: `control_persist_detach()` calls
+    // `daemon()`, which runs `setsid()`, so the master is in a session of its own and no
+    // group kill reaches it. What remains is caution: a live master could not be observed
+    // in review (no ssh connections were allowed), and whatever else ssh leaves in its
+    // group (a `ProxyJump` hop is its child and ends with it) has not been seen to linger.
+    // A cancel, a timeout or a drop still kills the whole group.
+    let ran = match run(
+        cmd,
+        Some(script),
+        OnExit::LeaveGroup,
+        limits,
+        deadline,
+        cancel,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             return Ok(ProbeOutcome::Unreachable {
