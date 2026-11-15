@@ -1109,7 +1109,6 @@ let
 
   packages = pureSet // {
     "ci-pure" = ciPure;
-  } // optionalAttrs (enabled "ci-android-generated") {
     "ci-android-generated" = ciAndroidGenerated;
   } // nonPureExtra;
 

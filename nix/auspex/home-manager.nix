@@ -28,12 +28,14 @@ let
     lib.filterAttrs (_: v: v != null && v != { }) (lib.mapAttrs (_: prune) value)
     else value;
   settings = prune cfg.settings;
+  themePath = "${config.xdg.configHome}/auspex/theme.toml";
 in {
+  _file = toString ./home-manager.nix;
   options.programs.auspex = {
     enable = lib.mkEnableOption "auspex fleet terminal UI";
     package = lib.mkPackageOption packages.${pkgs.stdenv.hostPlatform.system} "auspex" { };
     settings = mkOption {
-      description = "auspex config.toml settings; unknown keys pass through for newer versions.";
+      description = "auspex config.toml settings; unknown keys pass through for newer versions. Unset optional values and empty tables are omitted recursively, including explicitly supplied empty tables.";
       default = { };
       type = table {
         flake = optional types.str "Fleet flake path; --flake and CLAN_DIR take precedence.";
@@ -87,8 +89,10 @@ in {
       };
     }
     (lib.mkIf (cfg.stylix.enable && hasColors) {
-      xdg.configFile."auspex/theme.toml".source = theme;
-      programs.auspex.settings.theme.file = lib.mkDefault "${config.xdg.configHome}/auspex/theme.toml";
+      xdg.configFile."auspex/theme.toml" = lib.mkIf (cfg.settings.theme.file == themePath) {
+        source = theme;
+      };
+      programs.auspex.settings.theme.file = lib.mkDefault themePath;
     })
   ]);
 }

@@ -29,7 +29,7 @@
     inherit inputs;
     depsBase = ../nix/deps-base;
     pname = "rust-app-template";
-    extraStages = import ./auspex/stages.nix;
+    extraStages = import ./auspex/stages.nix { exports = import ./auspex/ci-exports.nix inputs; };
   } // import ./auspex/platform-args.nix { inherit pkgs lib; system = pkgs.stdenv.hostPlatform.system; });
 
   outputs = result.packages;

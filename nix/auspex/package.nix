@@ -1,12 +1,13 @@
-{ craneLib, hostArgs, depsL1, ... }:
+{ craneLib, hostArgs, src, discovery, ... }:
 craneLib.buildPackage (hostArgs // {
   pname = "auspex";
-  version = "0.1.0";
-  cargoArtifacts = depsL1;
-  cargoExtraArgs = "--locked -p auspex-tui";
+  version = (builtins.fromTOML (builtins.readFile (src + "/${discovery.byName.auspex-tui.dir}/Cargo.toml"))).package.version;
+  # Reuse the toolchain, source/vendor setup and native inputs, not workspace dev artifacts.
+  CARGO_PROFILE = "release";
+  cargoExtraArgs = "--locked -p auspex-tui --bin auspex-tui";
   doCheck = false;
-  postInstall = ''
-    mv "$out/bin/auspex-tui" "$out/bin/auspex"
+  installPhaseCommand = ''
+    install -Dm755 target/release/auspex-tui "$out/bin/auspex"
   '';
   meta.mainProgram = "auspex";
 })

@@ -71,7 +71,7 @@
             depsBase = ./nix/deps-base;
             # Match devenv's layer names instead of the changing flake source store basename.
             pname = "rust-app-template";
-            extraStages = import ./nix/auspex/stages.nix;
+            extraStages = import ./nix/auspex/stages.nix { exports = self; };
           } // import ./nix/auspex/platform-args.nix { inherit pkgs system; lib = nixpkgs.lib; });
           # The CLI (products run it from the pinned template input; see `just add`).
           cli = craneLib.buildPackage {
@@ -154,7 +154,11 @@
 
       packages = forAllSystems (system:
         let result = results.${system};
-        in result.packages // { inherit (result) cli; default = result.packages.auspex; });
+        # Only the optional Android stage may be null. Do not force real derivations
+        # merely to list names on the unsupported Intel Darwin package set.
+        in nixpkgs.lib.filterAttrs
+          (name: value: name != "ci-android-generated" || value != null)
+          result.packages // { inherit (result) cli; default = result.packages.auspex; });
 
       # The service checks: `<svc>-module-vm` and `<svc>-image-vm`, one pair per discovered
       # service, derived from the service's package and image. They are in `packages` too, so
@@ -174,6 +178,7 @@
           results.${system}.services)
       // import ./nix/auspex/checks.nix {
         pkgs = nixpkgs.legacyPackages.${system};
+        exports = self;
         package = self.packages.${system}.auspex;
       });
 
