@@ -1,0 +1,24 @@
+<!doctype html>
+<!--
+  The example service's built single-page application.
+
+  A real product's bundle comes out of its front-end build (a web shell's `dist/` is built by
+  trunk). This directory is committed so the example demonstrates the whole path with no npm,
+  no trunk and no network: the package installs it, the image bakes it at
+  /usr/share/api/web, and the module points `web.dir` there.
+
+  A service declares its bundle with `[package.metadata.app].spa = "web/bundle"` in its own
+  manifest. Without that key nothing is installed and `web.dir` is never set, which is the
+  right default for a service with no front end.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>api</title>
+    <script type="module" src="/assets/app.js"></script>
+  </head>
+  <body>
+    <main id="app">The example service's front end.</main>
+  </body>
+</html>

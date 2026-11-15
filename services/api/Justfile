@@ -1,0 +1,57 @@
+mod lib '../../just/lib.just'
+mod rust '../../just/rust.just'
+
+pkg := "api"
+
+# The service reads its configuration relative to the process's working directory, which
+# for `cargo run` is wherever cargo was invoked. These recipes run from this directory, so
+# they point it here explicitly rather than depending on where you happened to be.
+export APP_CONFIG_DIR := "config"
+
+default: dev
+
+doctor:
+    @echo '{{ style("command") }}doctor:{{ NORMAL }}'
+    @just lib::check-rust
+    @just lib::check-tool psql "provided by devenv (services.postgres)"
+
+fix:
+    @just rust::fmt
+
+check:
+    @just rust::fmt-check
+    @just rust::clippy {{ pkg }} --all-targets
+
+build:
+    @just rust::build {{ pkg }}
+
+# Integration tests drive the real router in-process and never reach a database, so this
+# needs no Postgres running.
+test:
+    @just rust::test {{ pkg }}
+
+# apply pending migrations and exit
+migrate:
+    @just rust::run {{ pkg }} -- migrate
+
+# serve locally (expects `devenv up postgres`, or the whole stack with `devenv up`)
+run:
+    @just rust::run {{ pkg }} -- serve
+
+# regenerate SeaORM entities from the live schema (migrate first — the generator reads the
+# database, not the migration source)
+[script('bash')]
+entities:
+    set -euo pipefail
+    echo '{{ style("command") }}entities:{{ NORMAL }}'
+    sea-orm-cli generate entity \
+        --database-url "postgres://counter:${APP__DATABASE__PASSWORD:-counter}@127.0.0.1:5432/counter" \
+        --output-dir src/entities \
+        --impl-active-model-behavior=false \
+        --with-serde none
+
+clean:
+    cargo clean -p {{ pkg }}
+
+dev: fix check build test
+ci: check build test

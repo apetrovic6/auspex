@@ -1,0 +1,6 @@
+# `crates/oidc`'s one dependency the client crate does not share (`cargo xtask add-auth-oidc`, ADR
+# 0027). It takes the `aws_lc_rs` provider and not `rust_crypto`, because the latter pulls `rsa` 0.9,
+# which carries RUSTSEC-2023-0071 (Marvin) with no fix below 0.10. `deny.toml` never ignores a
+# vulnerability advisory, so there is no exception to write. `use_pem` is asked for by the crate's
+# `testing` feature alone, for signing in tests.
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs"] }

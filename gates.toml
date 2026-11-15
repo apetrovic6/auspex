@@ -1,0 +1,274 @@
+# Where every gate runs.
+#
+# A recipe named `check`, `build` or `test` is a gate. Whether one actually runs is invisible
+# from the file that defines it: `just ci` reaches most of them through bash loops — `_each`
+# walks `$(just modules)`, `apps/<app>/check` walks `rust_modules` — and a recipe nothing
+# reaches reads exactly like a recipe everybody reaches. Five gates were running nowhere, and
+# reading the Justfiles did not say which.
+#
+# This is the list. `cargo xtask check` builds the recipe graph (`tools/xtask/src/gates.rs`),
+# follows it from `just ci` and from every job in `.forgejo/workflows/ci.yaml` and
+# `.forgejo/workflows/advisories.yaml`, and fails when this file and the graph disagree in either
+# direction: a gate no entry claims, an entry matching no recipe, a job that does not run what
+# its entry says it runs, a CI invocation nobody has thought about yet, and a derivation stage
+# no step builds. ADR 0022 records why a manifest was chosen over computing the answer from
+# reachability alone, and what that means the manifest is responsible for.
+#
+# Fields:
+#
+#   path     — recipe ids as they are typed at a prompt: `check`, `apps/<app>/core/check`,
+#              `proto::check`. `*` matches exactly one path segment. Entries are *patterns*,
+#              not instances: the gates of a second app are covered by the entry it already
+#              matches, so scaffolding an app is not an edit to this file. A new *shape* of
+#              gate is. Patterns are globs for that reason and never name an app: `just
+#              check-template` generates a product with other app names and checks this same
+#              file there.
+#   local    — does `just ci` reach it?
+#   ci       — which CI jobs reach it, spelled as the job's key in the workflows above:
+#              `ci-pure`, `ci-impure`, `ci-android`, `advisories`. Required of an entry rather
+#              than offered by one: a job that invokes a recipe with no entry fails, so an
+#              entry is what a new step costs.
+#   reason   — required unless it runs both locally and in CI. That is what the file is for:
+#              every exclusion says why it is one.
+#   terminal — stop at it. What runs inside belongs to another workspace, so following its
+#              edges would claim coverage this repository does not have.
+#
+# A job reaches a recipe either by running it — a `devenv shell -- just <recipe>` step — or by
+# building a derivation that stands in for it, which is what `DERIVATION_GATES` in
+# `tools/xtask/src/gates.rs` records. The second kind is why an entry below can name a job that
+# never types `just`: `ci-pure` covers `rust::clippy` through `outputs.ci-clippy`.
+#
+# Keep the entries in the order the gates are reached: the local gate first, then the ones
+# only a job runs.
+
+# --------------------------------------------------------------------------
+# The local gate — `just ci`
+# --------------------------------------------------------------------------
+
+# The three aggregates, and the per-module dispatch under them, run locally and in no CI job.
+#
+# That is a change in shape rather than a loss of coverage, and the distinction is the whole
+# reason it is written down. `just check` is `rust-check` plus `_each "check"`, which walks every
+# module and runs its own clippy; `just build` and `just test` are the same shape. CI no longer
+# invokes any of them. It runs the cargo commands they dispatch to, once over the whole workspace
+# instead of once per crate, as derivations — `outputs.ci-fmt`, `ci-clippy`, `ci-build`,
+# `ci-test` — which is what the entries further down claim.
+#
+# So the substance is covered and the recipes are not invoked, and the manifest says exactly
+# that rather than pretending one implies the other. What this costs is a narrower guarantee for
+# these three entries: nothing asserts that `ci-clippy`'s flags still match what
+# `apps/<app>/check` would have run. The leaves below are where that claim lives now.
+[[gate]]
+path = ["check", "build", "test"]
+local = true
+ci = []
+reason = "CI runs the cargo commands these dispatch to, as the ci-fmt/ci-clippy/ci-build/ci-test derivations over the whole workspace, rather than invoking the aggregates; see the leaf entries below for what claims that coverage"
+
+# --- app-gates: apps ---
+# The app aggregate: `_each` reaches it, and it reaches the app's crates in turn.
+[[gate]]
+path = ["apps/*/check", "apps/*/build", "apps/*/test"]
+local = true
+ci = []
+reason = "as above: the dispatch layer, which the workspace-wide derivations replace rather than invoke"
+# --- end app-gates: apps ---
+
+# --- app-gates: core ---
+# The Rust crates of an app. `apps/<app>/check` walks `rust_modules`, which is a list rather
+# than a discovery, and is exactly where a crate that forgot to be on it goes unnoticed — the
+# platform projects below are the same shape, and were on neither list.
+#
+# `build` is not in this list: the shells' builds have an entry of their own below, because one
+# of them is a gap that needs saying rather than a reason that fits the others.
+[[gate]]
+path = ["apps/*/core/check", "apps/*/core/build", "apps/*/core/test"]
+local = true
+ci = []
+reason = "the per-crate dispatch under the aggregates above; the workspace-wide derivations cover the same crates without invoking these recipes, and `rust_modules` staying honest is what `just ci` checks locally"
+# --- end app-gates: core ---
+
+# --- app-gates: client ---
+# --- end app-gates: client ---
+
+# --- app-gates: shells ---
+[[gate]]
+path = ["apps/*/shells/*/check", "apps/*/shells/*/test"]
+local = true
+ci = []
+reason = "the per-crate dispatch under the aggregates above; the workspace-wide derivations cover the same crates without invoking these recipes, and `rust_modules` staying honest is what `just ci` checks locally"
+
+# The shells' builds, including the web one — which is a gap worth stating plainly rather than
+# claiming around. `outputs.ci-trunk-build` does build a web shell: trunk compiling the crate for
+# wasm32, wasm-bindgen, wasm-opt and the asset bundle. It builds the one `nix/ci.nix` names, and
+# this entry is a glob over every app. Claiming `ci-pure` here would say CI builds a second app's
+# web shell when it does not; naming one app instead would leave the second app's `build` gate
+# with no entry at all, which the completeness check refuses. So the entry claims nothing and
+# says why, which is the honest option of the three.
+#
+# Closing it means enumerating apps in `nix/ci.nix` — the same follow-up as `crateDirs` there
+# naming one app's crates, which is what stops a product's derivations from covering an app
+# added after `cli new`.
+[[gate]]
+path = ["apps/*/shells/*/build"]
+local = true
+ci = []
+reason = "`ci-build` compiles the tui and desktop shells and `ci-trunk-build` builds a web shell, but no job invokes these recipes, and the trunk stage covers one app rather than every app this glob matches — see the comment"
+# --- end app-gates: shells ---
+
+# `check` is split from `build` because the archetype probes that used to reach a service's
+# check moved into `check-archetypes` (which scaffolds probes inside a generated product), so
+# no CI derivation invokes this recipe anymore. `ci-clippy` lints every service directly as a
+# workspace member.
+[[gate]]
+path = ["services/*/check"]
+local = true
+ci = []
+reason = "ci-clippy lints every service as a workspace member; nothing invokes this recipe in CI now that the archetype probes live in check-archetypes' generated product"
+
+[[gate]]
+path = ["services/*/build"]
+local = true
+ci = []
+reason = "`ci-build` compiles every service in the workspace, so the crate is built; no job invokes this recipe"
+
+# `test` is split from `check`/`build` above: the converted-probe suite that used to reach a
+# service's tests moved into `check-archetypes`' generated product, so no CI derivation invokes
+# this recipe anymore. `ci-test` runs the workspace suite directly.
+[[gate]]
+path = ["services/*/test"]
+local = true
+ci = []
+reason = "ci-test runs the workspace test suite; nothing invokes this recipe in CI now that the archetype probes live in check-archetypes' generated product"
+
+# The cargo invocations under every crate's thin delegation. Listed because they are gates,
+# and because it is the leaf of the build chain that the aggregate recipes reach: if
+# `rust::build` stopped being what `build` means, this is where the difference would show.
+#
+# These four are where the claim about CI's Rust coverage actually lives now. Each is the
+# recipe a derivation reproduces — `ci-fmt` runs `rust::fmt-check`'s command, `ci-clippy`
+# runs `rust::clippy`'s with the repository's exact flags, and so on — so `DERIVATION_GATES`
+# names them and `ci-pure` reaches them. They are listed even though none is gate-shaped
+# (`is_gate` reads the bare recipe name, so `check`/`build`/`test` are what the manifest
+# demands entries for), because a leaf nothing records is where a claim about a gate stops
+# being traceable.
+[[gate]]
+path = ["rust::build"]
+local = true
+ci = ["ci-pure"]
+
+[[gate]]
+path = ["rust::clippy"]
+local = true
+ci = ["ci-pure"]
+
+[[gate]]
+path = ["rust::fmt-check"]
+local = true
+ci = ["ci-pure"]
+
+[[gate]]
+path = ["rust::test"]
+local = true
+ci = ["ci-pure"]
+
+# `check-repo` runs it, and `just ci` runs `check-repo`. CI runs the same regeneration as a
+# derivation: `outputs.ci-proto-check` lints, formats, regenerates with the local plugins and
+# diffs the committed trees, which is this recipe's body. It was a networked host step until
+# RT-50 made every buf plugin local.
+[[gate]]
+path = ["proto::check"]
+local = true
+ci = ["ci-pure"]
+
+# The CLDR slice, and the one gate ADR 0021 named as running locally but nowhere else. It is
+# in `check-repo`, hence local. CI runs it as `outputs.ci-i18n-data`, which is a derivation
+# because the gate's only networked input was a download of a pinned file: `nix/cldr.nix`
+# fetches that release once into the store and datagen runs offline against it.
+[[gate]]
+path = ["i18n::check-data"]
+local = true
+ci = ["ci-pure"]
+
+# --------------------------------------------------------------------------
+# Gates only a CI job runs
+# --------------------------------------------------------------------------
+
+# --- app-gates: android ---
+# --- end app-gates: android ---
+
+# --- app-gates: apple ---
+# --- end app-gates: apple ---
+
+# --- app-gates: generate-android ---
+# Typegen and the `.so`: not a check, but CI runs it and the manifest covers every recipe CI
+# runs, so a job gaining a step has to be thought about here.
+#
+# `ci-android` reaches it through `outputs.ci-android-generated`, the derivation that
+# cross-compiles all four ABIs.
+[[gate]]
+path = ["apps/*/generate-android"]
+local = false
+ci = ["ci-android"]
+reason = "it produces the bindings and the native library rather than validating anything, and needs the NDK. ci-android builds it as a derivation so the cross-compile is shared through the binary cache"
+# --- end app-gates: generate-android ---
+
+# Wire compatibility against a base ref: the question is asked of a pull request, not of the
+# tree, and it needs `.git` — which a sandboxed build does not have, so this stays a host step.
+[[gate]]
+path = ["proto::breaking"]
+local = false
+ci = ["ci-impure"]
+reason = "it compares against a base ref in history, which `just ci` has no opinion about"
+
+
+# Spelling. Whole-tree rather than per-crate, and it was in the supply-chain job alone until a
+# misspelling in a doc comment reached CI for the second time: `just ci` did not run it, so a
+# green local gate could not predict a green pipeline. It is fast and offline and answers a
+# question about the commit, so it runs in both places and needs no reason.
+[[gate]]
+path = ["typos"]
+local = true
+ci = ["ci-pure"]
+
+# Advisories, licences, bans, sources. Split from `typos` above because the reason the two
+# shared was only ever true of this one: an advisory published overnight makes this fail with
+# nothing here changed, and it reads the network to find out. Both are reasons to report it on
+# a schedule rather than to block the change under review.
+#
+# Two jobs run it, and — as with `check-template` below — the graph cannot tell them apart:
+# `invocations` takes the first word after `just` and ignores the argument, so `just deny` and
+# `just deny --fix` are the same edge here. What separates them is which job is in which
+# workflow: `ci-impure` runs the gate as a report on every push, and `advisories` runs it with
+# its fix on the schedule alone, which is the only place a bump happens and the only place a
+# pull request is opened (ADR 0023). The `--fix` half is not in `ci.yaml` because a bump is not
+# a fact about the commit under review, and because a push that can open a pull request is a
+# pipeline that can write to the repository it is reviewing.
+[[gate]]
+path = ["deny"]
+local = false
+ci = ["ci-impure", "advisories"]
+reason = "its result depends on today's advisory database as much as on the commit, and fetching that needs the network; an advisory published overnight is information, not a reason to fail the gate someone runs before pushing. The scheduled job runs it with `--fix` for the other half of the same reason: the bump it produces is a change to a committed lockfile, and the only honest way to make one is a pull request somebody reviews"
+
+
+
+# Publishing (decision 5). The template never pushes its own images.
+#
+# The archive is validated on every push as a derivation per service — `<svc>-image-validate`,
+# built by `ci-pure` — so the validation is covered by the derivation entry keyed on the
+# template-only stages above rather than by a recipe invocation. `publish::validate` is the
+# local spelling of the same inspection: `publish::push` depends on it, and a person runs it
+# before a manual push.
+[[gate]]
+path = ["publish::validate"]
+local = false
+ci = []
+reason = "the archive is validated by ci-pure as `<svc>-image-validate` on every push; this recipe is the local spelling of that inspection, a dependency of `publish::push` and a thing a person runs before a manual push — `just ci` does not reach it, and a dependency is not an invocation the graph follows"
+
+# The push itself: master only, and a no-op with a notice when the registry credentials are
+# unset. The template has no registry of its own, so on this repository the step validates and
+# skips — which is the shape a product inherits before it configures one.
+[[gate]]
+path = ["publish::push"]
+local = false
+ci = ["ci-impure"]
+reason = "a master-only step: it publishes the images a product configured a registry for, and skips with a notice when HARBOR_USERNAME/HARBOR_PASSWORD are unset — the state this repository is in, so it must not be a red build"

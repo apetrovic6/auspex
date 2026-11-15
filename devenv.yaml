@@ -1,0 +1,35 @@
+# yaml-language-server: $schema=https://devenv.sh/devenv.schema.json
+inputs:
+  android-nixpkgs:
+    url: github:tadfisher/android-nixpkgs
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/d97234e58d4e90e3bf77c082fc3b546e51200938
+  nixpkgs-unstable:
+    url: github:nixos/nixpkgs?ref=nixos-unstable
+  rust-overlay:
+    url: github:oxalica/rust-overlay/7fcafdf6f0761462d68012aba6a627be3f008d68
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  connectrpc:
+    url: github:apetrovic6/connectrpc-rust-flake/4b34f1d603641c4f87113daee92e01e0be92ca4e
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  git-hooks:
+    url: github:cachix/git-hooks.nix
+  rustfs:
+    url: github:rustfs/rustfs/5d737eaeb7fcab5d40c655ba60a494e93dd98922
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  crane:
+    url: github:ipetkov/crane/788369ed71ed9d84ef72cb056e4d920050d5b32c
+
+nixpkgs:
+  allow_unfree: true
+  android_sdk:
+    accept_license: true

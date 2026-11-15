@@ -1,0 +1,60 @@
+[package]
+name = "oidc"
+version = "0.1.0"
+description = "Verifies an OIDC provider's access tokens for the identity seam: discovery, a cached key set, and nothing that logs a credential"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Application code, never published to a registry.
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Test support for this crate and for the services that wire it: an in-process identity provider
+# and a committed, PUBLIC RSA key to sign with. Off by default so no binary carries a private key,
+# even one that signs nothing real; a service enables it from its `[dev-dependencies]` only.
+testing = ["dep:axum", "dep:tokio-rustls", "jsonwebtoken/use_pem", "tokio/net", "tokio/io-util"]
+# Browser login through the service (BFF — Backend For Frontend). Installed by
+# `cargo xtask add-auth-oidc <svc> --web`. The BFF handles OAuth2 authorization-code flows
+# with PKCE so the SPA never sees a refresh token. The refresh token is stored in an
+# encrypted HttpOnly cookie; the SPA holds only a short-lived access token in memory.
+bff = ["dep:axum", "dep:aws-lc-rs", "dep:rand_core", "dep:base64", "dep:sha2", "tokio/net", "tokio/io-util"]
+
+[dependencies]
+identity = { path = "../identity" }
+
+jsonwebtoken.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+url.workspace = true
+rustls.workspace = true
+webpki-roots.workspace = true
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
+
+# `testing` only. `axum` serves the discovery document and the key set; `tokio-rustls` serves the
+# same over TLS for the one test that proves the client trusts the roots it was given.
+axum = { workspace = true, optional = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs", "tls12"], optional = true }
+
+# `bff` only. Cookie encryption, OAuth2 flows, and the BFF's axum routes.
+aws-lc-rs = { version = "1.19", optional = true }
+rand_core = { version = "0.6", optional = true, features = ["getrandom"] }
+base64 = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+
+[dev-dependencies]
+# The crate's own tests use the `testing` module, so they need it on.
+oidc = { path = ".", features = ["testing", "bff"] }
+tower = { workspace = true }

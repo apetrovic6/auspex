@@ -1,0 +1,71 @@
+# Codegen for the Rust side of the contract. The plugins come from the `connectrpc` flake
+# input (see devenv.nix) and are on PATH inside `devenv shell`.
+#
+# Run from the repository root (see just/proto.just), so `out` is repo-relative:
+#   buf generate proto --template proto/buf.gen.yaml
+#
+# Output is committed. That is deliberate: a plain `cargo build` then needs no buf, no
+# protoc and no network, which matters for CI and for contributors who only touch Rust.
+# `just proto::check` regenerates and fails if the result differs, so the committed copy
+# cannot drift from the .proto files.
+#
+# Messages and service stubs MUST go to different directories: both plugins emit a
+# per-package `<pkg>.mod.rs`, and sharing one `out` fails with
+# "file ... was generated multiple times". Each directory then gets its own packaging
+# pass to stitch the module tree.
+version: v2
+clean: true
+plugins:
+  # Message types. `json` matters here: the Connect protocol offers a JSON codec
+  # alongside binary, so the messages need JSON serialization to serve it.
+  - local: protoc-gen-buffa
+    out: crates/proto/src/gen/buffa
+    # Required by `reflect_mode=bridge` below: under buf's default per-directory strategy
+    # each invocation sees a single package, so the pool embedded in one would not cover
+    # the others and reflection would answer for whichever package happened to be last.
+    strategy: all
+    opt:
+      - views=true
+      - json=true
+      # Embeds each package's descriptors and exposes `descriptor_pool()`, which is what
+      # feeds gRPC server reflection — no FileDescriptorSet file to ship and no build
+      # script to run. `services/api/src/startup.rs` mounts the service that reads it.
+      - reflect_mode=bridge
+  - local: protoc-gen-buffa-packaging
+    out: crates/proto/src/gen/buffa
+    strategy: all
+
+  # Connect service stubs (client + server), Tower-based. `buffa_module` tells the stubs
+  # where the message types above actually live; without it the plugin fails with
+  # "type ... is not covered by any extern_path mapping".
+  - local: protoc-gen-connect-rust
+    out: crates/proto/src/gen/connect
+    opt:
+      - buffa_module=crate::gen::buffa
+  - local: protoc-gen-buffa-packaging
+    out: crates/proto/src/gen/connect
+    strategy: all
+    opt:
+      - filter=services
+
+  # ---- Shell languages -------------------------------------------------------------
+  # Every plugin is local (RT-50), so `just proto::generate` needs no network. Each one is
+  # built or chosen in nix/proto.nix from versions.toml's [proto] pins; protoc's own
+  # version is asserted there, and the Gradle and Xcode runtimes are checked against the
+  # same pins by `cargo xtask check-versions`.
+  #
+  # Kotlin protobuf codegen emits DSL wrappers over the Java classes, so java is required
+  # alongside kotlin, not instead of it.
+  - protoc_builtin: java
+    out: proto/gen/kotlin
+  - protoc_builtin: kotlin
+    out: proto/gen/kotlin
+  - local: protoc-gen-connect-kotlin
+    out: proto/gen/kotlin
+
+  # The two Swift plugins, now local as well. No remote calls remain — the whole
+  # buf.gen.yaml runs offline.
+  - local: protoc-gen-swift
+    out: proto/gen/swift
+  - local: protoc-gen-connect-swift
+    out: proto/gen/swift

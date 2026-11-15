@@ -1,0 +1,37 @@
+[package]
+name = "settings"
+version = "0.1.0"
+description = "Layered application configuration"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The engine. This crate is `settings` precisely so that this line can be `config`: the two
+# were briefly the same name, which compiled but made `cargo build -p config` ambiguous
+# between the path package and the registry one — `error: specification `config` is
+# ambiguous`. See ADR 0013.
+#
+# Declared here rather than in [workspace.dependencies] because it has exactly one
+# consumer, which is the call `crates/connect-web` already makes for `bytes`, `http` and
+# `js-sys`.
+#
+# `default-features = false` is load-bearing, not tidiness: the defaults are
+# toml + json + yaml + ini + ron + json5 + convert-case + async — five extra parsers and an
+# async-runtime dependency for a crate that reads one TOML file per service.
+config = { version = "0.15", default-features = false, features = ["toml"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+# The tests build the environment layer as data (`Environment::source(Some(map))`) rather
+# than by setting variables, because `std::env::set_var` is `unsafe` in edition 2024 and
+# the workspace forbids unsafe code. Only the file layers need a real directory. Already a
+# direct dependency of `tools/xtask`, so this adds no new third-party code.
+tempfile = "3"

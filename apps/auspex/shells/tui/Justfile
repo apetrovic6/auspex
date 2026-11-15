@@ -1,0 +1,33 @@
+mod lib '../../../../just/lib.just'
+mod rust '../../../../just/rust.just'
+
+pkg := "auspex-tui"
+
+default: dev
+
+doctor:
+    @echo '{{ style("command") }}doctor:{{ NORMAL }}'
+    @just lib::check-rust
+
+fix:
+    @just rust::fmt
+
+check:
+    @just rust::fmt-check
+    @just rust::clippy {{ pkg }} --all-targets
+
+build:
+    @just rust::build {{ pkg }}
+
+test:
+    @just rust::test {{ pkg }}
+
+# run the TUI app
+run:
+    @just rust::run {{ pkg }}
+
+clean:
+    cargo clean -p {{ pkg }}
+
+dev: fix check build test
+ci: check build test

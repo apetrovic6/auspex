@@ -1,0 +1,75 @@
+# The common file: words that belong to no single page. Keys here are bare, and
+# the per-page directories namespace their own.
+increment = "Increment"
+decrement = "Decrement"
+reset = "Reset"
+# The first interpolated key in this repository, and the first one that has to live
+# here rather than in `pages/counter/`. `i18n_keygen::resources::for_app` gives an app
+# its own namespace plus these bare keys and nothing else, so a key a *scaffolded* app's
+# shell must name cannot sit under `counter.` — `just add crux-app payments` would
+# compile against an Android resource that is never emitted for it. Since the crux-app
+# skeleton is a counter, this sentence belongs to every app made from it, which is what
+# "no single page" means. `counter.*` and here as well would have put the same sentence
+# into the example app's resources twice.
+count_is = "Count is: %{count}"
+# A `Status::Working` from a core that has no words of its own (ADR 0016). Same reasoning:
+# the first API effect any app grows gets a pending state, and it should not have to invent
+# one locale's sentence for it.
+working = "working…"
+#
+# `Failure`, the two kinds and the codes a core names when a request does not come back
+# (ADR 0016's follow-up). `common/` for the same reason as the two above: these are what an
+# API effect says, not what the counter page says, and a scaffolded app's shell has to name
+# them against resources its own app namespace would never have emitted.
+#
+# The second interpolated key in the repository, and the first whose argument is not a
+# number: `%{endpoint}` is an address, which is why it survives translation as it stands.
+failure_unreachable = "cannot reach the API at %{endpoint}"
+# One key per code the domain names, because what a caller does next differs per code — a
+# login, or nothing, or accepting that the fault was never theirs. `detail` (the server's own
+# words) is not interpolated here: a shell appends it after the sentence, untranslated.
+failure_unauthenticated = "sign in to do that"
+failure_permission_denied = "you are not allowed to do that"
+failure_not_found = "the API does not know what you asked for"
+failure_server_fault = "the API had a problem with that request"
+# The unnamed codes get the wire's spelling interpolated, for the same reason an address does:
+# there is no domain sentence to say, and a token is not a sentence to translate.
+failure_other = "the API refused the request (%{code})"
+#
+# When something last changed, in the reader's own calendar and clock zone (ADR 0020).
+# `common/` for the failure keys' reason: this is what an API effect says — the instant
+# arrives with the count it belongs to, from whoever owns the data — not what a particular
+# page says, and a scaffolded app whose core grows a server has to name it against
+# resources its own namespace would never have emitted. `%{when}` is deliberately not
+# `%{count}`-shaped: the shells fill it with a *formatted* date, never the `i64` the wire
+# carried, and xtask's `instants_are_formatted_at_the_edge` is what keeps that true.
+updated_at = "Updated %{when}"
+#
+# The demonstrator plural family (ADR 0018), and a real one: the first API effect that
+# answers with a count wants a legend, and it belongs in `common/` for `count_is`'s reason
+# — a scaffolded app's shell has to name it against resources its own namespace emits.
+#
+# `one` and `other`, because that is all English has. An `apples.two` here would compile,
+# ship, and be selected by nothing, which is the failure `plurals_match_cldr` refuses; an
+# `apples.few` would be the same mistake in the other direction, since Croatian needs one.
+apples.one = "%{count} apple"
+apples.other = "%{count} apples"
+#
+# Native login (ADR 0028): the Sign in / Sign out chrome every native shell shares, in
+# `common/` for the failure keys' reason — a scaffolded app's shell has to name them, and
+# they belong to no single page. `%{name}` is the display name userinfo returned; `%{uri}`
+# and `%{code}` are the device flow's verification link and user code.
+sign_in = "Sign in"
+sign_out = "Sign out"
+signing_in = "Signing in…"
+signed_in = "Signed in"
+signed_in_as = "Signed in as %{name}"
+sign_in_denied = "Sign-in was denied"
+device_code = "Go to %{uri} and enter code %{code}"
+sign_out_failed = "couldn't forget the saved session"
+session_not_persistent = "sign-in won't be kept after closing"
+device_login_keys = "y copy link · c copy code · o open"
+device_link_copied = "link copied"
+device_code_copied = "code copied"
+device_browser_opened = "opened in browser"
+device_browser_failed = "couldn't open a browser"

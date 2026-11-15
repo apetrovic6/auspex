@@ -1,0 +1,2 @@
+{"fields":{"code":"yanked","graphs":[{"Krate":{"name":"async-executor","version":"1.14.0"},"parents":[{"Krate":{"name":"accesskit_unix","version":"0.22.1"}},{"Krate":{"name":"smol","version":"2.0.2"}},{"Krate":{"name":"zbus","version":"5.19.0"}}]}],"severity":"error"},"type":"diagnostic"}
+{"fields":{"advisories":{"errors":1,"helps":0,"notes":22,"warnings":0}},"type":"summary"}

@@ -1,0 +1,35 @@
+increment = "Povećaj"
+decrement = "Smanji"
+reset = "Poništi"
+count_is = "Broj je: %{count}"
+working = "u tijeku…"
+failure_unreachable = "ne mogu doći do API-ja na %{endpoint}"
+failure_unauthenticated = "za to se treba prijaviti"
+failure_permission_denied = "to nije dopušteno"
+failure_not_found = "API ne poznaje što ste tražili"
+failure_server_fault = "API je imao problem s tim zahtjevom"
+failure_other = "API je odbio zahtjev (%{code})"
+# “Ažurirano”, not “Zadnje ažurirano”: English gets away with a bare participle because
+# English labels often do; Croatian writes the passive feminine of the act itself, which is
+# what a Croatian app says for the same row. `%{when}` is filled by the shell with a
+# formatted date, never the `i64` the wire carried (ADR 0020).
+updated_at = "Ažurirano %{when}"
+# Three categories, because Croatian has three: it asks about the last digit, so 21 jabuka
+# and 22 jabuke, and an English-shaped two-category copy would print `other` for both.
+apples.one = "%{count} jabuka"
+apples.few = "%{count} jabuke"
+apples.other = "%{count} jabuka"
+sign_in = "Prijavi se"
+sign_out = "Odjavi se"
+signing_in = "Prijava u tijeku…"
+signed_in = "Prijavljeni ste"
+signed_in_as = "Prijavljeni kao %{name}"
+sign_in_denied = "Prijava je odbijena"
+device_code = "Idite na %{uri} i unesite kod %{code}"
+sign_out_failed = "nije moguće zaboraviti spremljenu sesiju"
+session_not_persistent = "prijava se neće zadržati nakon zatvaranja"
+device_login_keys = "y kopiraj poveznicu · c kopiraj kod · o otvori"
+device_link_copied = "poveznica kopirana"
+device_code_copied = "kod kopiran"
+device_browser_opened = "otvoreno u pregledniku"
+device_browser_failed = "nije moguće otvoriti preglednik"

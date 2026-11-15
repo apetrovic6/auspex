@@ -1,0 +1,90 @@
+# cargo-deny: supply-chain policy. Run with `just deny` (or `cargo deny check`).
+
+[graph]
+# Only check targets we actually ship for. Without this, cargo-deny walks every target in
+# the universe and reports advisories for platforms this repo never builds.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-apple-darwin" },
+    { triple = "wasm32-unknown-unknown" },
+    { triple = "aarch64-linux-android" },
+    { triple = "armv7-linux-androideabi" },
+    { triple = "x86_64-linux-android" },
+    { triple = "i686-linux-android" },
+]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "deny"
+
+# Every entry here is an *unmaintained* advisory (not a vulnerability) on a TRANSITIVE
+# dependency this workspace does not choose directly. Each notes who pulls it in, so the
+# exception can be re-examined when that dependency moves. A vulnerability advisory should
+# never be added here — fix or replace the dependency instead.
+ignore = [
+    # crux_core's serde-generate/bincode type-generation stack
+    { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; via crux_core type generation" },
+    # the gpui / gpui-kit desktop stack
+    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; via gpui-kit" },
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; via gpui-kit" },
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error unmaintained; via gpui-kit" },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; via gpui-kit" },
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained; via gpui-pre text shaping" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; via gpui-pre text shaping" },
+    # gpui-pre-reqwest's TLS stack
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained; via gpui-pre-reqwest" },
+    # zbus 6.0 absorbed these three as its own modules, which is what makes the standalone
+    # crates unmaintained — no vulnerability, and nothing here can take the new version:
+    # `cargo update -p zbus --precise 6.0.0` is refused by ashpd 0.13.13, which requires
+    # `zbus = "^5.13"` and reaches this workspace through gpui-base and gpui-kit (checked
+    # 2026-10-19). It clears when that stack moves.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; merged into zbus 6; via the gpui desktop stack's zbus 5" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; merged into zbus 6; via the gpui desktop stack's zbus 5" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; merged into zbus 6; via the gpui desktop stack's zbus 5" },
+]
+
+[licenses]
+version = 2
+# Permissive licenses only. Anything copyleft must be an explicit, reviewed exception
+# added below rather than a silent addition to this list.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    # bzip2's own permissive BSD-style licence, via libbz2-rs-sys
+    "bzip2-1.0.6",
+    "CC0-1.0",
+    # Mozilla's CA certificate bundle (webpki-roots), via sqlx's TLS support. A data
+    # licence rather than a code one, and permissive: it grants use, modification and
+    # redistribution of the data with no copyleft and no attribution requirement beyond
+    # keeping the notice.
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A wildcard dependency on a path/workspace crate is fine; only registry wildcards are the
+# supply-chain hazard this rule is about.
+allow-wildcard-paths = true
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

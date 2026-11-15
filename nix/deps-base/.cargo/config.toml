@@ -1,0 +1,14 @@
+[alias]
+xtask = "run --quiet -p xtask --"
+
+# Android cross-linking needs the NDK's clang wrapper as the linker; without it cargo falls
+# back to the host `cc` and the host linker rejects the cross objects with
+# "Relocations in generic ELF (EM: 183) ... file in wrong format".
+#
+# The paths are machine-specific (a nix store path, or wherever the NDK was installed), so
+# they cannot be committed here. Inside `devenv shell` they are exported as
+# CARGO_TARGET_<TRIPLE>_LINKER — see the NDK block in devenv.nix. Outside Nix, set them
+# yourself, e.g.:
+#
+#   export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=\
+#     "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"

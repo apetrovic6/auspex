@@ -1,0 +1,22 @@
+[package]
+name = "proto"
+version = "0.1.0"
+description = "Generated Protocol Buffers messages and Connect RPC stubs"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Generated code for internal use; never published.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+buffa.workspace = true
+buffa-descriptor.workspace = true
+connectrpc.workspace = true
+# Required by the `json=true` codegen option: the generated views serialize through
+# ::serde directly, so it must be a dependency of this crate, not just of buffa.
+serde = { workspace = true, features = ["derive"] }

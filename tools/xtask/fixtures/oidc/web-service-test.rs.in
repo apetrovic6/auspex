@@ -1,0 +1,251 @@
+
+// -------------------------------------------------------------------------------------------------
+// Web login settings and routes — installed only by `add-auth-oidc --web`
+// -------------------------------------------------------------------------------------------------
+
+/// Public deterministic base64, isolated to tests and never deployment configuration.
+const WEB_TEST_COOKIE_KEY: &str = "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
+
+/// Supply valid web defaults to the shared verifier/configuration tests.
+/// These tests deliberately inspect settings before validating a missing issuer.
+fn load_web(environment: &[(&str, &str)]) -> Settings {
+    settings::load_from_env(
+        &committed(),
+        CONFIG_NAME,
+        "production",
+        [
+            ("APP__AUTH__PUBLIC_URL".to_owned(), "https://app.example.com".to_owned()),
+            ("APP__AUTH__COOKIE_KEY".to_owned(), WEB_TEST_COOKIE_KEY.to_owned()),
+        ]
+            .into_iter()
+            .chain(environment.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))),
+    ).expect("the committed configuration and test web settings load")
+}
+
+/// The same load-then-validate sequence used by the service's `config::load`.
+/// The injected source exercises real environment layering without process mutation.
+fn load_validated_web(environment: &[(&str, &str)]) -> Result<Settings, settings::Error> {
+    let settings: Settings = settings::load_from_env(
+        &committed(),
+        CONFIG_NAME,
+        "production",
+        environment.iter().map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+    )?;
+    settings.auth.validate()?;
+    Ok(settings)
+}
+
+fn web_defaults() -> AuthSettings {
+    AuthSettings {
+        public_url: "https://app.example.com".to_owned(),
+        cookie_key: serde_json::from_value(serde_json::json!(WEB_TEST_COOKIE_KEY))
+            .expect("deserialize a public test key setting"),
+        ..Default::default()
+    }
+}
+
+fn web_settings() -> AuthSettings {
+    load(&[("APP__AUTH__ISSUER", "https://id.example.com")]).auth
+}
+
+fn assert_invalid(settings: &AuthSettings, setting: &str) {
+    match settings.validate() {
+        Err(settings::Error::Invalid(message)) => {
+            assert!(message.contains(setting), "must name {setting}: {message}");
+        }
+        other => panic!("expected Invalid naming {setting}, got {other:?}"),
+    }
+}
+
+fn assert_invalid_web_load(environment: &[(&str, &str)], setting: &str) {
+    match load_validated_web(environment) {
+        Err(settings::Error::Invalid(message)) => {
+            assert!(message.contains(setting), "must name {setting}: {message}");
+        }
+        other => panic!("expected Invalid naming {setting}, got {other:?}"),
+    }
+}
+
+#[test]
+fn web_deployment_requires_a_public_url_at_load() {
+    for value in [None, Some(""), Some(" \t\n")] {
+        let mut environment = vec![("APP__AUTH__ISSUER", "https://id.example.com")];
+        if let Some(value) = value {
+            environment.push(("APP__AUTH__PUBLIC_URL", value));
+        }
+        match load_validated_web(&environment) {
+            Err(settings::Error::Invalid(message)) => {
+                assert!(message.contains("auth.public_url"), "{message}");
+                assert!(
+                    message.contains("unset") || message.contains("required"),
+                    "missing public URL must be diagnosed as required/unset: {message}"
+                );
+            }
+            other => panic!("expected Invalid for missing public URL, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn web_deployment_requires_a_cookie_key_at_load() {
+    assert_invalid_web_load(
+        &[
+            ("APP__AUTH__ISSUER", "https://id.example.com"),
+            ("APP__AUTH__PUBLIC_URL", "https://app.example.com"),
+        ],
+        "auth.cookie_key",
+    );
+}
+
+#[test]
+fn invalid_base64_cookie_keys_are_invalid_at_load() {
+    for key in [
+        "not-a-base64-cookie-secret",
+        "__________________________________________8=",
+        WEB_TEST_COOKIE_KEY.trim_end_matches('='),
+    ] {
+        assert_invalid_web_load(
+            &[
+                ("APP__AUTH__ISSUER", "https://id.example.com"),
+                ("APP__AUTH__PUBLIC_URL", "https://app.example.com"),
+                ("APP__AUTH__COOKIE_KEY", key),
+            ],
+            "auth.cookie_key",
+        );
+    }
+}
+
+#[test]
+fn a_wrong_decoded_cookie_key_length_is_invalid_at_load() {
+    assert_invalid_web_load(
+        &[
+            ("APP__AUTH__ISSUER", "https://id.example.com"),
+            ("APP__AUTH__PUBLIC_URL", "https://app.example.com"),
+            ("APP__AUTH__COOKIE_KEY", "AA=="),
+        ],
+        "auth.cookie_key",
+    );
+}
+
+#[test]
+fn cookie_key_file_indirection_loads_base64_text() {
+    let directory = tempfile::tempdir().expect("test secret directory");
+    let path = directory.path().join("cookie-key");
+    std::fs::write(&path, format!("{WEB_TEST_COOKIE_KEY}\n")).expect("write base64 secret");
+    let settings = load_validated_web(&[
+        ("APP__AUTH__ISSUER", "https://id.example.com"),
+        ("APP__AUTH__PUBLIC_URL", "https://app.example.com"),
+        ("APP__AUTH__COOKIE_KEY_FILE", path.to_str().expect("test path")),
+    ]).expect("file indirection supplies a valid base64 cookie key at load");
+    settings.auth.cookie_key.decode().expect("the loaded key decodes");
+}
+
+#[test]
+fn cookie_key_formatting_redacts_the_setting() {
+    let settings = web_settings();
+    let default = oidc::bff::cookies::CookieKeySetting::default();
+    assert_eq!(format!("{:?}", settings.cookie_key), format!("{default:?}"));
+    assert_eq!(format!("{}", settings.cookie_key), format!("{default}"));
+    assert!(!format!("{settings:?}").contains(WEB_TEST_COOKIE_KEY));
+    assert!(!format!("{}", settings.cookie_key).contains(WEB_TEST_COOKIE_KEY));
+}
+
+#[test]
+fn public_url_validation_uses_the_server_contract() {
+    for public_url in [
+        "app.example.com",
+        "http://app.example.com",
+        "http://[::1]",
+        "https://app.example.com/path",
+        "https://app.example.com/?query=1",
+        "https://app.example.com/#fragment",
+        "https://user:password@app.example.com",
+    ] {
+        let mut settings = web_settings();
+        settings.public_url = public_url.to_owned();
+        assert_invalid(&settings, "auth.public_url");
+    }
+    for public_url in [
+        "https://app.example.com",
+        "https://app.example.com:8443/",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080/",
+    ] {
+        let mut settings = web_settings();
+        settings.public_url = public_url.to_owned();
+        settings.validate().expect("a public origin or development loopback is valid");
+    }
+}
+
+#[test]
+fn scopes_require_openid_and_nonempty_whitespace_free_entries() {
+    for scopes in [
+        vec![],
+        vec!["profile"],
+        vec!["openid", ""],
+        vec!["openid", "profile email"],
+        vec!["openid", "profile\temail"],
+        vec!["openid", "profile\n"],
+        vec!["openid", "profile\u{2003}email"],
+    ] {
+        let mut settings = web_settings();
+        settings.scopes = scopes.into_iter().map(str::to_owned).collect();
+        assert_invalid(&settings, "auth.scopes");
+    }
+    let mut settings = web_settings();
+    settings.scopes = vec!["openid".to_owned()];
+    settings.validate().expect("openid alone is sufficient");
+}
+
+#[test]
+fn login_audience_must_not_be_blank_when_present() {
+    for audience in ["", " ", "\t\n"] {
+        let mut settings = web_settings();
+        settings.login_audience = Some(audience.to_owned());
+        assert_invalid(&settings, "auth.login_audience");
+    }
+    for audience in [None, Some("https://api.example.com".to_owned())] {
+        let mut settings = web_settings();
+        settings.login_audience = audience;
+        settings.validate().expect("absent or nonempty audience is valid");
+    }
+}
+
+#[tokio::test]
+async fn web_login_routes_are_mounted_with_the_real_service_router() {
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt as _;
+
+    let idp = TestIdp::start(&[("k1", SigningKey::A)]).await;
+    let mut settings = web_settings();
+    settings.issuer = idp.issuer().to_owned();
+    settings.validate().expect("valid web deployment");
+    let bff = oidc::bff::bff_router(oidc::bff::BffSetup {
+        issuer: settings.issuer.clone(),
+        client_id: settings.audience.clone(),
+        public_url: oidc::bff::parse_public_url(&settings.public_url)
+            .expect("public_url validated at load"),
+        scopes: settings.scopes.clone(),
+        login_audience: settings.login_audience.clone(),
+        cookie_key: settings.cookie_key.decode().expect("cookie_key validated at load"),
+    });
+    let app = bff.merge(router(&idp));
+    let response = app.clone().oneshot(
+        Request::get("/auth/login").body(Body::empty()).expect("request"),
+    ).await.expect("response");
+    assert_eq!(response.status(), StatusCode::FOUND);
+    let location = response.headers()[header::LOCATION].to_str().expect("ASCII redirect");
+    assert!(location.contains("redirect_uri=https%3A%2F%2Fapp.example.com%2Fauth%2Fcallback"), "{location}");
+    assert!(response.headers()[header::SET_COOKIE].to_str().expect("cookie")
+        .contains("__Host-login-flow="));
+
+    let response = app.oneshot(
+        Request::post("/auth/session")
+            .header("origin", "https://app.example.com")
+            .body(Body::empty()).expect("request"),
+    ).await.expect("response");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers()[header::SET_COOKIE].to_str().expect("clear cookie")
+        .contains("Max-Age=0"));
+}

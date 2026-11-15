@@ -1,0 +1,12 @@
+edition = "2024"
+
+# Sort imports into std / external / crate groups and merge per module. Both are
+# nightly-only rustfmt options, which is fine: this workspace requires nightly anyway
+# (gpui does not build on stable).
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
+
+# Generated code is formatted by its generator, not by rustfmt. Without this, `cargo fmt`
+# rewrites the committed output and `just proto::check` then reports drift on every run.
+# (`ignore` is nightly-only, like the import options above.)
+ignore = ["crates/proto/src/gen"]

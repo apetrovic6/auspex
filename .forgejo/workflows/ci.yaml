@@ -1,0 +1,170 @@
+# The CI pipeline, split into three jobs so the derivation stages, the impure host
+# steps, and the heavy Android build run on different runners.
+#
+#   ci-pure    — derivation stages (`devenv build outputs.ci-<stage>`), which share one
+#                evaluation of devenv and one set of cargo artifacts.
+#   ci-impure  — host steps (`devenv shell -- just <recipe>`) for wire compatibility, the
+#                advisory database and the template round trips. Each needs `.git` history or
+#                the network.
+#   ci-android — Android native libraries and Gradle lint/build/test. The generated tree is a
+#                derivation (`outputs.ci-android-generated`); Gradle runs on the host inside
+#                `devenv shell` for the SDK and Java.
+#
+# Runner prerequisites, all provided via hostPackages on the NixOS runners:
+# `nix`, `devenv`, `git`, `bash`, coreutils, `cargo`/`rustc`, `cacert`. Four runners
+# carry the `nix` label: cerberus (uncapped), and terra, luna and sol, which are capped
+# at 2 CPUs and 4 GiB (luna 3 GiB) for the runner and its Nix builds together, with
+# `max-jobs = 1`, `cores = 2`. Everything built here is signed and pushed to
+# https://ncps.noosphere.uk, so a stage built once is a store hit on the next runner
+# rather than a second cold compile.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+# Cancel a superseded run on a branch; never on the default branch, where every commit's
+# result is worth having.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  # Pure derivation stages. One job so they share the devenv evaluation and the
+  # cargo artifacts derivation.
+  ci-pure:
+    runs-on: nix
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # One aggregate step. `outputs.ci-pure` is a single derivation that depends on every
+      # pure stage (fmt, xtask check, clippy, typos, build, test, proto check,
+      # i18n check-data, trunk build); each stage is still its own derivation in
+      # the store, so each is cached/substituted individually, but the workflow stays static
+      # no matter how many stages a product enables or adds — that is the whole point of the
+      # library ([ADR 0026](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/9a40690b725310f872572c0b9450c35da9615e1f/docs/adr/0026-the-front-end-is-a-binary-and-products-pin-it.md)). Per-stage visibility in the forge UI is the trade; the aggregate's
+      # build log prints each stage name as it completes, and a product that wants per-stage
+      # steps can edit its own workflow.
+      - name: pure stages
+        run: devenv build outputs.ci-pure
+
+  # Impure stages — the ones that still need the network or `.git` history: wire
+  # compatibility (a base ref out of history), the advisory database (today's advisories,
+  # which is the point of the gate), and the two round trips, which fetch the CLI from the
+  # forge at the pinned revision.
+  ci-impure:
+    runs-on: nix
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `buf breaking` compares against a base ref in git history.
+          fetch-depth: 0
+
+      - name: proto breaking
+        run: devenv shell -- just proto::breaking
+
+      - name: deny
+        run: devenv shell -- just deny
+
+
+      # Publishing (decision 5). The template never pushes its own images: every push proves the
+      # archive parses and carries its contract, which ci-pure does as `<svc>-image-validate`.
+      # The push is the shared step, and it runs on master only. `just publish::push` skips with
+      # a notice when NEITHER credential is set (this repository's state), fails when only one
+      # is, and `cargo xtask check` asserts the two `env:` lines below — Forgejo does not put a
+      # secret in a step's environment unless the workflow maps it, and a step that reads an
+      # unmapped secret sees an empty string and reports success forever.
+      - name: publish
+        if: github.ref == 'refs/heads/master'
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: devenv shell -- just publish::push
+
+  # Android: typegen + boltffi native libraries, then Gradle lint, build, and unit
+  # Android: the generated tree Gradle compiles against, then Gradle's lint, build and unit
+  # tests. Each Gradle step is its own recipe so a failure names the stage. They run inside
+  # `devenv shell` for the Android SDK and Java.
+  #
+  # Gradle is configured with `-Xmx2048m` (JVM heap). Measured on the runners rather than
+  # estimated: the job ran on luna, the tightest cap at 3 GiB, and its CI slice peaked at
+  # 2.69 GB with no OOM kill in the kernel log or the cgroup's memory.events. It stays on the
+  # generic `nix` label.
+  ci-android:
+    runs-on: nix
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The generated tree — Kotlin bindings, the four ABIs' native libraries, the C header,
+      # the localized resources — built as a derivation and copied in, rather than generated on
+      # the host. Cross-compiling four ABIs is the most expensive thing this pipeline does
+      # outside a Gradle build (2m56s cold against 2.8s warm at two cores), and on a host step
+      # it is cold every time because the checkout dies with the task; as a derivation it is
+      # built once per commit and substituted from ncps everywhere else.
+      #
+      # `--no-preserve=mode` is load-bearing rather than tidy: store paths are read-only, and a
+      # plain `cp -r` carries 444 into the checkout, where the next `boltffi pack` or Gradle task
+      # that rewrites a generated file fails on a permission error that names neither the copy
+      # nor the reason.
+      # Every app with an Android project, discovered rather than listed — the shape the
+      # pipeline had before and lost, which matters because `gates.toml` claims these gates for
+      # `apps/*`, not for one app. A product with a second app inherits a manifest that says its
+      # Android gates run, and a hardcoded path here is how that claim quietly stops being true.
+      # `gates.rs` reads `$app` as a wildcard, so the loop is what makes the claim checkable.
+      - name: android generate
+        run: |
+          set -euo pipefail
+          # `devenv build` prints JSON — {"outputs.ci-android-generated": "/nix/store/…"} — so
+          # the path is read by key rather than pattern-matched out of the stream.
+          GEN="$(devenv build outputs.ci-android-generated | jq -r '."outputs.ci-android-generated"')"
+          test -n "$GEN" && test "$GEN" != null
+          for project in apps/*/platforms/android; do
+            [ -d "$project" ] || continue
+            app="${project#apps/}"; app="${app%%/*}"
+            # The derivation covers the apps `nix/ci.nix` builds — today one, the example's —
+            # and its tree is a store hit. Any other app is generated here, which is slower and
+            # still correct; the alternative is an app whose bindings nothing produces.
+            if [ -d "$GEN/$project/generated" ]; then
+              mkdir -p "$project/generated"
+              # `--no-preserve=mode` is load-bearing rather than tidy: store paths are read-only,
+              # and a plain `cp -r` carries 444 into the checkout, where the next Gradle task
+              # that rewrites a generated file fails on a permission error naming neither the
+              # copy nor the reason.
+              cp -r --no-preserve=mode,ownership "$GEN/$project/generated/." "$project/generated/"
+            else
+              devenv shell -- just "apps/$app/generate-android"
+            fi
+          done
+
+      - name: android lint
+        run: |
+          set -euo pipefail
+          for project in apps/*/platforms/android; do
+            [ -d "$project" ] || continue
+            app="${project#apps/}"; app="${app%%/*}"
+            devenv shell -- just "apps/$app/platforms/android/check"
+          done
+
+      - name: android build
+        run: |
+          set -euo pipefail
+          for project in apps/*/platforms/android; do
+            [ -d "$project" ] || continue
+            app="${project#apps/}"; app="${app%%/*}"
+            devenv shell -- just "apps/$app/platforms/android/build"
+          done
+
+      - name: android test
+        run: |
+          set -euo pipefail
+          for project in apps/*/platforms/android; do
+            [ -d "$project" ] || continue
+            app="${project#apps/}"; app="${app%%/*}"
+            devenv shell -- just "apps/$app/platforms/android/test"
+          done
+

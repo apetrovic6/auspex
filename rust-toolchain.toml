@@ -1,0 +1,16 @@
+# For checkouts that do NOT use Nix. Inside `devenv shell` the toolchain comes from the
+# nix store (see nix/rust.nix) and rustup is not involved at all, so this file is inert
+# there — it exists so a plain `git clone` + rustup still gets a working toolchain.
+#
+# nightly is required, not preferred: gpui (the desktop shell) does not build on stable.
+# Keep `channel` in sync with [rust].channel in versions.toml.
+[toolchain]
+channel = "nightly"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = [
+    "wasm32-unknown-unknown",
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+    "i686-linux-android",
+]

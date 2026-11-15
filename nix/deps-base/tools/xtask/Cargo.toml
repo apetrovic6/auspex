@@ -1,0 +1,39 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+description = "Repository tooling: structural and version invariants for the monorepo"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+# The case conversion facet's own Swift emitter uses (`facet_generate` calls
+# `to_lower_camel_case` on every variant and field name it writes), so the keyword
+# invariant compares against the spelling the generator produces rather than a second
+# implementation of its rule. Already in the lockfile as a transitive dependency.
+heck = "0.5"
+# `deny`: cargo-deny's NDJSON is parsed, not matched as text. `serde_json` alone cannot derive
+# `Deserialize`, so `serde` comes with it; both are already in `[workspace.dependencies]`.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml = "0.9"
+tempfile = "3"
+# Format-preserving, unlike `toml`: the workspace manifest is full of comments explaining
+# why each glob exists, and a scaffolder that strips them would be worse than one that
+# asked the user to edit it by hand.
+toml_edit = "0.23"
+# `i18n-resources`: the translations are read from the compiled crate rather than
+# re-parsed from `locales/`, so the fallback locale and grouping dirs are configured
+# exactly once — see tools/xtask/src/i18n_resources.rs. Default features: nothing
+# here may pull a web framework into a build-time binary.
+i18n = { path = "../../crates/i18n" }
+i18n-keygen = { path = "../../crates/i18n-keygen" }
+

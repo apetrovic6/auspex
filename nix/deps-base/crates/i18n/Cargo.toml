@@ -1,0 +1,126 @@
+[package]
+name = "i18n"
+version = "0.1.0"
+description = "The translations, and the type-checked keys over them"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# The core of this crate — the translations, `Key`, `Locale` and the path
+# helpers — is deliberately free of any UI framework, so a gpui or TUI client links it
+# exactly as the Leptos frontend does. Framework adapters go behind a feature each,
+# and none is on by default: `cargo check -p i18n` passing without features is that
+# guarantee, and it matters here more than in `fishing` — `services/` and the worker
+# template may depend on this crate, and a default-on Leptos would put a web framework
+# in a worker.
+[features]
+default = []
+# The reactive `tr` in `reactive.rs`: a translation that re-renders when the
+# locale signal changes.
+leptos = ["dep:leptos"]
+# Reading the system's language preferences, for the shells with no platform resource
+# system to do it for them — the two native ones and the wasm one, against Android and
+# Apple where the OS already picks. Off by default for the reason `leptos` is: a worker
+# that links this crate for one user-facing string has no business acquiring platform
+# detection. ADR 0015.
+detect = ["dep:sys-locale", "sys-locale/js"]
+# `number`, `plural` and `datetime`: writing an `i64`, choosing a plural category and
+# rendering an instant the way a locale does them, for the shells that put them into
+# translated sentences. Off by default for the reason `leptos` and `detect` are, and the
+# cost makes it sharper: it carries compiled CLDR data, which a worker has no business
+# acquiring for one log line. ADR 0017 measured that blob for numbers and plurals; dates are
+# the same CLDR asked a harder question, and the growth they cost each shell — by far the
+# largest of the three, and accepted with the measurement in hand — is ADR 0020's. What is
+# carried is now sliced to the locales `locales/` ships rather than every locale Unicode
+# publishes, which is ADR 0021; sliced, still not free, which is why this stays off by default.
+format = [
+    "dep:icu_decimal",
+    "dep:icu_locale_core",
+    "dep:icu_plurals",
+    "dep:icu_calendar",
+    "dep:icu_datetime",
+    "dep:i18n-data",
+    "dep:chrono",
+]
+
+# The shells that compile this to wasm32-unknown-unknown set the rule: everything
+# here has to build for wasm. rust-i18n at runtime is static maps and one global
+# `AtomicStr`, which does.
+[dependencies]
+# Declared here rather than in [workspace.dependencies] because it has exactly one
+# consumer — the same call `crates/settings` makes for `config`.
+rust-i18n = "4"
+# Inherited, like every other Leptos line in the workspace: the shells and this crate
+# must link one Leptos, or `tr`'s `expect_context` misses at runtime. The workspace
+# entry carries `csr`, which this crate's 30-line adapter does not need on its own;
+# the alternative is a second version literal, which is the thing ADR 0005's discipline
+# exists to prevent.
+leptos = { workspace = true, optional = true }
+# Already in the graph — gpui's text stack reaches it through `cosmic-text` — and its own
+# dependency is `libc`. One crate covers POSIX `LANG`/`LC_ALL`, macOS `AppleLanguages`
+# (which is not an environment variable, so a hand-rolled version is wrong on the platform
+# it looks most correct on) and Windows. `sys-locale/js` above adds `navigator.languages`
+# on wasm; its `js-sys`/`web-sys` dependencies are target-gated to `target_family = "wasm"`,
+# so asking for the feature costs a native build nothing.
+sys-locale = { version = "0.3", optional = true }
+# Declared here rather than in [workspace.dependencies] for `rust-i18n`'s reason: one
+# consumer, this crate, behind the feature above — the shells ask for `format`, they do
+# not name ICU. `icu_locale_core` is already in the graph (`idna` pulls it through
+# `url`), and adding `icu_decimal` unifies the whole ICU stack on one version — only
+# `icu_decimal` and its compiled-data blob are new weight, and what that weight is, per
+# shell, is measured in ADR 0017. Not versions.toml either: that file single-sources
+# versions two *tools* must agree on, and nothing outside Cargo reads these (ADR 0005).
+# `default-features = false` on every ICU crate whose *data* this crate ships, and only
+# on those: the default feature is `compiled_data`, which links all of CLDR — every locale
+# Unicode publishes, not the two `locales/` does. Turning it off is the slice (ADR 0021),
+# and it is off rather than on-with-an-override because the failure modes differ: with
+# `compiled_data` on, a build that loses its data slice silently regains ~300 KB and
+# nothing fails; with it off, only the explicit-provider constructors exist, so a missing
+# marker is a compile error in `src/format.rs`. `ICU4X_DATA_DIR` is the cheap alternative
+# and it is rejected for exactly that reason — see ADR 0021.
+icu_decimal = { version = "2.3", optional = true, default-features = false }
+icu_locale_core = { version = "2.3", optional = true }
+# Plurals ride with numbers for a reason beyond tidiness: a shell that interpolates a count
+# into a sentence needs both, and they must agree because they read the same compiled CLDR
+# data (ADR 0018). `icu_plurals` is already in the graph as an `icu_decimal` dependency, so
+# this is a declaration, not weight — which is worth stating plainly, because ADR 0017
+# measured what the ICU stack costs each shell and the honest answer for plurals is nil.
+icu_plurals = { version = "2.3", optional = true, default-features = false }
+# Named because the fixed-calendar formatter is generic over the calendar and the
+# epoch-millisecond input is built in `Iso`, which CLDR names `Gregorian` — and an
+# optional dependency here is one edge on packages `icu_datetime` already brings.
+icu_calendar = { version = "2.3", optional = true, default-features = false }
+icu_datetime = { version = "2.3", optional = true, default-features = false }
+# The generated CLDR slice (ADR 0021). It is a crate of its own because the workspace
+# forbids `unsafe` and Cargo will not let a member inherit the workspace lint set and then
+# lift one lint out of it; see the note in `crates/i18n-data/Cargo.toml`. This crate takes
+# the provider, keeps it private, and passes `&CLDR` to the `try_new_unstable`
+# constructors in `format.rs`.
+i18n-data = { path = "../i18n-data", optional = true }
+# The reader's clock zone, for the one input an instant on the wire cannot carry (ADR
+# 0019). Already in the graph via the core's `facet-chrono` — this declares it, it does
+# not add it. `wasmbind` is chrono's own answer to wasm (`Local` is UTC without it) and
+# pulls only wasm-target-gated crates, so a native build pays nothing for its presence.
+chrono = { version = "0.4", optional = true, features = ["clock", "wasmbind"] }
+
+# Runs on the host to turn `locales/**/*.toml` into `Key`, `Locale` and the
+# wrappers around them, so the wasm rule above does not apply here.
+[build-dependencies]
+i18n-keygen = { path = "../i18n-keygen" }
+
+# This crate's own tests, with `detect` switched on.
+#
+# The feature is off by default on purpose, and `cargo nextest run` — the whole-workspace
+# gate — builds `default-members`, which the shells that switch it on are not. So without
+# this line the one test that guards the detect/`set_locale` pairing is compiled out of the
+# run that exists to execute it, and reports nothing while looking green. Depending on
+# yourself under `dev-dependencies` is how cargo spells "turn this feature on for my own
+# tests"; the cycle is allowed precisely here.
+[dev-dependencies]
+i18n = { path = ".", features = ["detect", "format"] }

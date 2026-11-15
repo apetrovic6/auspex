@@ -1,0 +1,65 @@
+[package]
+name = "i18n-data"
+version = "0.1.0"
+description = "ICU4X CLDR data sliced to the locales crates/i18n/locales ships, committed as generated code"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Flip to true only if this crate is genuinely meant for a registry.
+publish = false
+
+# The one crate in this workspace that does NOT inherit `[workspace.lints]`, and the reason
+# is a hard Cargo rule rather than a preference (ADR 0021).
+#
+# `src/data/` is databake output, and databake deserialises a payload it validated at
+# generation time with `from_bytes_unchecked` — 174 `unsafe` blocks for nine markers. The
+# workspace lints set `unsafe_code = forbid`, Cargo refuses to let a member both inherit
+# `[lints] workspace = true` and override a lint from it ("cannot override
+# workspace.lints"), and an in-source `#[allow]` cannot lift a `forbid`. So the generated
+# data and the workspace lint set cannot share a crate.
+#
+# The alternative — `unsafe_code = "allow"` in `i18n` itself — was rejected: it would put
+# permissive unsafe over the hand-written formatting code in `format.rs`, which is exactly
+# the code the rule is there for, and it would be a quiet change for whoever edits that
+# file next. Keeping the exception in a crate with no hand-written code means the rule
+# still covers everything a person writes, and the exception has a directory.
+#
+# The counter-argument, at full strength: generated code is read line by line precisely
+# when it is not, because nobody reads it; a crate with `unsafe` allowed and a generator
+# it trusts is a smaller surface than a crate that forbids unsafe and therefore cannot
+# exist. The `crates/proto` comment on this subject — "`unsafe_code` is deliberately NOT
+# relaxed" — still holds for code a generator could plausibly emit safely, and does not
+# for data that is deserialised by construction.
+[lints.rust]
+# databake's zero-copy views; see above.
+unsafe_code = "allow"
+
+[dependencies]
+# The marker types the generated code names (`icu_datetime::provider::…`,
+# `icu_decimal::provider::…`, `icu_plurals::provider::…`) and the baked-data machinery it
+# builds the tries out of.
+#
+# `default-features = false` on all of these, and that is load-bearing in a way a normal
+# dependency line is not: Cargo unifies features across the whole graph, so a single
+# `icu_datetime = "2.3"` with its defaults anywhere in the workspace re-links all of CLDR
+# into every binary and this crate stops meaning anything. `just i18n::check-data` does not
+# catch that, and neither does the locale invariant in `crates/i18n` — both read the slice,
+# which stays present and correct while a second, whole copy rides in beside it. `cargo xtask
+# check` does: an `icu_<crate>_data` package appears in `Cargo.lock` if and only if something
+# in the graph resolved that crate's `compiled_data` feature, so the lockfile states in text
+# whether the payload is sliced, and there is an allowlist of the four that are tolerated with
+# a reason each (ADR 0021).
+icu_datetime = { version = "2.3", default-features = false }
+icu_decimal = { version = "2.3", default-features = false }
+icu_plurals = { version = "2.3", default-features = false }
+# The generated provider falls back internally with
+# `icu_locale_fallback::LocaleFallbacker::new()`, which needs its `compiled_data` — the
+# parent-locale rules, the same size however many locales ship. What is sliced is the
+# per-locale payload, not the fallback chain.
+icu_locale_fallback = { version = "2.3", features = ["compiled_data"] }
+icu_provider = { version = "2.3", features = ["baked"] }
+# Generated code names `zerovec::vecs::VarZeroVec16` directly, so this has to be a direct
+# dependency even though `icu_*` already pulled the crate in.
+zerovec = "0.11"

@@ -1,0 +1,29 @@
+[package]
+name = "identity"
+version = "0.1.0"
+description = "The seam between an authenticated request and a handler: an identity type, a layer that attaches one, and nothing that chooses a provider"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Application code, never published to a registry.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The workspace entry is `default-features = false, features = ["json"]`, so this inherits no
+# `axum`, `client` or `server` machinery — and needs none. `RequestContext`, `ConnectError`
+# and `ErrorCode` are all ungated, and the layer is a plain `tower::Service` over an
+# `http::Request`: it is mounted by a server, but it is not one.
+connectrpc.workspace = true
+http.workspace = true
+tower.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The layer is tested over a synthetic service, the way `crates/telemetry` tests its own.
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true, features = ["util"] }

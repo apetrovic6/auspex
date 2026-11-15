@@ -1,0 +1,52 @@
+[files]
+extend-exclude = [
+    "target/",
+    "**/generated/",
+    "**/dist/",
+    # Committed codegen output. Generated protobuf embeds the serialized FileDescriptorProto
+    # as an escaped string literal, so the file contains fragments of identifiers split
+    # across line boundaries — "omponent", "TATUS" — which are bytes rather than prose and
+    # cannot be corrected at the source.
+    "crates/proto/src/gen/",
+    "proto/gen/",
+    "Cargo.lock",
+    "devenv.lock",
+    "*.webp",
+    "**/gradle/wrapper/",
+]
+
+[default]
+# Long runs of hex are identifiers and test vectors — W3C trace/span ids, checksums — not
+# prose, the same reasoning as the generated-proto exclusion above. typos splits them and
+# flags a fragment ("ba" inside a span id) as a misspelling; there is nothing to correct.
+extend-ignore-re = [
+    "[0-9a-fA-F]{16,}",
+    # BCP-47 tags in prose and doc comments. The data slice is discussed by tag — `hr-BA`,
+    # Croatian as written in Bosnia and Herzegovina, and `hi-Latn` — and typos reads a region
+    # subtag as a word, "correcting" `BA` to `BY` or `BE`. The shape is what makes exempting
+    # it safe rather than broad: a lowercase language subtag, a hyphen, then a two-letter
+    # region or a four-letter script. A bare `BA` in prose is still checked.
+    '\b[a-z]{2,3}-(?:[A-Z]{2}|[A-Z][a-z]{3})\b',
+    # The Android Native Development Kit, plural. typos splits `NDKs` and reads the leading
+    # fragment as a dropped letter, "correcting" `ND` to `AND`; the singular passes untouched, so
+    # this only bites on the plural — which is the natural way to write "not two NDKs but one".
+    # Measured rather than guessed: `# the NDK is here` is clean, `# two NDKs are here` is
+    # flagged. An `extend-words` entry cannot fix it, because the token typos names is `ND` and
+    # not `NDKs`, and exempting `ND` outright would disable a rule worth keeping. Bounding the
+    # exemption to the whole word is what makes it narrow.
+    '\bNDKs\b',
+]
+
+[default.extend-words]
+# Crate and product names that typos would otherwise "correct"
+Ratatui = "Ratatui"
+ratatui = "ratatui"
+# Serialization abbreviations used throughout the generated bincode/serde code
+ser = "ser"
+de = "de"
+# A span with no parent — the precise tracing term (the plan and ADR 0011 use it). typos
+# would "correct" it to "parentless", which is not the term of art.
+unparented = "unparented"
+# A month name in a language this repository does not ship, named in ADR 0021 to show what a
+# sliced payload can no longer render. It is German, spelled correctly, and is not `december`.
+dezember = "dezember"

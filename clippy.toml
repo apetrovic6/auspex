@@ -1,0 +1,3 @@
+# Keep in sync with rust-version in [workspace.package]. Lets clippy warn when code uses
+# APIs newer than the declared MSRV.
+msrv = "1.90"

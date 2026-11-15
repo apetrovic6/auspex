@@ -1,0 +1,38 @@
+[package]
+name = "i18n-keygen"
+version = "0.1.0"
+description = "Build-time generator turning a rust-i18n locale tree into Key, Locale and wrappers"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Flip to true only if this crate is genuinely meant for a registry.
+publish = false
+
+[lints]
+workspace = true
+
+# A build-time generator: it runs on the host, never on wasm32, so the
+# "everything has to build for wasm" rule that governs the Leptos shells and the crates
+# it links does not reach here.
+#
+# TOML only, deliberately. rust-i18n also globs `.yml`/`.json`, but a project
+# that mixes formats gets two ways to spell the same key and no ordering guarantee
+# between them; adding a format is cheap if one is ever wanted.
+[dependencies]
+toml = "0.9"
+# Only `resources` needs it, and only for the Apple String Catalog: that file is
+# JSON, and hand-rolling the escaping of copy nobody here can compile-check is
+# how a silent misrender starts.
+serde_json = "1"
+# `check::plurals_match_cldr` asks CLDR which categories a locale has, next to the locale
+# files that claim them (ADR 0018). The same `icu_plurals` the shells ask for at runtime,
+# so "does Croatian have `few`?" has one answer in this repository rather than a table
+# copied out of a CLDR report — which is the kind of table that stops being true in a
+# year nobody re-reads. Already in the lock through `icu_decimal`; this adds no new
+# weight to a shipped binary, because a build-time crate is not in one.
+icu_plurals = "2.3"
+# For the locale code that question is asked about: `locales/` names its directories, and
+# this is the parser that turns one into a CLDR key.
+icu_locale_core = "2.3"

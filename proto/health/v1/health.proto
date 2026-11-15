@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package health.v1;
+
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  // Ready to take traffic.
+  STATUS_SERVING = 1;
+  // Alive, but a dependency is unavailable.
+  STATUS_NOT_SERVING = 2;
+}
+
+// One dependency's contribution to readiness, so a failing check says which dependency
+// failed rather than just that something did.
+message Component {
+  string name = 1;
+  Status status = 2;
+  // Populated only when status is not SERVING.
+  string message = 3;
+}
+
+message LiveRequest {}
+
+message LiveResponse {
+  Status status = 1;
+}
+
+message ReadyRequest {}
+
+message ReadyResponse {
+  Status status = 1;
+  repeated Component components = 2;
+}
+
+// Liveness and readiness as RPCs rather than plain HTTP routes, so they go through the
+// same routing, interceptors and codecs as everything else — a health check that bypasses
+// the stack can pass while the stack is broken.
+service HealthService {
+  // The process is up and can answer. Never touches dependencies, so a database outage
+  // does not get the container killed and restarted into the same outage.
+  rpc Live(LiveRequest) returns (LiveResponse);
+  // The process can serve real traffic, dependencies included. This is what a load
+  // balancer should gate on.
+  rpc Ready(ReadyRequest) returns (ReadyResponse);
+}

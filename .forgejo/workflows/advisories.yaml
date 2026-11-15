@@ -1,0 +1,99 @@
+# The checks that need a clock rather than a push.
+#
+# Three acts: the gate with its fix, the pull request the fix allows, and the generated product
+# compiled. Each is a `devenv shell` step on a `nix` runner, and none of them is a derivation —
+# the first two read today's advisory database and the third fetches the CLI from the forge,
+# which are exactly the things a sandbox cannot have.
+#
+# Why a clock at all is the reason this file exists separately from `ci.yaml`: `cargo deny check`
+# on a pull request catches a *new* dependency with a bad licence or a known-vulnerable version.
+# It cannot catch what actually happened to this repository — RUSTSEC publishing an advisory
+# against a dependency that was already here and unchanged. That is a function of the date, not
+# of the commit. Keeping it out of the push pipeline is what stops a Sunday-night advisory from
+# retroactively failing every open pull request with something none of them caused.
+#
+# The second act is the other half of that sentence, and the reason it is only reachable from a
+# clock: an advisory that names a fix has an answer, and the answer is a `Cargo.lock` diff. A bump
+# nobody reviews is worse than no bump, so the unit of work here is a pull request a person can
+# merge or close (ADR 0023). It is not in `ci.yaml` for the reason this whole file is not: a
+# bump is not a fact about the commit under review, and a push must not be able to open a pull
+# request.
+#
+# The third act is here for the other half of that sentence: not something the date does, but
+# something the wall clock does to a push. `template-full` compiles the product this repository
+# generates — a whole `just ci` run inside a second workspace, measured at +654 s against the 17 s
+# structure path every push already runs (RT-6). It fails for a template-side change on a commit
+# up to a day old, and either half reproduces on a laptop: `just check-template yes`.
+#
+# Required repository secret:
+#   secrets.ADVISORY_PR_TOKEN   `write:repository`, and nothing more — it cannot merge, which is
+#                               the difference between an automation that proposes and one that
+#                               decides (ADR 0023). Mapped into the one step that needs it.
+
+name: advisories
+
+on:
+  schedule:
+    # 06:17, rather than on the hour: every scheduled job in the world fires at :00, and this one
+    # has no reason to join them.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  advisories:
+    runs-on: nix
+
+    steps:
+      # `persist-credentials: false`, because the default is `true` and this is the one workflow
+      # here that writes back to the forge. The default records the runner's job token in the
+      # checkout's git config — `http.<server>/.extraheader = AUTHORIZATION: basic <job token>` —
+      # and git sends a header it was handed before it consults any credential helper. The push in
+      # `cargo xtask advisory-pr` goes to that same server URL, so its `GIT_ASKPASS` script and its
+      # `credential.helper=` would never be reached: the push would go out as the job token, which
+      # is the credential ADR 0023 rejects (it can merge, it exists on every run of every workflow,
+      # and it is not the bot) and which `master`'s protection would refuse anyway. Either way the
+      # bot-token path would never run, and a nightly that appears to work while its one write is
+      # made with the wrong credential is the failure this file exists to avoid.
+      #
+      # Nothing else in the job needs the job token: `deny` fetches its advisory database from a
+      # host that header is not scoped to, and `check-template` fetches the CLI from the forge at
+      # the pinned revision — a network fetch, which is also why the checkout has to happen at all.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The gate, with its fix — one step, and the fusion is load-bearing rather than tidy.
+      # `just deny --fix` prints the same verdict and exits with the same non-zero status whenever
+      # anything is left unfixable, so a separate reporting step would add nothing; worse, the
+      # order is not interchangeable, because the plain gate exits non-zero whenever *any* advisory
+      # exists, including the ones this step is about to fix, and a failed step stops the job
+      # before the bump could run.
+      #
+      # Green here means a pull request is open, not that nothing is wrong: the advisories are
+      # cleared in a `Cargo.lock` nobody has committed, and the review is where they live now. Red
+      # here means the escalation ADR 0023 asks for — an advisory no safe update can reach,
+      # reported by a job that fails.
+      #
+      # Nothing here needs a cache-busting stamp, and that is a property of the shape rather than
+      # luck: a gate whose whole reason for existing is that *the date* moved must never be
+      # answered from a cache. A `devenv shell` step has no cache to answer from — it always runs.
+      # (A step that ever became a derivation would need one, or it would report the advisories of
+      # the first night it ever ran, forever.)
+      - name: Advisories, and the bump they allow
+        run: devenv shell -- just deny --fix
+
+      # The bump becomes a branch and a pull request. The only credential in this file, on the one
+      # step that needs it, mapped into `env:` rather than interpolated at the call. An empty
+      # mapping is treated as no token at all, and the step fails naming it: a scheduled run that
+      # opens nothing says so, because a nightly that quietly succeeds is the failure this design
+      # is built to avoid.
+      #
+      # `cargo xtask advisory-pr` rather than a step that shells out to git and the API: the dedupe
+      # against open pull requests, the capped title, the branch name and the body are logic with
+      # tests (tools/xtask/src/advisory_pr.rs), and the same command reproduces the act on a laptop
+      # against a bump made an hour earlier.
+      - name: Open the advisory pull request
+        env:
+          ADVISORY_PR_TOKEN: ${{ secrets.ADVISORY_PR_TOKEN }}
+        run: devenv shell -- cargo xtask advisory-pr
+

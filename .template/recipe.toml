@@ -1,0 +1,15 @@
+# Written by generators, not by hand.
+version = 1
+
+[new]
+authors = "apetrovic <petrovicante6@gmail.com>"
+repository = "https://forge.noosphere.uk/manjo/auspex"
+license = "MIT OR Apache-2.0"
+description = "A fleet scanner TUI for Clan: reachability, drift, deploy previews and deploys."
+app = ""
+org = "com.example"
+drop_example = true
+
+[[step]]
+tool = "cli"
+args = ["add", "crux-app", "auspex", "--shells", "tui"]

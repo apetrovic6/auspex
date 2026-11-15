@@ -1,0 +1,31 @@
+[package]
+name = "connect-web"
+version = "0.1.0"
+description = "A Connect RPC client transport backed by the browser's fetch API"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Internal to this repository.
+publish = false
+
+[lints]
+workspace = true
+
+# Only for wasm32. On any other target this crate compiles to nothing (see lib.rs), so it
+# stays a member of the workspace — `cargo clippy --all-targets` on the host still visits
+# it — without dragging the browser bindings into a native build.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bytes = "1"
+connectrpc.workspace = true
+futures-channel = "0.3"
+http = "1"
+http-body-util = "0.1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-sys]
+version = "0.3"
+features = ["Headers", "Request", "RequestInit", "Response", "Window"]

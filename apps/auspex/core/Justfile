@@ -1,0 +1,34 @@
+mod lib '../../../just/lib.just'
+mod rust '../../../just/rust.just'
+
+pkg := "auspex-core"
+
+default: dev
+
+# checks required tools are installed
+doctor:
+    @echo '{{ style("command") }}doctor:{{ NORMAL }}'
+    @just lib::check-crux-core
+
+# auto-fix formatting issues
+fix:
+    @just rust::fmt
+
+# validate formatting and lint, natively and for wasm (the web shell builds this crate
+# for wasm32, so a lint that only passes natively is not enough)
+check:
+    @just rust::fmt-check
+    @just rust::clippy {{ pkg }} --all-targets
+    @just rust::clippy {{ pkg }} --target wasm32-unknown-unknown
+
+build:
+    @just rust::build {{ pkg }}
+
+test:
+    @just rust::test {{ pkg }}
+
+clean:
+    cargo clean -p {{ pkg }}
+
+dev: fix check build test
+ci: check build test

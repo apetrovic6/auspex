@@ -1,0 +1,317 @@
+//! OIDC verification, through the real router.
+//!
+//! Written by `cargo xtask add-auth-oidc` (`docs/adr/0027`). The rest of this suite swaps in a
+//! `TestVerifier` (`helpers.rs`), which proves the identity seam is mounted where a request hits
+//! it. This file proves the other half: that a credential survives the whole path with the
+//! **real** verifier — header, layer, verifier, a real HTTP fetch of the provider's keys,
+//! signature check, extension, handler. `build_router` takes the verifier as an argument, so what
+//! this cannot see is `main.rs` choosing it; that line is one `Arc::new(oidc::Verifier::new(..))`
+//! the compiler checks, and the configuration tests below are what stop it being built without an
+//! issuer.
+//!
+//! The provider is `oidc::testing::TestIdp`: an HTTP server on a loopback port in this process,
+//! publishing a public test key (`crates/oidc/src/testing`). Nothing leaves the machine, so the
+//! suite runs in the sandboxed `ci-test` like the rest. What each failure of the verifier itself
+//! looks like (algorithm confusion, expiry, rotation, a stale cache) is `crates/oidc`'s own suite;
+//! this one asserts the three answers a caller can get, and that the committed configuration
+//! cannot start a service with no issuer.
+
+use std::path::PathBuf;
+use axum::Router;
+use axum::http::{HeaderValue, StatusCode, header};
+use connectrpc::ErrorCode;
+use connectrpc::client::{ClientConfig, ServiceTransport};
+use oidc::testing::{self, AUDIENCE, SUBJECT, SigningKey, TestIdp};
+use proto::r#gen::{
+    buffa::@PKG@::WhoamiRequest, connect::@PKG@::@CLIENT@,
+};
+use __snake__::config::{AuthSettings, CONFIG_NAME, Settings};
+use __snake__::startup::{Reflection, Web};
+
+use crate::helpers::{client_config, raw_call_to_authorized};
+
+/// The real router with the real verifier pointed at `idp`.
+///
+/// The verifier comes from `__snake__::auth::verifier`, the function `main.rs` calls, with settings
+/// built the way the configuration would build them. That is the point: a test that constructed
+/// `oidc::Verifier` itself would keep passing after `main.rs` was edited back to
+/// `identity::NoIdentities`, because nothing under `tests/` can run `main.rs`. Break the function
+/// and `a_token_the_provider_signed_reaches_the_handler_as_its_subject` fails.
+fn router(idp: &TestIdp) -> Router {
+    let settings = AuthSettings {
+        issuer: idp.issuer().to_owned(),
+        audience: AUDIENCE.to_owned(),
+        ..Default::default()
+    };
+    let verifier =
+        __snake__::auth::verifier(&settings).expect("a loopback issuer is a valid configuration");
+    __snake__::startup::build_router(@DB@verifier, Reflection::Withheld, Web::Absent)
+}
+
+fn token(idp: &TestIdp) -> String {
+    testing::sign(SigningKey::A, "k1", &testing::claims(idp.issuer()))
+}
+
+fn bearer(token: &str) -> ClientConfig {
+    client_config().with_default_header(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {token}")).expect("a JWT is ASCII"),
+    )
+}
+
+fn whoami() -> String {
+    format!("{}/@PATH@/Whoami", __snake__::API_PREFIX)
+}
+
+#[tokio::test]
+async fn a_token_the_provider_signed_reaches_the_handler_as_its_subject() {
+    let idp = TestIdp::start(&[("k1", SigningKey::A)]).await;
+    let client = @CLIENT@::new(
+        ServiceTransport::new(router(&idp)),
+        bearer(&token(&idp)),
+    );
+
+    let response = client
+        .whoami(WhoamiRequest::default())
+        .await
+        .expect("a token from the configured provider, for the configured audience");
+
+    assert_eq!(
+        response.into_owned().subject,
+        SUBJECT,
+        "the handler must see the subject the token named, not the token"
+    );
+}
+
+#[tokio::test]
+async fn no_token_is_unauthenticated_and_does_not_wake_the_provider() {
+    let idp = TestIdp::start(&[("k1", SigningKey::A)]).await;
+    let client = @CLIENT@::new(ServiceTransport::new(router(&idp)), client_config());
+
+    let error = client
+        .whoami(WhoamiRequest::default())
+        .await
+        .expect_err("no credential means no identity");
+
+    assert_eq!(error.code, ErrorCode::Unauthenticated);
+    assert_eq!(error.message.as_deref(), Some("authentication required"));
+    assert_eq!(
+        idp.jwks_hits(),
+        0,
+        "an anonymous call to a public service must not cost the provider a request"
+    );
+}
+
+#[tokio::test]
+async fn a_token_the_provider_would_not_have_signed_is_unauthenticated() {
+    let idp = TestIdp::start(&[("k1", SigningKey::A)]).await;
+    // Right shape, right `kid`, wrong key: signed by the one the provider does not publish.
+    let forged = testing::sign(SigningKey::B, "k1", &testing::claims(idp.issuer()));
+
+    for presented in [forged.as_str(), "not-a-token"] {
+        let (status, body) = raw_call_to_authorized(
+            router(&idp),
+            &whoami(),
+            "{}",
+            &format!("Bearer {presented}"),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+        assert_eq!(body["code"], "unauthenticated", "{body}");
+        assert_eq!(
+            body["message"], "authentication required",
+            "one answer for every reason a credential is refused"
+        );
+        assert!(
+            !body.to_string().contains(presented),
+            "the credential reached the wire: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_provider_that_cannot_be_reached_is_internal_and_not_a_refusal() {
+    // The other arm of `VerifyFailure`: nobody said the credential is bad, and a 401 here would
+    // tell a caller with a good token to throw it away and sign in again against the same dead
+    // provider.
+    let mut idp = TestIdp::start(&[("k1", SigningKey::A)]).await;
+    let presented = token(&idp);
+    let router = router(&idp);
+    idp.stop().await;
+
+    let (status, body) =
+        raw_call_to_authorized(router, &whoami(), "{}", &format!("Bearer {presented}")).await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(body["code"], "internal", "{body}");
+    assert_eq!(
+        body["message"], "the service could not check that credential",
+        "{body}"
+    );
+    assert!(
+        !body.to_string().contains(&presented),
+        "the credential reached the wire: {body}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------------
+// The committed configuration
+// -------------------------------------------------------------------------------------------------
+
+/// The configuration directory as committed — not a fixture. A test that builds `AuthSettings` by
+/// hand cannot see a file problem, and the interesting question is what the files and a
+/// deployment's environment make between them.
+fn committed() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("config")
+}
+
+/// What a deployment runs: its own profile, so the committed `local` overlay does not apply.
+fn load(environment: &[(&str, &str)]) -> Settings {
+    settings::load_from_env(
+        &committed(),
+        CONFIG_NAME,
+        "production",
+        environment
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+    )
+    .expect("the committed configuration loads")
+}
+
+#[test]
+fn the_committed_file_names_an_audience_and_leaves_the_issuer_to_the_deployment() {
+    let settings = load(&[]);
+
+    assert!(
+        !settings.auth.audience.is_empty(),
+        "config/__name__.toml should carry the audience"
+    );
+    assert!(
+        settings.auth.issuer.is_empty(),
+        "an issuer committed to the base file is baked into the image and inherited by every \
+         environment"
+    );
+}
+
+#[test]
+fn a_deployment_with_no_issuer_is_refused_at_load_not_left_to_deny_everyone() {
+    let message = load(&[])
+        .auth
+        .validate()
+        .expect_err("no issuer must stop the service")
+        .to_string();
+
+    assert!(message.contains("APP__AUTH__ISSUER"), "name the fix: {message}");
+}
+
+#[test]
+fn an_issuer_from_the_environment_is_enough() {
+    load(&[("APP__AUTH__ISSUER", "https://id.example.com")])
+        .auth
+        .validate()
+        .expect("an https issuer and the committed audience are a complete configuration");
+}
+
+#[test]
+fn a_cleartext_issuer_is_refused_unless_it_is_loopback() {
+    let refused = load(&[("APP__AUTH__ISSUER", "http://id.example.com")])
+        .auth
+        .validate()
+        .expect_err("keys fetched in the clear can be replaced by anyone on the path")
+        .to_string();
+    assert!(refused.contains("https://"), "{refused}");
+
+    load(&[("APP__AUTH__ISSUER", "http://127.0.0.1:8080")])
+        .auth
+        .validate()
+        .expect("loopback is the machine itself, for dev and tests");
+}
+
+// -------------------------------------------------------------------------------------------------
+// Algorithm validation — built by hand so the test is about the code, not about the config file
+// -------------------------------------------------------------------------------------------------
+
+/// An `AuthSettings` that is valid except for its algorithms, with `issuer` and `audience` set
+/// so only the algorithm field is tested.
+fn with_algorithms(algorithms: Vec<String>) -> AuthSettings {
+    AuthSettings {
+        issuer: "https://id.example.com".to_owned(),
+        audience: "test-audience".to_owned(),
+        algorithms,
+    }
+}
+
+#[test]
+fn the_default_algorithms_validate() {
+    with_algorithms(vec!["RS256".to_owned()])
+        .validate()
+        .expect("RS256 should validate, so the default list works");
+}
+
+#[test]
+fn explicit_rs256_validates() {
+    with_algorithms(vec!["RS256".to_owned()])
+        .validate()
+        .expect("RS256 alone is valid");
+}
+
+#[test]
+fn empty_algorithms_is_refused_at_validation() {
+    let error = with_algorithms(vec![])
+        .validate()
+        .expect_err("empty algorithm list must be refused")
+        .to_string();
+    assert!(
+        error.contains("auth.algorithms"),
+        "the error must name auth.algorithms: {error}"
+    );
+}
+
+#[test]
+fn hs256_is_refused_at_validation() {
+    let error = with_algorithms(vec!["HS256".to_owned()])
+        .validate()
+        .expect_err("HS256 must be refused")
+        .to_string();
+    assert!(
+        error.contains("auth.algorithms"),
+        "the error must name auth.algorithms: {error}"
+    );
+}
+
+#[test]
+fn none_is_refused_at_validation() {
+    let error = with_algorithms(vec!["none".to_owned()])
+        .validate()
+        .expect_err("none must be refused")
+        .to_string();
+    assert!(
+        error.contains("auth.algorithms"),
+        "the error must name auth.algorithms: {error}"
+    );
+}
+
+#[test]
+fn lowercase_algorithm_is_refused_at_validation() {
+    let error = with_algorithms(vec!["rs256".to_owned()])
+        .validate()
+        .expect_err("lowercase rs256 must be refused")
+        .to_string();
+    assert!(
+        error.contains("auth.algorithms"),
+        "the error must name auth.algorithms: {error}"
+    );
+}
+
+#[test]
+fn duplicate_algorithms_is_refused_at_validation() {
+    let error = with_algorithms(vec!["RS256".to_owned(), "RS256".to_owned()])
+        .validate()
+        .expect_err("duplicate RS256 must be refused")
+        .to_string();
+    assert!(
+        error.contains("auth.algorithms"),
+        "the error must name auth.algorithms: {error}"
+    );
+}

@@ -1,0 +1,5 @@
+# Keys for the auspex app. Every key in this file must start with `auspex.`:
+# rust-i18n globs `locales/**/*.toml` into one flat key space, so the directory
+# contributes nothing to the key and the prefix is what keeps two pages apart.
+# See ADR 0014; `i18n-keygen` fails the build on a key that breaks the rule.
+[auspex]
