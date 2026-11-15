@@ -5,14 +5,31 @@
 //! an escape sequence in them can move the cursor, retitle the terminal or worse. So every
 //! piece of such text that reaches a status reason goes through [`sanitize_line`] first,
 //! and so does the inventory text the report prints (tags, `buildHost`).
+//!
+//! Both functions are public so that an adapter can make its own outside text safe (an
+//! HTTP error body from ncps or Prometheus, a tool's stderr) the same way, without going
+//! through a parser.
 
-/// Strips ANSI escape sequences, every other control character (C0, DEL and C1), every
+/// Makes one line safe to print in a terminal.
+///
+/// It strips ANSI escape sequences, every other control character (C0, DEL and C1), every
 /// Unicode format character (category Cf: the bidi embeddings, overrides and isolates, the
 /// zero-width spaces and joiners, the BOM) and the line and paragraph separators, and trims
 /// the result. Tabs become a space; nothing else is kept.
 ///
+/// It is for one line: line breaks are control characters too, so the lines of a
+/// multi-line text would run together. Use [`sanitized_tail`] for those.
+///
+/// ```
+/// use auspex_domain::text::sanitize_line;
+///
+/// assert_eq!(sanitize_line(" \u{1b}[1mHost key verification failed.\u{1b}[0m\r"), "Host key verification failed.");
+/// assert_eq!(sanitize_line("a\u{202e}b\tc"), "ab c");
+/// ```
+///
 /// Format characters are invisible but not inert: U+202E reverses the text after it in a
 /// terminal that applies bidi, so a reason can be made to read as something it does not say.
+#[must_use]
 pub fn sanitize_line(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -87,14 +104,30 @@ const fn is_format(c: char) -> bool {
     )
 }
 
-/// The last `n` non-empty lines of `text`, sanitised, oldest first.
-pub fn last_lines(text: &str, n: usize) -> Vec<String> {
+/// The last `max_lines` non-empty lines of `text`, sanitised, oldest first.
+///
+/// Each line goes through [`sanitize_line`]. Lines that are empty after sanitising (blank lines, a line that was only an
+/// escape sequence) are skipped and do not count.
+///
+/// This is the function for multi-line text from outside: nix's error output, ssh's
+/// stderr, an HTTP server's error body. The useful part of such text is usually at the end
+/// (nix prints its trace first and `error: …` last), so the tail is what is kept.
+///
+/// ```
+/// use auspex_domain::text::sanitized_tail;
+///
+/// let stderr = "warning: x\n\n\u{1b}[31merror:\u{1b}[0m boom\u{202e}\n";
+/// assert_eq!(sanitized_tail(stderr, 1), ["error: boom"]);
+/// assert_eq!(sanitized_tail(stderr, 5), ["warning: x", "error: boom"]);
+/// ```
+#[must_use]
+pub fn sanitized_tail(text: &str, max_lines: usize) -> Vec<String> {
     let mut lines: Vec<String> = text
         .lines()
         .map(sanitize_line)
         .filter(|l| !l.is_empty())
         .collect();
-    let start = lines.len().saturating_sub(n);
+    let start = lines.len().saturating_sub(max_lines);
     lines.drain(..start);
     lines
 }
@@ -171,7 +204,7 @@ mod tests {
 
     #[test]
     fn last_lines_skips_blanks() {
-        assert_eq!(last_lines("a\n\nb\n  \nc\n", 2), vec!["b", "c"]);
-        assert_eq!(last_lines("", 3), Vec::<String>::new());
+        assert_eq!(sanitized_tail("a\n\nb\n  \nc\n", 2), vec!["b", "c"]);
+        assert_eq!(sanitized_tail("", 3), Vec::<String>::new());
     }
 }

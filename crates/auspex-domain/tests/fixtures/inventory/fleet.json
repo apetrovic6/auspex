@@ -12,7 +12,7 @@
     "machineClass": "darwin"
   },
   "alfrost": {
-    "deploy": { "targetHost": "root@[2001:db8::7]:2222?ProxyJump=bastion" },
+    "deploy": { "targetHost": "root@[2001:db8::7]:2222?Compression=yes" },
     "tags": ["base", "server"]
   },
   "cerberus": {

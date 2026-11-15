@@ -19,7 +19,7 @@ use auspex_domain::observe::{
 use auspex_domain::report::{
     FleetError, FleetErrorKind, FleetFacts, FleetReport, JSON_VERSION, fleet_report, machine_report,
 };
-use auspex_domain::status::{Badge, MachineFacts, NarCache};
+use auspex_domain::status::{Badge, MachineFacts, NarCache, Outstanding};
 
 const INVENTORY: &str = r#"{
   "terra":    {"deploy": {"targetHost": "root@192.168.1.10", "buildHost": "localhost"}, "tags": ["base", "k8s-base"]},
@@ -37,7 +37,7 @@ const CERBERUS: &str = "/nix/store/3123456789abcdfghijklmnpqrsvwxyz-nixos-system
 
 fn success(attr: &str, out: &str) -> EvalOutcome {
     parse_eval_line(
-        &serde_json::json!({"attr": attr, "drvPath": format!("{out}.drv"), "outputs": {"out": out}})
+        &serde_json::json!({"attr": attr, "attrPath": [attr], "drvPath": format!("{out}.drv"), "outputs": {"out": out}})
             .to_string(),
     )
     .unwrap()
@@ -114,7 +114,7 @@ fn evals() -> BTreeMap<&'static str, EvalOutcome> {
         ("cerberus", success("cerberus", CERBERUS)),
         (
             "luna",
-            parse_eval_line(r#"{"attr":"luna","error":"error: attribute 'k3sToken' missing"}"#)
+            parse_eval_line(r#"{"attr":"luna","attrPath":["luna"],"error":"error: attribute 'k3sToken' missing"}"#)
                 .unwrap(),
         ),
     ]
@@ -159,7 +159,7 @@ fn rest(
                 cache: if m.name == "terra" {
                     NarCache::Cached
                 } else {
-                    NarCache::Unknown
+                    NarCache::NotApplicable
                 },
                 frozen: m.name == "cerberus",
                 ..MachineFacts::default()
@@ -173,7 +173,15 @@ fn rest(
             )
         })
         .collect();
-    fleet_report(reports, shared, FleetFacts::default())
+    fleet_report(reports, shared, complete())
+}
+
+/// The scan's fleet-wide requests are all back, nothing else to say.
+fn complete() -> FleetFacts {
+    FleetFacts {
+        scan_complete: true,
+        ..FleetFacts::default()
+    }
 }
 
 fn snapshot() -> serde_json::Value {
@@ -236,6 +244,7 @@ fn failed_inventory_report() -> FleetReport {
         vec![],
         vec![],
         FleetFacts {
+            scan_complete: true,
             timed_out: false,
             errors: vec![FleetError::new(
                 FleetErrorKind::InventoryFailed,
@@ -267,6 +276,7 @@ fn fleet_errors_are_reported_and_never_settle() {
             vec![],
             vec![],
             FleetFacts {
+                scan_complete: true,
                 timed_out: false,
                 errors: vec![FleetError {
                     kind,
@@ -282,7 +292,7 @@ fn fleet_errors_are_reported_and_never_settle() {
         assert_eq!(json["errors"][0]["reason"], "xy");
     }
     // No errors: the field is present and empty.
-    let r = fleet_report(vec![], vec![], FleetFacts::default());
+    let r = fleet_report(vec![], vec![], complete());
     assert!(r.settled);
     assert_eq!(
         serde_json::to_value(&r).unwrap()["errors"],
@@ -299,12 +309,13 @@ fn deadline_means_not_settled() {
         .find(|m| m.settled)
         .expect("the snapshot has a settled machine");
     let settled = vec![one];
-    let done = fleet_report(settled.clone(), vec![], FleetFacts::default());
+    let done = fleet_report(settled.clone(), vec![], complete());
     assert!(done.settled);
     let cut = fleet_report(
         settled,
         vec![],
         FleetFacts {
+            scan_complete: true,
             timed_out: true,
             errors: vec![],
         },
@@ -333,7 +344,8 @@ fn settled_needs_the_probe_and_the_eval() {
         "ssh: connect to host 192.168.1.20 port 22: Connection timed out\n",
         ProbeExit::Code(255),
     );
-    let err = parse_eval_line(r#"{"attr":"mars","error":"error: boom"}"#).unwrap();
+    let err =
+        parse_eval_line(r#"{"attr":"mars","attrPath":["mars"],"error":"error: boom"}"#).unwrap();
     let ok = success("mars", TERRA_NOW);
     let up = probe(&format!(
         "probe=nixos\ncurrent_system={TERRA_NOW}\nsystem_state=running\nfailed_units=[]\n"
@@ -364,7 +376,7 @@ fn settled_needs_the_probe_and_the_eval() {
     for (i, (r, want)) in cases.into_iter().enumerate() {
         assert_eq!(r.settled, want, "case {i}: {r:?}");
         assert_eq!(
-            fleet_report(vec![r], vec![], FleetFacts::default()).settled,
+            fleet_report(vec![r], vec![], complete()).settled,
             want,
             "case {i}"
         );
@@ -378,7 +390,7 @@ fn fleet_report_sorts_machines() {
     let want: Vec<String> = r.machines.iter().map(|m| m.name.clone()).collect();
     assert!(want.windows(2).all(|w| w[0] < w[1]));
     r.machines.reverse();
-    let sorted = fleet_report(r.machines, vec![], FleetFacts::default());
+    let sorted = fleet_report(r.machines, vec![], complete());
     let got: Vec<String> = sorted.machines.iter().map(|m| m.name.clone()).collect();
     assert_eq!(got, want);
 }
@@ -489,4 +501,108 @@ fn inventory_text_is_sanitised_in_the_report() {
     assert_eq!(r.name, "terra");
     assert_eq!(r.tags, ["base"]);
     assert_eq!(r.build_host.as_deref(), Some("x"));
+}
+
+fn terra() -> Machine {
+    machine("terra", "root@192.168.1.10")
+}
+
+/// N2: with an update pending, a machine is not settled until its ncps lookup answers, so
+/// `--json` cannot print before `cached` can appear.
+#[test]
+fn settled_waits_for_the_cache_lookup() {
+    let m = terra();
+    let p = probe(&format!(
+        "probe=nixos\ncurrent_system={TERRA_NOW}\nsystem_state=running\nfailed_units=[]\n"
+    ));
+    let e = success("terra", TERRA_NEXT);
+    let r = |cache| {
+        machine_report(
+            &m,
+            &resolve_target(&m, None),
+            &MachineFacts {
+                probe: Some(&p),
+                eval: Some(&e),
+                cache,
+                ..MachineFacts::default()
+            },
+            Health::default(),
+            &[],
+        )
+    };
+    let before = r(NarCache::Pending);
+    assert!(!before.settled);
+    assert!(!fleet_report(vec![before], vec![], complete()).settled);
+    for (cache, badges) in [
+        (NarCache::Cached, vec![Badge::UpdatePending, Badge::Cached]),
+        (NarCache::NotCached, vec![Badge::UpdatePending]),
+        (NarCache::Failed, vec![Badge::UpdatePending]),
+        (NarCache::NotApplicable, vec![Badge::UpdatePending]),
+    ] {
+        let after = r(cache);
+        assert!(after.settled, "{cache:?}");
+        assert_eq!(after.badges, badges, "{cache:?}");
+        assert!(
+            fleet_report(vec![after], vec![], complete()).settled,
+            "{cache:?}"
+        );
+    }
+}
+
+/// N2: an outstanding Prometheus (or Alertmanager) answer keeps the machine unsettled.
+#[test]
+fn settled_waits_for_prometheus_and_alerts() {
+    let m = terra();
+    let p = probe(&format!(
+        "probe=nixos\ncurrent_system={TERRA_NOW}\nsystem_state=running\nfailed_units=[]\n"
+    ));
+    let e = success("terra", TERRA_NOW);
+    let r = |outstanding| {
+        machine_report(
+            &m,
+            &resolve_target(&m, None),
+            &MachineFacts {
+                probe: Some(&p),
+                eval: Some(&e),
+                outstanding,
+                ..MachineFacts::default()
+            },
+            Health::default(),
+            &[],
+        )
+    };
+    assert!(r(Outstanding::default()).settled);
+    for o in [
+        Outstanding {
+            prometheus: true,
+            alerts: false,
+        },
+        Outstanding {
+            prometheus: false,
+            alerts: true,
+        },
+    ] {
+        let rep = r(o);
+        assert!(!rep.settled, "{o:?}");
+        assert!(
+            !fleet_report(vec![rep], vec![], complete()).settled,
+            "{o:?}"
+        );
+    }
+}
+
+/// N2: a scan still in progress is not settled, even with no machines yet, or with every
+/// row it has settled. The default `FleetFacts` is "in progress".
+#[test]
+fn scan_in_progress_is_not_settled() {
+    assert!(!fleet_report(vec![], vec![], FleetFacts::default()).settled);
+    let one = snapshot_report()
+        .machines
+        .into_iter()
+        .find(|m| m.settled)
+        .expect("the snapshot has a settled machine");
+    assert!(!fleet_report(vec![one.clone()], vec![], FleetFacts::default()).settled);
+    assert!(fleet_report(vec![one], vec![], complete()).settled);
+    // An empty fleet whose scan really is complete is settled (and healthy).
+    assert!(fleet_report(vec![], vec![], complete()).settled);
 }

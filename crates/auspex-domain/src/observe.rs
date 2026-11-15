@@ -9,7 +9,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::fleet::MachineClass;
-use crate::text::{last_lines, sanitize_line};
+use crate::text::{sanitize_line, sanitized_tail};
 
 // ---------------------------------------------------------------------------------------
 // The scripts
@@ -101,12 +101,35 @@ pub struct NotAStorePath(pub String);
 const STORE: &str = "/nix/store/";
 const HASH_LEN: usize = 32;
 
+/// nix's base-32 alphabet: digits and lowercase letters without `e`, `o`, `t` and `u`.
+const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
+
+/// The longest store path name nix accepts (checked against nix 2.35.6: a 211-character
+/// derivation name evaluates, 212 is refused as invalid).
+const MAX_NAME_LEN: usize = 211;
+
+/// The characters nix allows in a store path name, which this crate also requires of every
+/// later component.
+const fn is_store_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.' | b'_' | b'?' | b'=')
+}
+
 impl StorePath {
-    /// Validates a store path: `/nix/store/`, a 32-character hash, `-`, a name, and no
-    /// whitespace or control characters anywhere. After the `<hash>-<name>` part, a path
-    /// may go on into the store object (`…-linux-6.12.1/bzImage`), but only by plain
-    /// components: an empty, `.` or `..` component is refused, because
-    /// `…-system/../../../run/current-system` names a path outside the store.
+    /// Validates a store path strictly, as nix writes one:
+    ///
+    /// - `/nix/store/`, then exactly 32 characters of nix's base-32 alphabet
+    ///   (`0123456789abcdfghijklmnpqrsvwxyz`), then `-`;
+    /// - a name of 1 to 211 characters from `[A-Za-z0-9+._?=-]` that does not start with
+    ///   `.`;
+    /// - optionally, further `/`-separated components into the store object
+    ///   (`…-linux-6.12.1/bzImage`), from the same characters, never empty, `.` or `..`
+    ///   (`…-system/../../../run/current-system` names a path outside the store).
+    ///
+    /// Anything else is refused, so a store path in the report can carry no whitespace,
+    /// control or format character (a bidi override in a remote's `/run/current-system`
+    /// target), no shell metacharacter and nothing outside ASCII. The name rule is nix's own
+    /// character set; nix 2.35 itself accepts a name starting with `.`, but no system,
+    /// kernel or initrd is named that way, and refusing it is the stricter side.
     ///
     /// # Errors
     ///
@@ -115,13 +138,13 @@ impl StorePath {
         let s = s.into();
         let ok = s.strip_prefix(STORE).is_some_and(|rest| {
             let mut parts = rest.split('/');
-            let base = parts.next().unwrap_or("");
+            let base = parts.next().unwrap_or("").as_bytes();
             base.len() > HASH_LEN + 1
-                && base.is_char_boundary(HASH_LEN)
-                && base[..HASH_LEN].bytes().all(|b| b.is_ascii_alphanumeric())
-                && base.as_bytes()[HASH_LEN] == b'-'
-                && parts.all(|p| !matches!(p, "" | "." | ".."))
-        }) && !s.chars().any(|c| c.is_whitespace() || c.is_control());
+                && base[..HASH_LEN].iter().all(|b| NIX32.contains(b))
+                && base[HASH_LEN] == b'-'
+                && valid_name(&base[HASH_LEN + 1..])
+                && parts.all(|p| !matches!(p, "" | "." | "..") && p.bytes().all(is_store_char))
+        });
         if ok {
             Ok(Self(s))
         } else {
@@ -147,6 +170,13 @@ impl StorePath {
         let rest = &self.0[STORE.len() + HASH_LEN + 1..];
         rest.split('/').next().unwrap_or(rest)
     }
+}
+
+fn valid_name(name: &[u8]) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_NAME_LEN
+        && name[0] != b'.'
+        && name.iter().copied().all(is_store_char)
 }
 
 impl TryFrom<String> for StorePath {
@@ -230,10 +260,14 @@ pub struct Observation {
     /// `nixos-version`/`darwin-version --configuration-revision`. `None` when empty or
     /// `null`, which is what an unset `system.configurationRevision` prints.
     pub configuration_revision: Option<String>,
-    /// `systemctl is-system-running` (`running`, `degraded`, …). NixOS only.
+    /// `systemctl is-system-running`: one of systemd's eight states (`initializing`,
+    /// `starting`, `running`, `degraded`, `maintenance`, `stopping`, `offline`, `unknown`).
+    /// `None` on darwin, or when the probe printed anything else (unreadable). NixOS only.
     pub system_state: Option<String>,
-    /// Failed units, by name. `None` when unknown (darwin, or systemctl's output did not
-    /// parse); `Some(vec![])` when systemd reported none.
+    /// Failed units, by name, each in systemd's unit-name character set
+    /// (`[A-Za-z0-9:_.\@-]`, at most 255 characters). `None` when unknown: darwin, or
+    /// systemctl's output did not parse, or any name in it was outside that set.
+    /// `Some(vec![])` when systemd reported none.
     pub failed_units: Option<Vec<String>>,
     /// Uptime, disk and load as the probe saw them.
     pub ssh_health: SshHealth,
@@ -314,19 +348,50 @@ fn text_value(v: &str) -> Option<String> {
     (!v.is_empty() && v != "null").then_some(v)
 }
 
+/// The states `systemctl is-system-running` prints (systemd's `systemctl(1)`). Anything
+/// else is not systemd's answer, and is read as "could not be read".
+const SYSTEMD_STATES: &[&str] = &[
+    "initializing",
+    "starting",
+    "running",
+    "degraded",
+    "maintenance",
+    "stopping",
+    "offline",
+    "unknown",
+];
+
+fn parse_system_state(v: &str) -> Option<String> {
+    let v = v.trim();
+    SYSTEMD_STATES.contains(&v).then(|| v.to_owned())
+}
+
+/// The longest unit name systemd allows (`UNIT_NAME_MAX`).
+const MAX_UNIT_NAME: usize = 255;
+
+/// systemd's unit-name characters: ASCII letters and digits, `:`, `_`, `.`, `\`, `@` and
+/// `-` (`\` for its `\x2d` escapes).
+fn is_unit_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_UNIT_NAME
+        && name.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'.' | b'\\' | b'@' | b'-')
+        })
+}
+
+/// The failed-unit list, or `None` when it is not a list of `{"unit": name}` objects or any
+/// name is outside systemd's character set: one forged name makes the whole list
+/// unreadable, rather than being dropped while the rest is believed.
 fn parse_failed_units(v: &str) -> Option<Vec<String>> {
     #[derive(Deserialize)]
     struct Unit {
         unit: String,
     }
     let units: Vec<Unit> = serde_json::from_str(v.trim()).ok()?;
-    Some(
-        units
-            .into_iter()
-            .map(|u| sanitize_line(&u.unit))
-            .filter(|u| !u.is_empty())
-            .collect(),
-    )
+    units
+        .into_iter()
+        .map(|u| is_unit_name(&u.unit).then_some(u.unit))
+        .collect()
 }
 
 fn parse_uptime(v: &str) -> Option<u64> {
@@ -365,7 +430,7 @@ fn parse_disk(v: &str) -> Option<DiskUsage> {
 }
 
 fn last_stderr_line(stderr: &str) -> Option<String> {
-    last_lines(stderr, 1).pop()
+    sanitized_tail(stderr, 1).pop()
 }
 
 /// Turns one probe's stdout, stderr and exit into a [`ProbeOutcome`].
@@ -443,7 +508,7 @@ pub fn parse_probe(stdout: &str, stderr: &str, exit: ProbeExit) -> ProbeOutcome 
             "current_kernel" => obs.current_kernel = store_path(value),
             "current_initrd" => obs.current_initrd = store_path(value),
             "configuration_revision" => obs.configuration_revision = text_value(value),
-            "system_state" => obs.system_state = text_value(value),
+            "system_state" => obs.system_state = parse_system_state(value),
             "failed_units" => obs.failed_units = parse_failed_units(value),
             "uptime_seconds" => obs.ssh_health.uptime_seconds = parse_uptime(value),
             "load" => obs.ssh_health.load = parse_load(value),
@@ -886,14 +951,138 @@ mod tests {
         );
     }
 
-    /// M39 and M45: remote text in the observation is sanitised.
+    /// M45: the revision is sanitised. N7: a unit name outside systemd's character set
+    /// makes the whole failed-unit list unreadable, rather than being cleaned and believed.
     #[test]
-    fn unit_names_and_revision_are_sanitised() {
+    fn unit_names_and_revision_are_checked() {
         let out = "auspex_probe=1\nconfiguration_revision=\u{1b}[2Jabc\u{202e}def\n\
-                   failed_units=[{\"unit\":\"x\\u001b]0;t\\u0007.service\"},{\"unit\":\"\\u202e\"}]\n\
                    auspex_end=1\n";
         let o = observed(parse_probe(out, "", ProbeExit::Code(0)));
         assert_eq!(o.configuration_revision.as_deref(), Some("abcdef"));
-        assert_eq!(o.failed_units, Some(vec!["x.service".to_owned()]));
+
+        let units = |json: &str| {
+            observed(parse_probe(
+                &format!("auspex_probe=1\nfailed_units={json}\nauspex_end=1\n"),
+                "",
+                ProbeExit::Code(0),
+            ))
+            .failed_units
+        };
+        assert_eq!(
+            units(
+                r#"[{"unit":"a.service"},{"unit":"getty@tty1.service"},{"unit":"dev-disk-by\\x2duuid-a:b_c.mount"}]"#
+            ),
+            Some(vec![
+                "a.service".to_owned(),
+                "getty@tty1.service".to_owned(),
+                r"dev-disk-by\x2duuid-a:b_c.mount".to_owned()
+            ])
+        );
+        let long = format!(r#"[{{"unit":"{}"}}]"#, "a".repeat(256));
+        for bad in [
+            r#"[{"unit":"a.service"},{"unit":"x\u001b]0;t\u0007.service"}]"#,
+            r#"[{"unit":"\u202e"}]"#,
+            r#"[{"unit":"a.service; systemd reports degraded; 9 alerts firing"}]"#,
+            r#"[{"unit":"a b.service"}]"#,
+            r#"[{"unit":"a/b.service"}]"#,
+            r#"[{"unit":"é.service"}]"#,
+            r#"[{"unit":""}]"#,
+            long.as_str(),
+        ] {
+            assert_eq!(units(bad), None, "{bad}");
+        }
+        assert_eq!(
+            units(&format!(r#"[{{"unit":"{}"}}]"#, "a".repeat(255))).map(|u| u.len()),
+            Some(1)
+        );
+    }
+
+    /// N7: only systemd's eight states are a state.
+    #[test]
+    fn system_state_is_one_of_systemds() {
+        let state = |s: &str| {
+            observed(parse_probe(
+                &format!("auspex_probe=1\nsystem_state={s}\nauspex_end=1\n"),
+                "",
+                ProbeExit::Code(0),
+            ))
+            .system_state
+        };
+        for s in [
+            "initializing",
+            "starting",
+            "running",
+            "degraded",
+            "maintenance",
+            "stopping",
+            "offline",
+            "unknown",
+        ] {
+            assert_eq!(state(s).as_deref(), Some(s));
+            assert_eq!(state(&format!(" {s} ")).as_deref(), Some(s));
+        }
+        for s in [
+            "",
+            "null",
+            "Running",
+            "running; 3 alerts firing",
+            "running\u{202e}",
+            "degraded2",
+            "rescue",
+        ] {
+            assert_eq!(state(s), None, "{s:?}");
+        }
+    }
+
+    /// N3: a store path is what nix writes, and nothing else.
+    #[test]
+    fn store_paths_are_strict() {
+        const H: &str = "0123456789abcdfghijklmnpqrsvwxyz";
+        for good in [
+            format!("/nix/store/{H}-x"),
+            format!("/nix/store/{H}-a+b._?=-Z9"),
+            format!("/nix/store/{H}--x"),
+            format!("/nix/store/{H}-{}", "a".repeat(211)),
+            format!("/nix/store/{H}-linux-6.12.1/bzImage"),
+            format!("/nix/store/{H}-sys/sw/bin/.x"),
+        ] {
+            assert!(StorePath::new(good.as_str()).is_ok(), "{good:?}");
+        }
+        for bad in [
+            // Not nix32: upper case, and the four letters nix's alphabet leaves out.
+            "/nix/store/EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE-x".to_owned(),
+            format!("/nix/store/e{}-x", &H[1..]),
+            format!("/nix/store/o{}-x", &H[1..]),
+            format!("/nix/store/t{}-x", &H[1..]),
+            format!("/nix/store/u{}-x", &H[1..]),
+            format!("/nix/store/{}-x", &H[1..]),
+            // Names nix would never produce.
+            format!("/nix/store/{H}-$(id);`x`'\"<>|&"),
+            format!("/nix/store/{H}-.hidden"),
+            format!("/nix/store/{H}-é"),
+            format!("/nix/store/{H}-a:b"),
+            format!("/nix/store/{H}-a@b"),
+            format!("/nix/store/{H}-{}", "a".repeat(212)),
+            // Format characters, the route into `current_system` the re-review found.
+            format!("/nix/store/{H}-nixos-system-\u{202e}arret"),
+            format!("/nix/store/{H}-a\u{2066}b"),
+            format!("/nix/store/{H}-a\u{200b}b"),
+            format!("/nix/store/{H}-a\u{feff}b"),
+            format!("/nix/store/{H}-a\u{e0041}b"),
+            format!("/nix/store/{H}-a\u{ad}b"),
+            // The same rules for later components.
+            format!("/nix/store/{H}-x/a\u{202e}b"),
+            format!("/nix/store/{H}-x/a b"),
+            format!("/nix/store/{H}-x/$(id)"),
+        ] {
+            assert!(StorePath::new(bad.as_str()).is_err(), "{bad:?}");
+        }
+        let out = format!(
+            "auspex_probe=1\ncurrent_system=/nix/store/{H}-nixos-system-\u{202e}arret\nauspex_end=1\n"
+        );
+        assert_eq!(
+            observed(parse_probe(&out, "", ProbeExit::Code(0))).current_system,
+            None
+        );
     }
 }

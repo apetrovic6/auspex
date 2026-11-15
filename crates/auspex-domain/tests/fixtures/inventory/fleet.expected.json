@@ -7,7 +7,7 @@
       "base",
       "server"
     ],
-    "target_host": "root@[2001:db8::7]:2222?ProxyJump=bastion"
+    "target_host": "root@[2001:db8::7]:2222?Compression=yes"
   },
   {
     "build_host": "localhost",

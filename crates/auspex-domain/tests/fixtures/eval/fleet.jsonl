@@ -4,4 +4,4 @@
 {"attr":"luna","attrPath":["luna"],"drvPath":"/nix/store/c123456789abcdfghijklmnpqrsvwxyz-nixos-system-luna.drv","outputs":{"out":"/nix/sto
 warning: unknown setting 'eval-cores'
 {"attr":"sol","attrPath":["sol"],"drvPath":"/tmp/not-a-store-path.drv","outputs":{"out":"/nix/store/d123456789abcdfghijklmnpqrsvwxyz-nixos-system-sol"}}
-{"attr":"cerberus","attrPath":["cerberus"],"drvPath":"/nix/store/e123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus.drv","outputs":{}}
+{"attr":"cerberus","attrPath":["cerberus"],"drvPath":"/nix/store/f123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus.drv","outputs":{}}

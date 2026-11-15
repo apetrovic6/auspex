@@ -21,10 +21,11 @@
 //! - [`eval`]: `nix-eval-jobs` lines, the eval cache key and the cache entry.
 //! - [`status`]: the status-badge rules.
 //! - [`report`]: the versioned `--json` contract.
+//! - [`text`]: making remote-controlled text safe for a terminal, for adapters too.
 
 pub mod eval;
 pub mod fleet;
 pub mod observe;
 pub mod report;
 pub mod status;
-mod text;
+pub mod text;

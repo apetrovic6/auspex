@@ -342,9 +342,6 @@ enum Accepts {
     OneOf(&'static [&'static str]),
     /// A decimal integer in this inclusive range, no sign and no leading zero.
     Range(u32, u32),
-    /// A comma-separated list of `[user@]host[:port]` jump hosts, each read by the target
-    /// grammar itself: no `ssh://` URI, no `%`, no options, IPv6 only in brackets.
-    JumpHosts,
 }
 
 const YES_NO: &[&str] = &["yes", "no"];
@@ -357,21 +354,26 @@ const IPQOS: &[&str] = &[
 ];
 
 /// The only options a target may carry, in their canonical spelling, with the values each
-/// accepts. Why each is safe:
+/// accepts. Each one acts only on the one ssh process auspex starts, with auspex's own
+/// `BatchMode`, `ConnectTimeout` and control socket. Why each is safe:
 ///
-/// - `ProxyJump`: reach the host through bastions. Each hop goes through the same grammar
-///   as the target, so a hop cannot carry an option or a token, and ssh's connection to the
-///   hop is itself governed by `~/.ssh/config`. This is the one with a real use.
 /// - `AddressFamily`: IPv4, IPv6 or either, to the host the target names.
 /// - `ConnectionAttempts` (1 to 3) and `ServerAliveCountMax` (1 to 5): bounded so that, with
 ///   auspex's `ConnectTimeout` and `ServerAliveInterval`, an unreachable host still fails
 ///   within seconds rather than holding its row.
-/// - `IdentitiesOnly`, `PubkeyAuthentication`: which of the operator's keys are offered.
-///   Neither can add a key, and `BatchMode` already rules out every prompt.
+/// - `IdentitiesOnly`, `PubkeyAuthentication`: which of the operator's keys are offered to
+///   the host the target names. Neither can add a key, and `BatchMode` turns any prompt in
+///   that ssh into a failure.
 /// - `Compression`, `TCPKeepAlive`, `IPQoS`: transport tuning with no reach outside the
 ///   connection.
+///
+/// `ProxyJump` is deliberately not here. ssh runs each hop as a second `ssh` process that
+/// gets none of auspex's options, so `BatchMode` does not cover it, and a bastion the
+/// operator has never connected to would put a host-key (or password) prompt on the
+/// terminal the TUI draws on. Jump hosts belong in `~/.ssh/config`, where the operator can
+/// also set `BatchMode yes` for the hop; see [`ssh_args`] for what the adapter must do so
+/// that such hops cannot prompt either.
 const ALLOWED_OPTIONS: &[(&str, Accepts)] = &[
-    ("ProxyJump", Accepts::JumpHosts),
     ("AddressFamily", Accepts::OneOf(&["any", "inet", "inet6"])),
     ("ConnectionAttempts", Accepts::Range(1, 3)),
     ("ServerAliveCountMax", Accepts::Range(1, 5)),
@@ -408,19 +410,17 @@ const COMMAND_OPTIONS: &[&str] = &[
 /// be about the wrong machine. Named only so the refusal says why.
 const DESTINATION_OPTIONS: &[&str] = &["HostName", "Port", "User", "HostKeyAlias"];
 
-/// The longest option value accepted. Far above any real jump-host list.
+/// The longest option value accepted. Far above any allowed word or number.
 const MAX_OPTION_VALUE: usize = 255;
 
-/// The most hops a `ProxyJump` may list.
-const MAX_JUMP_HOPS: usize = 8;
-
 /// The characters an option value may contain at all, before the option's own check:
-/// ASCII letters and digits and `. _ - , : @ [ ]`. That is exactly what a jump-host list
-/// needs and no more, so `%` (ssh's token expansion), `$`, backtick, `;`, quotes,
-/// backslash, `/` (paths and `ssh://` URIs), `=`, `?`, `&`, whitespace, control characters
-/// and anything outside ASCII never reach ssh's argv.
+/// ASCII letters, digits, `.`, `_` and `-`. Every allowed value is a word or a number, so
+/// this is already wider than needed; it is a second fence, so that `%` (ssh's token
+/// expansion), `$`, backtick, `;`, quotes, backslash, `/`, `,`, `:`, `@`, brackets, `=`,
+/// `?`, `&`, whitespace, control characters and anything outside ASCII never reach ssh's
+/// argv even if an entry above is widened by mistake.
 const fn is_value_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ',' | ':' | '@' | '[' | ']')
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
 }
 
 fn find_name<'a>(list: &[&'a str], name: &str) -> Option<&'a str> {
@@ -441,6 +441,12 @@ fn refusal(name: &str) -> String {
              host and port in the target itself, or set it in ~/.ssh/config"
         );
     }
+    if name.eq_ignore_ascii_case("ProxyJump") {
+        return "a jump host runs as a second ssh without auspex's BatchMode, so it could \
+                prompt on the terminal; set ProxyJump in ~/.ssh/config (with BatchMode yes for \
+                the jump host), which auspex honours"
+            .to_owned();
+    }
     let allowed: Vec<&str> = ALLOWED_OPTIONS.iter().map(|(n, _)| *n).collect();
     format!(
         "a target may set only {}; set it in ~/.ssh/config, which auspex honours",
@@ -453,11 +459,6 @@ fn parse_bounded(value: &str, lo: u32, hi: u32) -> bool {
         && value.bytes().all(|b| b.is_ascii_digit())
         && !(value.len() > 1 && value.starts_with('0'))
         && value.parse::<u32>().is_ok_and(|n| (lo..=hi).contains(&n))
-}
-
-fn valid_jump_hosts(value: &str) -> bool {
-    let hops: Vec<&str> = value.split(',').collect();
-    hops.len() <= MAX_JUMP_HOPS && hops.iter().all(|h| parse_destination(h, true).is_ok())
 }
 
 fn parse_option(opt: &str) -> Result<(String, String), TargetError> {
@@ -487,7 +488,6 @@ fn parse_option(opt: &str) -> Result<(String, String), TargetError> {
         && match accepts {
             Accepts::OneOf(words) => words.contains(&value),
             Accepts::Range(lo, hi) => parse_bounded(value, *lo, *hi),
-            Accepts::JumpHosts => valid_jump_hosts(value),
         };
     if !value_ok {
         return Err(bad());
@@ -495,13 +495,8 @@ fn parse_option(opt: &str) -> Result<(String, String), TargetError> {
     Ok(((*canonical).to_owned(), value.to_owned()))
 }
 
-/// `[user@]host[:port]`, the destination part of a target or one `ProxyJump` hop. A hop
-/// (`jump`) must bracket IPv6 and may not carry a zone: ssh reads a jump host with its own
-/// `[user@]host[:port]` splitter, which would cut a bare IPv6 address at its first colon.
-fn parse_destination(
-    dest: &str,
-    jump: bool,
-) -> Result<(Option<String>, String, Option<u16>), TargetError> {
+/// `[user@]host[:port]`, the destination part of a target.
+fn parse_destination(dest: &str) -> Result<(Option<String>, String, Option<u16>), TargetError> {
     let (user, hostport) = match dest.split_once('@') {
         Some((u, h)) => {
             validate_user(u)?;
@@ -521,7 +516,7 @@ fn parse_destination(
         if host.is_empty() {
             return Err(TargetError::EmptyHost);
         }
-        if !is_ipv6_literal(host) || (jump && host.contains('%')) {
+        if !is_ipv6_literal(host) {
             return Err(TargetError::BadHost {
                 host: host.to_owned(),
             });
@@ -539,7 +534,7 @@ fn parse_destination(
                 (h, Some(parse_port(p)?))
             }
             _ => {
-                if jump || !is_ipv6_literal(hostport) {
+                if !is_ipv6_literal(hostport) {
                     return Err(TargetError::BadHost {
                         host: hostport.to_owned(),
                     });
@@ -567,7 +562,6 @@ impl Target {
     ///
     ///   | Option | Accepted values |
     ///   |---|---|
-    ///   | `ProxyJump` | 1 to 8 comma-separated `[user@]host[:port]`, IPv6 bracketed, no zone |
     ///   | `AddressFamily` | `any`, `inet`, `inet6` |
     ///   | `ConnectionAttempts` | 1 to 3 |
     ///   | `ServerAliveCountMax` | 1 to 5 |
@@ -575,9 +569,10 @@ impl Target {
     ///   | `IPQoS` | one DSCP name: `af11`…`af43`, `cs0`…`cs7`, `ef`, `le`, `none` |
     ///
     ///   No value may be longer than 255 characters or contain anything outside ASCII
-    ///   letters, digits and `. _ - , : @ [ ]`. Every other option, including `HostName`,
-    ///   `Port`, `User`, the host-key and forwarding options and the ones auspex sets
-    ///   itself, is refused with a reason that says to set it in `~/.ssh/config`.
+    ///   letters, digits, `.`, `_` and `-`. Every other option, including `ProxyJump`,
+    ///   `HostName`, `Port`, `User`, the host-key and forwarding options and the ones
+    ///   auspex sets itself, is refused with a reason that says to set it in
+    ///   `~/.ssh/config`.
     ///
     /// # Errors
     ///
@@ -599,7 +594,7 @@ impl Target {
                 });
             }
         }
-        let (user, host, port) = parse_destination(dest, false)?;
+        let (user, host, port) = parse_destination(dest)?;
         Ok(Self {
             user,
             host,
@@ -762,7 +757,7 @@ pub fn resolve_target(
 /// The control-socket directory was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "control path directory {dir:?} must be absolute and free of whitespace, control characters and '%'"
+    "control path directory {dir:?} must be absolute and free of whitespace, control characters, '%' and '$'"
 )]
 pub struct ControlDirError {
     /// The directory as given.
@@ -861,16 +856,32 @@ pub const PROBE_REMOTE_COMMAND: &str = "/bin/sh -s";
 ///
 /// auspex's own options come first because ssh keeps the first value it sees for an option.
 ///
+/// # What the caller must do
+///
+/// `BatchMode=yes` here covers the one ssh process auspex starts. It does not cover the
+/// second ssh that a `ProxyJump` or `ProxyCommand` in `~/.ssh/config` starts for a hop: that
+/// process reads only the operator's config and gets none of these options. So that neither
+/// process can prompt (for a host key, a password or a passphrase) on the terminal the TUI
+/// is drawing on, the adapter must run ssh
+///
+/// - with no controlling terminal: in a new session (`setsid`), with stdin a pipe (the probe
+///   script) and stdout and stderr pipes, never inherited from the TUI; and
+/// - with `SSH_ASKPASS` removed from its environment, or `SSH_ASKPASS_REQUIRE=never` set, so
+///   that ssh cannot fall back to a graphical prompt either.
+///
+/// The effects layer's tests should check both, because nothing in this crate can.
+///
 /// # Errors
 ///
 /// [`ControlDirError`] when `options.control_dir` is relative or contains whitespace, a
-/// control character or `%` (which ssh would expand as a token).
+/// control character, `%` (which ssh would expand as a token) or `$` (which ssh expands as
+/// `${VAR}`, and an unset variable makes every connection fail with exit 255).
 pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>, ControlDirError> {
     let control_dir = options.control_dir;
     if !control_dir.starts_with('/')
         || control_dir
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || c == '%')
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '%' | '$'))
     {
         return Err(ControlDirError {
             dir: control_dir.to_owned(),
@@ -1031,18 +1042,18 @@ mod tests {
             ("[fd00::1]", None, "fd00::1", None, &[]),
             ("fe80::1%eth0", None, "fe80::1%eth0", None, &[]),
             (
-                "root@host?ProxyJump=jump&ConnectionAttempts=2",
+                "root@host?Compression=no&ConnectionAttempts=2",
                 Some("root"),
                 "host",
                 None,
-                &[("ProxyJump", "jump"), ("ConnectionAttempts", "2")],
+                &[("Compression", "no"), ("ConnectionAttempts", "2")],
             ),
             (
-                "root@[fd00::1]:22?ProxyJump=me@jump:2200",
+                "root@[fd00::1]:22?IPQoS=ef",
                 Some("root"),
                 "fd00::1",
                 Some(22),
-                &[("ProxyJump", "me@jump:2200")],
+                &[("IPQoS", "ef")],
             ),
             ("terra.omnissiah", None, "terra.omnissiah", None, &[]),
         ];
@@ -1186,7 +1197,7 @@ mod tests {
     #[test]
     fn ssh_args_shape() {
         let args = ssh_args(
-            &t("root@[fd00::1]:2222?ProxyJump=jump"),
+            &t("root@[fd00::1]:2222?Compression=yes"),
             &SshOptions::new(DIR),
         )
         .unwrap();
@@ -1207,7 +1218,7 @@ mod tests {
                 "-o",
                 "ControlPersist=60s",
                 "-o",
-                "ProxyJump=jump",
+                "Compression=yes",
                 "-p",
                 "2222",
                 "--",
@@ -1263,7 +1274,18 @@ mod tests {
     #[test]
     fn control_dir_is_validated() {
         let target = t("host");
-        for bad in ["", "relative", "/a b", "/a\nb", "/a%h"] {
+        // N6: `$` is refused like `%`: ssh expands `${VAR}` in ControlPath.
+        for bad in [
+            "",
+            "relative",
+            "/a b",
+            "/a\nb",
+            "/a%h",
+            "/run/user/1000/${AUSPEX_UNSET}",
+            "/run/user/1000/a${HOME}b",
+            "/run/user/1000/${",
+            "/run/$x",
+        ] {
             assert!(ssh_args(&target, &SshOptions::new(bad)).is_err(), "{bad:?}");
         }
     }
@@ -1528,7 +1550,6 @@ mod tests {
     #[test]
     fn allowed_options_take_only_their_values() {
         let ok = [
-            ("proxyjump=jump", ("ProxyJump", "jump")),
             ("AddressFamily=inet6", ("AddressFamily", "inet6")),
             ("CONNECTIONATTEMPTS=3", ("ConnectionAttempts", "3")),
             ("ServerAliveCountMax=1", ("ServerAliveCountMax", "1")),
@@ -1570,7 +1591,7 @@ mod tests {
             );
         }
         // Given twice: ssh would silently use the first.
-        let why = forbidden_why("host?ProxyJump=a&proxyjump=b");
+        let why = forbidden_why("host?Compression=yes&compression=no");
         assert!(why.contains("twice"), "{why}");
     }
 
@@ -1592,56 +1613,63 @@ mod tests {
             "é",
             "a\u{202e}b",
             "a b",
+            "a,b",
+            "a:b",
+            "a@b",
+            "[fd00::1]",
         ] {
-            let s = format!("host?ProxyJump={v}");
+            let s = format!("host?IPQoS={v}");
             assert!(
                 matches!(Target::parse(&s), Err(TargetError::BadOption { .. })),
                 "{s:?}"
             );
         }
-        let long = format!("host?ProxyJump={}", "a".repeat(256));
+        let long = format!("host?IPQoS={}", "a".repeat(256));
         assert!(Target::parse(&long).is_err());
     }
 
     #[test]
-    fn proxy_jump_hops_use_the_target_grammar() {
+    /// N1 (and with it N4, N5): a target may not carry `ProxyJump` in any form, because
+    /// the hop runs as a second ssh without auspex's `BatchMode`.
+    fn proxy_jump_is_refused() {
         for v in [
             "jump",
             "me@jump:2200",
-            "a,b@c:22,d",
-            "[fd00::1]:22",
-            "root@[fd00::1]",
-            "192.168.1.1",
             "bastion.example.org",
+            "none",
+            "NONE",
+            "[fd00::1]:22,bastion",
+            "a,[fd00::1]:22,last",
+            "a,b@c:22,d",
         ] {
-            let s = format!("host?ProxyJump={v}");
-            assert_eq!(t(&s).options()[0].1, v, "{s}");
+            for name in ["ProxyJump", "proxyjump", "PROXYJUMP"] {
+                let why = forbidden_why(&format!("root@192.0.2.10?{name}={v}"));
+                assert!(
+                    why.contains("~/.ssh/config") && why.contains("BatchMode"),
+                    "{name}={v}: {why}"
+                );
+            }
         }
-        let nine = ["j"; 9].join(",");
-        for v in [
-            "fd00::1",
-            "[fe80::1%eth0]:22",
-            "a,",
-            ",a",
-            "a,,b",
-            "-oProxyCommand=sh",
-            "a,-oProxyCommand=sh",
-            "a:0",
-            "a:",
-            "a@b@c",
-            "@a",
-            "-l@a",
-            "192.168.1.012",
-            "0xc0a8010a",
-            "[a]:22",
-            nine.as_str(),
-        ] {
-            let s = format!("host?ProxyJump={v}");
-            assert!(
-                matches!(Target::parse(&s), Err(TargetError::BadOption { .. })),
-                "{s:?}"
-            );
-        }
+    }
+
+    /// The allow list is the security boundary, so its exact contents are pinned: widening
+    /// it (a new name, or `ProxyJump` back) must fail a test.
+    #[test]
+    fn allow_list_is_exactly_this() {
+        let names: Vec<&str> = ALLOWED_OPTIONS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            [
+                "AddressFamily",
+                "ConnectionAttempts",
+                "ServerAliveCountMax",
+                "IdentitiesOnly",
+                "PubkeyAuthentication",
+                "Compression",
+                "TCPKeepAlive",
+                "IPQoS",
+            ]
+        );
     }
 
     /// F7: a host that ssh reads as an IPv4 address in another spelling.
@@ -1700,7 +1728,11 @@ mod tests {
         let r = resolve_target(&machine("terra", None), None).unwrap();
         assert_eq!(r.target.to_string(), "terra");
         // The inventory's own target may still carry an allowed option.
-        let r = resolve_target(&machine("terra", Some("root@10.0.0.1?ProxyJump=j")), None).unwrap();
+        let r = resolve_target(
+            &machine("terra", Some("root@10.0.0.1?Compression=yes")),
+            None,
+        )
+        .unwrap();
         assert_eq!(r.target.options().len(), 1);
     }
 
