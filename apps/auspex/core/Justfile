@@ -5,21 +5,20 @@ pkg := "auspex-core"
 
 default: dev
 
-# checks required tools are installed
+# checks required tools are installed. `check-rust`, not the template's `check-crux-core`:
+# that one adds boltffi, which only the FFI shells need, and auspex has none.
 doctor:
     @echo '{{ style("command") }}doctor:{{ NORMAL }}'
-    @just lib::check-crux-core
+    @just lib::check-rust
 
 # auto-fix formatting issues
 fix:
     @just rust::fmt
 
-# validate formatting and lint, natively and for wasm (the web shell builds this crate
-# for wasm32, so a lint that only passes natively is not enough)
+# validate formatting and lint. Natively only: no shell builds this crate for wasm32.
 check:
     @just rust::fmt-check
     @just rust::clippy {{ pkg }} --all-targets
-    @just rust::clippy {{ pkg }} --target wasm32-unknown-unknown
 
 build:
     @just rust::build {{ pkg }}
