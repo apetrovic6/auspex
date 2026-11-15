@@ -10,5 +10,7 @@ input is an effect (`auspex-effects`); whatever *sequences* effects is the Crux 
 that needs "now" takes an age as an argument.
 
 Tests: unit tests beside the code, golden fixtures under `tests/fixtures/` (synthetic for
-now; see the README there), and a snapshot of the `--json` shape in `tests/json_contract.rs`.
+now; see the README there), snapshots of the `--json` shape in `tests/json_contract.rs`,
+and `tests/probe_scripts.rs`, which runs the probe scripts under a local `sh` against a
+fake root and shim commands (the only test that spawns a process).
 `AUSPEX_BLESS=1 cargo test -p auspex-domain` regenerates the expected files.

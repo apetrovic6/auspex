@@ -26,6 +26,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::eval::EvalOutcome;
+use crate::fleet::MachineClass;
 use crate::observe::{Observation, ProbeOutcome};
 
 /// One badge from the plan's table. Serialised as the snake-case name.
@@ -42,7 +43,7 @@ pub enum Badge {
     UpdatePending,
     /// `◆`: the pending toplevel is already in ncps. Only alongside `↑`.
     Cached,
-    /// `⚠`: a failed unit, or an alert firing.
+    /// `⚠`: a failed unit, systemd reporting `degraded`, or an alert firing.
     FailedUnits,
     /// `⟳`: the booted kernel or initrd differs from the current one.
     RebootNeeded,
@@ -145,7 +146,8 @@ pub struct MachineStatus {
     /// Every badge that applies, the primary among them, in the plan's table order.
     pub badges: Vec<Badge>,
     /// One line on why, for the detail panel: ssh's or nix's last line, or what is being
-    /// waited for. `None` when the primary needs no explanation (`✓`).
+    /// waited for, followed for a sync state by any health notes (failed units, `degraded`,
+    /// alerts, or health unknown), joined with `; `. `None` for a `✓` with nothing to note.
     pub reason: Option<String>,
 }
 
@@ -206,6 +208,21 @@ pub fn machine_status(facts: &MachineFacts<'_>) -> MachineStatus {
         (Badge::UpdatePending, Some(format!("pending {name}")))
     };
 
+    // Health qualifies a machine that is up and has a system: it is appended to the reason
+    // of a sync state (or of "evaluating", which becomes one), and never replaces the reason
+    // for an unreachable, failed or uninstalled machine.
+    let (notes, warn) = health_notes(observation, facts.alerts_firing);
+    let reason = if matches!(
+        primary,
+        Badge::Evaluating | Badge::InSync | Badge::UpdatePending
+    ) && !notes.is_empty()
+    {
+        let notes = notes.join("; ");
+        Some(reason.map_or_else(|| notes.clone(), |r| format!("{r}; {notes}")))
+    } else {
+        reason
+    };
+
     let mut badges = vec![primary];
     if facts.probe.is_none() && facts.target_error.is_none() {
         badges.push(Badge::Checking);
@@ -228,7 +245,7 @@ pub fn machine_status(facts: &MachineFacts<'_>) -> MachineStatus {
             badges.push(Badge::Cached);
         }
     }
-    if observation.is_some_and(Observation::has_failed_units) || facts.alerts_firing > 0 {
+    if warn {
         badges.push(Badge::FailedUnits);
     }
     if observation.is_some_and(Observation::reboot_needed) {
@@ -245,6 +262,60 @@ pub fn machine_status(facts: &MachineFacts<'_>) -> MachineStatus {
         badges,
         reason,
     }
+}
+
+/// How many failed units a reason names before it says "and N more".
+const UNITS_IN_REASON: usize = 3;
+
+/// The health notes for the reason, and whether they raise [`Badge::FailedUnits`].
+///
+/// The rule, NixOS only (darwin has no systemd, so nothing is unknown there):
+///
+/// - `⚠` when systemd lists a failed unit, when `system_state` is `degraded` (which means a
+///   unit has failed, even if the list could not be read or came back empty), or when an
+///   alert is firing. The reason names the units, or says systemd reports degraded, and
+///   counts the alerts.
+/// - Without `⚠`: if `system_state` or the failed-unit list could not be read, the reason
+///   says health is unknown. There is no badge for that: the values stay `null` and the row
+///   keeps its sync badge, but it no longer reads as a plain `✓`.
+/// - Any other state than `running` (`starting`, `maintenance`, …) is named in the reason.
+fn health_notes(observation: Option<&Observation>, alerts_firing: u32) -> (Vec<String>, bool) {
+    let mut notes = Vec::new();
+    let mut warn = false;
+    if let Some(o) = observation {
+        let units = o.failed_units.as_deref().unwrap_or_default();
+        if !units.is_empty() {
+            warn = true;
+            let shown = units[..units.len().min(UNITS_IN_REASON)].join(", ");
+            notes.push(match units.len().saturating_sub(UNITS_IN_REASON) {
+                0 => format!("failed units: {shown}"),
+                more => format!("failed units: {shown} and {more} more"),
+            });
+        } else if o.is_degraded() {
+            warn = true;
+            notes.push("systemd reports degraded".to_owned());
+        }
+        if o.class == Some(MachineClass::Nixos) && !warn {
+            match (o.system_state.as_deref(), &o.failed_units) {
+                (None, _) => {
+                    notes.push("health unknown: systemd state could not be read".to_owned());
+                }
+                (Some(_), None) => {
+                    notes.push("health unknown: failed units could not be read".to_owned());
+                }
+                (Some("running"), Some(_)) => {}
+                (Some(state), Some(_)) => notes.push(format!("systemd is {state}")),
+            }
+        }
+    }
+    if alerts_firing > 0 {
+        warn = true;
+        notes.push(match alerts_firing {
+            1 => "1 alert firing".to_owned(),
+            n => format!("{n} alerts firing"),
+        });
+    }
+    (notes, warn)
 }
 
 /// The plan's table order, which is also the display order of badges.
@@ -284,7 +355,9 @@ mod tests {
     }
 
     fn at(current: &str) -> ProbeOutcome {
-        probe(&format!("current_system={current}\nfailed_units=[]\n"))
+        probe(&format!(
+            "current_system={current}\nsystem_state=running\nfailed_units=[]\n"
+        ))
     }
 
     fn ok(out: &str) -> EvalOutcome {
@@ -506,5 +579,133 @@ mod tests {
         .map(|b| b.glyph().unwrap())
         .collect();
         assert_eq!(glyphs, ["✓", "↑", "◆", "⚠", "⟳", "?", "✗", "!", "❄"]);
+    }
+
+    /// F4: `degraded` raises `⚠` with a reason, even when the unit list is unreadable,
+    /// empty, or of the wrong shape.
+    #[test]
+    fn degraded_raises_the_warning_badge() {
+        let o = ok(A);
+        for units in [
+            "",
+            "[]",
+            "{\"unit\":\"x.service\"}",
+            "[{\"name\":\"x.service\"}]",
+            "[{\"unit\":\"x.service\"},null]",
+        ] {
+            let p = probe(&format!(
+                "current_system={A}\nsystem_state=degraded\nfailed_units={units}\n"
+            ));
+            let s = status(Some(&p), Some(&o));
+            assert_eq!(s.primary, B_::InSync, "{units}");
+            assert_eq!(s.badges, [B_::InSync, B_::FailedUnits], "{units}");
+            assert_eq!(
+                s.reason.as_deref(),
+                Some("systemd reports degraded"),
+                "{units}"
+            );
+        }
+        // With the units known, the reason names them, after the primary's own reason.
+        let p = probe(&format!(
+            "current_system={A}\nsystem_state=degraded\nfailed_units=[{{\"unit\":\"a.service\"}},\
+             {{\"unit\":\"b.service\"}},{{\"unit\":\"c.mount\"}},{{\"unit\":\"d.timer\"}}]\n"
+        ));
+        let next = ok(B);
+        let s = status(Some(&p), Some(&next));
+        assert_eq!(s.badges, [B_::UpdatePending, B_::FailedUnits]);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some(
+                "pending nixos-system-terra-b; failed units: a.service, b.service, c.mount and 1 more"
+            )
+        );
+    }
+
+    /// F4: unknown health is said in the reason, without a badge.
+    #[test]
+    fn unknown_health_is_a_reason_not_a_badge() {
+        let o = ok(A);
+        for (lines, why) in [
+            // What the real probe prints when systemctl cannot reach the bus.
+            (
+                "system_state=\nfailed_units=\n",
+                "health unknown: systemd state could not be read",
+            ),
+            (
+                "failed_units=[]\n",
+                "health unknown: systemd state could not be read",
+            ),
+            (
+                "system_state=running\nfailed_units=garbage\n",
+                "health unknown: failed units could not be read",
+            ),
+            (
+                "system_state=starting\nfailed_units=[]\n",
+                "systemd is starting",
+            ),
+        ] {
+            let p = probe(&format!("current_system={A}\n{lines}"));
+            let s = status(Some(&p), Some(&o));
+            assert_eq!(s.badges, [B_::InSync], "{lines:?}");
+            assert_eq!(s.reason.as_deref(), Some(why), "{lines:?}");
+            // Still waiting for the eval: appended to that reason.
+            let s = status(Some(&p), None);
+            assert_eq!(
+                s.reason,
+                Some(format!("waiting for the evaluation; {why}")),
+                "{lines:?}"
+            );
+        }
+        // Darwin has no systemd, so nothing is unknown there.
+        let p = parse_probe(
+            &format!("auspex_probe=1\nprobe=darwin\ncurrent_system={A}\nauspex_end=1\n"),
+            "",
+            ProbeExit::Code(0),
+        );
+        assert_eq!(status(Some(&p), Some(&o)).reason, None);
+        // Health never replaces the reason of an unhealthy primary.
+        let p = probe("current_system=\nsystem_state=degraded\n");
+        let s = status(Some(&p), Some(&o));
+        assert_eq!(s.primary, B_::NotInstalled);
+        assert_eq!(
+            s.reason.as_deref(),
+            Some("reachable, but /run/current-system is missing")
+        );
+    }
+
+    #[test]
+    fn alerts_are_named_in_the_reason() {
+        let (p, o) = (at(A), ok(A));
+        for (n, why) in [(1, "1 alert firing"), (3, "3 alerts firing")] {
+            let s = machine_status(&MachineFacts {
+                probe: Some(&p),
+                eval: Some(&o),
+                alerts_firing: n,
+                ..MachineFacts::default()
+            });
+            assert_eq!(s.badges, [B_::InSync, B_::FailedUnits]);
+            assert_eq!(s.reason.as_deref(), Some(why));
+        }
+    }
+
+    /// M43: a changed initrd alone needs a reboot.
+    #[test]
+    fn initrd_only_change_needs_a_reboot() {
+        const I1: &str = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-initrd-linux-6.12.1/initrd";
+        const I2: &str = "/nix/store/zyxwvsrqpnmlkjihgfdcba9876543210-initrd-linux-6.12.1/initrd";
+        let p = probe(&format!(
+            "current_system={A}\nsystem_state=running\nfailed_units=[]\n\
+             booted_kernel={K1}\ncurrent_kernel={K1}\nbooted_initrd={I1}\ncurrent_initrd={I2}\n"
+        ));
+        let o = ok(A);
+        assert_eq!(
+            status(Some(&p), Some(&o)).badges,
+            [B_::InSync, B_::RebootNeeded]
+        );
+        let same = probe(&format!(
+            "current_system={A}\nsystem_state=running\nfailed_units=[]\n\
+             booted_kernel={K1}\ncurrent_kernel={K1}\nbooted_initrd={I1}\ncurrent_initrd={I1}\n"
+        ));
+        assert_eq!(status(Some(&same), Some(&o)).badges, [B_::InSync]);
     }
 }

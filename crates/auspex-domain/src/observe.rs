@@ -21,26 +21,34 @@ use crate::text::{last_lines, sanitize_line};
 //   names with them (`dev-disk-by\x2duuid`), so `echo` corrupts the failed-units JSON.
 // - `kv` folds a value onto one line: a value with a newline would otherwise start a second,
 //   bogus key.
-// - Plain `readlink`, never `readlink -f`: with `/run/current-system` missing, `readlink -f`
-//   still prints a path and exits 0. The parser also refuses anything outside /nix/store.
+// - `link` tests that the path exists before reading the link, then uses plain `readlink`,
+//   never `readlink -f`: with `/run/current-system` missing, `readlink -f` still prints a
+//   path and exits 0, and a dangling link (an incomplete uninstall, or nix-darwin's `/run`
+//   being `/private/var/run`) still has a target to print. `[ -e ]` follows the link, so a
+//   link to nothing is "not installed". The parser also refuses anything outside /nix/store.
 // - PATH is extended first: a non-interactive ssh session on darwin has only the system
 //   PATH, which has no `darwin-version`.
 // - The `auspex_probe` and `auspex_end` markers bracket the output, so a login banner before
 //   it is skipped and a cut-off run is told apart from a machine that lacks a key.
 // - Uptime, disk and load are always collected; whether to use them or Prometheus's is the
 //   caller's decision (`merge_health`), and costs nothing extra in the same round trip.
+//
+// `tests/probe_scripts.rs` runs both scripts under a local `sh` against a fake root and
+// shim commands, and feeds what they print to `parse_probe`, so a renamed key or a dropped
+// command fails a test rather than showing every machine as "not installed".
 
 /// The NixOS probe: POSIX `sh`, `key=value` lines, no `jq`.
 pub const NIXOS_PROBE: &str = r#"PATH=/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:$PATH
 export PATH
 kv() { printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr -d '\r\n')"; }
+link() { if [ -e "$1" ]; then readlink "$1" 2>/dev/null; fi; }
 printf 'auspex_probe=1\n'
 kv probe nixos
-kv current_system "$(readlink /run/current-system 2>/dev/null)"
-kv booted_kernel "$(readlink /run/booted-system/kernel 2>/dev/null)"
-kv booted_initrd "$(readlink /run/booted-system/initrd 2>/dev/null)"
-kv current_kernel "$(readlink /run/current-system/kernel 2>/dev/null)"
-kv current_initrd "$(readlink /run/current-system/initrd 2>/dev/null)"
+kv current_system "$(link /run/current-system)"
+kv booted_kernel "$(link /run/booted-system/kernel)"
+kv booted_initrd "$(link /run/booted-system/initrd)"
+kv current_kernel "$(link /run/current-system/kernel)"
+kv current_initrd "$(link /run/current-system/initrd)"
 kv configuration_revision "$(nixos-version --configuration-revision 2>/dev/null)"
 kv system_state "$(systemctl is-system-running 2>/dev/null)"
 kv failed_units "$(systemctl --failed --output=json --no-pager 2>/dev/null)"
@@ -54,9 +62,10 @@ printf 'auspex_end=1\n'
 pub const DARWIN_PROBE: &str = r#"PATH=/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:$PATH
 export PATH
 kv() { printf '%s=%s\n' "$1" "$(printf '%s' "$2" | tr -d '\r\n')"; }
+link() { if [ -e "$1" ]; then readlink "$1" 2>/dev/null; fi; }
 printf 'auspex_probe=1\n'
 kv probe darwin
-kv current_system "$(readlink /run/current-system 2>/dev/null)"
+kv current_system "$(link /run/current-system)"
 kv configuration_revision "$(darwin-version --configuration-revision 2>/dev/null)"
 boot=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\),.*/\1/p')
 if [ -n "$boot" ]; then kv uptime_seconds "$(( $(date +%s) - boot ))"; fi
@@ -94,7 +103,10 @@ const HASH_LEN: usize = 32;
 
 impl StorePath {
     /// Validates a store path: `/nix/store/`, a 32-character hash, `-`, a name, and no
-    /// whitespace or control characters anywhere.
+    /// whitespace or control characters anywhere. After the `<hash>-<name>` part, a path
+    /// may go on into the store object (`…-linux-6.12.1/bzImage`), but only by plain
+    /// components: an empty, `.` or `..` component is refused, because
+    /// `…-system/../../../run/current-system` names a path outside the store.
     ///
     /// # Errors
     ///
@@ -102,11 +114,13 @@ impl StorePath {
     pub fn new(s: impl Into<String>) -> Result<Self, NotAStorePath> {
         let s = s.into();
         let ok = s.strip_prefix(STORE).is_some_and(|rest| {
-            let base = rest.split('/').next().unwrap_or("");
+            let mut parts = rest.split('/');
+            let base = parts.next().unwrap_or("");
             base.len() > HASH_LEN + 1
                 && base.is_char_boundary(HASH_LEN)
                 && base[..HASH_LEN].bytes().all(|b| b.is_ascii_alphanumeric())
                 && base.as_bytes()[HASH_LEN] == b'-'
+                && parts.all(|p| !matches!(p, "" | "." | ".."))
         }) && !s.chars().any(|c| c.is_whitespace() || c.is_control());
         if ok {
             Ok(Self(s))
@@ -202,8 +216,8 @@ pub struct SshHealth {
 pub struct Observation {
     /// Which script answered (`probe=`); `None` if the key was missing.
     pub class: Option<MachineClass>,
-    /// `/run/current-system`. `None` means **not installed**: the link is missing, or points
-    /// outside the store.
+    /// `/run/current-system`. `None` means **not installed**: the link is missing or
+    /// dangling, or points outside the store.
     pub current_system: Option<StorePath>,
     /// `/run/booted-system/kernel`. NixOS only.
     pub booted_kernel: Option<StorePath>,
@@ -239,6 +253,13 @@ impl Observation {
     #[must_use]
     pub fn has_failed_units(&self) -> bool {
         self.failed_units.as_ref().is_some_and(|u| !u.is_empty())
+    }
+
+    /// `systemctl is-system-running` said `degraded`: at least one unit has failed, whether
+    /// or not the failed-unit list could be read.
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.system_state.as_deref() == Some("degraded")
     }
 }
 
@@ -352,8 +373,9 @@ fn last_stderr_line(stderr: &str) -> Option<String> {
 /// - Exit 255 is ssh's own failure, and a [`ProbeExit::TimedOut`] is auspex's deadline:
 ///   both are [`ProbeOutcome::Unreachable`] with ssh's last non-empty stderr line.
 /// - Otherwise, the output between the `auspex_probe=1` and `auspex_end=1` markers is
-///   parsed, whatever the exit status. Before the start marker (a login banner) is ignored;
-///   no end marker is [`ProbeOutcome::Failed`].
+///   parsed, whatever the exit status. Before the start marker (a login banner) is ignored,
+///   and so is everything after the end marker. No end marker, or an `auspex_end` with any
+///   value but `1` (a run cut off mid-line), is [`ProbeOutcome::Failed`].
 /// - Within it: CRLF, blank lines, lines that are not `key=value` and unknown keys are
 ///   ignored; a value may contain `=` (split at the first); a repeated key keeps its last
 ///   value; a missing or unparsable value is `None`.
@@ -402,8 +424,10 @@ pub fn parse_probe(stdout: &str, stderr: &str, exit: ProbeExit) -> ProbeOutcome 
             continue;
         }
         match key {
+            // Only the complete marker ends a probe. A run cut off just after `auspex_end=`,
+            // or any other value, is not a finished probe.
             "auspex_end" => {
-                ended = true;
+                ended = value.trim() == "1";
                 break;
             }
             "probe" => {
@@ -723,7 +747,13 @@ mod tests {
     #[test]
     fn scripts_follow_the_rules() {
         for s in [NIXOS_PROBE, DARWIN_PROBE] {
-            assert!(!s.contains("readlink -f"));
+            // No `readlink -f`, `-m` or `-e`: each prints a path for a missing link.
+            assert!(!s.contains("readlink -"));
+            // Every link is read through `link`, which tests existence first.
+            assert!(
+                s.contains(r#"link() { if [ -e "$1" ]; then readlink "$1" 2>/dev/null; fi; }"#)
+            );
+            assert_eq!(s.matches("readlink").count(), 1);
             assert!(!s.contains("jq"));
             assert!(!s.contains("echo"));
             assert!(s.contains("printf 'auspex_probe=1\\n'"));
@@ -781,5 +811,89 @@ mod tests {
         assert_eq!(h.uptime_seconds.unwrap().source, HealthSource::Prometheus);
 
         assert_eq!(merge_health(None, None, 60), Health::default());
+    }
+
+    /// Correctness 1: only `auspex_end=1` completes a probe.
+    #[test]
+    fn end_marker_must_be_complete() {
+        for input in [
+            format!("auspex_probe=1\ncurrent_system={SYS}\nauspex_end="),
+            format!("auspex_probe=1\ncurrent_system={SYS}\nauspex_end=\n"),
+            "auspex_probe=1\nauspex_end=0\n".to_owned(),
+            "auspex_probe=1\nauspex_end=garbage\n".to_owned(),
+            "auspex_probe=1\nauspex_end=11\n".to_owned(),
+        ] {
+            assert_eq!(
+                parse_probe(&input, "", ProbeExit::Code(0)),
+                ProbeOutcome::Failed {
+                    reason: "probe output cut off".to_owned()
+                },
+                "{input:?}"
+            );
+        }
+        // Surrounding whitespace and CRLF are still fine.
+        assert!(matches!(
+            parse_probe(
+                "auspex_probe=1\r\nauspex_end= 1 \r\n",
+                "",
+                ProbeExit::Code(0)
+            ),
+            ProbeOutcome::Observed(_)
+        ));
+    }
+
+    /// M20/M31: a start marker of another version is not this probe's output.
+    #[test]
+    fn start_marker_must_be_version_1() {
+        for start in ["auspex_probe=2", "auspex_probe=", "auspex_probe=10"] {
+            let out = format!("{start}\ncurrent_system={SYS}\nauspex_end=1\n");
+            assert_eq!(
+                parse_probe(&out, "", ProbeExit::Code(0)),
+                ProbeOutcome::Failed {
+                    reason: "probe output cut off, no probe output".to_owned()
+                },
+                "{start}"
+            );
+        }
+    }
+
+    /// Correctness 3: dot components are not store paths.
+    #[test]
+    fn store_path_components_are_plain() {
+        for bad in [
+            format!("{SYS}/../../../run/current-system"),
+            format!("{SYS}/.."),
+            format!("{SYS}/."),
+            format!("{SYS}/./kernel"),
+            format!("{SYS}//kernel"),
+            format!("{SYS}/"),
+        ] {
+            assert!(StorePath::new(bad.as_str()).is_err(), "{bad:?}");
+        }
+        for good in [
+            format!("{SYS}/kernel"),
+            format!("{SYS}/sw/bin/..x"),
+            format!("{SYS}/.x"),
+        ] {
+            assert!(StorePath::new(good.as_str()).is_ok(), "{good:?}");
+        }
+        let out = format!(
+            "auspex_probe=1\ncurrent_system={SYS}/../../../run/current-system\nauspex_end=1\n"
+        );
+        assert_eq!(
+            observed(parse_probe(&out, "", ProbeExit::Code(0))).current_system,
+            None
+        );
+    }
+
+    /// M39 and M45: remote text in the observation is sanitised.
+    #[test]
+    fn unit_names_and_revision_are_sanitised() {
+        let out = "auspex_probe=1\nconfiguration_revision=\u{1b}[2Jabc\u{202e}def\n\
+                   failed_units=[{\"unit\":\"x\\u001b]0;t\\u0007.service\"},{\"unit\":\"\\u202e\"}]\n\
+                   auspex_end=1\n";
+        let o = observed(parse_probe(out, "", ProbeExit::Code(0)));
+        assert_eq!(o.configuration_revision.as_deref(), Some("abcdef"));
+        assert_eq!(o.failed_units, Some(vec!["x.service".to_owned()]));
     }
 }

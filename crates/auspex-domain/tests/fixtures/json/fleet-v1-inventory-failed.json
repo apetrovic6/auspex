@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "settled": false,
+  "errors": [
+    {
+      "kind": "inventory_failed",
+      "reason": "error: flake 'path:/home/op/fleet' does not provide attribute 'clanInternals'"
+    }
+  ],
+  "machines": [],
+  "shared_ips": []
+}

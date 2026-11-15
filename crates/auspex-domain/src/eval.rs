@@ -8,6 +8,7 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::observe::StorePath;
@@ -90,62 +91,96 @@ pub enum EvalLineError {
     /// Not a JSON object.
     #[error("not a JSON object: {0}")]
     Malformed(String),
-    /// A required field is missing or has the wrong type.
+    /// A required field is missing or has the wrong type. Since a line that names its `attr`
+    /// always comes back as an [`EvalOutcome`], this is only ever `Field("attr")`.
     #[error("missing or invalid field {0}")]
     Field(&'static str),
-    /// `drvPath` or `outputs.out` is not a store path.
+    /// `drvPath` or `outputs.out` is not a store path. No longer returned by
+    /// [`parse_eval_line`], which reports that as an [`EvalOutcome::Error`] for the line's
+    /// `attr`; kept so code matching on it still compiles.
     #[error("{0}")]
     StorePath(#[from] crate::observe::NotAStorePath),
 }
 
-#[derive(Deserialize)]
-struct RawLine {
-    attr: Option<String>,
-    #[serde(default, rename = "attrPath")]
-    attr_path: Option<Vec<String>>,
-    #[serde(rename = "drvPath")]
-    drv_path: Option<String>,
-    outputs: Option<RawOutputs>,
-    error: Option<String>,
+/// Why a line that names its `attr` is not a usable success, as the text of its
+/// [`EvalFailure`].
+fn malformed(attr: &str, what: &str) -> String {
+    format!("error: nix-eval-jobs printed a malformed result for {attr}: {what}")
 }
 
-#[derive(Deserialize)]
-struct RawOutputs {
-    out: Option<String>,
+fn success_fields(obj: &serde_json::Map<String, Value>) -> Result<(StorePath, StorePath), String> {
+    let path = |v: Option<&Value>, name: &str| match v {
+        None | Some(Value::Null) => Err(format!("{name} is missing or null")),
+        Some(Value::String(s)) => StorePath::new(s.as_str()).map_err(|e| format!("{name}: {e}")),
+        Some(_) => Err(format!("{name} is not a string")),
+    };
+    let drv = path(obj.get("drvPath"), "drvPath")?;
+    let out = match obj.get("outputs") {
+        Some(Value::Object(o)) => path(o.get("out"), "outputs.out")?,
+        _ => return Err("outputs is missing or not an object".to_owned()),
+    };
+    Ok((drv, out))
 }
 
-/// Parses one line of `nix-eval-jobs` output. A line with an `error` string is an
-/// [`EvalOutcome::Error`] whatever else it carries; otherwise `drvPath` and `outputs.out`
-/// are required. Unknown fields are ignored.
+/// Parses one line of `nix-eval-jobs` output.
+///
+/// Once a line names its `attr` (a string), it always comes back as an [`EvalOutcome`] for
+/// that attr, so the machine's row leaves "evaluating" whatever else is wrong with it:
+///
+/// - An `error` field that is present and not null makes it an [`EvalOutcome::Error`],
+///   whatever else the line carries, even ill-typed success fields. An `error` that is not
+///   a string is still an error, with a note saying so.
+/// - Otherwise `drvPath` and `outputs.out` must be store paths. If either is missing, null
+///   (as `outputs.out` is for a content-addressed derivation), ill-typed or outside the
+///   store, the line is an [`EvalOutcome::Error`] saying which.
+///
+/// `attrPath` is kept when it is a list of strings and is empty otherwise. Unknown fields
+/// are ignored.
 ///
 /// # Errors
 ///
-/// [`EvalLineError`] for a line that is not JSON, lacks `attr`, or is a success without a
-/// valid `drvPath` and `outputs.out`.
+/// [`EvalLineError::Malformed`] for a line that is not a JSON object, and
+/// [`EvalLineError::Field`] for one without a string `attr`: neither can be attributed to a
+/// machine.
 pub fn parse_eval_line(line: &str) -> Result<EvalOutcome, EvalLineError> {
-    let raw: RawLine =
+    let value: Value =
         serde_json::from_str(line.trim()).map_err(|e| EvalLineError::Malformed(e.to_string()))?;
-    let attr = raw.attr.ok_or(EvalLineError::Field("attr"))?;
-    let attr_path = raw.attr_path.unwrap_or_default();
-    if let Some(error) = raw.error {
-        return Ok(EvalOutcome::Error(EvalFailure {
+    let Value::Object(obj) = value else {
+        return Err(EvalLineError::Malformed("not an object".to_owned()));
+    };
+    let Some(Value::String(attr)) = obj.get("attr") else {
+        return Err(EvalLineError::Field("attr"));
+    };
+    let attr = attr.clone();
+    let attr_path = match obj.get("attrPath") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|v| v.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let failure = |text: &str| {
+        EvalOutcome::Error(EvalFailure {
+            attr: attr.clone(),
+            attr_path: attr_path.clone(),
+            error_tail: last_lines(text, ERROR_TAIL_LINES),
+        })
+    };
+    match obj.get("error") {
+        None | Some(Value::Null) => {}
+        Some(Value::String(error)) => return Ok(failure(error)),
+        Some(_) => return Ok(failure(&malformed(&attr, "error is not a string"))),
+    }
+    match success_fields(&obj) {
+        Ok((drv_path, out_path)) => Ok(EvalOutcome::Success(EvalSuccess {
             attr,
             attr_path,
-            error_tail: last_lines(&error, ERROR_TAIL_LINES),
-        }));
+            drv_path,
+            out_path,
+        })),
+        Err(what) => Ok(failure(&malformed(&attr, &what))),
     }
-    let drv_path = StorePath::new(raw.drv_path.ok_or(EvalLineError::Field("drvPath"))?)?;
-    let out_path = StorePath::new(
-        raw.outputs
-            .and_then(|o| o.out)
-            .ok_or(EvalLineError::Field("outputs.out"))?,
-    )?;
-    Ok(EvalOutcome::Success(EvalSuccess {
-        attr,
-        attr_path,
-        drv_path,
-        out_path,
-    }))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -265,7 +300,9 @@ pub struct CacheEntry {
     /// The key it was written under. Checked on read, so a file renamed or copied to the
     /// wrong key is a miss, not a wrong answer.
     pub key: CacheKey,
-    /// The machine it belongs to. Checked on read for the same reason.
+    /// The machine it belongs to. Checked on read for the same reason, and so is
+    /// `result.attr`: auspex evaluates each machine under its own name, so a result whose
+    /// `attr` is another machine is another machine's closure.
     pub machine: String,
     /// The result.
     pub result: EvalSuccess,
@@ -280,7 +317,8 @@ pub enum CacheMiss {
     /// Written by a different format version.
     #[error("cache entry version {0}, expected {CACHE_FORMAT_VERSION}")]
     Version(u32),
-    /// Written under another key or for another machine.
+    /// Written under another key or for another machine, or holding a result whose `attr`
+    /// is not the machine.
     #[error("cache entry is for another key or machine")]
     Mismatch,
 }
@@ -325,7 +363,7 @@ impl CacheEntry {
         }
         let e: Self =
             serde_json::from_slice(bytes).map_err(|e| CacheMiss::Unreadable(e.to_string()))?;
-        if &e.key != key || e.machine != machine {
+        if &e.key != key || e.machine != machine || e.result.attr != machine {
             return Err(CacheMiss::Mismatch);
         }
         Ok(e.result)
@@ -394,23 +432,99 @@ mod tests {
             parse_eval_line("warning: Git tree is dirty"),
             Err(EvalLineError::Malformed(_))
         ));
-        assert_eq!(
-            parse_eval_line(r#"{"error":"x"}"#),
-            Err(EvalLineError::Field("attr"))
+        for no_attr in [
+            r#"{"error":"x"}"#,
+            r#"{"attr":null}"#,
+            r#"{"attr":7,"error":"x"}"#,
+        ] {
+            assert_eq!(
+                parse_eval_line(no_attr),
+                Err(EvalLineError::Field("attr")),
+                "{no_attr}"
+            );
+        }
+    }
+
+    fn attributed_error(line: &str) -> EvalFailure {
+        match parse_eval_line(line) {
+            Ok(EvalOutcome::Error(e)) => e,
+            other => panic!("{line}: expected an attributed error, got {other:?}"),
+        }
+    }
+
+    /// F8: a line that names its attr always comes back for that attr, so the row leaves
+    /// "evaluating" and says what was wrong.
+    #[test]
+    fn malformed_lines_with_an_attr_are_errors_for_it() {
+        let cases = [
+            (
+                r#"{"attr":"terra"}"#.to_owned(),
+                "drvPath is missing or null",
+            ),
+            (
+                format!(r#"{{"attr":"terra","drvPath":"{DRV}","outputs":{{}}}}"#),
+                "outputs.out is missing or null",
+            ),
+            (
+                format!(r#"{{"attr":"terra","drvPath":"{DRV}","outputs":{{"out":null}}}}"#),
+                "outputs.out is missing or null",
+            ),
+            (
+                format!(r#"{{"attr":"terra","drvPath":"{DRV}","outputs":false}}"#),
+                "outputs is missing or not an object",
+            ),
+            (
+                format!(r#"{{"attr":"terra","drvPath":"{DRV}","outputs":{{"out":7}}}}"#),
+                "outputs.out is not a string",
+            ),
+            (
+                r#"{"attr":"terra","drvPath":"/tmp/x.drv","outputs":{"out":"/tmp/x"}}"#.to_owned(),
+                "drvPath: not a store path",
+            ),
+            (
+                r#"{"attr":"terra","error":42}"#.to_owned(),
+                "error is not a string",
+            ),
+        ];
+        for (line, what) in cases {
+            let e = attributed_error(&line);
+            assert_eq!(e.attr, "terra", "{line}");
+            let summary = e.summary().unwrap();
+            assert!(
+                summary.starts_with("error: nix-eval-jobs printed a malformed result for terra")
+                    && summary.contains(what),
+                "{line}: {summary}"
+            );
+        }
+        // attrPath of the wrong type is dropped, not fatal.
+        let line = format!(
+            r#"{{"attr":"terra","attrPath":"terra","drvPath":"{DRV}","outputs":{{"out":"{OUT}"}}}}"#
         );
-        assert_eq!(
-            parse_eval_line(r#"{"attr":"a"}"#),
-            Err(EvalLineError::Field("drvPath"))
+        let Ok(EvalOutcome::Success(s)) = parse_eval_line(&line) else {
+            panic!()
+        };
+        assert_eq!(s.attr_path, Vec::<String>::new());
+    }
+
+    /// Correctness 4 and M82: an `error` wins over success fields, well typed or not.
+    #[test]
+    fn error_wins_over_success_fields() {
+        let e = attributed_error(
+            r#"{"attr":"terra","error":"error: boom","drvPath":123,"outputs":false}"#,
         );
-        assert_eq!(
-            parse_eval_line(&format!(
-                r#"{{"attr":"a","drvPath":"{DRV}","outputs":{{}}}}"#
-            )),
-            Err(EvalLineError::Field("outputs.out"))
+        assert_eq!(e.error_tail, ["error: boom"]);
+        let e = attributed_error(&format!(
+            r#"{{"attr":"terra","attrPath":["terra"],"error":"error: boom","drvPath":"{DRV}","outputs":{{"out":"{OUT}"}}}}"#
+        ));
+        assert_eq!(e.error_tail, ["error: boom"]);
+        assert_eq!(e.attr_path, ["terra"]);
+        // A null error is no error.
+        let line = format!(
+            r#"{{"attr":"terra","error":null,"drvPath":"{DRV}","outputs":{{"out":"{OUT}"}}}}"#
         );
         assert!(matches!(
-            parse_eval_line(r#"{"attr":"a","drvPath":"/tmp/x.drv","outputs":{"out":"/tmp/x"}}"#),
-            Err(EvalLineError::StorePath(_))
+            parse_eval_line(&line),
+            Ok(EvalOutcome::Success(_))
         ));
     }
 
@@ -521,6 +635,11 @@ mod tests {
         // Order and duplicates of the untracked list do not matter.
         let c = ["c".to_owned(), "ab".to_owned(), "c".to_owned()];
         assert_eq!(k(&a), k(&c));
+        // M71: without the length prefix, these two lists feed the same bytes ("uabucud")
+        // to the hash, because the tag byte `u` can also be a name's content.
+        let a = ["ab".to_owned(), "cud".to_owned()];
+        let b = ["abuc".to_owned(), "d".to_owned()];
+        assert_ne!(k(&a), k(&b));
     }
 
     fn success() -> EvalSuccess {
@@ -547,6 +666,20 @@ mod tests {
         );
         assert_eq!(
             CacheEntry::read(bytes.as_bytes(), &k, "luna"),
+            Err(CacheMiss::Mismatch)
+        );
+        // F9: the entry says terra but its result is luna's, and the other way round. Each
+        // is caught by its own check.
+        let mut luna = success();
+        luna.attr = "luna".to_owned();
+        let swapped = CacheEntry::new(k.clone(), "terra".to_owned(), luna).to_json();
+        assert_eq!(
+            CacheEntry::read(swapped.as_bytes(), &k, "terra"),
+            Err(CacheMiss::Mismatch)
+        );
+        let relabelled = CacheEntry::new(k.clone(), "luna".to_owned(), success()).to_json();
+        assert_eq!(
+            CacheEntry::read(relabelled.as_bytes(), &k, "terra"),
             Err(CacheMiss::Mismatch)
         );
         let future = bytes.replacen("\"version\":1", "\"version\":2", 1);

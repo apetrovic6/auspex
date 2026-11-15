@@ -56,7 +56,7 @@ fn check(input: &Path, got: &Value) {
 #[test]
 fn probe_fixtures() {
     let cases = cases("probe", "stdout");
-    assert!(cases.len() >= 12, "a probe fixture went missing");
+    assert!(cases.len() >= 14, "a probe fixture went missing");
     for stdout_path in cases {
         let stdout = fs::read_to_string(&stdout_path).unwrap();
         let stderr = fs::read_to_string(stdout_path.with_extension("stderr")).unwrap_or_default();

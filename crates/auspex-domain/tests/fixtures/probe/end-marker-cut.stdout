@@ -1,0 +1,4 @@
+auspex_probe=1
+probe=nixos
+current_system=/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.05
+auspex_end=
