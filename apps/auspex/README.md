@@ -52,6 +52,7 @@ The module installs `auspex` and writes only configured settings to
 `stylix.enable` selects a generated Base16 `theme.toml`, unless you set another
 `settings.theme.file` (then no unused theme is written); without a theme, auspex uses
 the terminal's ANSI colours. A hand-written config works without Home Manager.
+A leading `~/` in the selected theme path uses Home Manager's home directory.
 The package is also available as `packages.<system>.auspex` (and `default`);
 `overlays.default` adds `pkgs.auspex`.
 

@@ -29,6 +29,10 @@ let
     else value;
   settings = prune cfg.settings;
   themePath = "${config.xdg.configHome}/auspex/theme.toml";
+  selectedThemePath =
+    if cfg.settings.theme.file != null && lib.hasPrefix "~/" cfg.settings.theme.file
+    then "${config.home.homeDirectory}/${lib.removePrefix "~/" cfg.settings.theme.file}"
+    else cfg.settings.theme.file;
 in {
   _file = toString ./home-manager.nix;
   options.programs.auspex = {
@@ -89,7 +93,7 @@ in {
       };
     }
     (lib.mkIf (cfg.stylix.enable && hasColors) {
-      xdg.configFile."auspex/theme.toml" = lib.mkIf (cfg.settings.theme.file == themePath) {
+      xdg.configFile."auspex/theme.toml" = lib.mkIf (selectedThemePath == themePath) {
         source = theme;
       };
       programs.auspex.settings.theme.file = lib.mkDefault themePath;

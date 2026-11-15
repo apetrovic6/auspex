@@ -5,6 +5,7 @@ let
   stub = { ... }: {
     options = {
       home.packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
+      home.homeDirectory = lib.mkOption { type = lib.types.str; default = "/home/test"; };
       xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/test/.config"; };
       xdg.configFile = lib.mkOption { type = lib.types.attrsOf (lib.types.submodule {
         options.source = lib.mkOption { type = lib.types.path; };
@@ -16,7 +17,7 @@ let
   evaluate = extra: lib.evalModules {
     specialArgs = { inherit pkgs; };
     modules = [ stub exports.homeManagerModules.auspex
-      { programs.auspex.enable = true; } extra ];
+      { programs.auspex.enable = lib.mkDefault true; } extra ];
   };
   checked = cfg: if builtins.all (a: a.assertion) cfg.assertions then cfg
     else throw (lib.concatStringsSep "\n" (map (a: a.message) (builtins.filter (a: !a.assertion) cfg.assertions)));
@@ -50,39 +51,59 @@ let
     "auspex-full: every fixture leaf must be covered by a declared settings option";
     full.config.xdg.configFile."auspex/config.toml".source;
   unknown = (evaluate { programs.auspex.settings.future.answer = 42; }).config;
-  probe = value: (evaluate { programs.auspex.settings.timeouts.probe = value; }).config.programs.auspex.settings.timeouts.probe;
-  rejected = value: !(builtins.tryEval (builtins.deepSeq (probe value) true)).success;
-  probeType = ((settingsType.getSubOptions [ ]).timeouts.type.getSubOptions [ ]).probe.type;
+  unsignedPaths = map (name: [ "timeouts" name ]) [ "ssh_connect" "probe" "eval" "settle" ]
+    ++ [ [ "prometheus" "stale_after" ] ];
+  positivePaths = [ [ "eval" "workers" ] [ "eval" "max_memory_mb" ] ];
+  numberOK = positive: path:
+    let
+      type = lib.foldl' (type: name: (type.getSubOptions [ ]).${name}.type) settingsType path;
+      probe = value: lib.getAttrFromPath path (evaluate {
+        programs.auspex.settings = lib.setAttrByPath path value;
+      }).config.programs.auspex.settings;
+      rejected = value: !(builtins.tryEval (builtins.deepSeq (probe value) true)).success;
+    in probe 1 == 1 && !type.check "ten" && rejected "ten"
+      && !type.check (-1) && rejected (-1)
+      && (if positive then !type.check 0 && rejected 0 else probe 0 == 0);
   slots = map (s: "base${s}") [ "00" "01" "02" "03" "04" "05" "06" "07" "08" "09" "0A" "0B" "0C" "0D" "0E" "0F" ];
-  styled = color: extra: checked (evaluate ({
-    lib.stylix.colors = lib.genAttrs slots (_: color);
+  palette = builtins.listToAttrs (lib.imap0 (index: slot: {
+    name = slot;
+    value = lib.fixedWidthString 6 "0" (toString index);
+  }) slots);
+  styled = colors: extra: checked (evaluate ({
+    lib.stylix.colors = colors;
     programs.auspex.stylix.enable = true;
   } // extra)).config;
-  stylix = styled "123abc" { };
-  prefixed = styled "#123abc" { };
-  customTheme = styled "123abc" {
-    programs.auspex = { stylix.enable = true; settings.theme.file = "/mine.toml"; };
+  stylix = styled palette { };
+  prefixed = styled (lib.mapAttrs (_: color: "#${color}") palette) { };
+  withTheme = file: styled palette {
+    programs.auspex = { stylix.enable = true; settings.theme.file = file; };
   };
+  customTheme = withTheme "/mine.toml";
+  tildeTheme = withTheme "~/.config/auspex/theme.toml";
+  absoluteTheme = withTheme "/home/test/.config/auspex/theme.toml";
   absent = (evaluate { programs.auspex.stylix.enable = true; }).config;
-  partial = (evaluate {
+  partialPalettes = map (slot: (evaluate {
     programs.auspex.stylix.enable = true;
-    lib.stylix.colors.base00 = "123abc";
-  }).config;
+    lib.stylix.colors = builtins.removeAttrs palette [ slot ];
+  }).config) slots;
   paletteRejected = cfg:
     !(builtins.tryEval (builtins.deepSeq (checked cfg).assertions true)).success
     && builtins.any (a: !a.assertion && lib.hasInfix "requires Stylix" a.message) cfg.assertions
     && cfg.xdg.configFile == { };
-  revision = module: self: override: (lib.evalModules {
-    specialArgs = { inherit self; };
+  revisionWithArgs = module: specialArgs: override: (lib.evalModules {
+    inherit specialArgs;
     modules = [ {
       options.system.configurationRevision = lib.mkOption { type = lib.types.nullOr lib.types.str; };
     } module override ];
   }).config.system.configurationRevision;
+  revision = module: self: override: revisionWithArgs module { inherit self; } override;
   revisionOK = module: builtins.all (x: x) [
     (revision module { rev = "abc"; dirtyRev = "dirty"; } { } == "abc")
     (revision module { dirtyRev = "dirty"; } { } == "dirty")
     (revision module { } { } == null)
     (revision module { rev = "abc"; } { system.configurationRevision = "consumer"; } == "consumer")
+    (revisionWithArgs module { } { _module.args.self.rev = "module-argument"; } == "module-argument")
+    (!(builtins.tryEval (builtins.deepSeq (revisionWithArgs module { } { }) true)).success)
   ];
   compareToml = name: sources: expectedValue: pkgs.runCommand "auspex-${name}" {
     nativeBuildInputs = [ pkgs.python3 ];
@@ -101,6 +122,13 @@ let
     PY
     touch $out
   '';
+  exportedPackage = exports.packages.${system}.auspex;
+  disabled = (evaluate {
+    programs.auspex = { enable = false; stylix.enable = true; settings.flake = "/ignored"; };
+  }).config;
+  installedPackages = map (p: p.drvPath) full.config.home.packages;
+  otherPkgs = import pkgs.path { system = "aarch64-linux"; };
+  otherOverlayPackage = (exports.overlays.default otherPkgs otherPkgs).auspex;
   defaultPackage = exports.packages.${system}.default;
   overlayPackage = (exports.overlays.default pkgs pkgs).auspex;
 in {
@@ -108,18 +136,29 @@ in {
   auspex-full = compareToml "full" fullSource expected;
   auspex-freeform = compareToml "freeform" unknown.xdg.configFile."auspex/config.toml".source { future.answer = 42; };
   # Positive evaluation and the declared type guard prevent an unrelated throw from passing.
-  auspex-types = check "types" (probe 10 == 10 && probe 0 == 0
-    && !probeType.check "ten" && !probeType.check (-1)
-    && rejected "ten" && rejected (-1));
+  auspex-types = check "types" (builtins.all (numberOK false) unsignedPaths
+    && builtins.all (numberOK true) positivePaths);
   auspex-stylix = compareToml "stylix" [
     stylix.xdg.configFile."auspex/theme.toml".source
     prefixed.xdg.configFile."auspex/theme.toml".source
-  ] (lib.genAttrs slots (_: "#123abc"));
+  ] (lib.mapAttrs (_: color: "#${color}") palette);
   auspex-theme-path = pkgs.linkFarm "auspex-theme-path" [
     {
       name = "default";
       path = compareToml "theme-default" stylix.xdg.configFile."auspex/config.toml".source
         { theme.file = "/home/test/.config/auspex/theme.toml"; };
+    }
+    {
+      name = "tilde";
+      path = compareToml "theme-tilde" tildeTheme.xdg.configFile."auspex/config.toml".source
+        { theme.file = "~/.config/auspex/theme.toml"; };
+    }
+    {
+      name = "selected-palettes";
+      path = compareToml "theme-selected" [
+        tildeTheme.xdg.configFile."auspex/theme.toml".source
+        absoluteTheme.xdg.configFile."auspex/theme.toml".source
+      ] (lib.mapAttrs (_: color: "#${color}") palette);
     }
     {
       name = "override";
@@ -128,16 +167,20 @@ in {
           customTheme.xdg.configFile."auspex/config.toml".source) { theme.file = "/mine.toml"; };
     }
   ];
-  auspex-no-stylix = check "no-stylix" (paletteRejected absent && paletteRejected partial);
+  auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision
     && builtins.all (self: revision (exports.lib.mkConfigurationRevisionModule self) { } { }
       == (self.rev or self.dirtyRev or null)) [ { rev = "abc"; dirtyRev = "dirty"; } { dirtyRev = "dirty"; } { } ]
     && revision (exports.lib.mkConfigurationRevisionModule { rev = "abc"; }) { }
       { system.configurationRevision = "consumer"; } == "consumer");
-  auspex-package = assert lib.assertMsg (defaultPackage.drvPath == package.drvPath
-    && overlayPackage.drvPath == package.drvPath) "auspex-package: default and overlay must export auspex";
-    pkgs.runCommand "auspex-package" { nativeBuildInputs = [ defaultPackage overlayPackage ]; } ''
+  auspex-package = assert lib.assertMsg (defaultPackage.drvPath == exportedPackage.drvPath
+    && overlayPackage.drvPath == exportedPackage.drvPath
+    && otherOverlayPackage.drvPath == exports.packages.aarch64-linux.auspex.drvPath)
+    "auspex-package: default and overlay must export their system's auspex";
+    assert lib.assertMsg (installedPackages == [ exportedPackage.drvPath ] && disabled.home.packages == [ ])
+      "auspex-package: home-manager must install exactly auspex only when enabled";
+    pkgs.runCommand "auspex-package" { nativeBuildInputs = [ package ]; } ''
       test '${package.meta.mainProgram}' = auspex
       test '${package.CARGO_PROFILE}' = release
       test "$(command -v auspex)" = '${package}/bin/auspex'
