@@ -1,0 +1,56 @@
+[package]
+name = "auspex-effects"
+version = "0.1.0"
+description = "auspex's adapters: ssh probes, nix evaluation, the eval cache, Prometheus, narinfo and DNS"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+# Flip to true only if this crate is genuinely meant for a registry.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+auspex-domain = { path = "../auspex-domain" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+# The digest of a machine name in its cache file name (names are data, never path
+# components). Already in the graph through auspex-domain.
+sha2 = "0.10"
+# `process` for child processes with their own process group, `io-util` for the capped
+# readers, `net` for DNS, `fs` for the cache, `sync` for the evaluation channel.
+tokio = { workspace = true, features = ["process", "io-util", "net", "fs", "sync"] }
+# `CancellationToken`: the one way a caller cancels any function here. Already in the graph.
+tokio-util = { version = "0.7", default-features = false }
+# Safe wrappers for the three syscalls std does not offer: kill a whole process group,
+# getuid (the control directory's owner check) and, in tests, probing a pid. The workspace
+# forbids `unsafe`, so libc is not an option. Already in the graph.
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
+
+# --- HTTP (Prometheus and narinfo) ---
+#
+# The workspace's shared HTTPS stack (see the comment in the root Cargo.toml): hyper-util's
+# legacy client over hyper-rustls with an explicit rustls config, and NOT reqwest, whose
+# TLS features would unify into `crates/telemetry`'s blocking client. rustls is declared
+# here on `ring` rather than the workspace entry's `aws-lc-rs`. Neither was in Cargo.lock,
+# so one had to arrive; ring is the smaller C build (aws-lc-sys compiles all of AWS-LC, and
+# off its pre-generated targets wants cmake or bindgen). The workspace chose aws-lc-rs so
+# that `crates/oidc`'s JWT checks and its TLS share a provider, and auspex has no oidc.
+# Both licences pass deny.toml. The provider is passed explicitly
+# (`builder_with_provider`), so a second provider elsewhere in a build cannot make
+# construction panic.
+http.workspace = true
+http-body-util.workspace = true
+hyper = { workspace = true, features = ["client", "http1"] }
+hyper-util.workspace = true
+hyper-rustls.workspace = true
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["process", "io-util", "net", "fs", "sync", "test-util"] }

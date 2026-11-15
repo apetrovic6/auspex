@@ -17,3 +17,7 @@ args = ["add", "crux-app", "auspex", "--shells", "tui"]
 [[step]]
 tool = "cli"
 args = ["add", "lib-crate", "auspex-domain"]
+
+[[step]]
+tool = "cli"
+args = ["add", "lib-crate", "auspex-effects"]

@@ -24,5 +24,15 @@
     # the runner's PATH carries nix, devenv, git, bash and coreutils, and nothing else.
     skopeo
     jq
+
+    # auspex evaluates each machine's toplevel with nix-eval-jobs (one evaluator per machine,
+    # so one failure cannot abort the rest), and `crates/auspex-effects/tests/nix_fixture.rs`
+    # runs it against a fixture flake. Pinned here so that test runs in the dev shell rather
+    # than skipping for want of the binary. Not in the `ci-pure` sandbox: there is no Nix
+    # daemon to evaluate against there, so the test skips itself.
+    nix-eval-jobs
+  ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+    # Git's address-space cap must be installed before exec, not raced from the parent.
+    pkgs.util-linux
   ];
 }
