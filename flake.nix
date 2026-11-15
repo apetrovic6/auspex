@@ -64,12 +64,15 @@
             targets = discovery.rustTargets;
           };
           craneLib = (crane.mkLib pkgs).overrideToolchain (_: toolchain);
-          result = mkPipeline {
+          result = mkPipeline ({
             src = ./.;
             inherit pkgs craneLib;
             inputs = { inherit connectrpc; };
             depsBase = ./nix/deps-base;
-          };
+            # Match devenv's layer names instead of the changing flake source store basename.
+            pname = "rust-app-template";
+            extraStages = import ./nix/auspex/stages.nix;
+          } // import ./nix/auspex/platform-args.nix { inherit pkgs system; lib = nixpkgs.lib; });
           # The CLI (products run it from the pinned template input; see `just add`).
           cli = craneLib.buildPackage {
             pname = "cli";
@@ -146,11 +149,12 @@
     {
       lib = {
         inherit mkPipeline mkToolchain discover;
+        inherit (import ./nix/auspex/revision.nix) mkConfigurationRevisionModule;
       };
 
       packages = forAllSystems (system:
         let result = results.${system};
-        in result.packages // { inherit (result) cli; });
+        in result.packages // { inherit (result) cli; default = result.packages.auspex; });
 
       # The service checks: `<svc>-module-vm` and `<svc>-image-vm`, one pair per discovered
       # service, derived from the service's package and image. They are in `packages` too, so
@@ -167,7 +171,11 @@
           (name: svc: {
             "${name}-nixos-module" = consumerCheck system name svc;
           })
-          results.${system}.services));
+          results.${system}.services)
+      // import ./nix/auspex/checks.nix {
+        pkgs = nixpkgs.legacyPackages.${system};
+        package = self.packages.${system}.auspex;
+      });
 
       # The NixOS modules, one per discovered service. A module is system-independent, but the
       # package it defaults to is not, so each wrapper imports the variant built for the
@@ -193,7 +201,14 @@
             config.services.${generic.product}.${name}.package = lib.mkDefault ours.package;
           })
         (nixpkgs.lib.listToAttrs
-          (map (service: nixpkgs.lib.nameValuePair service.name service) (discover ./.).services));
+          (map (service: nixpkgs.lib.nameValuePair service.name service) (discover ./.).services))
+        // { configurationRevision = (import ./nix/auspex/revision.nix).module; };
+
+      darwinModules.configurationRevision = (import ./nix/auspex/revision.nix).module;
+      homeManagerModules.auspex = import ./nix/auspex/home-manager.nix { inherit (self) packages; };
+      overlays.default = final: prev: {
+        auspex = self.packages.${final.stdenv.hostPlatform.system}.auspex;
+      };
 
       # `nix run <repo>#new -- <name> [flags]`, and the `add` half for `just add`.
       apps = forAllSystems (system:

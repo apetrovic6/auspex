@@ -23,13 +23,14 @@
 
   mkPipeline = import ./pipeline/pipeline.nix { inherit lib; };
 
-  result = mkPipeline {
+  result = mkPipeline ({
     src = ../.;
     inherit pkgs craneLib;
     inherit inputs;
     depsBase = ../nix/deps-base;
     pname = "rust-app-template";
-  };
+    extraStages = import ./auspex/stages.nix;
+  } // import ./auspex/platform-args.nix { inherit pkgs lib; system = pkgs.stdenv.hostPlatform.system; });
 
   outputs = result.packages;
 in {
