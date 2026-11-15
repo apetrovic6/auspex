@@ -945,10 +945,29 @@ mod tests {
 
     #[test]
     fn the_committed_entities_still_parse_to_what_they_did() {
-        let counters = fields_from_entity(include_str!(
-            "../../../../services/api/src/entities/counters.rs"
-        ))
-        .expect("the counters entity is a readable entity");
+        // The template's example service's `src/entities/counters.rs`, verbatim. This used to
+        // be an `include_str!` of that file, which made a product without the example service
+        // fail to compile its xtask tests at all. It is inlined rather than added to
+        // `fixtures/entities/`, because `api::fixtures` copies that directory wholesale over a
+        // probe service's entities and this module is not one it declares.
+        const COUNTERS: &str = r#"//! Generated-shape entity for the `counters` table.
+
+use sea_orm::entity::prelude::*;
+
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+#[sea_orm(table_name = "counters")]
+pub struct Model {
+    #[sea_orm(primary_key, auto_increment = false)]
+    pub id: String,
+    pub count: i64,
+    pub updated_at: DateTimeWithTimeZone,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+"#;
+        let counters =
+            fields_from_entity(COUNTERS).expect("the counters entity is a readable entity");
         let names: Vec<&str> = counters.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, ["count"]);
         assert_eq!(counters.infrastructure, ["id", "updated_at"]);

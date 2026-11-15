@@ -29,7 +29,7 @@ plugins:
       - json=true
       # Embeds each package's descriptors and exposes `descriptor_pool()`, which is what
       # feeds gRPC server reflection — no FileDescriptorSet file to ship and no build
-      # script to run. `services/api/src/startup.rs` mounts the service that reads it.
+      # script to run. A service mounts the reflection service that reads it.
       - reflect_mode=bridge
   - local: protoc-gen-buffa-packaging
     out: crates/proto/src/gen/buffa
