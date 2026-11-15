@@ -1,10 +1,6 @@
 mod lib '../../just/lib.just'
-mod crux '../../just/crux.just'
 
 app := "auspex"
-core_pkg := "auspex-core"
-app_dir := justfile_directory()
-core_dir := app_dir / "core"
 
 # Rust crates belonging to this app, as paths relative to this file. These are Cargo
 # workspace members (apps/*/core and apps/*/shells/*), so creating a directory here is the
@@ -75,93 +71,15 @@ dev: fix check build test
 ci: check build test
 
 # --------------------------------------------------------------------------
-# Code generation
+# No code generation, no native platforms
 # --------------------------------------------------------------------------
-# Two generators feed a native platform project, driven from here with absolute paths so
-# they share one working directory:
-#
-#   typegen -> serde/bincode types (Event, ViewModel, Effect) from the Crux core
-#   pack    -> the FFI surface and prebuilt native libraries from core/boltffi.toml
-#
-# Both refuse, as their first line, when the app has no project for that platform — a product
-# scaffolded with one platform does not carry a recipe that pretends at the other. The check
-# is the first line of the GENERATOR rather than a guard in the `android`/`apple` recipes
-# below, for two reasons measured in RT-13:
-#
-#   - `android: generate-android` runs the dependency before its body, so a guard in that
-#     body fires only after everything below has already run. And everything below WRITES:
-#     typegen creates `platforms/android/generated` out of nothing. A late guard therefore
-#     leaves the junk it exists to prevent, and nothing ever lists it again — `_platforms`
-#     discovers `platforms/*/Justfile`, and there is no Justfile inside.
-#   - once `platforms/android` exists but holds no Justfile, `just platforms/android/build`
-#     stops saying so. `just` walks up from that directory, finds THIS file, and runs the
-#     app's own `build`. Measured, RT-13, on a scaffolded Apple-only app: its `android` recipe
-#     compiled every Rust shell, trunk included, printed no complaint and exited 0.
-#
-# So the guard is what the generator does first, and `android`/`apple` stay typeable and
-# explain themselves rather than vanishing with the project. `native` and `generate` are the
-# other half of the split: they mean "every platform this host has", so they DISCOVER, via
-# `_platforms`, and in a one-platform product they run that one and nothing else.
-#
-# When adding prose to a recipe's comment block below, note that `just --list` shows only the
-# LAST line of it (measured, just 1.58.0). The line nearest the recipe is the one a person
-# browsing recipes sees, so it has to read alone; the reasoning goes in the body.
-
-# Kotlin bindings + jniLibs + localization resources into platforms/android/generated
-generate-android:
-    @test -f platforms/android/Justfile || { echo '  no Android project: platforms/android/Justfile is absent. Add one with' >&2; echo '    just add platform-android {{ app }}' >&2; exit 1; }
-    @just crux::typegen {{ core_pkg }} kotlin '{{ app_dir }}/platforms/android/generated'
-    @just crux::pack '{{ core_dir }}' android
-    # The third feed is the same TOML tree the Rust shells read; it goes in here and
-    # not in a recipe of its own because a platform build that skipped it would render
-    # the fallback language forever with nothing failing.
-    @cargo xtask i18n-resources {{ app }} android
-
-# Swift package + xcframework + String Catalog into platforms/apple/generated (macOS hosts only)
-generate-apple:
-    # Same guard as generate-android, for the same reasons.
-    @test -f platforms/apple/Justfile || { echo '  no Apple project: platforms/apple/Justfile is absent. Add one with' >&2; echo '    just add platform-apple {{ app }}' >&2; exit 1; }
-    rm -rf '{{ app_dir }}/platforms/apple/generated/Shared'
-    @just crux::typegen {{ core_pkg }} swift '{{ app_dir }}/platforms/apple/generated'
-    @just crux::pack '{{ core_dir }}' apple
-    # Same third feed as generate-android, for the same reason.
-    @cargo xtask i18n-resources {{ app }} apple
-
-# regenerate every platform available on this host
-[script('bash')]
-generate:
-    set -euo pipefail
-    # Discovered, exactly as `native` runs them: an unconditional `just generate-android` here
-    # was the same bug, and the guard above would otherwise turn a product that has Apple and
-    # not Android into a failure on the Android it was never given (RT-13).
-    for p in $(just _platforms); do
-        n=$(basename "$p")
-        just "generate-$n"
-    done
-
-# --------------------------------------------------------------------------
-# Native platforms
-# --------------------------------------------------------------------------
-# Only useful once `just add platform-auspex <android|apple>` has created one, and
-# that is now enforced rather than merely stated: `generate-android`/`generate-apple` refuse
-# without their project (RT-13). They are explicit rather than part of `dev`/`ci` because they
-# need an Android SDK or Xcode, which an ordinary Rust checkout has neither of.
-
-# generate bindings, then build the Android app
-android: generate-android
-    just platforms/android/build
-
-# generate bindings, then build the Apple app (macOS hosts only)
-apple: generate-apple
-    just platforms/apple/build
-
-# every platform available on this host
-[script('bash')]
-native:
-    set -euo pipefail
-    for p in $(just _platforms); do
-        just "$(basename "$p")"
-    done
+# The template's `generate-android`, `generate-apple`, `generate`, `android`, `apple` and
+# `native` recipes are gone, deliberately. They drove the Crux typegen (`--bin codegen
+# --features codegen,facet_typegen`) and `boltffi pack`, and auspex-core has neither: auspex
+# has one shell, the Rust terminal one, linking the core directly. Left in, they failed with a
+# cargo feature error the moment a `platforms/` project existed. `_platforms` above stays,
+# because `doctor` and `clean` walk it and xtask's `gates.rs` asserts the macOS skip it
+# declares.
 
 # --------------------------------------------------------------------------
 
@@ -169,6 +87,3 @@ native:
 clean:
     set -euo pipefail
     for m in {{ rust_modules }} $(just _platforms); do just "$m/clean"; done
-    just crux::clean-generated \
-        '{{ app_dir }}/platforms/android/generated' \
-        '{{ app_dir }}/platforms/apple/generated'

@@ -22,9 +22,11 @@ pub mod effects;
 pub mod view;
 
 pub use app::{
-    Auspex, EVAL_MISSING, EVAL_TIMED_OUT, Event, Model, PROBE_TIMED_OUT, PROMETHEUS_TIMED_OUT,
+    Auspex, EVAL_MISSING, EVAL_TIMED_OUT, Event, INVENTORY_TIMED_OUT, Model, PROBE_TIMED_OUT,
+    PROMETHEUS_TIMED_OUT,
 };
+pub use auspex_domain::report::{FleetError, FleetErrorKind};
 pub use config::{Config, PrometheusConfig};
 pub use crux_core::Core;
 pub use effects::{Effect, Generation, RequestId};
-pub use view::{FleetError, Mode, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel};
+pub use view::{Mode, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel};

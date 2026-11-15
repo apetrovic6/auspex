@@ -13,14 +13,14 @@ use crate::effects::Generation;
 pub struct ViewModel {
     /// The fleet report: per machine, the domain's [`MachineReport`]
     /// (`auspex_domain::report::machine_report`), sorted by name, plus the shared-IP list.
-    /// `--json` prints exactly this. Its `settled` is `true` only once the scan finished
-    /// before the global deadline: a run the deadline cut short reports `false`, as the
-    /// contract documents.
+    /// `--json` prints exactly this. Fleet-level failures (the machine list failed or timed
+    /// out, the evaluator could not run) are its `errors`; there is no second copy of them
+    /// here. Its `settled` is the domain's: the scan completed cleanly, which is `false`
+    /// when the deadline cut it short or any fleet error is present. What headless mode
+    /// waits for is [`RefreshView::settled`], not this.
     ///
     /// [`MachineReport`]: auspex_domain::report::MachineReport
     pub report: FleetReport,
-    /// Fleet-level errors: what has no machine row to sit on.
-    pub fleet_errors: Vec<FleetError>,
     /// Where the current refresh is.
     pub refresh: RefreshView,
     /// Whether the Prometheus fallback is in effect, for the status bar.
@@ -67,34 +67,17 @@ pub enum Phase {
     Settled,
 }
 
-/// A fleet-level error.
-///
-/// Kinds and the underlying tool's own words, not a sentence: the shell writes the sentence
-/// (ADR 0016).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FleetError {
-    /// The machine list could not be read. There are no rows.
-    InventoryFailed {
-        /// What the adapter reported.
-        reason: String,
-    },
-    /// The machine list did not arrive before the global deadline. There are no rows.
-    InventoryTimedOut,
-    /// The evaluator as a whole failed. Every machine it had not answered for carries this
-    /// reason too, as an eval error on its row.
-    EvaluationFailed {
-        /// What the adapter reported.
-        reason: String,
-    },
-}
-
 /// The state of the Prometheus source in this refresh.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PrometheusStatus {
     /// Not configured: health comes from ssh.
     #[default]
     NotConfigured,
-    /// Asked, no answer yet: health comes from ssh meanwhile.
+    /// Configured, but not asked this refresh: the machine list failed, timed out or is
+    /// empty, so there was no instance to ask about.
+    NotAsked,
+    /// Configured and asked (or about to be, once the list arrives), no answer yet: health
+    /// comes from ssh meanwhile.
     Pending,
     /// Answered. Machines with a fresh sample use it; the rest fall back to ssh.
     Available,

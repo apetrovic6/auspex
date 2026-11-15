@@ -211,7 +211,9 @@ pub struct ResolveRequest {
 
 impl Operation for ResolveRequest {
     /// Machine name to every address its hostname resolved to. A machine that is missing or
-    /// has none did not resolve; that is not an error, it just cannot collide.
+    /// has none did not resolve; that is not an error, it just cannot collide. An entry for a
+    /// machine that is not in `hosts` is ignored: it can neither invent a collision nor
+    /// overwrite an IP-literal target's address.
     type Output = BTreeMap<String, Vec<IpAddr>>;
 }
 

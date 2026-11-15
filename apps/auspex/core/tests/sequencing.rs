@@ -8,8 +8,8 @@ use std::net::IpAddr;
 
 use auspex_core::effects::{EvalAnswer, EvalMachine};
 use auspex_core::{
-    Config, EVAL_MISSING, Event, FleetError, PROBE_TIMED_OUT, Phase, PrometheusConfig,
-    PrometheusStatus, RequestId,
+    Config, EVAL_MISSING, Event, FleetError, FleetErrorKind, INVENTORY_TIMED_OUT, PROBE_TIMED_OUT,
+    Phase, PrometheusConfig, PrometheusStatus, RequestId,
 };
 use auspex_domain::fleet::MachineClass;
 use auspex_domain::observe::HealthSource;
@@ -497,10 +497,11 @@ fn a_finished_evaluator_settles_the_machines_it_skipped() {
         Some("error: flake.lock is not up to date")
     );
     assert_eq!(
-        shell.view().fleet_errors,
-        [FleetError::EvaluationFailed {
-            reason: "error: flake.lock is not up to date".to_owned()
-        }]
+        shell.view().report.errors,
+        [FleetError::new(
+            FleetErrorKind::EvaluationFailed,
+            "error: flake.lock is not up to date"
+        )]
     );
 }
 
@@ -514,7 +515,13 @@ fn the_deadline_settles_every_state_it_can_arrive_in() {
     });
     let view = shell.view();
     assert!(view.refresh.settled);
-    assert_eq!(view.fleet_errors, [FleetError::InventoryTimedOut]);
+    assert_eq!(
+        view.report.errors,
+        [FleetError::new(
+            FleetErrorKind::InventoryTimedOut,
+            INVENTORY_TIMED_OUT
+        )]
+    );
 
     let mut shell = Shell::new();
     shell.start_with(full_config(), "{}");
@@ -558,7 +565,7 @@ fn prometheus_unavailable_means_every_value_from_ssh() {
             reason: "connection refused".to_owned()
         }
     );
-    assert_eq!(view.fleet_errors.len(), 0, "not an error");
+    assert_eq!(view.report.errors.len(), 0, "not an error");
     for m in &view.report.machines {
         let h = m.health;
         assert_eq!(
@@ -688,7 +695,7 @@ fn an_evaluation_error_stays_on_its_row_with_its_reason() {
     );
     assert_eq!(shell.row("sol").status, Badge::InSync);
     assert_eq!(shell.row("terra").status, Badge::Evaluating);
-    assert_eq!(shell.view().fleet_errors.len(), 0);
+    assert_eq!(shell.view().report.errors.len(), 0);
 }
 
 #[test]
@@ -702,10 +709,11 @@ fn a_machine_list_failure_is_a_fleet_error_with_its_reason() {
     );
     let view = shell.view();
     assert_eq!(
-        view.fleet_errors,
-        [FleetError::InventoryFailed {
-            reason: "error: flake '/fleet' does not provide clanInternals".to_owned()
-        }]
+        view.report.errors,
+        [FleetError::new(
+            FleetErrorKind::InventoryFailed,
+            "error: flake '/fleet' does not provide clanInternals"
+        )]
     );
     assert_eq!(view.report.machines.len(), 0);
     assert!(view.refresh.settled, "nothing else will come");
@@ -713,7 +721,7 @@ fn a_machine_list_failure_is_a_fleet_error_with_its_reason() {
 
     // A refresh clears it.
     shell.send(Event::Refresh);
-    assert_eq!(shell.view().fleet_errors.len(), 0);
+    assert_eq!(shell.view().report.errors.len(), 0);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -863,4 +871,404 @@ fn help_and_quit() {
         shell.cancels.iter().copied().collect::<BTreeSet<_>>(),
         outstanding
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Review round 1: reproductions
+// ---------------------------------------------------------------------------------------
+
+/// Both reviews, finding 1: a failed list must not serialise as a settled, empty fleet.
+#[test]
+fn a_failed_list_does_not_serialise_as_an_empty_fleet() {
+    let mut failed = Shell::new();
+    failed.send(Event::Start(bare_config()));
+    let mut list = failed.take_inventory();
+    failed.resolve(
+        &mut list,
+        Err("error: flake does not provide clanInternals".to_owned()),
+    );
+    let mut empty = Shell::new();
+    empty.start_with(bare_config(), "{}");
+
+    assert!(failed.view().refresh.settled, "headless stops waiting");
+    let f = serde_json::to_value(failed.view().report).unwrap();
+    let e = serde_json::to_value(empty.view().report).unwrap();
+    assert_ne!(f, e);
+    assert_eq!(f["settled"], false);
+    assert_eq!(
+        f["errors"],
+        serde_json::json!([{
+            "kind": "inventory_failed",
+            "reason": "error: flake does not provide clanInternals"
+        }])
+    );
+    assert_eq!(e["settled"], true);
+    assert_eq!(e["errors"], serde_json::json!([]));
+}
+
+/// Sol's variant of finding 1: an evaluator failure after every row already has a result.
+#[test]
+fn an_evaluator_failure_reaches_the_report() {
+    let mut shell = Shell::new();
+    shell.start_with(
+        bare_config(),
+        r#"{"terra": {"deploy": {"targetHost": "192.168.1.10"}}}"#,
+    );
+    let sys = path('0', "nixos-system-terra");
+    shell.probe("terra", observed(&sys, ""));
+    let mut eval = shell.take_eval();
+    shell.eval_item(&mut eval, "terra", evaluated("terra", &sys));
+    shell.resolve(
+        &mut eval,
+        EvalAnswer::Finished {
+            error: Some("error: evaluator crashed".to_owned()),
+        },
+    );
+    let view = shell.view();
+    assert!(view.refresh.settled);
+    assert_eq!(
+        shell.row("terra").status,
+        Badge::InSync,
+        "answered rows stand"
+    );
+    let report = serde_json::to_value(&view.report).unwrap();
+    assert_eq!(report["settled"], false);
+    assert_eq!(report["errors"][0]["kind"], "evaluation_failed");
+    assert_eq!(report["errors"][0]["reason"], "error: evaluator crashed");
+}
+
+/// The deadline before the list: the report says so, with a reason.
+#[test]
+fn a_list_timeout_reaches_the_report() {
+    let mut shell = Shell::new();
+    shell.send(Event::Start(bare_config()));
+    shell.send(Event::DeadlinePassed {
+        generation: shell.view().refresh.generation,
+    });
+    let report = serde_json::to_value(shell.view().report).unwrap();
+    assert_eq!(report["settled"], false);
+    assert_eq!(report["errors"][0]["kind"], "inventory_timed_out");
+    assert_ne!(report["errors"][0]["reason"], "");
+}
+
+const RESOLVE_FLEET: &str = r#"{
+  "cerberus": {"deploy": {"targetHost": "root@192.168.1.2"}},
+  "mars":     {"deploy": {"targetHost": "root@mars.example.org"}},
+  "broken":   {"deploy": {"targetHost": "-oProxyCommand=sh"}}
+}"#;
+
+/// Opus finding 2a: an answer for a refused machine, never asked about, must not collide.
+#[test]
+fn an_address_for_a_machine_not_asked_about_is_ignored() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config(), RESOLVE_FLEET);
+    let before = shell.row("cerberus");
+    let mut req = shell.resolves.remove(0);
+    assert_eq!(req.operation.hosts.keys().collect::<Vec<_>>(), ["mars"]);
+    shell.resolve(
+        &mut req,
+        BTreeMap::from([
+            ("mars".to_owned(), vec!["10.9.9.9".parse().unwrap()]),
+            ("broken".to_owned(), vec!["192.168.1.2".parse().unwrap()]),
+        ]),
+    );
+    assert_eq!(shell.row("cerberus"), before);
+    assert_eq!(shell.view().report.shared_ips.len(), 0);
+}
+
+/// Opus finding 2b: an answer must not overwrite a literal IP's known address.
+#[test]
+fn an_answer_cannot_overwrite_a_literal_address() {
+    let mut shell = Shell::new();
+    shell.start_with(
+        bare_config(),
+        r#"{
+          "cerberus": {"deploy": {"targetHost": "root@192.168.1.2"}},
+          "mars":     {"deploy": {"targetHost": "root@mars.example.org"}}
+        }"#,
+    );
+    let mut req = shell.resolves.remove(0);
+    shell.resolve(
+        &mut req,
+        BTreeMap::from([
+            ("mars".to_owned(), vec!["192.168.1.2".parse().unwrap()]),
+            ("cerberus".to_owned(), vec!["10.9.9.9".parse().unwrap()]),
+        ]),
+    );
+    let shared = shell.view().report.shared_ips;
+    assert_eq!(shared.len(), 1);
+    assert_eq!(shared[0].machines, ["cerberus", "mars"]);
+}
+
+/// Sol finding 2: an empty unrequested entry must not erase the real collision either.
+#[test]
+fn an_unrequested_empty_answer_does_not_hide_a_shared_ip() {
+    let mut shell = Shell::new();
+    shell.start_with(
+        bare_config(),
+        r#"{
+          "terra": {"deploy": {"targetHost": "192.168.1.10"}},
+          "luna":  {"deploy": {"targetHost": "luna.example"}}
+        }"#,
+    );
+    let mut dns = shell.resolves.remove(0);
+    assert_eq!(
+        dns.operation
+            .hosts
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["luna"]
+    );
+    shell.resolve(
+        &mut dns,
+        BTreeMap::from([
+            ("luna".to_owned(), vec!["192.168.1.10".parse().unwrap()]),
+            ("terra".to_owned(), vec![]),
+        ]),
+    );
+    assert_eq!(shell.view().report.shared_ips.len(), 1);
+}
+
+/// Opus finding 4: with Prometheus configured, the status never reads `NotConfigured`.
+#[test]
+fn prometheus_is_not_reported_unconfigured_when_it_is_configured() {
+    let mut failed = Shell::new();
+    failed.send(Event::Start(full_config()));
+    assert_eq!(failed.view().prometheus, PrometheusStatus::Pending);
+    let mut list = failed.take_inventory();
+    failed.resolve(&mut list, Err("boom".to_owned()));
+    assert_eq!(failed.view().prometheus, PrometheusStatus::NotAsked);
+
+    let mut empty = Shell::new();
+    empty.start_with(full_config(), "{}");
+    assert_eq!(empty.view().prometheus, PrometheusStatus::NotAsked);
+
+    let mut bare = Shell::new();
+    bare.start_with(bare_config(), "{}");
+    assert_eq!(bare.view().prometheus, PrometheusStatus::NotConfigured);
+}
+
+// ---------------------------------------------------------------------------------------
+// Review round 1: guards no test protected (Opus mutations)
+// ---------------------------------------------------------------------------------------
+
+/// Answers every request of the current generation: every probe in sync, every eval, the
+/// evaluator finished, Prometheus with `samples`, and any address and cache questions.
+fn complete(shell: &mut Shell, samples: BTreeMap<String, auspex_domain::observe::PromSample>) {
+    let mut eval = shell.take_eval();
+    let names: Vec<String> = eval
+        .operation
+        .machines
+        .iter()
+        .map(|m| m.name.clone())
+        .collect();
+    for name in &names {
+        let sys = path('0', &format!("nixos-system-{name}"));
+        if shell.probes.iter().any(|r| r.operation.machine == *name) {
+            shell.probe(name, observed(&sys, ""));
+        }
+        shell.eval_item(&mut eval, name, evaluated(name, &sys));
+    }
+    shell.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    if !shell.prometheus.is_empty() {
+        let mut prom = shell.take_prometheus();
+        shell.resolve(&mut prom, Ok(samples));
+    }
+    while let Some(mut req) = shell.resolves.pop() {
+        shell.resolve(&mut req, BTreeMap::new());
+    }
+}
+
+/// Refreshes and answers the new list with `json`.
+fn refresh_with(shell: &mut Shell, json: &str) {
+    shell.send(Event::Refresh);
+    shell.drop_cancelled();
+    let mut list = shell.take_inventory();
+    shell.resolve(&mut list, Ok(inventory(json)));
+}
+
+fn deadline(shell: &mut Shell) {
+    let generation = shell.view().refresh.generation;
+    shell.send(Event::DeadlinePassed { generation });
+}
+
+/// M4: a second deadline for the same refresh changes nothing (it would otherwise find
+/// nothing outstanding and clear `timed_out`).
+#[test]
+fn a_second_deadline_changes_nothing() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config(), THREE);
+    deadline(&mut shell);
+    let before = shell.view();
+    assert!(before.refresh.timed_out);
+    assert!(!before.report.settled);
+    let cancels = shell.cancels.len();
+    deadline(&mut shell);
+    assert_eq!(shell.view(), before);
+    assert_eq!(shell.cancels.len(), cancels);
+}
+
+/// M25: a refresh forgets the last generation's Prometheus samples.
+#[test]
+fn a_refresh_forgets_the_old_samples() {
+    let mut shell = Shell::new();
+    shell.start_with(full_config(), THREE);
+    complete(
+        &mut shell,
+        BTreeMap::from([("terra".to_owned(), sample(9_999, 1))]),
+    );
+    assert_eq!(
+        shell.row("terra").health.uptime_seconds.unwrap().source,
+        HealthSource::Prometheus
+    );
+    refresh_with(&mut shell, THREE);
+    shell.probe("terra", observed(&path('0', "x"), ""));
+    let uptime = shell.row("terra").health.uptime_seconds.unwrap();
+    assert_eq!(
+        uptime.source,
+        HealthSource::Ssh,
+        "not the last refresh's sample"
+    );
+    assert_eq!(uptime.value, 100);
+}
+
+/// M26: a refresh forgets the last generation's addresses, so a machine that has gone
+/// cannot collide with one that took its address.
+#[test]
+fn a_refresh_forgets_the_old_addresses() {
+    let mut shell = Shell::new();
+    shell.start_with(
+        bare_config(),
+        r#"{"old": {"deploy": {"targetHost": "root@192.168.1.50"}}}"#,
+    );
+    refresh_with(
+        &mut shell,
+        r#"{"new": {"deploy": {"targetHost": "root@192.168.1.50"}}}"#,
+    );
+    assert_eq!(
+        shell.view().report.shared_ips.len(),
+        0,
+        "no ghost collision"
+    );
+}
+
+/// M27 and M28: a deadline in one refresh does not settle, or mark as timed out, the next.
+#[test]
+fn a_deadline_does_not_carry_into_the_next_refresh() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config(), THREE);
+    deadline(&mut shell);
+    assert!(shell.view().refresh.timed_out);
+
+    refresh_with(&mut shell, THREE);
+    let view = shell.view();
+    assert!(
+        !view.refresh.settled,
+        "the new refresh has answers to wait for"
+    );
+    assert!(!view.refresh.timed_out);
+
+    complete(&mut shell, BTreeMap::new());
+    let view = shell.view();
+    assert!(view.refresh.settled);
+    assert!(!view.refresh.timed_out);
+    assert!(view.report.settled, "a clean second run reports settled");
+}
+
+/// M33: Prometheus still out at the deadline is reported unavailable.
+#[test]
+fn the_deadline_marks_prometheus_unavailable() {
+    let mut shell = Shell::new();
+    shell.start_with(full_config(), THREE);
+    let prom = shell.prometheus[0].operation.id;
+    deadline(&mut shell);
+    assert!(shell.cancels.contains(&prom));
+    assert_eq!(
+        shell.view().prometheus,
+        PrometheusStatus::Unavailable {
+            reason: auspex_core::PROMETHEUS_TIMED_OUT.to_owned()
+        }
+    );
+}
+
+/// M36: a deadline before `Start` (generation 0) is ignored.
+#[test]
+fn a_deadline_before_start_is_ignored() {
+    let mut shell = Shell::new();
+    let before = shell.view();
+    assert_eq!(before.refresh.generation.0, 0);
+    deadline(&mut shell);
+    assert_eq!(shell.view(), before);
+    assert!(!shell.view().refresh.settled);
+}
+
+/// M41 and M45: a deadline after the fleet settled by itself changes nothing, a refused
+/// target included (it was never probed, and must not be marked as timed out).
+#[test]
+fn a_deadline_after_settling_changes_nothing() {
+    let mut shell = Shell::new();
+    shell.start_with(
+        bare_config(),
+        r#"{
+          "terra":  {"deploy": {"targetHost": "root@192.168.1.10"}},
+          "broken": {"deploy": {"targetHost": "-oProxyCommand=sh"}}
+        }"#,
+    );
+    complete(&mut shell, BTreeMap::new());
+    let before = shell.view();
+    assert!(before.refresh.settled);
+    assert!(before.report.settled);
+    deadline(&mut shell);
+    let after = shell.view();
+    assert!(!after.refresh.timed_out);
+    assert_eq!(after.report, before.report);
+}
+
+/// M8: after a quit cancelled everything, the deadline still marks the run as timed out,
+/// because the rows it marks were cut short.
+#[test]
+fn a_deadline_after_a_quit_is_a_timeout() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config(), THREE);
+    shell.send(Event::Quit);
+    deadline(&mut shell);
+    let view = shell.view();
+    assert!(view.refresh.timed_out);
+    assert!(!view.report.settled);
+}
+
+/// M15: a machine the adapter lists twice is one row, probed once.
+#[test]
+fn a_machine_listed_twice_is_one_row() {
+    let mut shell = Shell::new();
+    shell.send(Event::Start(bare_config()));
+    let mut list = shell.take_inventory();
+    let mut machines = inventory(THREE);
+    machines.push(machines[0].clone());
+    shell.resolve(&mut list, Ok(machines));
+    assert_eq!(shell.view().report.machines.len(), 3);
+    assert_eq!(shell.probes.len(), 3);
+}
+
+/// M37: a refresh resets the Prometheus status of the last run.
+#[test]
+fn a_refresh_resets_the_prometheus_status() {
+    let mut shell = Shell::new();
+    shell.start_with(full_config(), THREE);
+    let mut prom = shell.take_prometheus();
+    shell.resolve(&mut prom, Err("down".to_owned()));
+    shell.send(Event::Refresh);
+    assert_eq!(shell.view().prometheus, PrometheusStatus::Pending);
+}
+
+/// M42: `/` from a row that already matches stays on it, as vim's incremental search does.
+#[test]
+fn a_search_that_matches_the_selection_stays_there() {
+    let mut shell = Shell::new();
+    shell.start_with(bare_config(), r#"{"luna": {}, "mars": {}, "terra": {}}"#);
+    shell.send(Event::MoveDown(1)); // mars
+    // "a" matches luna, mars and terra: the one at the cursor wins over the next.
+    shell.send(Event::Search("a".to_owned()));
+    assert_eq!(selected(&shell), "mars");
 }

@@ -27,7 +27,7 @@ use std::net::IpAddr;
 use auspex_domain::eval::{EvalFailure, EvalOutcome};
 use auspex_domain::fleet::{Machine, ResolveError, ResolvedTarget, resolve_target, shared_ips};
 use auspex_domain::observe::{Health, ProbeOutcome, PromSample, merge_health};
-use auspex_domain::report::{FleetFacts, fleet_report, machine_report};
+use auspex_domain::report::{FleetError, FleetErrorKind, FleetFacts, fleet_report, machine_report};
 use auspex_domain::status::{MachineFacts, NarCache, Outstanding, machine_status};
 use crux_core::render::render;
 use crux_core::{App, Command};
@@ -38,9 +38,7 @@ use crate::effects::{
     InventoryAnswer, InventoryRequest, ProbeRequest, PrometheusAnswer, PrometheusRequest,
     RequestId, ResolveRequest,
 };
-use crate::view::{
-    FleetError, Mode, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState,
-};
+use crate::view::{Mode, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState};
 
 /// The reason a probe still out at the global deadline is shown with.
 pub const PROBE_TIMED_OUT: &str = "timed out: no answer from the probe before the global deadline";
@@ -50,6 +48,8 @@ pub const EVAL_TIMED_OUT: &str = "error: the evaluation did not finish before th
 pub const EVAL_MISSING: &str = "error: the evaluator finished without a result for this machine";
 /// The Prometheus reason when the deadline passed first.
 pub const PROMETHEUS_TIMED_OUT: &str = "no answer before the global deadline";
+/// The `inventory_timed_out` fleet error's reason.
+pub const INVENTORY_TIMED_OUT: &str = "the machine list did not arrive before the global deadline";
 
 /// Everything a shell can tell the core.
 ///
@@ -169,7 +169,10 @@ enum Pending {
     Prometheus,
     /// The cache lookup for this machine.
     Cache(String),
-    Resolve,
+    /// Address resolution for exactly these machines: its answer may update no others, so
+    /// an adapter answering for a name it was not asked about can neither invent a
+    /// collision nor overwrite an IP-literal target's known address.
+    Resolve(BTreeSet<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -190,8 +193,6 @@ struct Row {
     probe: Option<ProbeOutcome>,
     eval: Option<EvalOutcome>,
     cache: NarCache,
-    /// The cache question has been asked this generation; it is asked at most once.
-    cache_asked: bool,
 }
 
 impl Row {
@@ -265,6 +266,13 @@ impl Model {
             Inventory::Loaded => {
                 self.outstanding.is_empty() && !self.rows.iter().any(Row::spinning)
             }
+        }
+    }
+
+    /// Prometheus is configured but there is nothing to ask it about this refresh.
+    fn prometheus_not_asked(&mut self) {
+        if self.prometheus == PrometheusStatus::Pending {
+            self.prometheus = PrometheusStatus::NotAsked;
         }
     }
 
@@ -391,18 +399,16 @@ impl App for Auspex {
                 generation,
                 id,
                 addresses,
-            } => match model.accept(generation, id, |p| *p == Pending::Resolve) {
-                Some(_) => {
+            } => match model.accept(generation, id, |p| matches!(p, Pending::Resolve(_))) {
+                Some(Pending::Resolve(asked)) => {
                     for (name, ips) in addresses {
-                        // Only machines of this generation: an adapter answering for a name it
-                        // was not asked about must not create a collision with a ghost.
-                        if model.rows.iter().any(|r| r.machine.name == name) {
+                        if asked.contains(&name) {
                             model.addresses.insert(name, ips);
                         }
                     }
                     render()
                 }
-                None => Command::done(),
+                _ => Command::done(),
             },
             Event::Quit => {
                 model.view.quit = true;
@@ -424,12 +430,22 @@ impl App for Auspex {
             .iter()
             .map(|r| machine_report(&r.machine, &r.target, &r.facts(), model.health(r), &shared))
             .collect();
-        let mut report = fleet_report(machines, shared, FleetFacts::default());
+        // The fleet errors and the timed-out flag go into the report, which is what `--json`
+        // prints: a failed list must not read as a settled, empty fleet. `report.settled`
+        // is the domain's ("the scan completed cleanly"); `refresh.settled` below is
+        // "nothing more will change", which is what headless mode waits for.
+        let report = fleet_report(
+            machines,
+            shared,
+            FleetFacts {
+                // Wired to the real progress by the next commit; until then, as before the
+                // domain grew this field, `settled` is judged on the rows and errors alone.
+                scan_complete: true,
+                timed_out: model.timed_out,
+                errors: model.fleet_errors.clone(),
+            },
+        );
         let settled = model.fleet_settled();
-        // `fleet_report` decides `settled` from badges alone, and after the deadline has
-        // marked everything as timed out there are no spinners left. The contract says a run
-        // the deadline cut short is `false`, and only the core knows that it was.
-        report.settled = settled && !model.timed_out;
 
         let names = model.names();
         let phase = match model.inventory {
@@ -447,7 +463,6 @@ impl App for Auspex {
                 timed_out: model.timed_out,
             },
             report,
-            fleet_errors: model.fleet_errors.clone(),
             prometheus: model.prometheus.clone(),
             selected: model.view.index(&names),
             search: (!model.view.query.is_empty()).then(|| SearchView {
@@ -474,7 +489,15 @@ fn refresh(model: &mut Model) -> Command<Effect, Event> {
     model.fleet_errors.clear();
     model.deadline_passed = false;
     model.timed_out = false;
-    model.prometheus = PrometheusStatus::NotConfigured;
+    model.prometheus = if model
+        .config
+        .as_ref()
+        .is_some_and(|c| c.prometheus.is_some())
+    {
+        PrometheusStatus::Pending
+    } else {
+        PrometheusStatus::NotConfigured
+    };
 
     let generation = model.generation;
     let id = model.issue(Pending::Inventory);
@@ -506,7 +529,8 @@ fn inventory_answered(model: &mut Model, answer: InventoryAnswer) -> Command<Eff
             model.inventory = Inventory::Failed;
             model
                 .fleet_errors
-                .push(FleetError::InventoryFailed { reason });
+                .push(FleetError::new(FleetErrorKind::InventoryFailed, &reason));
+            model.prometheus_not_asked();
             return render();
         }
     };
@@ -533,7 +557,6 @@ fn inventory_answered(model: &mut Model, answer: InventoryAnswer) -> Command<Eff
                 probe: None,
                 eval: None,
                 cache: NarCache::NotApplicable,
-                cache_asked: false,
             }
         })
         .collect();
@@ -620,6 +643,7 @@ fn ask_evaluation(model: &mut Model, flake: &str) -> Option<Command<Effect, Even
 fn ask_prometheus(model: &mut Model, config: &Config) -> Option<Command<Effect, Event>> {
     let prom = config.prometheus.as_ref()?;
     if model.rows.is_empty() {
+        model.prometheus_not_asked();
         return None;
     }
     let generation = model.generation;
@@ -628,7 +652,6 @@ fn ask_prometheus(model: &mut Model, config: &Config) -> Option<Command<Effect, 
         .iter()
         .map(|r| prom.instance_for(&r.machine.name).to_owned())
         .collect();
-    model.prometheus = PrometheusStatus::Pending;
     let id = model.issue(Pending::Prometheus);
     Some(
         Command::request_from_shell(PrometheusRequest {
@@ -664,7 +687,7 @@ fn ask_addresses(model: &mut Model) -> Option<Command<Effect, Event>> {
         return None;
     }
     let generation = model.generation;
-    let id = model.issue(Pending::Resolve);
+    let id = model.issue(Pending::Resolve(hostnames.keys().cloned().collect()));
     Some(
         Command::request_from_shell(ResolveRequest {
             id,
@@ -716,15 +739,20 @@ fn eval_answered(
             if let Some(reason) = error {
                 model
                     .fleet_errors
-                    .push(FleetError::EvaluationFailed { reason });
+                    .push(FleetError::new(FleetErrorKind::EvaluationFailed, &reason));
             }
             render()
         }
     }
 }
 
-/// The cache question, when it applies to `name` now: a cache is configured, it has not been
-/// asked this generation, the toplevel evaluated, and the machine runs something else.
+/// The cache question, when it applies to `name` now: a cache is configured, the toplevel
+/// evaluated, and the machine runs something else.
+///
+/// Called when the probe or the evaluation lands. Each is accepted at most once per
+/// generation (the probe's id leaves the outstanding table; the first eval result stands),
+/// so exactly one of those calls sees both, and the question is asked at most once without a
+/// flag to say so.
 fn ask_cache(model: &mut Model, name: &str) -> Command<Effect, Event> {
     let binary_cache = model.config.as_ref().is_some_and(|c| c.binary_cache);
     let Some(row) = model.rows.iter_mut().find(|r| r.machine.name == name) else {
@@ -739,10 +767,9 @@ fn ask_cache(model: &mut Model, name: &str) -> Command<Effect, Event> {
         .current_system
         .as_ref()
         .is_some_and(|current| *current != eval.out_path);
-    if !binary_cache || row.cache_asked || !pending {
+    if !binary_cache || !pending {
         return Command::done();
     }
-    row.cache_asked = true;
     let store_path = eval.out_path.clone();
     let generation = model.generation;
     let id = model.issue(Pending::Cache(name.to_owned()));
@@ -784,7 +811,11 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
         match pending {
             Pending::Inventory => {
                 model.inventory = Inventory::Failed;
-                model.fleet_errors.push(FleetError::InventoryTimedOut);
+                model.fleet_errors.push(FleetError::new(
+                    FleetErrorKind::InventoryTimedOut,
+                    INVENTORY_TIMED_OUT,
+                ));
+                model.prometheus_not_asked();
             }
             Pending::Prometheus => {
                 model.prometheus = PrometheusStatus::Unavailable {
@@ -794,7 +825,7 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
             // A cache question left unanswered stays `NotApplicable`, as before the rename. An
             // unresolved hostname simply cannot collide. Rows are marked below, whatever was
             // outstanding: after a quit nothing is, and the rows still spin.
-            Pending::Cache(_) | Pending::Resolve | Pending::Probe(_) | Pending::Eval => {}
+            Pending::Cache(_) | Pending::Resolve(_) | Pending::Probe(_) | Pending::Eval => {}
         }
     }
     for row in &mut model.rows {

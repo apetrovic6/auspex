@@ -210,6 +210,18 @@ impl Shell {
         self.absorb(effects);
     }
 
+    /// Drops every queued request the core has cancelled, as a real shell does on `Cancel`.
+    pub fn drop_cancelled(&mut self) {
+        let cancelled = self.cancels.clone();
+        let live = |id: &RequestId| !cancelled.contains(id);
+        self.inventory.retain(|r| live(&r.operation.id));
+        self.probes.retain(|r| live(&r.operation.id));
+        self.evals.retain(|r| live(&r.operation.id));
+        self.prometheus.retain(|r| live(&r.operation.id));
+        self.caches.retain(|r| live(&r.operation.id));
+        self.resolves.retain(|r| live(&r.operation.id));
+    }
+
     /// The number of requests of every kind not yet taken by the test.
     pub const fn waiting(&self) -> usize {
         self.inventory.len()

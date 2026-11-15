@@ -74,6 +74,5 @@ An explicit `system.configurationRevision` overrides the module's default.
 
 auspex has one shell, in Rust, and will never have another. So the core carries none of the
 template's multi-shell machinery: no `Facet` typegen, no `codegen` binary, no `ffi.rs`, no
-`boltffi.toml`, no `cdylib`/`staticlib`, no wasm32 pass. The `generate-*`, `android`, `apple`
-and `native` recipes in this directory's Justfile are the template's, and refuse to run
-without a `platforms/` project, which this app will not get.
+`boltffi.toml`, no `cdylib`/`staticlib`, no wasm32 pass, and its Justfile has no
+code-generation or native-platform recipes.

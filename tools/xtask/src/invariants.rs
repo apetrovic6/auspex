@@ -109,6 +109,12 @@ const CORE_FORBIDDEN_DEPENDENCIES: &[&str] = &[
     "sea-orm",
     "tower",
     "tower-http",
+    // auspex's own boundary (docs/plan.md: "core never sees effects"): the adapters and the
+    // runtime they run on. Before this entry, the only thing that kept them out of
+    // auspex's core was its wasm32 pass, and only by accident. That pass is gone, because
+    // auspex has no web shell.
+    "auspex-effects",
+    "tokio",
 ];
 
 /// The dependency tables a forbidden crate could be smuggled in through.
@@ -684,9 +690,15 @@ fn cores_stay_domain_level(
                 let Some(dependencies) = manifest.get(table).and_then(toml::Value::as_table) else {
                     continue;
                 };
-                for dependency in dependencies.keys() {
+                for (key, spec) in dependencies {
                     *checked += 1;
-                    if CORE_FORBIDDEN_DEPENDENCIES.contains(&dependency.as_str()) {
+                    // The package, not the key: `fx = { package = "auspex-effects" }` is the
+                    // same dependency under another name.
+                    let dependency = spec
+                        .get("package")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or(key);
+                    if CORE_FORBIDDEN_DEPENDENCIES.contains(&dependency) {
                         problems.push(format!(
                             "{}: a Crux core must not depend on `{dependency}` — the core stays \
                              domain-level (ADR 0002) and the wire lives in apps/<app>/client. \
@@ -2953,6 +2965,54 @@ mod tests {
             !report.breakdown.is_empty(),
             "no check reported a contribution, which means the breakdown stopped being built"
         );
+    }
+
+    fn core_dependency_problems(fixture: &Fixture) -> Vec<String> {
+        let mut checked = 0;
+        let mut problems = Vec::new();
+        cores_stay_domain_level(&fixture.root, &mut checked, &mut problems)
+            .expect("the fixture is readable");
+        problems
+    }
+
+    #[test]
+    fn a_core_may_not_depend_on_the_adapters_or_their_runtime() {
+        let fixture = Fixture::new("core-adapters");
+        fixture.file(
+            "apps/fleet/core/Cargo.toml",
+            "[package]\nname = \"fleet-core\"\n\n[dependencies]\n\
+             auspex-domain = { path = \"../../../crates/auspex-domain\" }\n\
+             auspex-effects = { path = \"../../../crates/auspex-effects\" }\n\n\
+             [dev-dependencies]\ntokio = \"1\"\n",
+        );
+        let problems = core_dependency_problems(&fixture);
+        assert_eq!(problems.len(), 2, "{problems:#?}");
+        assert!(problems[0].contains("`auspex-effects`"), "{problems:#?}");
+        assert!(problems[1].contains("`tokio`"), "{problems:#?}");
+    }
+
+    #[test]
+    fn a_renamed_forbidden_dependency_is_still_refused() {
+        let fixture = Fixture::new("core-renamed");
+        fixture.file(
+            "apps/fleet/core/Cargo.toml",
+            "[package]\nname = \"fleet-core\"\n\n[dependencies]\n\
+             fx = { package = \"auspex-effects\", path = \"../../../crates/auspex-effects\" }\n",
+        );
+        let problems = core_dependency_problems(&fixture);
+        assert_eq!(problems.len(), 1, "{problems:#?}");
+        assert!(problems[0].contains("`auspex-effects`"), "{problems:#?}");
+    }
+
+    #[test]
+    fn a_core_on_the_domain_alone_passes() {
+        let fixture = Fixture::new("core-domain-only");
+        fixture.file(
+            "apps/fleet/core/Cargo.toml",
+            "[package]\nname = \"fleet-core\"\n\n[dependencies]\n\
+             auspex-domain = { path = \"../../../crates/auspex-domain\" }\ncrux_core = \"0.20\"\n",
+        );
+        assert_eq!(core_dependency_problems(&fixture), Vec::<String>::new());
     }
 
     fn template_only_problems(fixture: &Fixture) -> Vec<String> {
