@@ -1,0 +1,978 @@
+{
+  "version": 1,
+  "settled": true,
+  "errors": [],
+  "machines": [
+    {
+      "name": "alfrost",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "server"
+      ],
+      "target": "root@203.0.113.7",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/27bglqx15afjpv048dimsy37bhlqx16a-nixos-system-alfrost-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/27bglqx15afjpv048dimsy37bhlqx16a-nixos-system-alfrost-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "callisto",
+      "class": "nixos",
+      "tags": [
+        "base"
+      ],
+      "target": "root@192.168.1.31",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": "localhost",
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/h3m7sczi3n8sdzj4n9vd0j5p9wf0k5qa-nixos-system-callisto-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/h3m7sczi3n8sdzj4n9vd0j5p9wf0k5qa-nixos-system-callisto-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "cerberus",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "server"
+      ],
+      "target": "root@192.168.1.2",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": "localhost",
+      "status": "in_sync",
+      "badges": [
+        "in_sync",
+        "failed_units"
+      ],
+      "settled": true,
+      "reason": "failed units: forgejo-runner.service",
+      "current_system": "/nix/store/49gls05binw17djqy39flsz5bhnv17cj-nixos-system-cerberus-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/49gls05binw17djqy39flsz5bhnv17cj-nixos-system-cerberus-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "degraded",
+      "failed_units": [
+        "forgejo-runner.service"
+      ],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "cypramundi",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "server"
+      ],
+      "target": "root@198.51.100.4:2222",
+      "target_source": "override",
+      "target_error": null,
+      "build_host": null,
+      "status": "update_pending",
+      "badges": [
+        "update_pending"
+      ],
+      "settled": true,
+      "reason": "pending nixos-system-cypramundi-25.11.20261101.6a2f1c0",
+      "current_system": "/nix/store/i4payi4paxh3paxh3n9wh3n9wg2m9wg2-nixos-system-cypramundi-25.11.20261019.b81e2d4",
+      "pending_system": "/nix/store/8jx7iv6hs4gr3dq2cn1bmzaly8kx7iw6-nixos-system-cypramundi-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "deimos",
+      "class": "nixos",
+      "tags": [
+        "base"
+      ],
+      "target": "root@192.168.1.41",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "not_installed",
+      "badges": [
+        "not_installed"
+      ],
+      "settled": true,
+      "reason": "reachable, but /run/current-system is missing",
+      "current_system": null,
+      "pending_system": "/nix/store/rlga61wpjd83zsmhb61wqkf94zsmic72-nixos-system-deimos-25.11.20261101.6a2f1c0",
+      "deployed_revision": null,
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "europa",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "dev"
+      ],
+      "target": "root@europa.lab.example",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/cr7m3hycs7m3iycs8m3izcs8n3izds8n-nixos-system-europa-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/cr7m3hycs7m3iycs8m3izcs8n3izds8n-nixos-system-europa-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [
+        {
+          "kind": "hostname_target",
+          "host": "europa.lab.example"
+        },
+        {
+          "kind": "shared_ip",
+          "ip": "192.168.1.30",
+          "with": [
+            "io",
+            "vulcan"
+          ]
+        }
+      ],
+      "frozen": false
+    },
+    {
+      "name": "ganymede",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "gaming"
+      ],
+      "target": "root@192.168.1.33",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync",
+        "reboot_needed"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/qib5zqjc6zrkd60sld71vlf82vmg92wn-nixos-system-ganymede-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/qib5zqjc6zrkd60sld71vlf82vmg92wn-nixos-system-ganymede-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "genetor",
+      "class": "darwin",
+      "tags": [
+        "workstation"
+      ],
+      "target": "admin@192.168.1.109",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/pia4xpha3xnh93wng92wmg82vmf81vlf-darwin-system-genetor-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/pia4xpha3xnh93wng92wmg82vmf81vlf-darwin-system-genetor-25.11.20261101.6a2f1c0",
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "io",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "dev"
+      ],
+      "target": "root@io.lab.example",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/dvar8n5l3i0gycvar7n5l2i0gxcvaq7n-nixos-system-io-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/dvar8n5l3i0gycvar7n5l2i0gxcvaq7n-nixos-system-io-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [
+        {
+          "kind": "hostname_target",
+          "host": "io.lab.example"
+        },
+        {
+          "kind": "shared_ip",
+          "ip": "192.168.1.30",
+          "with": [
+            "europa",
+            "vulcan"
+          ]
+        }
+      ],
+      "frozen": false
+    },
+    {
+      "name": "luna",
+      "class": "nixos",
+      "tags": [
+        "k8s",
+        "k8s-server"
+      ],
+      "target": "root@192.168.1.11",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": "localhost",
+      "status": "update_pending",
+      "badges": [
+        "update_pending",
+        "cached"
+      ],
+      "settled": true,
+      "reason": "pending nixos-system-luna-25.11.20261101.6a2f1c0",
+      "current_system": "/nix/store/0357acgiknqsxz2469bdhjmprwy0358a-nixos-system-luna-25.11.20261019.b81e2d4",
+      "pending_system": "/nix/store/g1j4m7qavdyh1k4n7rawdzh2k5n8rbwf-nixos-system-luna-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "mars",
+      "class": "nixos",
+      "tags": [
+        "k8s",
+        "k8s-master"
+      ],
+      "target": "root@192.168.1.20",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": "localhost",
+      "status": "unreachable",
+      "badges": [
+        "unreachable"
+      ],
+      "settled": true,
+      "reason": "ssh: connect to host 192.168.1.20 port 22: Connection timed out",
+      "current_system": null,
+      "pending_system": "/nix/store/bp4hxan3hw9m2gv8m1fs7l0ds6kzcr5j-nixos-system-mars-25.11.20261101.6a2f1c0",
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "mechanicus-forge-world-archive-node-01",
+      "class": "nixos",
+      "tags": [
+        "base"
+      ],
+      "target": "root@192.168.1.50",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/37chmsy38cimsz38dinsz48djnvz49dj-nixos-system-mechanicus-forge-world-archive-node-01-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/37chmsy38cimsz38dinsz48djnvz49dj-nixos-system-mechanicus-forge-world-archive-node-01-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "phobos",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "laptop"
+      ],
+      "target": "root@192.168.1.42",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/nf6xmd5xmd5wlc4wlc4vkb3vkb3sja2s-nixos-system-phobos-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/nf6xmd5xmd5wlc4wlc4vkb3vkb3sja2s-nixos-system-phobos-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "sol",
+      "class": "nixos",
+      "tags": [
+        "k8s",
+        "k8s-server"
+      ],
+      "target": "root@192.168.1.12",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": "localhost",
+      "status": "update_pending",
+      "badges": [
+        "update_pending"
+      ],
+      "settled": true,
+      "reason": "pending nixos-system-sol-25.11.20261101.6a2f1c0",
+      "current_system": "/nix/store/8kx7jw7iv6hs5gs4fr3dq2dp1cn0bm0a-nixos-system-sol-25.11.20261019.b81e2d4",
+      "pending_system": "/nix/store/mc4vj91qg6ymc3vj90qg6xmc3sj90pg6-nixos-system-sol-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "terra",
+      "class": "nixos",
+      "tags": [
+        "k8s",
+        "k8s-base"
+      ],
+      "target": "root@192.168.1.10",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": "localhost",
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/xwwvsrrqpnnmlkkjihhgfddcbaa98776-nixos-system-terra-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/xwwvsrrqpnnmlkkjihhgfddcbaa98776-nixos-system-terra-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "titan",
+      "class": "nixos",
+      "tags": [
+        "base"
+      ],
+      "target": "root@192.168.1.34",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/xvsrqnmlkihgfcba97654210zxwvsqpn-nixos-system-titan-25.11.20261101.6a2f1c0",
+      "pending_system": "/nix/store/xvsrqnmlkihgfcba97654210zxwvsqpn-nixos-system-titan-25.11.20261101.6a2f1c0",
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "triton",
+      "class": "nixos",
+      "tags": [
+        "base"
+      ],
+      "target": "root@192.168.1.35",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "unreachable",
+      "badges": [
+        "unreachable"
+      ],
+      "settled": true,
+      "reason": "Host key verification failed.",
+      "current_system": null,
+      "pending_system": "/nix/store/i4paxh3n9wg2m8vf1l7sd0k6rczj5qby-nixos-system-triton-25.11.20261101.6a2f1c0",
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "vulcan",
+      "class": "nixos",
+      "tags": [],
+      "target": "vulcan",
+      "target_source": "machine_name",
+      "target_error": null,
+      "build_host": null,
+      "status": "eval_error",
+      "badges": [
+        "eval_error"
+      ],
+      "settled": true,
+      "reason": "error: attribute 'hardware-configuration' missing",
+      "current_system": "/nix/store/wvrpnlkigfca976421zxwsrpmljhgdca-nixos-system-vulcan-25.11.20261101.6a2f1c0",
+      "pending_system": null,
+      "deployed_revision": "6a2f1c0e9d",
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": {
+          "value": 1209650,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 250880000000,
+            "used_bytes": 100352000000,
+            "available_bytes": 137728000000
+          },
+          "source": "prometheus"
+        },
+        "load": {
+          "value": {
+            "one": 0.4,
+            "five": 0.35,
+            "fifteen": 0.3
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 34359738368,
+            "available_bytes": 21474836480
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [
+        {
+          "kind": "hostname_target",
+          "host": "vulcan"
+        },
+        {
+          "kind": "shared_ip",
+          "ip": "192.168.1.30",
+          "with": [
+            "europa",
+            "io"
+          ]
+        }
+      ],
+      "frozen": false
+    }
+  ],
+  "shared_ips": [
+    {
+      "ip": "192.168.1.30",
+      "machines": [
+        "europa",
+        "io",
+        "vulcan"
+      ]
+    }
+  ]
+}

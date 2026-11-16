@@ -1,0 +1,36 @@
+┌ machines (18) ─────────────────────────────────────┐┌ alfrost ───────────────────────────────────────────────────────┐
+│›✓    alfrost              in s┌ help ────────────────────────────────────────────────┐                               │
+│ ✓    callisto             in s│j down        down (count: 5j)                        │                               │
+│ ✓⚠   cerberus             in s│k up          up (count: 5k)                          │                               │
+│ ↑    cypramundi           upda│ctrl-d        half a page down                        │tory deploy.targetHost)        │
+│ ?    deimos               not │ctrl-u        half a page up                          │er                             │
+│ ✓    europa               in s│gg home       first row (5gg: row 5)                  │                               │
+│ ✓⟳   ganymede             in s│G end         last row (5G: row 5)                    │lfrost-25.11.20261101.6a2f1c0  │
+│ ✓    genetor              in s│/             search names                            │lfrost-25.11.20261101.6a2f1c0  │
+│ ✓    io                   in s│n             next match                              │                               │
+│ ↑◆   luna                 upda│N             previous match                          │                               │
+│ ✗    mars                 unre│enter tab     machine detail (narrow)                 │                               │
+│ ✓    mechanicus-forge-wo… in s│L             log                                     │                               │
+│ ✓    phobos               in s│r             scan again                              │sed, 128.3 GiB free            │
+│ ↑    sol                  upda│:             command (:q, :refresh)                  │                               │
+│ ✓    terra                in s│?             this help                               │eus)                           │
+│ ✓    titan                in s│q esc ctrl-c  quit                                    │ee (prometheus)                │
+│ ✗    triton               unre│:q            quit                                    │                               │
+│ !    vulcan               eval│:refresh      scan again                              │                               │
+│                               │                                                      │                               │
+│                               │⠋ checking                                            │                               │
+│                               │⠋ evaluating                                          │                               │
+│                               │✓ in sync                                             │                               │
+│                               │↑ update pending                                      │                               │
+│                               │◆ cached                                              │                               │
+│                               │⚠ failed units / alerts                               │                               │
+│                               │⟳ reboot needed                                       │                               │
+│                               │? not installed                                       │                               │
+│                               │✗ unreachable                                         │                               │
+│                               │! eval error                                          │                               │
+│                               │❄ frozen                                              │                               │
+│                               └──────────────────────────────────────────────────────┘                               │
+│                                                    ││                                                                │
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+log: eval results stored in the cache: cypramundi, deimos, luna
+OBSERVE │ settled │ 0 pending │ prom: ok                                                                          ? help

@@ -14,6 +14,12 @@ craneLib.buildPackage (hostArgs // {
   # exec. The absolute path is compiled in (`option_env!`), so the installed program needs no
   # `prlimit` on PATH, and no wrapper changes the PATH of anything it starts.
   AUSPEX_PRLIMIT = "${pkgs.util-linux}/bin/prlimit";
+  # The same route for nix-eval-jobs, which a typical system does not have. The shell uses the
+  # one on PATH when there is one (the system's own wins, matching its nix), and this store
+  # path otherwise. Not a wrapper: a wrapper's PATH prefix would put a whole package ahead of
+  # the operator's PATH for ssh, nix and git too, and the package must stay exactly
+  # `bin/auspex` (the `auspex-package` check).
+  AUSPEX_NIX_EVAL_JOBS = "${pkgs.nix-eval-jobs}/bin/nix-eval-jobs";
   installPhaseCommand = ''
     install -Dm755 target/release/auspex-tui "$out/bin/auspex"
   '';

@@ -17,6 +17,26 @@ just apps/auspex/dev              # format, lint, build and test every crate her
 just apps/auspex/shells/tui/run
 ```
 
+## Running it
+
+```sh
+auspex                       # the TUI, read-only (observe mode)
+auspex --plain               # scan once, print one line per machine, exit
+auspex --json                # scan once, print the fleet report (the versioned contract)
+auspex --demo                # a scripted fleet: no machine, nix, cache or network is touched
+auspex --flake ~/clan/fleet  # the fleet flake; default: config `flake`, then CLAN_DIR, then .
+```
+
+Headless exit status: 0 for a scan that completed with no fleet-level error, 1 when the
+machine list or the evaluator failed or `timeouts.settle` cut the scan short, 2 for usage
+and config errors. Unreachable or out-of-date machines are findings, not failures.
+
+In the TUI, `?` lists the live keymap (`[keymap]` in the config rebinds any action; an empty
+list unbinds it) and `L` shows the log: eval cache hits, caching off and why, config
+warnings. A plain-path fleet inside a git repository is evaluated as a `git+file`
+reference, so **a machine file that is not tracked yet is not evaluated** (the same rule as
+`nix build .#…`): `git add` it.
+
 ## Installing
 
 Run directly with `nix run git+https://forge.noosphere.uk/manjo/auspex`, or add
