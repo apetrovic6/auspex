@@ -1034,3 +1034,82 @@ async fn evaluator_runtime_directories_owned_by_another_user_are_refused() {
     assert!(error.contains("runtime directory"), "{error}");
     assert!(error.contains("not by this user"), "{error}");
 }
+
+// ---------------------------------------------------------------------------------------
+// PR #9 fix round 1: output accepted only when read to its end
+// ---------------------------------------------------------------------------------------
+
+fn kill_holder(dir: &Path) {
+    if let Ok(pids) = fs::read_to_string(dir.join("holder")) {
+        let pids: Vec<i32> = pids.lines().filter_map(|l| l.trim().parse().ok()).collect();
+        cleanup(&pids);
+    }
+}
+
+/// `nix eval` (the machine list) prints a valid list and exits 0, but its stdout is still
+/// held open by a process outside its group: that is not the whole output. The holder
+/// writes its pid once it is in its own session, and only then does the fake exit, so the
+/// group kill at the exit cannot reach it.
+#[tokio::test]
+async fn a_machine_list_not_read_to_its_end_is_refused() {
+    let Some(t) = tools(&["setsid", "sleep"]) else {
+        return;
+    };
+    let dir = tempdir();
+    let prog = t.script(
+        dir.path(),
+        "nix",
+        "printf '{}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; exec @sleep@ 30' sh '@dir@/holder' &\nwhile [ ! -s '@dir@/holder' ]; do :; done",
+    );
+    let r = inventory(
+        prog.as_os_str(),
+        &FlakeRef::new("path:/f").unwrap(),
+        Duration::from_secs(1),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    kill_holder(dir.path());
+    let e = r.expect_err("a list not read to its end was accepted");
+    assert!(e.contains("not read to the end"), "{e}");
+}
+
+/// nix-eval-jobs prints one result and exits 0 with its stdout still held open: the result
+/// that arrived is delivered, and the run ends with an error, not as a complete one.
+#[tokio::test]
+async fn evaluator_output_not_read_to_its_end_is_an_error() {
+    let Some(t) = tools(&["setsid", "sleep"]) else {
+        return;
+    };
+    let dir = tempdir();
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        &format!(
+            "printf '%s\\n' '{}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; exec @sleep@ 30' sh '@dir@/holder' &\nwhile [ ! -s '@dir@/holder' ]; do :; done",
+            ok_line(r#""a""#, r#""a""#)
+        ),
+    );
+    let (tx, mut rx) = unbounded_channel();
+    evaluate(
+        &FlakeRef::new("path:/x").unwrap(),
+        &machines(&["a", "b"]),
+        &params(&prog, Duration::from_secs(1)),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    kill_holder(dir.path());
+    let items = collect(&mut rx).await;
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(i, EvalItem::Machine { machine, .. } if machine == "a")),
+        "{items:?}"
+    );
+    assert!(
+        matches!(items.last(), Some(EvalItem::Finished { error: Some(e) }) if e.contains("not read to the end")),
+        "{items:?}"
+    );
+}

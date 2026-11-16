@@ -114,7 +114,13 @@
 //!   nixpkgs), and the first failure ends the key;
 //! - with `-c core.fsmonitor=false` ([`GIT_HARDENING`]), `GIT_OPTIONAL_LOCKS=0`, and none
 //!   of the inherited variables that would point it at another repository or index. The
-//!   operator's own global and system configuration apply as usual.
+//!   operator's own global and system configuration apply as usual;
+//! - and its output counts only when it was read to its end and within its cap. The exit
+//!   can be seen before the last bytes are read; a listing over the cap is "printed more
+//!   than", and one whose pipe something outside git's process group still holds open is
+//!   "not read to the end". Either is no caching, never a truncated listing taken for the
+//!   whole (PR #9 fix round 1: a truncated index listing would leave tracked files out of
+//!   the key and the guard).
 //!
 //! What a hostile `.git/` can still cost per refresh is bounded by those two limits
 //! (review finding F5): an oversized `HEAD` grows git to the limit (about 417 MB, 0.3 s)
@@ -283,7 +289,17 @@ async fn git(
         End::Cancelled => return Err(Cancelled),
         End::TimedOut => Err(format!("{what} timed out after {:?}", params.timeout)),
         End::Overflow => Err(format!("{what} printed more than {cap} bytes")),
-        End::Exited(s) if s.success() => Ok(ran.stdout),
+        // Only an output read to its end and within the cap is git's answer: the exit can
+        // be seen before the last bytes are read, and a truncated listing would leave
+        // tracked files out of the key (PR #9, fix round 1).
+        End::Exited(s) if s.success() => match ran.whole_stdout() {
+            Ok(_) => Ok(ran.stdout),
+            Err(true) => Err(format!("{what} printed more than {cap} bytes")),
+            Err(false) => Err(format!(
+                "{what} exited, but its output was not read to the end (something still \
+                 held it open)"
+            )),
+        },
         End::Exited(s) => {
             let stderr = lossy(&ran.stderr);
             let why = last_line(&stderr).unwrap_or_default();
@@ -991,4 +1007,204 @@ async fn store_checked(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    /// An executable `sh` script in `dir`, written by a separate process (as the
+    /// integration tests' helper does), so no thread's fork can inherit a write descriptor
+    /// for it and make executing it fail with "Text file busy".
+    fn script(dir: &Path, body: &str) -> PathBuf {
+        let sh = which("sh");
+        let path = dir.join("fake-git");
+        let ok = std::process::Command::new(&sh)
+            .arg("-c")
+            .arg(r#"printf '#!%s\n%s\n' "$1" "$2" > "$3" && chmod 755 "$3""#)
+            .arg("sh")
+            .arg(&sh)
+            .arg(body)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        path
+    }
+
+    fn which(name: &str) -> PathBuf {
+        let c = command(OsStr::new(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+        PathBuf::from(c.as_std().get_program())
+    }
+
+    /// Blocks this thread (so the runtime polls nothing) until process `pid` is a zombie.
+    fn block_until_zombie(pid_file: &Path) {
+        let began = std::time::Instant::now();
+        loop {
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "the fake never exited"
+            );
+            if let Ok(pid) = std::fs::read_to_string(pid_file) {
+                let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
+                // `pid (comm) S ...`: the state follows the last ')'.
+                if stat.is_ok_and(|s| {
+                    s.rsplit(')')
+                        .next()
+                        .is_some_and(|r| r.trim_start().starts_with('Z'))
+                }) {
+                    return;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Polls `fut` once: far enough for `run` to have spawned the child and found nothing
+    /// to read yet.
+    async fn poll_once<F: std::future::Future>(mut fut: std::pin::Pin<&mut F>) {
+        std::future::poll_fn(|cx| {
+            assert!(
+                fut.as_mut().poll(cx).is_pending(),
+                "finished on the first poll"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
+    fn params(program: &Path, timeout: Duration) -> GitParams<'_> {
+        GitParams {
+            program: program.as_os_str(),
+            timeout,
+            read_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Case 1 of the CI failure on `ca2cc3f`, without depending on machine speed: git
+    /// writes one byte more than the cap and exits, and the runtime sees the exit before
+    /// reading any of it (the thread is blocked until git is a zombie), so every byte is
+    /// read after the exit. That is still "printed more than", never the output cut to the
+    /// cap.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn output_over_the_cap_read_after_the_exit_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let fake = script(
+            dir.path(),
+            &format!(
+                "echo $$ > '{d}/pid'\nwhile [ ! -e '{d}/go' ]; do :; done\nprintf '%01001d' 0"
+            ),
+        );
+        let p = params(&fake, Duration::from_secs(20));
+        let cancel = CancellationToken::new();
+        let fut = git(&p, dir.path(), &["ls-files"], 1000, &cancel);
+        tokio::pin!(fut);
+        poll_once(fut.as_mut()).await;
+        std::fs::write(dir.path().join("go"), "").unwrap();
+        block_until_zombie(&dir.path().join("pid"));
+        let r = fut.await.unwrap();
+        assert_eq!(
+            r,
+            Err("git ls-files printed more than 1000 bytes".to_owned())
+        );
+    }
+
+    /// The same at exactly the cap: all of it, accepted.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn output_at_the_cap_read_after_the_exit_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let fake = script(
+            dir.path(),
+            &format!(
+                "echo $$ > '{d}/pid'\nwhile [ ! -e '{d}/go' ]; do :; done\nprintf '%01000d' 0"
+            ),
+        );
+        let p = params(&fake, Duration::from_secs(20));
+        let cancel = CancellationToken::new();
+        let fut = git(&p, dir.path(), &["ls-files"], 1000, &cancel);
+        tokio::pin!(fut);
+        poll_once(fut.as_mut()).await;
+        std::fs::write(dir.path().join("go"), "").unwrap();
+        block_until_zombie(&dir.path().join("pid"));
+        assert_eq!(fut.await.unwrap(), Ok(vec![b'0'; 1000]));
+    }
+
+    /// Case 2: git exits 0 but its stdout is still open, held by a process that left its
+    /// session (`setsid`), so the group kill at exit does not reach it. Whatever was read is
+    /// not the whole output and must not be taken for it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn output_not_read_to_its_end_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let (sh, setsid, sleep) = (which("sh"), which("setsid"), which("sleep"));
+        // The holder writes its pid only once it is in its own session; git exits only
+        // after that, so the group kill at the exit can never reach it.
+        let fake = script(
+            dir.path(),
+            &format!(
+                "printf 'partial'\n'{}' '{}' -c 'echo $$ > \"$1\"; exec \"$2\" 30' sh '{d}/holder' '{}' &\nwhile [ ! -s '{d}/holder' ]; do :; done",
+                setsid.display(),
+                sh.display(),
+                sleep.display()
+            ),
+        );
+        let p = params(&fake, Duration::from_secs(1));
+        let r = git(
+            &p,
+            dir.path(),
+            &["ls-files"],
+            1000,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        if let Ok(pid) = std::fs::read_to_string(dir.path().join("holder"))
+            && let Some(pid) = pid
+                .trim()
+                .parse()
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        }
+        let e = r.expect_err("a partial output was accepted as complete");
+        assert!(e.contains("not read to the end"), "{e}");
+    }
+
+    /// What `OnExit::KillGroup` gives git: a descendant still in git's group is killed when
+    /// git exits, so the pipe reaches EOF at once and the output is accepted.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_descendant_in_the_group_does_not_hold_the_output_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let sleep = which("sleep");
+        let fake = script(
+            dir.path(),
+            &format!("printf 'whole'\n'{}' 30 &", sleep.display()),
+        );
+        let p = params(&fake, Duration::from_secs(20));
+        let start = std::time::Instant::now();
+        let r = git(
+            &p,
+            dir.path(),
+            &["ls-files"],
+            1000,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r, Ok(b"whole".to_vec()));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "waited for the deadline: {:?}",
+            start.elapsed()
+        );
+    }
 }

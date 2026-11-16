@@ -38,13 +38,15 @@ use std::time::Duration;
 use rustix::process::{Pid, Signal, kill_process_group};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
 /// How long the pipe readers get after the process has exited (or been killed). The plan's
 /// "`ControlPersist` can hold pipes open" trap: some OpenSSH versions leave the backgrounded
 /// master holding the first ssh's stdout and stderr, so reading to EOF would hang after the
-/// child is gone. What was read by then is kept.
+/// child is gone. What was read by then is kept, and [`Ran::stdout_eof`] says whether it is
+/// all of it. After an [`OnExit::KillGroup`] exit an unfinished stdout gets until the run's
+/// deadline instead, if that is later (see [`run`]).
 pub const PIPE_GRACE: Duration = Duration::from_millis(250);
 
 /// How long to wait for a `SIGKILL`ed leader to be reaped before leaving it to tokio's
@@ -337,6 +339,8 @@ pub struct Head {
     pub truncated: bool,
     /// EOF, an error, or the cap reached: do not read again.
     pub done: bool,
+    /// The stream really ended (a read returned 0), as opposed to an error or the cap.
+    pub eof: bool,
 }
 
 impl Head {
@@ -347,13 +351,18 @@ impl Head {
             cap,
             truncated: false,
             done: false,
+            eof: false,
         }
     }
 
     /// One read. Cancel-safe.
     pub async fn step<R: AsyncRead + Unpin>(&mut self, r: &mut R) {
         match r.read(&mut self.scratch).await {
-            Ok(0) | Err(_) => self.done = true,
+            Ok(0) => {
+                self.done = true;
+                self.eof = true;
+            }
+            Err(_) => self.done = true,
             Ok(n) => {
                 let room = self.cap - self.buf.len();
                 if n > room {
@@ -429,6 +438,8 @@ pub struct Lines<R> {
     cap: usize,
     skipping: bool,
     pub done: bool,
+    /// The stream really ended (EOF), as opposed to a read error.
+    pub eof: bool,
 }
 
 impl<R: AsyncRead + Unpin> Lines<R> {
@@ -439,6 +450,7 @@ impl<R: AsyncRead + Unpin> Lines<R> {
             cap,
             skipping: false,
             done: false,
+            eof: false,
         }
     }
 
@@ -452,6 +464,7 @@ impl<R: AsyncRead + Unpin> Lines<R> {
             };
             if buf.is_empty() {
                 self.done = true;
+                self.eof = true;
                 if self.skipping {
                     self.skipping = false;
                     return Some(Line::TooLong);
@@ -515,16 +528,43 @@ pub struct Ran {
     /// The status, when the process was reaped (always, unless it would not die).
     pub status: Option<ExitStatus>,
     pub stdout: Vec<u8>,
+    /// More than the cap arrived, during the run or after the exit.
     pub stdout_truncated: bool,
+    /// stdout was read to its end. False when it passed the cap, on a read error, or when
+    /// something still held it open when reading stopped: then `stdout` is a prefix of
+    /// what was printed, and must not be taken for all of it.
+    pub stdout_eof: bool,
     pub stderr: Vec<u8>,
+}
+
+impl Ran {
+    /// The whole stdout of a process that exited, or why it is not whole: it passed `cap`
+    /// (`Err(true)`), or it was not read to its end (`Err(false)`).
+    ///
+    /// # Errors
+    ///
+    /// As above.
+    pub fn whole_stdout(&self) -> Result<&[u8], bool> {
+        if self.stdout_truncated {
+            Err(true)
+        } else if self.stdout_eof {
+            Ok(&self.stdout)
+        } else {
+            Err(false)
+        }
+    }
 }
 
 /// Runs `cmd` to completion, feeding it `stdin` (when given), until it exits, `deadline`
 /// passes, `cancel` fires or stdout passes its cap.
 ///
-/// After the process has exited or been killed, the pipe readers get [`PIPE_GRACE`] to
-/// finish, and are then dropped with what they read. A cancelled run returns at once after
-/// the kill and reap.
+/// After the process has been killed, the pipe readers get [`PIPE_GRACE`] to finish, and
+/// are then dropped with what they read. After it exited on its own, an unfinished stdout
+/// gets the same, or until `deadline` if that is later, when the rest of its group was killed at the exit
+/// ([`OnExit::KillGroup`]): what is left in the pipe is then at most one pipe buffer and
+/// EOF follows, unless a process outside the group holds it open, and a loaded machine
+/// must not cut a whole output short. [`Ran::stdout_eof`] says whether stdout ended. A
+/// cancelled run returns at once after the kill and reap.
 ///
 /// # Errors
 ///
@@ -586,12 +626,18 @@ pub async fn run(
     };
 
     if !matches!(end, End::Cancelled) {
-        let grace = sleep(PIPE_GRACE);
-        tokio::pin!(grace);
+        let grace = Instant::now() + PIPE_GRACE;
+        let limit = if matches!(end, End::Exited(_)) && on_exit == OnExit::KillGroup {
+            grace.max(deadline)
+        } else {
+            grace
+        };
         while !(out.done && err.done) {
             tokio::select! {
                 biased;
-                () = &mut grace => break,
+                () = sleep_until(limit) => break,
+                // Past the grace, only an unfinished stdout is waited for.
+                () = sleep_until(grace), if out.done => break,
                 () = step_out(&mut out, &mut out_pipe), if !out.done => {}
                 () = err.step_opt(&mut err_pipe), if !err.done => {}
             }
@@ -602,6 +648,7 @@ pub async fn run(
         end,
         status,
         stdout_truncated: out.truncated,
+        stdout_eof: out.eof,
         stdout: out.buf,
         stderr: err.buf,
     })

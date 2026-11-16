@@ -368,6 +368,12 @@ async fn the_worktree_cap_is_a_total() {
 /// Review finding F6: the index listing is capped at 64 MiB, exactly. A git whose
 /// `ls-files` prints one byte more is "no caching"; at the cap it is read (all NULs: no
 /// records, so a key).
+///
+/// Whether the exit is seen before the last bytes are read depends on the machine (the
+/// forge runner saw it, this machine did not); both orders must give the same answer, and
+/// the unit tests in `cache.rs` force the late order. Each git command gets 60 s, not the
+/// default 2 s: piping 64 MiB through a fake on a loaded runner is not what the default is
+/// sized for, and a timeout here would hide which answer the cap gave.
 #[tokio::test]
 async fn the_index_listing_cap_is_64_mib() {
     let Some(t) = tools(&["git", "head"]) else {
@@ -385,9 +391,12 @@ async fn the_index_listing_cap_is_64_mib() {
         );
         let mut g = GitParams::new();
         g.program = fake.as_os_str();
+        g.timeout = Duration::from_secs(60);
+        let start = Instant::now();
         let k = key_for(r.path(), &g, &CancellationToken::new())
             .await
             .unwrap();
+        eprintln!("{len} bytes: {:?}", start.elapsed());
         let printed = format!("git ls-files printed more than {} bytes", 64 << 20);
         match k {
             Err(e) => assert!(over && e == printed, "{len}: {e}"),
