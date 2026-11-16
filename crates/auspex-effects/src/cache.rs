@@ -38,11 +38,65 @@
 //! the tree again when it starts, and workers restart on their memory cap, so a file saved
 //! mid-scan can be evaluated under the key of the tree before it. Results are therefore
 //! streamed to the caller at once (they are right for the tree nix read) but stored only
-//! after the evaluator has exited and a second key, computed then, equals the first;
-//! otherwise none of the run's results is stored, with a note. An edit made and undone
-//! between the two keys is not seen; that needs a save and a revert within one scan, a
-//! window of seconds to a minute, and would need an immutable source (`?rev=` of a clean
-//! tree) to close.
+//! after the evaluator has exited, a second key, computed then, equals the first, and the
+//! two keys' run guards are equal too; otherwise none of the run's results is stored, with
+//! a note ("the worktree changed during evaluation").
+//!
+//! **The run guard** (review finding N2) is what catches a change made *and undone* while
+//! the evaluator runs, which leaves the two keys equal: `git stash` then `git stash pop`,
+//! `git checkout other` then `git checkout -`, a pre-commit hook that stashes and restores,
+//! an editor's undo. Each key computation also records, without entering the key, the
+//! identity and change time (`dev`, `ino`, `ctime` with nanoseconds, `size`) of:
+//!
+//! - every tracked path: a regular file's from the descriptor opened to hash it (`fstat`,
+//!   before the first byte; no second lookup), a symlink's or other entry's from the
+//!   `lstat` that classified it, and for a path with nothing there, the deepest directory
+//!   the walk reached (it changes when the name, or a directory on the way, is created);
+//! - `flake.lock` when it is present (from its read);
+//! - `HEAD` and `index` in the git directory (`rev-parse --absolute-git-dir`, printed by
+//!   the same command as `HEAD`'s id, so a linked worktree's own files), each by one
+//!   `lstat`.
+//!
+//! A write and its revert each set `ctime` to the current time, and no unprivileged call
+//! sets it back; deleting and recreating, or saving through a rename, gives a new inode or
+//! a new `ctime`; a checkout there and back rewrites `HEAD` and every file that differs.
+//! `HEAD` alone catches a move to a commit with the same tree (nix's `self.rev` differs).
+//! The index alone catches `git add` of an untracked file, which nix then reads, and
+//! `git reset` of it.
+//!
+//! The index is in the guard on purpose. Its cost is a spurious "not cached" when
+//! something rewrites it during a scan without changing the tree, chiefly a background
+//! `git status` (an editor's or a prompt's) refreshing stat data. Measured with git 2.56 in
+//! a quiet repository of 50 files: no rewrite in about 1,000 consecutive `git status` runs
+//! over 5 s; after a commit, `git status` rewrote it on 77 of about 1,000 runs, all within
+//! 0.5 s of the commit (git's racy-entry handling), then never. A missed store costs one
+//! re-evaluation; a stale hit is a wrong answer the operator trusts.
+//!
+//! The guard is for one run only. A key that changed with `ctime` would never hit again
+//! after a checkout, a clone or a `touch`. So a `touch` (which moves `ctime`) during a scan
+//! means that run is not stored, and the next undisturbed run is stored and hits as usual.
+//!
+//! What the guard still cannot see:
+//!
+//! - a filesystem without a reliable `ctime` (not verified here): FAT and exFAT store no
+//!   change time, and Linux reports the modification time instead, which is coarse and
+//!   which `touch` can set back; network and FUSE filesystems report what the server does;
+//! - a write and its revert in the same clock tick as the key's `stat` of that file, on a
+//!   kernel or filesystem without multigrain timestamps (Linux before 6.13, or, as far as
+//!   the kernel documents, a filesystem other than tmpfs, ext4, xfs and btrfs): a coarse
+//!   `ctime` moves once per tick, a few milliseconds. Measured here (Linux 6.18, tmpfs and
+//!   btrfs): in 20,000 tries each, a write and its revert right after a `stat` never kept
+//!   the stat's `ctime`;
+//! - root writing to the block device, setting `ctime` through a debugger such as
+//!   `debugfs`, or setting the clock back to the nanosecond: none is an ordinary program;
+//! - a tracked directory renamed away and back, when every path in it is a file: a
+//!   directory's rename changes its own `ctime`, not its files' (directories are stamped
+//!   only for paths that are missing);
+//! - a ref changing without `HEAD`, the index or any file changing (`update-ref` of the
+//!   current branch and back): the refs are not stamped;
+//! - anything the key does not cover either (see above, and the `--impure` reads).
+//!
+//! An immutable source (`?rev=` of a clean tree) would close the window for clean trees.
 //!
 //! # Running git safely
 //!
@@ -99,7 +153,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Cancelled;
 use crate::nix::{EvalItem, EvalMachine, EvalParams, FlakeRef, evaluate};
 use crate::process::{End, Limits, OnExit, command, describe_status, run, spawn_error};
-use crate::safe_fs::{ReadError, kind, open_dir, open_root, read_file, walk};
+use crate::safe_fs::{ReadError, Stamp, kind, open_dir, open_root, read_file, walk};
 use crate::text::{last_line, lossy};
 
 /// The default git program, looked up on `PATH`.
@@ -285,18 +339,30 @@ pub async fn key_for(
     params: &GitParams<'_>,
     cancel: &CancellationToken,
 ) -> Result<Result<CacheKey, String>, Cancelled> {
-    Ok(key_and_top(flake_dir, params, cancel)
-        .await?
-        .map(|(key, _)| key))
+    Ok(key_and_top(flake_dir, params, cancel).await?.map(|k| k.key))
 }
 
-/// [`key_for`], also returning the repository top level git reported, so the caller can
-/// check that the reference nix evaluates names the same repository.
+/// The run guard: a digest of the [`Stamp`] of every path the key read or looked at, and of
+/// the git directory's `HEAD` and `index`. It is compared between the two key computations
+/// around one evaluation and never enters the key (see the module documentation).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Guard(Vec<u8>);
+
+/// What one key computation found.
+struct Keyed {
+    key: CacheKey,
+    /// The repository top level git reported, so the caller can check that the reference
+    /// nix evaluates names the same repository.
+    top: PathBuf,
+    guard: Guard,
+}
+
+/// [`key_for`], also returning git's top level and the run [`Guard`].
 async fn key_and_top(
     flake_dir: &Path,
     params: &GitParams<'_>,
     cancel: &CancellationToken,
-) -> Result<Result<(CacheKey, PathBuf), String>, Cancelled> {
+) -> Result<Result<Keyed, String>, Cancelled> {
     let top = match git(
         params,
         flake_dir,
@@ -313,16 +379,21 @@ async fn key_and_top(
         use std::os::unix::ffi::OsStrExt as _;
         PathBuf::from(OsStr::from_bytes(top.strip_suffix(b"\n").unwrap_or(&top)))
     };
-    let head = match git(
+    // The git directory comes with HEAD, from the same command, for the run guard. It is
+    // printed first and may contain a newline; the commit id is the last line.
+    let (git_dir, head) = match git(
         params,
         &top,
-        &["rev-parse", "--verify", "HEAD"],
-        4096,
+        &["rev-parse", "--absolute-git-dir", "--verify", "HEAD"],
+        8192,
         cancel,
     )
     .await?
     {
-        Ok(h) => lossy(&h),
+        Ok(out) => match git_dir_and_head(&out) {
+            Some(v) => v,
+            None => return Ok(Err("git rev-parse printed no git directory".to_owned())),
+        },
         Err(e) => return Ok(Err(format!("not a git repository with a commit ({e})"))),
     };
     let index = match git(
@@ -357,15 +428,17 @@ async fn key_and_top(
     let token = cancel.clone();
     let deadline = std::time::Instant::now() + params.read_timeout;
     let flake_dir = flake_dir.to_path_buf();
-    let reported_top = top.clone();
+    let tree_top = top.clone();
     let job = tokio::task::spawn_blocking(move || {
         let stop = || token.is_cancelled() || std::time::Instant::now() > deadline;
         let paths = index_paths(&index).map_err(Stop::NoCache)?;
-        let lock = read_lock(&flake_dir, &stop)?;
-        let digest = worktree_digest(&top, &rel, &index, &paths, &stop)?;
-        Ok::<_, Stop>((lock, digest))
+        let mut guard = Sha256::new_with_prefix(b"auspex run guard v1\0");
+        let lock = read_lock(&flake_dir, &stop, &mut guard)?;
+        let digest = worktree_digest(&tree_top, &rel, &index, &paths, &stop, &mut guard)?;
+        git_dir_stamps(&git_dir, &mut guard)?;
+        Ok::<_, Stop>((lock, digest, Guard(guard.finalize().to_vec())))
     });
-    let (lock, digest) = tokio::select! {
+    let (lock, digest, guard) = tokio::select! {
         biased;
         () = cancel.cancelled() => return Err(Cancelled),
         // The job checks the deadline between reads; this covers a read or open(2) that
@@ -392,7 +465,19 @@ async fn key_and_top(
             untracked: &[],
         },
     });
-    Ok(Ok((key, reported_top)))
+    Ok(Ok(Keyed { key, top, guard }))
+}
+
+/// `rev-parse --absolute-git-dir --verify HEAD` output: the git directory, which may
+/// contain a newline, then the commit id on the last line, kept with its newline as the key
+/// has always hashed it.
+fn git_dir_and_head(out: &[u8]) -> Option<(PathBuf, String)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let cut = out.strip_suffix(b"\n")?.iter().rposition(|&b| b == b'\n')?;
+    Some((
+        PathBuf::from(OsStr::from_bytes(&out[..cut])),
+        lossy(&out[cut + 1..]),
+    ))
 }
 
 enum Stop {
@@ -400,9 +485,38 @@ enum Stop {
     NoCache(String),
 }
 
+/// Feeds one guard record: a tag and a [`Stamp`], or the tag alone when there is none.
+fn stamp(g: &mut Sha256, tag: u8, s: Option<Stamp>) {
+    g.update([tag]);
+    match s {
+        Some(s) => {
+            g.update([1]);
+            g.update(s.to_bytes());
+        }
+        None => g.update([0]),
+    }
+}
+
+/// The guard records of `HEAD` and `index` in the git directory, each from one `lstat`.
+/// `HEAD` is rewritten by every checkout and `symbolic-ref`; the index by `add`, `reset`,
+/// `commit`, `checkout`, `stash`, and by any index refresh (see the module documentation).
+fn git_dir_stamps(git_dir: &Path, g: &mut Sha256) -> Result<(), Stop> {
+    let dir = open_root(git_dir)
+        .map_err(|e| Stop::NoCache(format!("cannot open the git directory: {e:?}")))?;
+    for (tag, name) in [(b'H', &b"HEAD"[..]), (b'I', b"index")] {
+        stamp(g, tag, kind(&dir, name).ok().map(|(_, s)| s));
+    }
+    Ok(())
+}
+
 /// `flake.lock` in `flake_dir`: `None` when absent; refused when it is a symlink, not a
-/// regular file, or larger than [`MAX_LOCK_BYTES`].
-fn read_lock(flake_dir: &Path, stop: &dyn Fn() -> bool) -> Result<Option<Vec<u8>>, Stop> {
+/// regular file, or larger than [`MAX_LOCK_BYTES`]. Its stamp goes to the guard `g` (it is
+/// usually tracked too, but need not be).
+fn read_lock(
+    flake_dir: &Path,
+    stop: &dyn Fn() -> bool,
+    g: &mut Sha256,
+) -> Result<Option<Vec<u8>>, Stop> {
     let no = |why: &str| Stop::NoCache(format!("flake.lock {why}"));
     let root = open_root(flake_dir)
         .map_err(|e| Stop::NoCache(format!("cannot open the flake directory: {e:?}")))?;
@@ -410,8 +524,16 @@ fn read_lock(flake_dir: &Path, stop: &dyn Fn() -> bool) -> Result<Option<Vec<u8>
     match read_file(&root, b"flake.lock", MAX_LOCK_BYTES, stop, &mut |b| {
         bytes.extend_from_slice(b);
     }) {
-        Ok(_) => Ok(Some(bytes)),
-        Err(ReadError::Missing) => Ok(None),
+        Ok(read) => {
+            stamp(g, b'L', Some(read.stamp));
+            Ok(Some(bytes))
+        }
+        Err(ReadError::Missing) => {
+            // An untracked lock appearing is not read by nix; a tracked one is a tracked
+            // path, guarded with the others.
+            stamp(g, b'M', None);
+            Ok(None)
+        }
         Err(ReadError::NotAFile(what)) => Err(no(&format!("is {what}; refusing to read it"))),
         Err(ReadError::TooBig) => Err(no(&format!("is larger than {MAX_LOCK_BYTES} bytes"))),
         Err(ReadError::Stopped) => Err(Stop::Stopped),
@@ -426,13 +548,17 @@ fn field(h: &mut Sha256, tag: u8, bytes: &[u8]) {
     h.update(bytes);
 }
 
-/// The digest of every tracked path's worktree state under `top`.
+/// The digest of every tracked path's worktree state under `top`. Each path's [`Stamp`]
+/// goes to the guard `g`: the opened file's own, a symlink's or other entry's from the
+/// `lstat` that classified it, or, when nothing is there, the deepest directory reached
+/// (it changes when the name is created in it).
 fn worktree_digest(
     top: &Path,
     rel: &Path,
     index: &[u8],
     paths: &[&[u8]],
     stop: &dyn Fn() -> bool,
+    g: &mut Sha256,
 ) -> Result<Vec<u8>, Stop> {
     use std::os::unix::ffi::OsStrExt as _;
     let root =
@@ -453,30 +579,40 @@ fn worktree_digest(
             return Err(Stop::Stopped);
         }
         field(&mut h, b'p', p);
-        let Ok((dir, name)) = walk(&root, p) else {
-            // A directory on the way is missing or a symlink: the file is not there for
-            // nix either.
-            field(&mut h, b'x', &[]);
-            continue;
+        field(g, b'p', p);
+        let (dir, name) = match walk(&root, p) {
+            Ok(found) => found,
+            Err((_, reached)) => {
+                // A directory on the way is missing or a symlink: the file is not there
+                // for nix either.
+                field(&mut h, b'x', &[]);
+                stamp(g, b'x', reached.and_then(|d| Stamp::of_fd(&d).ok()));
+                continue;
+            }
         };
         match kind(&dir, name) {
-            Err(_) => field(&mut h, b'd', &[]),
-            Ok(FileType::Symlink) => {
+            Err(_) => {
+                field(&mut h, b'd', &[]);
+                stamp(g, b'd', Stamp::of_fd(&dir).ok());
+            }
+            Ok((FileType::Symlink, s)) => {
                 let target = rustix::fs::readlinkat(&dir, name, Vec::new())
                     .map(std::ffi::CString::into_bytes)
                     .unwrap_or_default();
                 field(&mut h, b'l', &target);
+                stamp(g, b'l', Some(s));
             }
-            Ok(FileType::RegularFile) => {
+            Ok((FileType::RegularFile, _)) => {
                 let mut fh = Sha256::new();
                 let mut n: u64 = 0;
                 match read_file(&dir, name, left, stop, &mut |b| {
                     n += b.len() as u64;
                     fh.update(b);
                 }) {
-                    Ok(exec) => {
+                    Ok(read) => {
                         left -= n;
-                        field(&mut h, if exec { b'X' } else { b'f' }, &fh.finalize());
+                        field(&mut h, if read.exec { b'X' } else { b'f' }, &fh.finalize());
+                        stamp(g, b'f', Some(read.stamp));
                     }
                     Err(ReadError::TooBig) => {
                         return Err(Stop::NoCache(format!(
@@ -485,11 +621,17 @@ fn worktree_digest(
                     }
                     Err(ReadError::Stopped) => return Err(Stop::Stopped),
                     // Replaced between the stat and the open, or unreadable.
-                    Err(_) => field(&mut h, b'e', &[]),
+                    Err(_) => {
+                        field(&mut h, b'e', &[]);
+                        stamp(g, b'e', Stamp::of_fd(&dir).ok());
+                    }
                 }
             }
             // A submodule (a gitlink is a directory), a FIFO, a device: its kind only.
-            Ok(other) => field(&mut h, b'o', &other.as_raw_mode().to_be_bytes()),
+            Ok((other, s)) => {
+                field(&mut h, b'o', &other.as_raw_mode().to_be_bytes());
+                stamp(g, b'o', Some(s));
+            }
         }
     }
     Ok(h.finalize().to_vec())
@@ -627,9 +769,10 @@ pub struct CacheParams<'a> {
 ///
 /// Computes the key; looks each machine up; sends every hit at once as an
 /// [`EvalItem::Machine`] with `from_cache: true`; evaluates only the misses, sending each
-/// result as it arrives; keeps successes until a second key confirms the tree is unchanged;
-/// and ends with the evaluator's [`EvalItem::Finished`] (or no evaluation when all hit).
-/// When there is no caching (no directory, a non-git flake reference, not a git repository,
+/// result as it arrives; keeps successes until a second key and run guard confirm that the
+/// tree was not changed during the evaluation, not even changed and undone; and ends with
+/// the evaluator's [`EvalItem::Finished`] (or no evaluation when all hit). When there is
+/// no caching (no directory, a non-git flake reference, not a git repository,
 /// git failed), one [`EvalItem::Note`] says why and every machine is evaluated. A failed
 /// cache write is a note too.
 ///
@@ -663,7 +806,7 @@ async fn cache_key_or_why<'c>(
     cache: &CacheParams<'c>,
     cancel: &CancellationToken,
     tx: &UnboundedSender<EvalItem>,
-) -> Result<Result<(&'c Path, CacheKey), String>, Cancelled> {
+) -> Result<Result<(&'c Path, CacheKey, Guard), String>, Cancelled> {
     Ok(match cache.cache_dir {
         None => Err("no cache directory".to_owned()),
         Some(_) if flake.has_query() => Err(
@@ -700,10 +843,10 @@ async fn cache_key_or_why<'c>(
                     // ancestor with a `.git`; the key from git's own discovery. Where they
                     // disagree (a ceiling, a `.git` that is not a repository, `core.worktree`)
                     // the two describe different trees, so there is no caching.
-                    Ok((key, top))
+                    Ok(Keyed { key, top, guard })
                         if std::fs::canonicalize(&top).ok().as_deref() == flake.repo_top() =>
                     {
-                        Ok((dir, key))
+                        Ok((dir, key, guard))
                     }
                     Ok(_) => Err(
                         "git's repository top level is not the one the flake reference names"
@@ -724,7 +867,7 @@ async fn evaluate_with(
     cache: &CacheParams<'_>,
     cancel: &CancellationToken,
     tx: UnboundedSender<EvalItem>,
-    keyed: Option<(&Path, CacheKey)>,
+    keyed: Option<(&Path, CacheKey, Guard)>,
 ) -> Result<(), Cancelled> {
     let mut misses = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
@@ -733,7 +876,7 @@ async fn evaluate_with(
             continue;
         }
         let hit = match &keyed {
-            Some((dir, key)) => lookup(dir, key, &m.name).await,
+            Some((dir, key, _)) => lookup(dir, key, &m.name).await,
             None => None,
         };
         match hit {
@@ -759,7 +902,7 @@ async fn evaluate_with(
         let _ = tx.send(EvalItem::Finished { error: None });
         return Ok(());
     }
-    let Some((_, key)) = keyed else {
+    let Some((_, key, guard)) = keyed else {
         return evaluate(flake, &misses, eval, cancel, tx).await;
     };
 
@@ -809,7 +952,7 @@ async fn evaluate_with(
         return Err(Cancelled);
     }
     if !pending.is_empty() {
-        store_checked(flake, cache, cancel, &tx, &key, pending).await?;
+        store_checked(flake, cache, cancel, &tx, (&key, &guard), pending).await?;
     }
     if let Some(finished) = finished {
         tx.send(finished).map_err(|_| Cancelled)?;
@@ -817,17 +960,19 @@ async fn evaluate_with(
     Ok(())
 }
 
-/// Publish only results whose before/after keys agree.
+/// Publish only results whose before/after keys agree, and whose before/after guards agree:
+/// nothing the key read was written, replaced or recreated in between, even if it was put
+/// back (review finding N2).
 async fn store_checked(
     flake: &FlakeRef,
     cache: &CacheParams<'_>,
     cancel: &CancellationToken,
     tx: &UnboundedSender<EvalItem>,
-    key: &CacheKey,
+    (key, guard): (&CacheKey, &Guard),
     pending: Vec<(String, EvalSuccess)>,
 ) -> Result<(), Cancelled> {
     match cache_key_or_why(flake, cache, cancel, tx).await? {
-        Ok((dir, after)) if after == *key => {
+        Ok((dir, after, after_guard)) if after == *key && after_guard == *guard => {
             for (machine, result) in pending {
                 if cancel.is_cancelled() || tx.is_closed() {
                     return Err(Cancelled);

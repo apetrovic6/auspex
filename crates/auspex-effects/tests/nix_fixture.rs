@@ -382,3 +382,116 @@ async fn edits_during_real_worker_restarts_do_not_poison_the_cache() {
         assert_eq!(warm[name].1, restored[name].1);
     }
 }
+
+/// Review finding N2 with the real nix-eval-jobs: `extra.nix` is edited at the first
+/// result and its committed bytes written back at the second. The key after the evaluation
+/// equals the key before it, yet some worker read the edited tree; the run guard sees the
+/// change, so nothing is stored and the next run evaluates again.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario: the edited and reverted run, then the check"
+)]
+#[tokio::test]
+async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
+    for tool in ["nix", "nix-eval-jobs", "git"] {
+        if find_on_path(tool).is_none() {
+            eprintln!("SKIPPED: {tool} is not on PATH");
+            return;
+        }
+    }
+    let repo = tempdir();
+    fs::write(repo.path().join("extra.nix"), "original").unwrap();
+    fs::write(
+        repo.path().join("flake.nix"),
+        r#"{
+      outputs = _: {
+        nixosConfigurations = builtins.listToAttrs (map (name: {
+          inherit name;
+          value.config.system.build.toplevel = derivation {
+            inherit name;
+            system = "x86_64-linux";
+            builder = "/auspex-fixture-never-built";
+            source = builtins.readFile ./extra.nix;
+            work = builtins.toString (builtins.foldl' (a: b: a + b) 0
+              (builtins.genList (n: n) 200000));
+          };
+        }) ["a" "b" "c" "d"]);
+      };
+    }"#,
+    )
+    .unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "edit and revert"]);
+    let flake = FlakeRef::new(repo.path().to_str().unwrap()).unwrap();
+    let cache_dir = tempdir();
+    let cache = CacheParams {
+        cache_dir: Some(cache_dir.path()),
+        flake_dir: repo.path(),
+        git: GitParams::new(),
+    };
+    let machines: Vec<_> = ["a", "b", "c", "d"]
+        .into_iter()
+        .map(|name| EvalMachine {
+            name: name.to_owned(),
+            class: MachineClass::Nixos,
+        })
+        .collect();
+    let mut eval = EvalParams::new();
+    eval.runtime_dir = Some(common::runtime_dir());
+    eval.workers = 1;
+    eval.max_memory_mib = 1; // Force a new source read for every worker.
+    let (tx, mut rx) = unbounded_channel();
+    let collect = async {
+        let mut items = Vec::new();
+        let mut successes = 0;
+        while let Some(item) = rx.recv().await {
+            if matches!(
+                &item,
+                EvalItem::Machine {
+                    outcome: EvalOutcome::Success(_),
+                    ..
+                }
+            ) {
+                successes += 1;
+                match successes {
+                    1 => fs::write(repo.path().join("extra.nix"), "edited").unwrap(),
+                    2 => fs::write(repo.path().join("extra.nix"), "original").unwrap(),
+                    _ => {}
+                }
+            }
+            items.push(item);
+        }
+        assert!(successes >= 2, "fewer than two successes: {items:?}");
+        items
+    };
+    let cancel = CancellationToken::new();
+    let (result, items) = tokio::join!(
+        evaluate_cached(&flake, &machines, &eval, &cache, &cancel, tx),
+        collect,
+    );
+    result.unwrap();
+    assert!(
+        items.iter().any(|i| matches!(
+            i,
+            EvalItem::Note(n) if n == "eval results not cached: the worktree changed during evaluation"
+        )),
+        "{items:?}"
+    );
+    let (changed, error) = split(&items);
+    assert_eq!(error, None);
+    let (restored, error) = split(&run(&flake, &machines, &cache).await);
+    assert_eq!(error, None);
+    for name in ["a", "b", "c", "d"] {
+        assert!(
+            !restored[name].0,
+            "{name} was cached from the edited-and-reverted run"
+        );
+    }
+    assert!(
+        ["b", "c", "d"]
+            .into_iter()
+            .any(|name| changed[name].1 != restored[name].1),
+        "the experiment did not exercise a worker reading the edited tree"
+    );
+}

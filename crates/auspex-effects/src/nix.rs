@@ -917,6 +917,32 @@ mod tests {
         );
     }
 
+    /// Review item T1 (mutation X01): a `.git` *file* (a linked worktree or a submodule)
+    /// makes its directory the top, even inside another checkout.
+    #[test]
+    fn a_git_file_marks_its_own_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(top.join(".git")).unwrap();
+        let wt = top.join("nested-wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../.git/worktrees/nested-wt\n").unwrap();
+        let f = FlakeRef::new(wt.to_str().unwrap()).unwrap();
+        assert_eq!(f.as_str(), format!("git+file://{}/", wt.display()));
+        assert_eq!(f.repo_top(), Some(wt.as_path()));
+    }
+
+    /// Review item T2 (mutation X18): a `path:` reference is percent-encoded, so a
+    /// directory named like a query names that directory, not a `dir=` inside another.
+    #[test]
+    fn a_path_reference_encodes_query_syntax() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("q?dir=sub");
+        std::fs::create_dir(&q).unwrap();
+        let f = FlakeRef::new(q.to_str().unwrap()).unwrap();
+        assert!(f.as_str().ends_with("/q%3Fdir=sub"), "{f:?}");
+    }
+
     #[test]
     fn the_machine_is_the_attr_path_not_the_quoted_attr() {
         let line = r#"{"attr":"\"1odd\"","attrPath":["1odd"],"error":"error: x"}"#;

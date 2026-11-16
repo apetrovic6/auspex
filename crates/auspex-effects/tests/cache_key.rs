@@ -365,6 +365,37 @@ async fn the_worktree_cap_is_a_total() {
     assert!(e.contains("larger than"), "{e}");
 }
 
+/// Review finding F6: the index listing is capped at 64 MiB, exactly. A git whose
+/// `ls-files` prints one byte more is "no caching"; at the cap it is read (all NULs: no
+/// records, so a key).
+#[tokio::test]
+async fn the_index_listing_cap_is_64_mib() {
+    let Some(t) = tools(&["git", "head"]) else {
+        return;
+    };
+    let Some(r) = repo() else { return };
+    let side = tempdir();
+    for (len, over) in [(64 << 20, false), ((64 << 20) + 1, true)] {
+        let fake = t.script(
+            side.path(),
+            &format!("git{len}"),
+            &format!(
+                "case \" $* \" in *' ls-files '*) exec @head@ -c {len} /dev/zero;; esac\nexec @git@ \"$@\""
+            ),
+        );
+        let mut g = GitParams::new();
+        g.program = fake.as_os_str();
+        let k = key_for(r.path(), &g, &CancellationToken::new())
+            .await
+            .unwrap();
+        let printed = format!("git ls-files printed more than {} bytes", 64 << 20);
+        match k {
+            Err(e) => assert!(over && e == printed, "{len}: {e}"),
+            Ok(_) => assert!(!over, "{len} bytes were accepted"),
+        }
+    }
+}
+
 /// Review mutation R09: an inherited `GIT_DIR` or `GIT_INDEX_FILE` does not redirect git.
 /// Run in a child test process, since the variables must be in this crate's own
 /// environment and `set_var` is `unsafe`.
