@@ -91,6 +91,10 @@ pub fn plain(view: &ViewModel, colour: bool, settle_seconds: u64) -> String {
     let target_w = width(|m| m.target.clone().unwrap_or_else(|| "-".to_owned()));
     let source_w = width(|m| source(m.target_source).to_owned());
     let mut out = String::new();
+    // An empty fleet must not look like a silent failure (review C5).
+    if report.machines.is_empty() {
+        out.push_str("no machines\n");
+    }
     for m in &report.machines {
         // Spinners do not survive settling, so a frame number is not needed; `0` keeps the
         // output fixed if one ever does.

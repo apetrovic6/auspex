@@ -27,9 +27,16 @@ auspex --demo                # a scripted fleet: no machine, nix, cache or netwo
 auspex --flake ~/clan/fleet  # the fleet flake; default: config `flake`, then CLAN_DIR, then .
 ```
 
-Headless exit status: 0 for a scan that completed with no fleet-level error, 1 when the
-machine list or the evaluator failed or `timeouts.settle` cut the scan short, 2 for usage
-and config errors. Unreachable or out-of-date machines are findings, not failures.
+Headless exit status: 0 for a scan that completed with no fleet-level error; 1 only when the
+fleet has a problem (the machine list or the evaluator failed, or `timeouts.settle` cut the
+scan short); 2 when auspex itself could not do its job (a usage or config error, no usable
+terminal, the report could not be written, a closed pipe on stdout); 128 + n after signal n.
+Unreachable or out-of-date machines are findings, not failures. With Prometheus configured
+but unreachable, headless mode says so on stderr and takes health from ssh.
+
+The package carries `nix-eval-jobs` (used only when none is on `PATH`), which with the nix
+libraries it links adds about 170 MiB to the closure: the price of `nix run` working on a
+system without it.
 
 In the TUI, `?` lists the live keymap (`[keymap]` in the config rebinds any action; an empty
 list unbinds it) and `L` shows the log: eval cache hits, caching off and why, config

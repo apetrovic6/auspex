@@ -294,3 +294,16 @@ fn errors_on_stderr_carry_no_escape_sequences() {
         "{stderr:?}"
     );
 }
+
+/// Review mutation A: `stale_after` was parsed but nothing checked it reaches the core.
+#[test]
+fn stale_after_reaches_the_core() {
+    let (s, _) = config::parse("[prometheus]\nurl = \"http://p\"\nstale_after = 33\n").unwrap();
+    assert_eq!(
+        core_config(&s, ".".to_owned())
+            .prometheus
+            .unwrap()
+            .max_age_seconds,
+        33
+    );
+}

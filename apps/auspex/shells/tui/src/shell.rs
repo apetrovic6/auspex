@@ -30,12 +30,20 @@ use auspex_effects::nix::EvalItem;
 use auspex_effects::{CancellationToken, Cancelled};
 use crux_core::Request;
 use crux_core::capability::Operation;
-use tokio::sync::Notify;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::task::TaskTracker;
 
 use crate::backend::Backend;
 use crate::log::Log;
+
+/// How many per-machine calls (probes, cache lookups) may run at once.
+///
+/// Each probe holds
+/// an ssh process and its pipes, so a fleet of thousands would otherwise run out of file
+/// descriptors and fail the evaluator and git with it (review C2). Fleet-wide calls (the list,
+/// the evaluation, Prometheus, DNS) are not limited: they must not queue behind hung probes.
+pub const MAX_CONCURRENT: usize = 32;
 
 /// How long a shutdown waits for adapter calls to kill and reap what they started.
 pub const REAP_GRACE: Duration = Duration::from_secs(5);
@@ -60,6 +68,8 @@ pub struct Shell {
     /// Machine names the config has `[machines.<name>]` for, and whether a name the fleet
     /// does not have was already reported this run.
     configured: Mutex<(BTreeSet<String>, bool)>,
+    /// Permits for per-machine calls ([`MAX_CONCURRENT`]).
+    limit: Arc<Semaphore>,
 }
 
 impl Shell {
@@ -77,6 +87,7 @@ impl Shell {
             settle,
             deadline: Mutex::new(None),
             configured: Mutex::new((BTreeSet::new(), false)),
+            limit: Arc::new(Semaphore::new(MAX_CONCURRENT)),
         })
     }
 
@@ -162,7 +173,9 @@ impl Shell {
                 let op = request.operation.clone();
                 let token = self.open(op.id);
                 let shell = Arc::clone(self);
+                let gate = self.gate(&token);
                 self.one_shot(op.id, request, async move {
+                    let _permit = gate.await?;
                     shell.backend.probe(&op, &token).await
                 });
             }
@@ -179,7 +192,9 @@ impl Shell {
                 let op = request.operation.clone();
                 let token = self.open(op.id);
                 let shell = Arc::clone(self);
+                let gate = self.gate(&token);
                 self.one_shot(op.id, request, async move {
+                    let _permit = gate.await?;
                     shell.backend.cache_lookup(&op, &token).await
                 });
             }
@@ -333,4 +348,29 @@ impl Shell {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Shell {
+    /// Waits for a per-machine permit, or for `token` to be cancelled first (a request
+    /// cancelled while queued never starts).
+    fn gate(
+        &self,
+        token: &CancellationToken,
+    ) -> impl Future<Output = Result<OwnedSemaphorePermit, Cancelled>> + Send + 'static {
+        let limit = Arc::clone(&self.limit);
+        let token = token.clone();
+        async move {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => Err(Cancelled),
+                p = limit.acquire_owned() => p.map_err(|_| Cancelled),
+            }
+        }
+    }
+
+    /// Per-machine calls running now, for tests.
+    #[must_use]
+    pub fn running_per_machine(&self) -> usize {
+        MAX_CONCURRENT - self.limit.available_permits()
+    }
 }

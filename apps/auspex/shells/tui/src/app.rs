@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use auspex_core::{Config, Event, PrometheusConfig};
+use auspex_core::{Config, Event, PrometheusConfig, PrometheusStatus};
 use auspex_effects::Termination;
 use clap::Parser as _;
 use crossterm::event::EventStream;
@@ -43,7 +43,9 @@ use crate::ui::{self, Context, Ui};
 /// answers arriving on other tasks never touch the terminal themselves.
 const FRAME: Duration = Duration::from_millis(33);
 
-/// Usage and config errors.
+/// Anything that is not the fleet's problem: a usage or config error, or auspex itself
+/// unable to do its job (no usable terminal, the report could not be written, no runtime).
+/// 1 means only "the fleet has a problem" (review C4); signals are 128 + n.
 const USAGE: u8 = 2;
 
 /// The core's configuration from the settings and the resolved flake.
@@ -130,7 +132,7 @@ pub fn main() -> ExitCode {
         Ok(r) => r,
         Err(e) => {
             say(&format!("cannot start the async runtime: {e}"));
-            return ExitCode::FAILURE;
+            return ExitCode::from(USAGE);
         }
     };
     // Synchronously and before the runtime exists, so before `Termination` takes the signals
@@ -175,7 +177,7 @@ impl Run {
             Ok(t) => t,
             Err(e) => {
                 say(&format!("cannot handle termination signals: {e}"));
-                return ExitCode::FAILURE;
+                return ExitCode::from(USAGE);
             }
         };
         let mode = self.args.mode();
@@ -237,6 +239,12 @@ async fn headless(
     }
     let view = shell.view();
     shell.shutdown().await;
+    // The TUI shows "prom: down"; headless output would otherwise not say it at all (C3).
+    if let PrometheusStatus::Unavailable { reason } = &view.prometheus {
+        shell.log.line(&format!(
+            "prometheus unavailable, so health comes from ssh: {reason}"
+        ));
+    }
     let text = match mode {
         Mode::Json => headless::json(&view.report),
         _ => headless::plain(&view, std::io::stdout().is_terminal(), settle),
@@ -246,11 +254,12 @@ async fn headless(
         .write_all(text.as_bytes())
         .and_then(|()| stdout.flush())
     {
-        // A closed pipe (`| head`) is not worth a second message on a broken stream.
+        // A closed pipe (`| head`) is not worth a message on a broken stream; still 2, as
+        // the report was not delivered.
         if e.kind() != std::io::ErrorKind::BrokenPipe {
             say(&format!("cannot write the report: {e}"));
         }
-        return ExitCode::FAILURE;
+        return ExitCode::from(USAGE);
     }
     ExitCode::from(headless::exit_status(&view))
 }
@@ -269,7 +278,7 @@ async fn tui(
             say(&format!(
                 "cannot use the terminal ({e}); try --plain or --json"
             ));
-            return ExitCode::FAILURE;
+            return ExitCode::from(USAGE);
         }
     };
     shell.send(Event::Start(config));
@@ -287,7 +296,7 @@ async fn tui(
                 let ctx = Context { theme, keymap, flake, log: &log };
                 if let Err(e) = terminal.draw(|f| ui::draw(f, &view, &mut ui, &ctx)) {
                     failure = Some(format!("cannot draw: {e}"));
-                    code = ExitCode::FAILURE;
+                    code = ExitCode::from(USAGE);
                     break;
                 }
             }
@@ -309,7 +318,7 @@ async fn tui(
                 Some(Err(e)) => {
                     // Said after the terminal is restored, so it is readable (review finding 6).
                     failure = Some(format!("cannot read the terminal: {e}"));
-                    code = ExitCode::FAILURE;
+                    code = ExitCode::from(USAGE);
                     break;
                 }
                 None => shell.send(Event::Quit),

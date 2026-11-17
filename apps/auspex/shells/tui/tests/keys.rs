@@ -23,6 +23,7 @@ const SCREEN: Screen = Screen {
     page: 20,
     matches: 3,
     listing: false,
+    rows: 18,
 };
 
 const fn ctrl(c: char) -> Key {
@@ -327,7 +328,8 @@ fn repeat_counts_stay_cheap() {
     keys.push(ctrl('d'));
     assert_eq!(
         feed(&mut i, &km, SCREEN, &keys),
-        ev(&[Event::HalfPageDown(20 * 99_999)])
+        ev(&[Event::HalfPageDown(20 * 18)]),
+        "at most as many half pages as there are rows"
     );
     // 3 matches: 5n lands where 2n does; 99999n where 3n does.
     assert_eq!(

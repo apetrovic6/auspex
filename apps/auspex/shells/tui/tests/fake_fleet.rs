@@ -290,3 +290,370 @@ fn sighup_stops_auspex_and_every_child() {
 fn sigquit_stops_auspex_and_every_child() {
     signal_kills_everything(Signal::QUIT, "SIGQUIT");
 }
+
+// ---------------------------------------------------------------------------------------
+// Each config value is used, not only read (review mutations B to E, G and H).
+// ---------------------------------------------------------------------------------------
+
+/// An ssh that records its arguments, then answers like `ssh_ok`.
+fn ssh_recording(t: &Tools, dir: &Path, current: &str) -> std::path::PathBuf {
+    t.script(
+        dir,
+        "ssh",
+        &format!(
+            r#"echo "$*" >> '@dir@/ssh.argv'
+for a; do case "$prev" in --) dest=$a;; esac; prev=$a; done
+case "$dest" in
+  *192.0.2.11*) echo 'ssh: connect to host 192.0.2.11 port 22: No route to host' >&2; exit 255;;
+esac
+cat > /dev/null
+printf 'auspex_probe=1\nprobe=nixos\ncurrent_system={current}\nsystem_state=running\nfailed_units=[]\nauspex_end=1\n'"#
+        ),
+    )
+}
+
+/// An evaluator that records its arguments, then answers `terra` with `out` and `luna`.
+fn eval_recording(t: &Tools, dir: &Path, out: &str) -> std::path::PathBuf {
+    let luna = store("nixos-system-luna");
+    t.script(
+        dir,
+        "nix-eval-jobs",
+        &format!(
+            r#"printf '%s\n' "$@" > '@dir@/eval.argv'
+printf '%s\n' '{{"attr":"terra","attrPath":["terra"],"drvPath":"{out}.drv","outputs":{{"out":"{out}"}}}}' '{{"attr":"luna","attrPath":["luna"],"drvPath":"{luna}.drv","outputs":{{"out":"{luna}"}}}}'"#
+        ),
+    )
+}
+
+#[test]
+fn the_ssh_and_evaluator_settings_reach_the_programs() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let nix = nix_ok(&t, dir.path());
+    let eval = eval_recording(&t, dir.path(), &store("nixos-system-terra"));
+    let ssh = ssh_recording(&t, dir.path(), &store("nixos-system-terra"));
+    let cfg = config(
+        dir.path(),
+        "[timeouts]\nssh_connect = 7\n[eval]\nworkers = 3\nmax_memory_mb = 1234\n",
+    );
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--plain", "--config"])
+        .arg(&cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()));
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let out = run_within(&mut cmd, LIMIT);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let ssh_argv = std::fs::read_to_string(dir.path().join("ssh.argv")).unwrap();
+    assert!(ssh_argv.contains("ConnectTimeout=7"), "{ssh_argv}");
+    let eval_argv: Vec<String> = std::fs::read_to_string(dir.path().join("eval.argv"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let after = |flag: &str| {
+        eval_argv
+            .iter()
+            .position(|a| a == flag)
+            .and_then(|i| eval_argv.get(i + 1))
+            .cloned()
+    };
+    assert_eq!(after("--workers").as_deref(), Some("3"), "{eval_argv:?}");
+    assert_eq!(
+        after("--max-memory-size").as_deref(),
+        Some("1234"),
+        "{eval_argv:?}"
+    );
+}
+
+#[test]
+fn the_probe_timeout_cuts_a_hung_probe_before_the_deadline() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let (nix, eval, ssh) = (
+        nix_ok(&t, dir.path()),
+        eval_ok(&t, dir.path()),
+        ssh_hangs(&t, dir.path()),
+    );
+    let cfg = config(dir.path(), "[timeouts]\nprobe = 1\nsettle = 120\n");
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--plain", "--config"])
+        .arg(&cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()));
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let start = Instant::now();
+    let out = run_within(&mut cmd, LIMIT);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        start.elapsed() < Duration::from_secs(9),
+        "the configured 1 s probe timeout: not the 10 s default, nor the 120 s deadline"
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a timed-out probe is a finding: {stdout}"
+    );
+    let terra = stdout.lines().find(|l| l.contains("terra")).unwrap();
+    assert!(
+        terra.contains("unreachable") && !terra.contains("global deadline"),
+        "{terra}"
+    );
+}
+
+#[test]
+fn the_eval_timeout_cuts_a_hung_evaluator_before_the_deadline() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let (nix, eval, ssh) = (
+        nix_ok(&t, dir.path()),
+        eval_hangs(&t, dir.path()),
+        ssh_ok(&t, dir.path()),
+    );
+    let cfg = config(dir.path(), "[timeouts]\neval = 1\nsettle = 120\n");
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--plain", "--config"])
+        .arg(&cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()));
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let start = Instant::now();
+    let out = run_within(&mut cmd, LIMIT);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        start.elapsed() < Duration::from_secs(30),
+        "the eval timeout, not the deadline"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("error: evaluation_failed"), "{stdout}");
+    assert!(!stdout.contains("did not settle"), "{stdout}");
+}
+
+/// A one-shot HTTP/1.1 responder on 127.0.0.1 for both HTTP adapters: Prometheus's query
+/// gets `prometheus`; `HEAD /<cached>.narinfo` gets 200, any other narinfo 404.
+fn serve(prometheus: String, cached: &str) -> u16 {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let cached = format!("/{cached}.narinfo");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && s.read(&mut byte).is_ok_and(|n| n == 1) {
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head);
+            let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+            let (status, body) = if path.starts_with("/api/v1/query") {
+                ("200 OK", prometheus.clone())
+            } else if path == cached {
+                ("200 OK", String::new())
+            } else {
+                ("404 Not Found", String::new())
+            };
+            let head_only = head.starts_with("HEAD");
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                if head_only { "" } else { &body }
+            );
+        }
+    });
+    port
+}
+
+#[test]
+fn prometheus_answers_and_the_cached_badge_reach_the_report() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let hash = "1123456789abcdfghijklmnpqrsvwxyz";
+    let pending = format!("/nix/store/{hash}-nixos-system-terra-new");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // terra has no instance label in the config, so it is asked for as `terra:9100`.
+    let prometheus = format!(
+        r#"{{"status":"success","data":{{"resultType":"vector","result":[{{"metric":{{"instance":"terra:9100","auspex_metric":"scraped"}},"value":[0,"{now}"]}},{{"metric":{{"instance":"terra:9100","auspex_metric":"uptime"}},"value":[0,"4242"]}}]}}}}"#
+    );
+    let port = serve(prometheus, hash);
+    let nix = nix_ok(&t, dir.path());
+    let eval = eval_recording(&t, dir.path(), &pending);
+    let ssh = ssh_recording(&t, dir.path(), &store("nixos-system-terra"));
+    let cfg = config(
+        dir.path(),
+        &format!(
+            "[prometheus]\nurl = \"http://127.0.0.1:{port}\"\n[cache]\nurl = \"http://127.0.0.1:{port}\"\n"
+        ),
+    );
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--json", "--config"])
+        .arg(&cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()));
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let out = run_within(&mut cmd, LIMIT);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let terra = report["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "terra")
+        .unwrap();
+    assert_eq!(
+        terra["health"]["uptime_seconds"]["value"], 4242,
+        "{terra:#}"
+    );
+    assert_eq!(terra["health"]["uptime_seconds"]["source"], "prometheus");
+    assert!(
+        terra["badges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "cached"),
+        "{terra:#}"
+    );
+}
+
+/// Review C3: Prometheus down was invisible in headless output.
+#[test]
+fn prometheus_unavailable_is_said_on_stderr() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    // A port nothing listens on: bound, then released.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (nix, eval, ssh) = (
+        nix_ok(&t, dir.path()),
+        eval_ok(&t, dir.path()),
+        ssh_ok(&t, dir.path()),
+    );
+    let cfg = config(
+        dir.path(),
+        &format!("[prometheus]\nurl = \"http://127.0.0.1:{port}\"\n"),
+    );
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--json", "--config"])
+        .arg(&cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()));
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let out = run_within(&mut cmd, LIMIT);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("prometheus unavailable"), "{stderr}");
+}
+
+/// Review C5: an empty fleet printed nothing at all.
+#[test]
+fn plain_with_no_machines_says_so() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let nix = t.script(dir.path(), "nix", "echo '{}'");
+    let (eval, ssh) = (eval_ok(&t, dir.path()), ssh_ok(&t, dir.path()));
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--plain", "--flake"]).arg(flake_dir(dir.path()));
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let out = run_within(&mut cmd, LIMIT);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "no machines\n");
+}
+
+/// Review C4: a report that could not be delivered is auspex's failure (2), not the
+/// fleet's (1); a closed pipe is quiet about it.
+#[test]
+fn a_report_that_cannot_be_written_exits_2() {
+    let dir = tempdir();
+    if Path::new("/dev/full").exists() {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let out = auspex(dir.path())
+            .args(["--demo", "--json"])
+            .stdout(full)
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("cannot write the report"));
+    } else {
+        eprintln!("SKIPPED part: no /dev/full");
+    }
+    let mut child = auspex(dir.path())
+        .args(["--demo", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take()); // the reader is gone before anything is written
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        !String::from_utf8_lossy(&out.stderr).contains("cannot write"),
+        "quiet"
+    );
+}
+
+/// Review C2: every probe ran at once, so a large fleet ran out of file descriptors. At most
+/// `MAX_CONCURRENT` per-machine calls run together; the rest wait.
+#[test]
+fn at_most_max_concurrent_probes_run_at_once() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let limit = auspex_tui::shell::MAX_CONCURRENT;
+    let dir = tempdir();
+    let fleet: Vec<String> = (0..limit + 8)
+        .map(|i| {
+            format!(
+                r#""m{i:03}":{{"deploy":{{"targetHost":"root@192.0.2.{}"}}}}"#,
+                i + 1
+            )
+        })
+        .collect();
+    let nix = t.script(
+        dir.path(),
+        "nix",
+        &format!("printf '%s\\n' '{{{}}}'", fleet.join(",")),
+    );
+    let (eval, ssh) = (eval_ok(&t, dir.path()), ssh_hangs(&t, dir.path()));
+    let cfg = config(dir.path(), "[timeouts]\nsettle = 600\nprobe = 600\n");
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--plain", "--config"])
+        .arg(&cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let mut child = cmd.spawn().unwrap();
+    let pids = wait_for_pids(&dir.path().join("ssh.pids"), limit);
+    // Give any probe beyond the limit time to start, if one could.
+    std::thread::sleep(Duration::from_millis(1500));
+    let all = wait_for_pids(&dir.path().join("ssh.pids"), limit);
+    let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+    kill_process(pid, Signal::TERM).unwrap();
+    let status = child.wait().unwrap();
+    let left: Vec<i32> = all.iter().copied().filter(|&p| alive(p)).collect();
+    cleanup(&all);
+    assert_eq!(pids.len(), limit);
+    assert_eq!(all.len(), limit, "no more than {limit} probes ran at once");
+    assert_eq!(status.code(), Some(128 + Signal::TERM.as_raw()));
+    assert!(left.is_empty(), "{left:?}");
+}

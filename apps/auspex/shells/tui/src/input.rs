@@ -64,6 +64,8 @@ pub struct Screen {
     /// A refresh is starting (its machine list is being read): another `r` is dropped
     /// rather than start one more `nix` process.
     pub listing: bool,
+    /// How many rows the list has: no count needs to move further than that.
+    pub rows: usize,
 }
 
 impl Screen {
@@ -75,6 +77,7 @@ impl Screen {
             page,
             matches: view.search.as_ref().map_or(0, |s| s.matches.len()),
             listing: view.refresh.phase == Phase::ListingMachines,
+            rows: view.report.machines.len(),
         }
     }
 }
@@ -155,8 +158,12 @@ impl Input {
             Action::Down => vec![Event::MoveDown(n)],
             Action::Up => vec![Event::MoveUp(n)],
             // One event of `n` half pages, not `n` events (review finding 6).
-            Action::HalfPageDown => vec![Event::HalfPageDown(half.saturating_mul(n))],
-            Action::HalfPageUp => vec![Event::HalfPageUp(half.saturating_mul(n))],
+            Action::HalfPageDown => vec![Event::HalfPageDown(
+                half.saturating_mul(n.min(screen.rows.max(1))),
+            )],
+            Action::HalfPageUp => vec![Event::HalfPageUp(
+                half.saturating_mul(n.min(screen.rows.max(1))),
+            )],
             Action::Top | Action::Bottom if count.is_some() => {
                 vec![Event::MoveTop, Event::MoveDown(n.saturating_sub(1))]
             }

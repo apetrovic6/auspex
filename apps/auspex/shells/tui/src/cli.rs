@@ -8,8 +8,9 @@ use clap::Parser;
 ///
 /// Starts a read-only terminal UI. With --plain or --json it scans once without a terminal,
 /// prints the result when the fleet has settled, and exits: 0 for a scan that completed with
-/// no fleet-level error, 1 when there was one or the scan timed out, 2 for usage and config
-/// errors.
+/// no fleet-level error; 1 only when the fleet has a problem (a fleet-level error, or the scan
+/// did not settle in time); 2 when auspex itself could not do its job (a usage or config
+/// error, no usable terminal, the report could not be written); 128 + n after signal n.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "auspex", version, about, long_about)]
 pub struct Args {
