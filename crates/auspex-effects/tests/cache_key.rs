@@ -758,3 +758,56 @@ async fn no_prlimit_inner() {
     let e = key(Path::new(&repo)).await.unwrap_err();
     assert!(e.contains("prlimit"), "{e}");
 }
+
+/// Review F4 (mutation M17): a git directory whose path contains a newline. `rev-parse`
+/// prints it before HEAD's id, so only the last line is the id.
+#[tokio::test]
+async fn a_git_directory_path_with_a_newline_is_keyed() {
+    if !have_git() {
+        return;
+    }
+    let base = tempdir();
+    let r = base.path().join("fleet\nrepo");
+    fs::create_dir(&r).unwrap();
+    fs::write(r.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+    git(&r, &["init", "-q"]);
+    git(&r, &["add", "flake.nix"]);
+    git(&r, &["commit", "-q", "-m", "one"]);
+    let k = key(&r).await;
+    assert!(k.is_ok(), "{k:?}");
+}
+
+/// Review F4 (mutation M18): the key of a fixed repository, pinned. The run guard must
+/// never change the key, so entries written by `master` keep hitting; this value was
+/// computed by `master` (`a818479`) and by this branch alike.
+#[tokio::test]
+async fn the_key_of_a_fixed_repository_is_pinned() {
+    if !have_git() {
+        return;
+    }
+    let r = tempdir();
+    fs::write(r.path().join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+    fs::write(r.path().join("flake.lock"), "{}\n").unwrap();
+    git(r.path(), &["init", "-q"]);
+    git(r.path(), &["add", "flake.nix", "flake.lock"]);
+    let ok = Command::new("git")
+        .current_dir(r.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+        .args(["-c", "user.name=auspex", "-c", "user.email=auspex@invalid"])
+        .args(["commit", "-q", "-m", "pinned"])
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    assert_eq!(
+        git(r.path(), &["rev-parse", "HEAD"]).trim(),
+        "579811899085928f2cda55b0b05dae39e78bffad",
+        "the fixture commit is not the pinned one"
+    );
+    assert_eq!(
+        key(r.path()).await.unwrap().as_str(),
+        "v1-1aecae61c518e1837e9cc6720f719d1ce33bcbdbe7f1543da606d89a2d4de668"
+    );
+}

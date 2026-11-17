@@ -57,6 +57,14 @@ const DIR: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
+/// A directory opened only to name things in it (`O_PATH`): needs search permission on
+/// the way to it, not read permission on it, as git itself does in `.git` (review of
+/// `ca2cc3f`, F6). `statat` and `openat` relative to it work; listing it does not.
+const PATH_DIR: OFlags = OFlags::PATH
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
 const FILE: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK)
@@ -97,6 +105,16 @@ pub fn open_root(path: &Path) -> Result<OwnedFd, ReadError> {
     )?)
 }
 
+/// Opens a starting directory with `O_PATH` (see [`PATH_DIR`]). Like [`open_root`], the
+/// start itself may be reached through symlinks.
+pub fn open_path_root(path: &Path) -> Result<OwnedFd, ReadError> {
+    Ok(rustix::fs::open(
+        path,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
+}
+
 /// Opens directory `name` in `dir`, without following a symlink. With `create`, makes it
 /// (mode 0700) first if missing.
 pub fn open_dir(dir: impl AsFd, name: &[u8], create: bool) -> Result<OwnedFd, ReadError> {
@@ -120,6 +138,15 @@ pub type Walked<'p> = Result<(OwnedFd, &'p [u8]), (ReadError, Option<OwnedFd>)>;
 ///
 /// Why the walk stopped, with the deepest directory it reached (`root` at worst).
 pub fn walk<'p>(root: &OwnedFd, rel: &'p [u8]) -> Walked<'p> {
+    walk_with(root, rel, DIR)
+}
+
+/// [`walk`] with every directory opened `O_PATH` (see [`PATH_DIR`]).
+pub fn walk_path<'p>(root: &OwnedFd, rel: &'p [u8]) -> Walked<'p> {
+    walk_with(root, rel, PATH_DIR)
+}
+
+fn walk_with<'p>(root: &OwnedFd, rel: &'p [u8], flags: OFlags) -> Walked<'p> {
     let mut parts = rel
         .split(|&b| b == b'/')
         .filter(|p| !p.is_empty())
@@ -135,7 +162,7 @@ pub fn walk<'p>(root: &OwnedFd, rel: &'p [u8]) -> Walked<'p> {
                 Some(dir),
             ));
         }
-        dir = match openat(&dir, part, DIR, Mode::empty()) {
+        dir = match openat(&dir, part, flags, Mode::empty()) {
             Ok(d) => d,
             Err(e) => return Err((e.into(), Some(dir))),
         };

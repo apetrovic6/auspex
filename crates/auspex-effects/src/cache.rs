@@ -51,49 +51,78 @@
 //! - every tracked path: a regular file's from the descriptor opened to hash it (`fstat`,
 //!   before the first byte; no second lookup), a symlink's or other entry's from the
 //!   `lstat` that classified it, and for a path with nothing there, the deepest directory
-//!   the walk reached (it changes when the name, or a directory on the way, is created);
+//!   the walk reached (it changes when the name, or a directory on the way, is created). A
+//!   regular file that cannot be opened gets its own `lstat` and its directory's (a `chmod`
+//!   and an edit move only the file's; review of PR #9, F3);
 //! - `flake.lock` when it is present (from its read);
-//! - `HEAD` and `index` in the git directory (`rev-parse --absolute-git-dir`, printed by
-//!   the same command as `HEAD`'s id, so a linked worktree's own files), each by one
-//!   `lstat`.
+//! - in the git directory (`rev-parse --absolute-git-dir`, printed by the same command as
+//!   `HEAD`'s id, so a linked worktree's own files), each by one `lstat`: `HEAD` and
+//!   `index`;
+//! - in the common git directory (named by the git directory's `commondir` file, else the
+//!   git directory itself): the loose file of the ref `HEAD` names (`rev-parse
+//!   --symbolic-full-name HEAD`, the end of any chain of symbolic refs; per-worktree refs
+//!   are in the git directory), or that it is not loose; `packed-refs`; and
+//!   `reftable/tables.list` under the reftable backend. A detached `HEAD` is the `HEAD`
+//!   file itself.
+//!
+//! The git directories are opened `O_PATH`, so search permission is enough, as it is for
+//! git (review of PR #9, F6). When one cannot be opened at all, the note says that the
+//! git directory cannot be checked for changes during the scan, and there is no caching.
 //!
 //! A write and its revert each set `ctime` to the current time, and no unprivileged call
-//! sets it back; deleting and recreating, or saving through a rename, gives a new inode or
-//! a new `ctime`; a checkout there and back rewrites `HEAD` and every file that differs.
-//! `HEAD` alone catches a move to a commit with the same tree (nix's `self.rev` differs).
-//! The index alone catches `git add` of an untracked file, which nix then reads, and
-//! `git reset` of it.
+//! sets it back (a revert that restores the old mtime, as `touch -r` or `cp
+//! --preserve=all` do, is still seen); deleting and recreating, or saving through a
+//! rename, gives a new inode or a new `ctime`; a checkout there and back rewrites `HEAD`
+//! and every file that differs. `HEAD` alone catches a move to a commit with the same tree
+//! (nix's `self.rev` differs). The index alone catches `git add` of an untracked file,
+//! which nix then reads, and `git reset` of it. The ref's own file catches what writes
+//! neither: `reset --soft HEAD~` then `reset --soft ORIG_HEAD`, `commit --amend` then
+//! `reset --soft HEAD@{1}`, `commit --allow-empty` then `reset --soft HEAD~`, and
+//! `update-ref` there and back (review of PR #9, B1). Every update of a ref writes its
+//! loose file by lock and rename, even when it was packed; a ref that stays packed across
+//! the scan is seen through `packed-refs`. Reflogs are not used, so they need not be on.
 //!
-//! The index is in the guard on purpose. Its cost is a spurious "not cached" when
-//! something rewrites it during a scan without changing the tree, chiefly a background
-//! `git status` (an editor's or a prompt's) refreshing stat data. Measured with git 2.56 in
-//! a quiet repository of 50 files: no rewrite in about 1,000 consecutive `git status` runs
-//! over 5 s; after a commit, `git status` rewrote it on 77 of about 1,000 runs, all within
-//! 0.5 s of the commit (git's racy-entry handling), then never. A missed store costs one
-//! re-evaluation; a stale hit is a wrong answer the operator trusts.
+//! What it costs: a store skipped when something rewrites one of these during a scan
+//! without changing the tree. Measured with git 2.56 in a quiet 50-file repository:
+//!
+//! - the index: no rewrite by `git status` in a quiet repository. The first `git status`
+//!   after any commit or `add` rewrites it whenever it comes (seen at 2 s and 5 s after),
+//!   and a tracked file with a future mtime makes every `git status` rewrite it until the
+//!   clock passes that mtime (300 of 300). A `git status` with `GIT_OPTIONAL_LOCKS=0`, as
+//!   editors and prompts often run it, never did;
+//! - `packed-refs`, rewritten by `git gc` or `pack-refs` during a scan;
+//! - the deepest-directory stamp, while a tracked path is deleted but not committed: any
+//!   entry created or removed in that directory (an editor's swap file, a `result`
+//!   symlink in the top for a deleted directory) skips the store.
+//!
+//! A skipped store costs one re-evaluation, and the next quiet run stores (review of PR
+//! #9, F9); a stale hit is a wrong answer the operator trusts.
 //!
 //! The guard is for one run only. A key that changed with `ctime` would never hit again
 //! after a checkout, a clone or a `touch`. So a `touch` (which moves `ctime`) during a scan
 //! means that run is not stored, and the next undisturbed run is stored and hits as usual.
 //!
-//! What the guard still cannot see:
+//! What the guard still cannot see (review of PR #9, F5):
 //!
-//! - a filesystem without a reliable `ctime` (not verified here): FAT and exFAT store no
-//!   change time, and Linux reports the modification time instead, which is coarse and
-//!   which `touch` can set back; network and FUSE filesystems report what the server does;
-//! - a write and its revert in the same clock tick as the key's `stat` of that file, on a
-//!   kernel or filesystem without multigrain timestamps (Linux before 6.13, or, as far as
-//!   the kernel documents, a filesystem other than tmpfs, ext4, xfs and btrfs): a coarse
-//!   `ctime` moves once per tick, a few milliseconds. Measured here (Linux 6.18, tmpfs and
-//!   btrfs): in 20,000 tries each, a write and its revert right after a `stat` never kept
-//!   the stat's `ctime`;
-//! - root writing to the block device, setting `ctime` through a debugger such as
-//!   `debugfs`, or setting the clock back to the nanosecond: none is an ordinary program;
+//! - a filesystem that stores coarse timestamps: 1 s (ext3, ext4 with 128-byte inodes),
+//!   2 s (FAT, which keeps no change time at all and reports the settable mtime), or
+//!   whatever an NFS or FUSE server returns. There an edit and its revert within the same
+//!   second as the previous change to that file can pass. Not observed (it needs a mount).
+//!   A kernel whose timestamps are only jiffy-coarse in memory is not such a case: a
+//!   write and its revert must both fall in the tick of the key's `stat`, and nix's first
+//!   read came 259 ms after it (measured by the reviewer; fine-grained `ctime` verified
+//!   here on tmpfs, btrfs and overlayfs over tmpfs, and its absence on ramfs; the kernel
+//!   list of multigrain filesystems is not verified);
+//! - a write through a shared memory mapping whose page was already dirty at the first key:
+//!   it does not move `ctime` (a clean page's first write fault does). No editor writes
+//!   that way (review of PR #9, F8);
 //! - a tracked directory renamed away and back, when every path in it is a file: a
 //!   directory's rename changes its own `ctime`, not its files' (directories are stamped
-//!   only for paths that are missing);
-//! - a ref changing without `HEAD`, the index or any file changing (`update-ref` of the
-//!   current branch and back): the refs are not stamped;
+//!   only for paths that are missing). Confirmed with real nix; not an ordinary operation
+//!   (review of PR #9, F7);
+//! - refs other than the one `HEAD` names, which no key input depends on;
+//! - root writing to the block device, setting `ctime` through a debugger such as
+//!   `debugfs`, or setting the clock back to the nanosecond: none is an ordinary program;
 //! - anything the key does not cover either (see above, and the `--impure` reads).
 //!
 //! An immutable source (`?rev=` of a clean tree) would close the window for clean trees.
@@ -102,7 +131,7 @@
 //!
 //! The repository's own configuration and files are not trusted (review findings F1 and
 //! N1). git is asked only what it answers from the index and refs, without reading file
-//! contents: the two `rev-parse` commands and `ls-files -s -v -z`; no status, diff, filters,
+//! contents: the three `rev-parse` commands and `ls-files -s -v -z`; no status, diff, filters,
 //! attributes, ignore or exclude files. Every git command runs:
 //!
 //! - under an address-space limit of [`GIT_MEMORY_LIMIT`], set by util-linux `prlimit`
@@ -110,7 +139,7 @@
 //!   F4; measured: `ls-files -s` on nixpkgs, about 40,000 files, peaks at 25 MB and needs
 //!   about 37 MB of address space). Without `prlimit` on an absolute `PATH` entry, or on
 //!   another platform, git is not run and there is no caching;
-//! - with a short timeout (2 s by default; the three commands take at most 22 ms on
+//! - with a short timeout (2 s by default; the commands take at most 22 ms on
 //!   nixpkgs), and the first failure ends the key;
 //! - with `-c core.fsmonitor=false` ([`GIT_HARDENING`]), `GIT_OPTIONAL_LOCKS=0`, and none
 //!   of the inherited variables that would point it at another repository or index. The
@@ -159,7 +188,9 @@ use tokio_util::sync::CancellationToken;
 use crate::Cancelled;
 use crate::nix::{EvalItem, EvalMachine, EvalParams, FlakeRef, evaluate};
 use crate::process::{End, Limits, OnExit, command, describe_status, run, spawn_error};
-use crate::safe_fs::{ReadError, Stamp, kind, open_dir, open_root, read_file, walk};
+use crate::safe_fs::{
+    ReadError, Stamp, kind, open_dir, open_path_root, open_root, read_file, walk, walk_path,
+};
 use crate::text::{last_line, lossy};
 
 /// The default git program, looked up on `PATH`.
@@ -395,22 +426,9 @@ async fn key_and_top(
         use std::os::unix::ffi::OsStrExt as _;
         PathBuf::from(OsStr::from_bytes(top.strip_suffix(b"\n").unwrap_or(&top)))
     };
-    // The git directory comes with HEAD, from the same command, for the run guard. It is
-    // printed first and may contain a newline; the commit id is the last line.
-    let (git_dir, head) = match git(
-        params,
-        &top,
-        &["rev-parse", "--absolute-git-dir", "--verify", "HEAD"],
-        8192,
-        cancel,
-    )
-    .await?
-    {
-        Ok(out) => match git_dir_and_head(&out) {
-            Some(v) => v,
-            None => return Ok(Err("git rev-parse printed no git directory".to_owned())),
-        },
-        Err(e) => return Ok(Err(format!("not a git repository with a commit ({e})"))),
+    let (git_dir, head, head_ref) = match head_of(params, &top, cancel).await? {
+        Ok(h) => h,
+        Err(e) => return Ok(Err(e)),
     };
     let index = match git(
         params,
@@ -451,7 +469,7 @@ async fn key_and_top(
         let mut guard = Sha256::new_with_prefix(b"auspex run guard v1\0");
         let lock = read_lock(&flake_dir, &stop, &mut guard)?;
         let digest = worktree_digest(&tree_top, &rel, &index, &paths, &stop, &mut guard)?;
-        git_dir_stamps(&git_dir, &mut guard)?;
+        git_dir_stamps(&git_dir, &head_ref, &stop, &mut guard)?;
         Ok::<_, Stop>((lock, digest, Guard(guard.finalize().to_vec())))
     });
     let (lock, digest, guard) = tokio::select! {
@@ -484,6 +502,55 @@ async fn key_and_top(
     Ok(Ok(Keyed { key, top, guard }))
 }
 
+/// The git directory, HEAD's commit id (with its newline, as the key has always hashed it)
+/// and the ref HEAD names, from two `rev-parse` commands in `top`.
+///
+/// The git directory comes with the id, from the same command: it is printed first and
+/// may contain a newline, so the id is the last line. The ref is `HEAD` itself when HEAD
+/// is detached, else the end of its chain of symbolic refs (review of `ca2cc3f`, B1); a
+/// ref name has no newline.
+async fn head_of(
+    params: &GitParams<'_>,
+    top: &Path,
+    cancel: &CancellationToken,
+) -> Result<Result<(PathBuf, String, Vec<u8>), String>, Cancelled> {
+    let no_commit = |e: String| format!("not a git repository with a commit ({e})");
+    let (git_dir, head) = match git(
+        params,
+        top,
+        &["rev-parse", "--absolute-git-dir", "--verify", "HEAD"],
+        8192,
+        cancel,
+    )
+    .await?
+    {
+        Ok(out) => match git_dir_and_head(&out) {
+            Some(v) => v,
+            None => {
+                return Ok(Err(
+                    "git rev-parse printed no git directory before HEAD's id, so changes \
+                     during the scan cannot be checked, and there is no caching"
+                        .to_owned(),
+                ));
+            }
+        },
+        Err(e) => return Ok(Err(no_commit(e))),
+    };
+    let head_ref = match git(
+        params,
+        top,
+        &["rev-parse", "--symbolic-full-name", "HEAD"],
+        4096,
+        cancel,
+    )
+    .await?
+    {
+        Ok(out) => out.strip_suffix(b"\n").unwrap_or(&out).to_vec(),
+        Err(e) => return Ok(Err(no_commit(e))),
+    };
+    Ok(Ok((git_dir, head, head_ref)))
+}
+
 /// `rev-parse --absolute-git-dir --verify HEAD` output: the git directory, which may
 /// contain a newline, then the commit id on the last line, kept with its newline as the key
 /// has always hashed it.
@@ -513,15 +580,81 @@ fn stamp(g: &mut Sha256, tag: u8, s: Option<Stamp>) {
     }
 }
 
-/// The guard records of `HEAD` and `index` in the git directory, each from one `lstat`.
-/// `HEAD` is rewritten by every checkout and `symbolic-ref`; the index by `add`, `reset`,
-/// `commit`, `checkout`, `stash`, and by any index refresh (see the module documentation).
-fn git_dir_stamps(git_dir: &Path, g: &mut Sha256) -> Result<(), Stop> {
-    let dir = open_root(git_dir)
-        .map_err(|e| Stop::NoCache(format!("cannot open the git directory: {e:?}")))?;
+/// Refs that live in each worktree's own git directory; every other ref is shared, in the
+/// common one (git's rule, `gitrepository-layout(5)`).
+const PER_WORKTREE_REFS: &[&[u8]] = &[b"refs/bisect/", b"refs/worktree/", b"refs/rewritten/"];
+
+/// The guard records of the git directory, each from one `lstat`, every directory opened
+/// `O_PATH` (search permission is all git needs, and all this needs; review of `ca2cc3f`,
+/// F6):
+///
+/// - `HEAD` and `index` in the worktree's git directory. `HEAD` is rewritten by every
+///   checkout and `symbolic-ref`, and holds the id when detached; the index by `add`,
+///   `reset`, `commit`, `checkout`, `stash`, and any index refresh;
+/// - the ref `HEAD` names (`head_ref`), as a loose file, in the common git directory unless
+///   it is a per-worktree ref, or that it is not loose. Every update of a ref, even a
+///   packed one, writes its loose file by lock and rename, so `reset --soft`,
+///   `commit --amend` and `update-ref` there and back are seen (review of `ca2cc3f`, B1);
+/// - `packed-refs`, and `reftable/tables.list` (rewritten by every ref update under the
+///   reftable backend), in the common directory, or that they are absent.
+///
+/// The common directory is git's: the `commondir` file in the git directory names it,
+/// relative to the git directory unless absolute; without one it is the git directory.
+fn git_dir_stamps(
+    git_dir: &Path,
+    head_ref: &[u8],
+    stop: &dyn Fn() -> bool,
+    g: &mut Sha256,
+) -> Result<(), Stop> {
+    let unusable = |what: &str, e: &dyn std::fmt::Debug| {
+        Stop::NoCache(format!(
+            "the git directory {} cannot be checked for changes during the scan ({what}: \
+             {e:?}), so there is no caching",
+            git_dir.display()
+        ))
+    };
+    let dir = open_path_root(git_dir).map_err(|e| unusable("cannot open it", &e))?;
     for (tag, name) in [(b'H', &b"HEAD"[..]), (b'I', b"index")] {
         stamp(g, tag, kind(&dir, name).ok().map(|(_, s)| s));
     }
+    let mut named = Vec::new();
+    let common = match read_file(&dir, b"commondir", 4096, stop, &mut |b| {
+        named.extend_from_slice(b);
+    }) {
+        Ok(_) => {
+            use std::os::unix::ffi::OsStrExt as _;
+            let named = named.strip_suffix(b"\n").unwrap_or(&named);
+            let common = git_dir.join(OsStr::from_bytes(named));
+            Some(
+                open_path_root(&common)
+                    .map_err(|e| unusable("cannot open its common directory", &e))?,
+            )
+        }
+        Err(ReadError::Missing) => None,
+        Err(ReadError::Stopped) => return Err(Stop::Stopped),
+        Err(e) => return Err(unusable("cannot read its commondir file", &e)),
+    };
+    let common = common.as_ref().unwrap_or(&dir);
+    if head_ref != b"HEAD" {
+        let base = if PER_WORKTREE_REFS.iter().any(|p| head_ref.starts_with(p)) {
+            &dir
+        } else {
+            common
+        };
+        field(g, b'r', head_ref);
+        // Not loose (packed, or under reftable): nothing to stamp here. When an update
+        // writes the loose file, this record changes; while it stays packed,
+        // `packed-refs` does.
+        let loose = walk_path(base, head_ref)
+            .ok()
+            .and_then(|(d, name)| kind(&d, name).ok());
+        stamp(g, b'R', loose.map(|(_, s)| s));
+    }
+    stamp(g, b'P', kind(common, b"packed-refs").ok().map(|(_, s)| s));
+    let tables = walk_path(common, b"reftable/tables.list")
+        .ok()
+        .and_then(|(d, name)| kind(&d, name).ok());
+    stamp(g, b'T', tables.map(|(_, s)| s));
     Ok(())
 }
 
@@ -618,7 +751,7 @@ fn worktree_digest(
                 field(&mut h, b'l', &target);
                 stamp(g, b'l', Some(s));
             }
-            Ok((FileType::RegularFile, _)) => {
+            Ok((FileType::RegularFile, lstat)) => {
                 let mut fh = Sha256::new();
                 let mut n: u64 = 0;
                 match read_file(&dir, name, left, stop, &mut |b| {
@@ -639,7 +772,10 @@ fn worktree_digest(
                     // Replaced between the stat and the open, or unreadable.
                     Err(_) => {
                         field(&mut h, b'e', &[]);
-                        stamp(g, b'e', Stamp::of_fd(&dir).ok());
+                        // The file's own `lstat` too: a `chmod` and an edit move only
+                        // its `ctime` (review of `ca2cc3f`, F3).
+                        stamp(g, b'e', Some(lstat));
+                        stamp(g, b'E', Stamp::of_fd(&dir).ok());
                     }
                 }
             }

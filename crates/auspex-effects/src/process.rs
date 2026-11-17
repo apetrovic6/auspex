@@ -644,6 +644,12 @@ pub async fn run(
         }
     }
 
+    // Past the cap is past the cap, whether or not the exit was seen first (review of
+    // `ca2cc3f`, B2).
+    let end = match end {
+        End::Exited(_) if out.truncated => End::Overflow,
+        other => other,
+    };
     Ok(Ran {
         end,
         status,
@@ -748,6 +754,58 @@ mod tests {
         .unwrap();
         assert!(matches!(ran.end, End::Exited(status) if status.success()));
         assert_eq!(ran.stdout, dir.path().as_os_str().as_encoded_bytes());
+    }
+
+    /// Review of `ca2cc3f`, B2: stdout that passes its cap after the exit was seen is
+    /// `End::Overflow`, as it is before the exit. The order is forced: the child writes
+    /// only after the first poll, and the runtime's only thread is blocked until the child
+    /// is a zombie, so the exit is certain to be seen before any byte is read.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_overflow_read_after_the_exit_is_an_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pid, go) = (dir.path().join("pid"), dir.path().join("go"));
+        let mut cmd = command(OsStr::new("sh")).unwrap();
+        cmd.args([
+            "-c",
+            "echo $$ > \"$1\"; while [ ! -e \"$2\" ]; do :; done; printf '%01001d' 0",
+            "sh",
+        ])
+        .arg(&pid)
+        .arg(&go);
+        let limits = Limits {
+            stdout: 1000,
+            stderr: 1024,
+            memory: None,
+        };
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let fut = run(cmd, None, OnExit::KillGroup, limits, deadline, &cancel);
+        tokio::pin!(fut);
+        std::future::poll_fn(|cx| {
+            assert!(fut.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        std::fs::write(&go, "").unwrap();
+        let began = std::time::Instant::now();
+        loop {
+            assert!(began.elapsed() < Duration::from_secs(20), "never exited");
+            if let Ok(p) = std::fs::read_to_string(&pid)
+                && std::fs::read_to_string(format!("/proc/{}/stat", p.trim())).is_ok_and(|s| {
+                    s.rsplit(')')
+                        .next()
+                        .is_some_and(|r| r.trim_start().starts_with('Z'))
+                })
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ran = fut.await.unwrap();
+        assert!(matches!(ran.end, End::Overflow), "{:?}", ran.end);
+        assert!(ran.stdout_truncated && !ran.stdout_eof);
+        assert!(ran.status.is_some_and(|s| s.success()), "{:?}", ran.status);
     }
 
     /// Review finding F6: empty and relative `PATH` entries are never searched, so a

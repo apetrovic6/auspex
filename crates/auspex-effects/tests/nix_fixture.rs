@@ -383,28 +383,54 @@ async fn edits_during_real_worker_restarts_do_not_poison_the_cache() {
     }
 }
 
-/// Review finding N2 with the real nix-eval-jobs: `extra.nix` is edited at the first
-/// result and its committed bytes written back at the second. The key after the evaluation
-/// equals the key before it, yet some worker read the edited tree; the run guard sees the
-/// change, so nothing is stored and the next run evaluates again.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one scenario: the edited and reverted run, then the check"
-)]
-#[tokio::test]
-async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
+/// A change at the first success and its undo at the second, with the real nix-eval-jobs:
+/// `workers = 1` and `max_memory_mib = 1`, so every job's worker reads the tree again.
+///
+/// Checks that the key after the run equals the key before it (so only the run guard
+/// can have refused), that the note was sent, that the next run on the restored tree
+/// serves nothing from the cache, and that some worker really read the changed tree (a
+/// result differs from the restored run's). `None` when a tool is missing.
+///
+/// Under load, nix-eval-jobs with `max_memory_mib = 1` can kill a worker before it reports
+/// ("memory budget of 1 MiB exceeded ... evaluation worker exited with 0") and exit 1; that
+/// is its own race, not the guard's, and the scenario is then run again in a fresh
+/// repository, at most three times. Any other failure fails at once.
+async fn real_change_and_undo(
+    setup: impl Fn(&Path) + Sync,
+    change: impl Fn(&Path) + Sync,
+    undo: impl Fn(&Path) + Sync,
+) -> Option<()> {
     for tool in ["nix", "nix-eval-jobs", "git"] {
         if find_on_path(tool).is_none() {
             eprintln!("SKIPPED: {tool} is not on PATH");
-            return;
+            return None;
         }
     }
+    for attempt in 1..=3 {
+        match real_attempt(&setup, &change, &undo).await {
+            Ok(()) => return Some(()),
+            Err(e) => eprintln!("attempt {attempt}: nix-eval-jobs's own budget race: {e}"),
+        }
+    }
+    panic!("nix-eval-jobs hit its budget race three times");
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario: the changed run, the checks, the restored run"
+)]
+async fn real_attempt(
+    setup: &(impl Fn(&Path) + Sync),
+    change: &(impl Fn(&Path) + Sync),
+    undo: &(impl Fn(&Path) + Sync),
+) -> Result<(), String> {
     let repo = tempdir();
-    fs::write(repo.path().join("extra.nix"), "original").unwrap();
+    let r = repo.path();
+    fs::write(r.join("extra.nix"), "original").unwrap();
     fs::write(
-        repo.path().join("flake.nix"),
+        r.join("flake.nix"),
         r#"{
-      outputs = _: {
+      outputs = { self }: {
         nixosConfigurations = builtins.listToAttrs (map (name: {
           inherit name;
           value.config.system.build.toplevel = derivation {
@@ -412,6 +438,7 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
             system = "x86_64-linux";
             builder = "/auspex-fixture-never-built";
             source = builtins.readFile ./extra.nix;
+            rev = self.rev or self.dirtyRev or "none";
             work = builtins.toString (builtins.foldl' (a: b: a + b) 0
               (builtins.genList (n: n) 200000));
           };
@@ -420,15 +447,22 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
     }"#,
     )
     .unwrap();
-    git(repo.path(), &["init", "-q"]);
-    git(repo.path(), &["add", "."]);
-    git(repo.path(), &["commit", "-q", "-m", "edit and revert"]);
-    let flake = FlakeRef::new(repo.path().to_str().unwrap()).unwrap();
+    git(r, &["init", "-q"]);
+    git(r, &["add", "."]);
+    git(r, &["commit", "-q", "-m", "one"]);
+    setup(r);
+    let flake = FlakeRef::new(r.to_str().unwrap()).unwrap();
     let cache_dir = tempdir();
     let cache = CacheParams {
         cache_dir: Some(cache_dir.path()),
-        flake_dir: repo.path(),
+        flake_dir: r,
         git: GitParams::new(),
+    };
+    let key = || async {
+        auspex_effects::cache::key_for(r, &GitParams::new(), &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap()
     };
     let machines: Vec<_> = ["a", "b", "c", "d"]
         .into_iter()
@@ -441,10 +475,11 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
     eval.runtime_dir = Some(common::runtime_dir());
     eval.workers = 1;
     eval.max_memory_mib = 1; // Force a new source read for every worker.
+    let before = key().await;
     let (tx, mut rx) = unbounded_channel();
     let collect = async {
+        let (mut change, mut undo) = (Some(change), Some(undo));
         let mut items = Vec::new();
-        let mut successes = 0;
         while let Some(item) = rx.recv().await {
             if matches!(
                 &item,
@@ -453,24 +488,30 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
                     ..
                 }
             ) {
-                successes += 1;
-                match successes {
-                    1 => fs::write(repo.path().join("extra.nix"), "edited").unwrap(),
-                    2 => fs::write(repo.path().join("extra.nix"), "original").unwrap(),
-                    _ => {}
+                if let Some(f) = change.take() {
+                    f(r);
+                } else if let Some(f) = undo.take() {
+                    f(r);
                 }
             }
             items.push(item);
         }
-        assert!(successes >= 2, "fewer than two successes: {items:?}");
-        items
+        (items, undo.is_none())
     };
     let cancel = CancellationToken::new();
-    let (result, items) = tokio::join!(
+    let (result, (items, undone)) = tokio::join!(
         evaluate_cached(&flake, &machines, &eval, &cache, &cancel, tx),
         collect,
     );
     result.unwrap();
+    if let Some(EvalItem::Finished { error: Some(e) }) = items.last()
+        && e.contains("memory budget of 1 MiB exceeded")
+        && e.contains("evaluation worker exited with 0")
+    {
+        return Err(e.clone());
+    }
+    assert!(undone, "fewer than two successes: {items:?}");
+    assert_eq!(key().await, before, "the undo must restore the key exactly");
     assert!(
         items.iter().any(|i| matches!(
             i,
@@ -483,15 +524,41 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
     let (restored, error) = split(&run(&flake, &machines, &cache).await);
     assert_eq!(error, None);
     for name in ["a", "b", "c", "d"] {
-        assert!(
-            !restored[name].0,
-            "{name} was cached from the edited-and-reverted run"
-        );
+        assert!(!restored[name].0, "{name} was cached from the changed run");
     }
     assert!(
         ["b", "c", "d"]
             .into_iter()
             .any(|name| changed[name].1 != restored[name].1),
-        "the experiment did not exercise a worker reading the edited tree"
+        "the experiment did not exercise a worker reading the changed tree"
     );
+    Ok(())
+}
+
+/// Review finding N2 with the real nix-eval-jobs: `extra.nix` is edited at the first
+/// result and its committed bytes written back at the second.
+#[tokio::test]
+async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
+    real_change_and_undo(
+        |_| {},
+        |r| fs::write(r.join("extra.nix"), "edited").unwrap(),
+        |r| fs::write(r.join("extra.nix"), "original").unwrap(),
+    )
+    .await;
+}
+
+/// Review finding B1 with the real nix-eval-jobs: `reset --soft HEAD~` at the first
+/// result, `reset --soft ORIG_HEAD` at the second. Only the branch moves; nix's
+/// `self.rev` (and its dirty state) differs in between.
+#[tokio::test]
+async fn a_soft_reset_undone_during_real_worker_restarts_is_not_cached() {
+    real_change_and_undo(
+        |r| {
+            fs::write(r.join("extra.nix"), "two").unwrap();
+            git(r, &["commit", "-q", "-am", "two"]);
+        },
+        |r| git(r, &["reset", "-q", "--soft", "HEAD~"]),
+        |r| git(r, &["reset", "-q", "--soft", "ORIG_HEAD"]),
+    )
+    .await;
 }
