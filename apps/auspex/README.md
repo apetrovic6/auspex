@@ -24,7 +24,7 @@ auspex                       # the TUI, read-only (observe mode)
 auspex --plain               # scan once, print one line per machine, exit
 auspex --json                # scan once, print the fleet report (the versioned contract)
 auspex --demo                # a scripted fleet: no machine, nix, cache or network is touched
-auspex --flake ~/clan/fleet  # the fleet flake; default: config `flake`, then CLAN_DIR, then .
+auspex --flake ~/clan/fleet  # the fleet flake; else CLAN_DIR, then config `flake`, then .
 ```
 
 Headless exit status: 0 for a scan that completed with no fleet-level error; 1 only when the

@@ -7,6 +7,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use auspex_core::Event;
 use auspex_tui::input::{Input, Prompt, Screen};
@@ -22,7 +23,7 @@ const SCREEN: Screen = Screen {
     help_open: false,
     page: 20,
     matches: 3,
-    listing: false,
+    listing_for: None,
     rows: 18,
 };
 
@@ -85,7 +86,7 @@ fn a_count_multiplies_a_move() {
     );
     assert_eq!(
         feed(&mut i, &km, SCREEN, &[Key::char('3'), ctrl('d')]),
-        ev(&[Event::HalfPageDown(60)]),
+        ev(&[Event::MoveDown(30)]),
         "three half pages are one event"
     );
     assert_eq!(
@@ -328,7 +329,7 @@ fn repeat_counts_stay_cheap() {
     keys.push(ctrl('d'));
     assert_eq!(
         feed(&mut i, &km, SCREEN, &keys),
-        ev(&[Event::HalfPageDown(20 * 18)]),
+        ev(&[Event::MoveDown(10 * 18)]),
         "at most as many half pages as there are rows"
     );
     // 3 matches: 5n lands where 2n does; 99999n where 3n does.
@@ -347,24 +348,88 @@ fn repeat_counts_stay_cheap() {
     );
 }
 
-/// Review finding 6: holding `r` started (and killed) one `nix` per key repeat. While a
-/// refresh is still reading the machine list, another is dropped, from the key and from `:`.
+/// Review finding 6 and the re-review: holding `r` started (and killed) one `nix` per key
+/// repeat, but dropping every `r` while the list is out meant a hung list could not be
+/// restarted until `settle`. Now a refresh within `input::MIN_RESTART` of the last one is
+/// dropped (key and `:` alike); after that it goes through, and the core's `Refresh`
+/// cancels the hung list request and asks again.
 #[test]
-fn a_refresh_while_one_is_starting_is_dropped() {
+fn a_refresh_while_the_list_is_out_restarts_it_after_a_short_interval() {
     let km = Keymap::defaults();
     let mut i = Input::default();
-    let starting = Screen {
-        listing: true,
+    let just_started = Screen {
+        listing_for: Some(Duration::from_millis(500)),
         ..SCREEN
     };
-    assert_eq!(feed(&mut i, &km, starting, &chars("r")), NOTHING);
+    assert_eq!(feed(&mut i, &km, just_started, &chars("r")), NOTHING);
+    assert!(i.message.is_some(), "it says why");
     let mut keys = chars(":refresh");
     keys.push(Key::plain(KeyCode::Enter));
-    assert_eq!(feed(&mut i, &km, starting, &keys), NOTHING);
+    assert_eq!(feed(&mut i, &km, just_started, &keys), NOTHING);
+    let hung = Screen {
+        listing_for: Some(auspex_tui::input::MIN_RESTART + Duration::from_millis(1)),
+        ..SCREEN
+    };
+    assert_eq!(feed(&mut i, &km, hung, &chars("r")), ev(&[Event::Refresh]));
+    assert_eq!(feed(&mut i, &km, hung, &keys), ev(&[Event::Refresh]));
     assert_eq!(
         feed(&mut i, &km, SCREEN, &chars("r")),
         ev(&[Event::Refresh])
     );
+}
+
+/// Review N5: a counted half page moved `(page * n) / 2` rows, not `n` half pages: with a
+/// one-row page, `3 ctrl-d` moved one row. It is `n * max(page / 2, 1)` rows again, as
+/// one event, and no further than the rows there are.
+#[test]
+fn counted_half_pages_move_n_half_pages() {
+    let km = Keymap::defaults();
+    let mut i = Input::default();
+    let page = |page| Screen { page, ..SCREEN };
+    assert_eq!(
+        feed(&mut i, &km, page(5), &[Key::char('2'), ctrl('d')]),
+        ev(&[Event::MoveDown(4)])
+    );
+    assert_eq!(
+        feed(&mut i, &km, page(1), &[Key::char('3'), ctrl('d')]),
+        ev(&[Event::MoveDown(3)])
+    );
+    assert_eq!(
+        feed(&mut i, &km, page(5), &[Key::char('3'), ctrl('u')]),
+        ev(&[Event::MoveUp(6)])
+    );
+    assert_eq!(
+        feed(&mut i, &km, page(5), &[ctrl('d')]),
+        ev(&[Event::HalfPageDown(5)])
+    );
+}
+
+/// The re-review's M04-M06: `Screen::from_view` is what the app uses, and nothing checked
+/// it reads the list's phase, the search's matches and the row count from the view.
+#[tokio::test(start_paused = true)]
+async fn the_screen_is_read_from_the_view() {
+    let shell = common::started_demo();
+    // The demo's list answers after 150 ms.
+    let starting = Screen::from_view(&shell.view(), 20, Duration::from_secs(1));
+    assert_eq!(starting.listing_for, Some(Duration::from_secs(1)));
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys(&shell, &mut ui, &km, "/ar\n");
+    let view = shell.view();
+    let settled = Screen::from_view(&view, 20, Duration::from_secs(1));
+    assert_eq!(settled.listing_for, None);
+    assert_eq!(settled.matches, view.search.as_ref().unwrap().matches.len());
+    assert!(settled.matches > 1);
+    assert_eq!(settled.rows, 18);
+    // And through the keys: 2 half pages of a 5-row page from the top is row 4.
+    let mut ui = Ui {
+        page: 5,
+        ..Ui::default()
+    };
+    type_keys(&shell, &mut ui, &km, "gg2");
+    common::press(&shell, &mut ui, &km, ctrl('d'));
+    assert_eq!(shell.view().selected, Some(4));
 }
 
 /// Review finding 6: `quit = []` with `command = []` left no key that exits (raw mode makes
@@ -377,4 +442,29 @@ fn a_keymap_with_no_way_to_quit_is_refused() {
     assert!(e.contains("keymap.quit"), "{e}");
     assert!(Keymap::with_overrides(&overrides(&[("quit", &[])]), &mut w).is_ok());
     assert!(Keymap::with_overrides(&overrides(&[("command", &[])]), &mut w).is_ok());
+}
+
+/// Review N4: a terminal sends Ctrl-M as Enter, Ctrl-I as Tab and Ctrl-[ as Esc, so a
+/// binding to those never fires, and `quit = ["ctrl-m"]` with `command = []` passed the
+/// "a way to quit" check yet left none. They are refused, pointing at the key to write.
+#[test]
+fn keys_the_terminal_never_delivers_are_refused() {
+    for (spec, instead) in [
+        ("ctrl-m", "enter"),
+        ("ctrl-i", "tab"),
+        ("ctrl-[", "esc"),
+        ("CTRL-M", "enter"),
+    ] {
+        let e = auspex_tui::keymap::parse_chord(spec).unwrap_err();
+        assert!(e.contains(instead), "{spec}: {e}");
+    }
+    let mut w = Vec::new();
+    let e = Keymap::with_overrides(
+        &overrides(&[("quit", &["ctrl-m"]), ("command", &[])]),
+        &mut w,
+    )
+    .unwrap_err();
+    assert!(e.contains("keymap.quit"), "{e}");
+    // The keys they arrive as are bindable.
+    assert!(auspex_tui::keymap::parse_chord("ctrl-d").is_ok());
 }

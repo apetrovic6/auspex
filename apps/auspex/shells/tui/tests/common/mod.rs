@@ -74,7 +74,8 @@ pub fn press(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, key: Key) {
         .as_ref()
         .map(|s| s.query.clone())
         .unwrap_or_default();
-    let screen = Screen::from_view(&view, ui.page.max(1));
+    // Long after any refresh started: a test that needs "just started" builds its Screen.
+    let screen = Screen::from_view(&view, ui.page.max(1), Duration::from_secs(3600));
     for e in ui.input.key(key, screen, keymap, &query) {
         shell.send(e);
     }

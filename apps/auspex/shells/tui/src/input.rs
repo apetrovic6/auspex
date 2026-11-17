@@ -9,11 +9,20 @@
 //! log closes; the narrow layout's detail view closes; a half-typed count or sequence is
 //! dropped. Only then is Esc an ordinary key (by default, quit).
 
+use std::time::Duration;
+
 use auspex_core::{Event, Phase, ViewModel};
 use auspex_domain::text::sanitize_line;
 use crossterm::event::KeyCode;
 
 use crate::keymap::{Action, Key, Keymap, Lookup};
+
+/// How soon a second refresh may restart a machine list that is still being read.
+///
+/// A refresh this soon after the last one started, while its machine list is still being
+/// read, is dropped: holding `r` must not start a `nix` per key repeat. Later, it goes
+/// through and restarts a list that hangs.
+pub const MIN_RESTART: Duration = Duration::from_secs(2);
 
 /// The largest count accepted; more digits are ignored, as vim caps a count.
 pub const MAX_COUNT: usize = 99_999;
@@ -61,22 +70,23 @@ pub struct Screen {
     pub page: usize,
     /// How many rows the current search matches, so `99999n` costs at most that many steps.
     pub matches: usize,
-    /// A refresh is starting (its machine list is being read): another `r` is dropped
-    /// rather than start one more `nix` process.
-    pub listing: bool,
+    /// How long the current refresh has been reading its machine list, or `None` when it
+    /// is not reading it.
+    pub listing_for: Option<Duration>,
     /// How many rows the list has: no count needs to move further than that.
     pub rows: usize,
 }
 
 impl Screen {
-    /// What `view` shows, with the list `page` rows high.
+    /// What `view` shows, with the list `page` rows high, `since_refresh` after the current
+    /// refresh started.
     #[must_use]
-    pub fn from_view(view: &ViewModel, page: usize) -> Self {
+    pub fn from_view(view: &ViewModel, page: usize, since_refresh: Duration) -> Self {
         Self {
             help_open: view.help_open,
             page,
             matches: view.search.as_ref().map_or(0, |s| s.matches.len()),
-            listing: view.refresh.phase == Phase::ListingMachines,
+            listing_for: (view.refresh.phase == Phase::ListingMachines).then_some(since_refresh),
             rows: view.report.machines.len(),
         }
     }
@@ -157,13 +167,13 @@ impl Input {
         match action {
             Action::Down => vec![Event::MoveDown(n)],
             Action::Up => vec![Event::MoveUp(n)],
-            // One event of `n` half pages, not `n` events (review finding 6).
-            Action::HalfPageDown => vec![Event::HalfPageDown(
-                half.saturating_mul(n.min(screen.rows.max(1))),
-            )],
-            Action::HalfPageUp => vec![Event::HalfPageUp(
-                half.saturating_mul(n.min(screen.rows.max(1))),
-            )],
+            // Counted: `n` half pages as one move of `n * max(page / 2, 1)` rows (the core's
+            // half page), not `n` events (review finding 6, C6) nor one half page of `page * n`
+            // rows, which rounded differently (N5). No further than the rows there are.
+            Action::HalfPageDown if count.is_some() => vec![Event::MoveDown(half_pages(n, screen))],
+            Action::HalfPageUp if count.is_some() => vec![Event::MoveUp(half_pages(n, screen))],
+            Action::HalfPageDown => vec![Event::HalfPageDown(half)],
+            Action::HalfPageUp => vec![Event::HalfPageUp(half)],
             Action::Top | Action::Bottom if count.is_some() => {
                 vec![Event::MoveTop, Event::MoveDown(n.saturating_sub(1))]
             }
@@ -274,11 +284,14 @@ impl Input {
 }
 
 impl Input {
-    /// A refresh, unless one is still reading its machine list: holding `r` would otherwise
-    /// start and kill one `nix` process per key repeat (review finding 6).
+    /// A refresh, unless the last one started under [`MIN_RESTART`] ago and is still reading
+    /// its machine list: holding `r` would otherwise start and kill one `nix` per key
+    /// repeat (review finding 6). Later it goes through, and the core's `Refresh` cancels a
+    /// hung list request and asks again (re-review).
     fn refresh(&mut self, screen: Screen) -> Vec<Event> {
-        if screen.listing {
-            self.message = Some("a refresh is already starting".to_owned());
+        if screen.listing_for.is_some_and(|d| d < MIN_RESTART) {
+            self.message =
+                Some("a refresh is starting; press again in a moment to restart it".to_owned());
             return Vec::new();
         }
         vec![Event::Refresh]
@@ -296,4 +309,16 @@ pub const fn steps(n: usize, matches: usize) -> usize {
         return 1;
     }
     (n - 1) % matches + 1
+}
+
+/// Rows for `n` half pages of `screen`'s page: the core's half page is `max(page / 2, 1)`.
+const fn half_pages(n: usize, screen: Screen) -> usize {
+    let half = if screen.page / 2 > 1 {
+        screen.page / 2
+    } else {
+        1
+    };
+    let n = if n < screen.rows { n } else { screen.rows };
+    let n = if n > 1 { n } else { 1 };
+    n.saturating_mul(half)
 }

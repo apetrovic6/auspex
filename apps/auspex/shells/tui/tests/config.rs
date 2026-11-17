@@ -211,8 +211,9 @@ fn every_number_in_the_fixture_is_read_not_defaulted() {
 #[test]
 fn timeouts_are_between_one_second_and_a_day() {
     for key in ["ssh_connect", "probe", "eval", "settle"] {
-        for bad in ["0", "86401", "9223372036854775807"] {
+        for bad in ["0", "86401", "9223372036854775807", "-1"] {
             let e = config::parse(&format!("[timeouts]\n{key} = {bad}\n")).unwrap_err();
+            assert!(e.contains("between 1"), "{key} = {bad}: {e}");
             assert!(
                 e.contains(&format!("`timeouts.{key}`")),
                 "{key} = {bad}: {e}"

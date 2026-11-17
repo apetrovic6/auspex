@@ -382,14 +382,19 @@ impl Walk {
     /// A timeout: whole seconds, at least 1 (0 would fail or settle everything at once) and
     /// at most a day. The cap keeps `Instant::now() + timeout` in the adapters far from
     /// overflowing (review finding 2), and no scan step is meant to take longer.
+    #[expect(
+        clippy::unused_self,
+        reason = "kept beside `unknown` so every key reads alike"
+    )]
     fn timeout(&self, v: &Value, key: &str) -> Result<u64, String> {
-        let s = self.seconds(v, key)?;
-        if (1..=MAX_TIMEOUT).contains(&s) {
-            Ok(s)
-        } else {
-            Err(format!(
-                "`{key}` must be between 1 and {MAX_TIMEOUT} seconds (a day), not {s}"
-            ))
+        match v {
+            Value::Integer(i) => u64::try_from(*i)
+                .ok()
+                .filter(|s| (1..=MAX_TIMEOUT).contains(s))
+                .ok_or_else(|| {
+                    format!("`{key}` must be between 1 and {MAX_TIMEOUT} seconds (a day), not {i}")
+                }),
+            other => Err(wrong(key, "a whole number of seconds", other)),
         }
     }
 

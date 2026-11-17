@@ -7,6 +7,7 @@
 //! Every line is sanitised on the way in: notes carry nix's and git's text.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use auspex_domain::text::sanitize_line;
 
@@ -23,7 +24,31 @@ pub fn clean(text: &str) -> String {
 /// Writes one message to stderr, sanitised: config, keymap and argument errors quote the
 /// operator's own text, which may hold escape sequences (review finding 4).
 pub fn say(text: &str) {
-    eprintln!("auspex: {}", clean(text));
+    to_stderr(&format!("auspex: {}", clean(text)));
+}
+
+/// Failed writes to stderr so far.
+static STDERR_FAILURES: AtomicUsize = AtomicUsize::new(0);
+
+/// The one way anything reaches stderr: `line` and a newline, with a failed write counted
+/// and otherwise ignored.
+///
+/// Not `eprintln!`, which panics when the write fails: in an adapter task that killed the
+/// task, so headless waited for `settle` and then printed a false report (review N1), and
+/// `auspex --plain 2>&1 | head -1` took the whole deadline. Nothing about the scan may
+/// depend on whether stderr is readable.
+pub fn to_stderr(line: &str) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    if writeln!(err, "{line}").and_then(|()| err.flush()).is_err() {
+        STDERR_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// How many writes to stderr have failed (for tests and a last word, never for decisions).
+#[must_use]
+pub fn stderr_failures() -> usize {
+    STDERR_FAILURES.load(Ordering::Relaxed)
 }
 
 /// How many lines the TUI keeps. Older ones are dropped.
@@ -49,7 +74,7 @@ impl Log {
     pub fn line(&self, text: &str) {
         let text = sanitize_line(text);
         match self {
-            Self::Stderr => eprintln!("auspex: {text}"),
+            Self::Stderr => to_stderr(&format!("auspex: {text}")),
             Self::Memory(lines) => {
                 let mut lines = lines
                     .lock()

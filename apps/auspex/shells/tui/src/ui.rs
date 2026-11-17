@@ -461,10 +461,14 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, theme: &Theme) {
         ));
     }
     lines.push(Line::from(badges));
+    let room = usize::from(inner.height);
     for (label, value) in detail_lines(m) {
+        if lines.len() >= room {
+            break; // nothing below the panel is drawn, so nothing below it is wrapped
+        }
         // Values wrap onto continuation lines under themselves, never under the labels.
         let mut first = true;
-        for chunk in wrap(&value, value_cells) {
+        for chunk in wrap(&cap_value(&value), value_cells) {
             let label = if first { label } else { "" };
             first = false;
             lines.push(Line::from(vec![
@@ -475,6 +479,25 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, theme: &Theme) {
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The most of any one detail value that is wrapped: 2 KiB.
+///
+/// A deployed revision is 40
+/// characters and a reason one line, but both come from a remote host (the probe allows
+/// 256 KiB of output), and 2 KiB is already about thirty full lines at 80 columns. A
+/// longer value is cut and ends in `…`; `--json` still carries it whole.
+pub const DETAIL_VALUE_CAP: usize = 2048;
+
+fn cap_value(value: &str) -> std::borrow::Cow<'_, str> {
+    if value.len() <= DETAIL_VALUE_CAP {
+        return value.into();
+    }
+    let mut end = DETAIL_VALUE_CAP;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end]).into()
 }
 
 /// `s` broken into pieces of at most `width` cells, at spaces where possible.
@@ -497,26 +520,24 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
         if !line.is_empty() {
             out.push(std::mem::take(&mut line));
         }
-        // A word longer than the line is split by cells. Each piece takes at least one
-        // character: a two-cell character on a one-cell line is a piece of its own (and
-        // overflows by a cell, which the widget clips). Without that floor the split was
-        // empty and this loop never ended (review finding 1).
-        let mut rest = word;
-        while rest.width() > width {
-            let mut cells = 0;
-            let split = rest
-                .char_indices()
-                .find(|(_, c)| {
-                    cells += c.width().unwrap_or(0);
-                    cells > width
-                })
-                .map_or(rest.len(), |(i, _)| i)
-                .max(rest.chars().next().map_or(rest.len(), char::len_utf8));
-            out.push(rest[..split].to_owned());
-            rest = &rest[split..];
+        // A word longer than the line is split by cells, in one pass over its characters
+        // (review N2: rescanning the rest for every piece cost the square of the word's
+        // length). Each piece takes at least one character: a two-cell character on a
+        // one-cell line is a piece of its own and overflows by a cell, which the widget
+        // clips; without that floor the piece was empty and this never ended (finding 1).
+        let mut piece = String::new();
+        let mut cells = 0;
+        for c in word.chars() {
+            let cw = c.width().unwrap_or(0);
+            if cells + cw > width && !piece.is_empty() {
+                out.push(std::mem::take(&mut piece));
+                cells = 0;
+            }
+            piece.push(c);
+            cells += cw;
         }
-        line.push_str(rest);
-        used = rest.width();
+        line = piece;
+        used = cells;
     }
     if !line.is_empty() || out.is_empty() {
         out.push(line);

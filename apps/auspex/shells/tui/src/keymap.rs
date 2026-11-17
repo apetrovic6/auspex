@@ -253,6 +253,16 @@ pub fn parse_chord(spec: &str) -> Result<Chord, String> {
     if let Some(rest) = lower.strip_prefix("ctrl-") {
         let mut chars = rest.chars();
         return match (chars.next(), chars.next()) {
+            // A terminal sends these three as other keys (the same byte), so a binding
+            // to them would never fire (review N4).
+            (Some(c @ ('m' | 'i' | '[')), None) => Err(format!(
+                "`{spec}` never arrives as such: the terminal sends it as `{}`; write that",
+                match c {
+                    'm' => "enter",
+                    'i' => "tab",
+                    _ => "esc",
+                }
+            )),
             (Some(c), None) if c.is_ascii_graphic() => Ok(vec![Key {
                 code: KeyCode::Char(c),
                 ctrl: true,

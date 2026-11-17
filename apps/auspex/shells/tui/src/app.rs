@@ -89,7 +89,7 @@ pub fn main() -> ExitCode {
         Err(e) => {
             if e.use_stderr() {
                 // clap quotes the offending argument; plain text, sanitised (finding 4).
-                eprintln!("{}", crate::log::clean(&e.render().to_string()));
+                crate::log::to_stderr(&crate::log::clean(&e.render().to_string()));
             } else {
                 let _ = e.print(); // --help, --version: our own text
             }
@@ -135,8 +135,8 @@ pub fn main() -> ExitCode {
             return ExitCode::from(USAGE);
         }
     };
-    // Synchronously and before the runtime exists, so before `Termination` takes the signals
-    // over: the read is bounded now (review finding 3), and even so nothing slow may sit
+    // Synchronously, before `Termination` takes the signals over (the runtime is built
+    // already, but nothing runs on it yet): the read is bounded now (review finding 3), and even so nothing slow may sit
     // between taking SIGINT and the first place that listens for it.
     let (theme, theme_note) = if args.mode() == Mode::Tui {
         theme::load(loaded.settings.theme_file.as_deref())
@@ -286,6 +286,9 @@ async fn tui(
     let mut events = EventStream::new();
     let mut frames = tokio::time::interval(FRAME);
     let mut failure: Option<String> = None;
+    // When the current refresh started, so a second `r` can tell a list that is merely
+    // starting from one that hangs.
+    let mut refresh = (shell.view().refresh.generation, std::time::Instant::now());
     let mut code = ExitCode::SUCCESS;
     while !shell.view().quit {
         tokio::select! {
@@ -307,7 +310,10 @@ async fn tui(
                     };
                     let view = shell.view();
                     let query = view.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
-                    let screen = Screen::from_view(&view, ui.page);
+                    if view.refresh.generation != refresh.0 {
+                        refresh = (view.refresh.generation, std::time::Instant::now());
+                    }
+                    let screen = Screen::from_view(&view, ui.page, refresh.1.elapsed());
                     for e in ui.input.key(key, screen, keymap, &query) {
                         shell.send(e);
                     }
