@@ -819,6 +819,18 @@ impl Default for ConnectTimeout {
     }
 }
 
+/// Which SSH operation to perform, using the same destination and control socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SshOperation {
+    /// Run a remote probe.
+    #[default]
+    Probe,
+    /// Check for an existing master without opening a connection.
+    Check,
+    /// Authenticate, then detach a persistent master without a remote command.
+    Connect,
+}
+
 /// What [`ssh_args`] needs besides the target: the effects layer's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SshOptions<'a> {
@@ -827,6 +839,10 @@ pub struct SshOptions<'a> {
     pub control_dir: &'a str,
     /// `ConnectTimeout`, from the config's `timeouts.ssh_connect`.
     pub connect_timeout: ConnectTimeout,
+    /// `ControlPersist` in seconds, from `ssh.control_persist` (default 600).
+    pub control_persist: u64,
+    /// The operation, defaulting to a remote probe.
+    pub operation: SshOperation,
 }
 
 impl<'a> SshOptions<'a> {
@@ -836,6 +852,8 @@ impl<'a> SshOptions<'a> {
         Self {
             control_dir,
             connect_timeout: ConnectTimeout::DEFAULT,
+            control_persist: 600,
+            operation: SshOperation::Probe,
         }
     }
 }
@@ -850,11 +868,18 @@ pub const PROBE_REMOTE_COMMAND: &str = "/bin/sh -s";
 ///
 /// ```text
 /// -T -o BatchMode=yes -o ConnectTimeout=<connect_timeout> -o ServerAliveInterval=5
-///    -o ControlMaster=auto -o ControlPath=<control_dir>/%C -o ControlPersist=60s
+///    -o ControlMaster=auto -o ControlPath=<control_dir>/%C -o ControlPersist=<seconds>s
 ///    [-o Opt=val]… [-p port] -- [user@]host
 /// ```
 ///
 /// auspex's own options come first because ssh keeps the first value it sees for an option.
+///
+/// A live master lets any process running as the operator reuse the authenticated
+/// connection for `control_persist` seconds. The control directory's ownership and 0700
+/// permissions are what restrict that access to the operator.
+///
+/// [`SshOperation::Check`] adds `-O check`; [`SshOperation::Connect`] uses
+/// `ControlMaster=yes -N -f`. Both use this same destination and safety options.
 ///
 /// # What the caller must do
 ///
@@ -898,12 +923,21 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
         "-o".to_owned(),
         "ServerAliveInterval=5".to_owned(),
         "-o".to_owned(),
-        "ControlMaster=auto".to_owned(),
+        match options.operation {
+            SshOperation::Connect => "ControlMaster=yes",
+            SshOperation::Probe | SshOperation::Check => "ControlMaster=auto",
+        }
+        .to_owned(),
         "-o".to_owned(),
         format!("ControlPath={dir}/%C"),
         "-o".to_owned(),
-        "ControlPersist=60s".to_owned(),
+        format!("ControlPersist={}s", options.control_persist),
     ];
+    match options.operation {
+        SshOperation::Probe => {}
+        SshOperation::Check => args.extend(["-O".to_owned(), "check".to_owned()]),
+        SshOperation::Connect => args.extend(["-N".to_owned(), "-f".to_owned()]),
+    }
     for (k, v) in &target.options {
         args.push("-o".to_owned());
         args.push(format!("{k}={v}"));
@@ -1217,7 +1251,7 @@ mod tests {
                 "-o",
                 "ControlPath=/run/user/1000/auspex/%C",
                 "-o",
-                "ControlPersist=60s",
+                "ControlPersist=600s",
                 "-o",
                 "Compression=yes",
                 "-p",
@@ -1809,9 +1843,15 @@ mod tests {
         let opts = SshOptions {
             control_dir: DIR,
             connect_timeout: ConnectTimeout::new(12).unwrap(),
+            control_persist: 1200,
+            operation: SshOperation::Probe,
         };
         let args = ssh_args(&t("terra"), &opts).unwrap();
         assert!(args.contains(&"ConnectTimeout=12".to_owned()), "{args:?}");
+        assert!(
+            args.contains(&"ControlPersist=1200s".to_owned()),
+            "{args:?}"
+        );
         assert!(!args.contains(&"ConnectTimeout=5".to_owned()));
         assert_eq!(
             args.iter()

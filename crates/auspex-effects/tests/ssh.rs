@@ -29,6 +29,147 @@ fn control(dir: &Path) -> ControlDir {
     ControlDir::prepare(&dir.join("c")).unwrap()
 }
 
+/// Legacy script tests exercise the probe over an already-authenticated master.
+fn warm_script(t: &common::Tools, dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    t.script(
+        dir,
+        name,
+        &format!("for arg; do [ \"$arg\" = '-O' ] && exit 0; done\n{body}"),
+    )
+}
+
+/// A fake master appears only after the simulated approval. All probes need that master.
+fn cold_script(t: &common::Tools, dir: &Path, delay: u64) -> std::path::PathBuf {
+    t.script(
+        dir,
+        "ssh-cold",
+        &format!(
+            r#"for arg; do
+  case "$arg" in
+    -O) [ -f '@dir@/master' ]; exit $?;;
+    -N)
+      [ "${{SSH_ASKPASS-unset}}|${{SSH_ASKPASS_REQUIRE-unset}}" = 'unset|never' ] || exit 73
+      if (exec 3</dev/tty) 2>/dev/null; then exit 74; fi
+      echo $$ >> '@dir@/connections'
+      @sleep@ {delay} &
+      echo $! >> '@dir@/children'
+      wait
+      : > '@dir@/master'
+      exit 0;;
+  esac
+done
+[ -f '@dir@/master' ] || exit 255
+printf '{}'
+"#,
+            probe_output()
+        ),
+    )
+}
+
+#[tokio::test]
+async fn approval_has_its_own_deadline_and_a_warm_master_is_reused() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = cold_script(&t, dir.path(), 15);
+    let cd = control(dir.path());
+    let target = Target::parse("h").unwrap();
+    let phases = std::sync::Mutex::new(Vec::new());
+    let signal = |waiting| phases.lock().unwrap().push(waiting);
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    params.deadline = Duration::from_secs(10);
+    params.approval_deadline = Duration::from_secs(60);
+    params.on_approval = Some(&signal);
+    for _ in 0..2 {
+        let result = probe(
+            &target,
+            MachineClass::Nixos,
+            &params,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, ProbeOutcome::Observed(_)), "{result:?}");
+    }
+    assert_eq!(*phases.lock().unwrap(), [true, false]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("connections"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn approval_timeout_is_distinct_and_reaps_the_waiter() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = cold_script(&t, dir.path(), 15);
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    params.approval_deadline = Duration::from_secs(5);
+    let result = probe(
+        &Target::parse("h").unwrap(),
+        MachineClass::Nixos,
+        &params,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let pids = wait_for_pids(&dir.path().join("connections"), 1);
+    let children = wait_for_pids(&dir.path().join("children"), 1);
+    let left = still_alive_after_wait(&children);
+    cleanup(&children);
+    assert!(!common::pid_exists(pids[0]), "approval ssh was not reaped");
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(
+        result,
+        ProbeOutcome::Unreachable {
+            reason: "waiting for ssh approval timed out".to_owned()
+        }
+    );
+}
+
+#[tokio::test]
+async fn cancelling_approval_kills_and_reaps_and_clears_the_signal() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = cold_script(&t, dir.path(), 30);
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    let phases = std::sync::Mutex::new(Vec::new());
+    let signal = |waiting| phases.lock().unwrap().push(waiting);
+    params.on_approval = Some(&signal);
+    let cancel = CancellationToken::new();
+    let canceller = {
+        let cancel = cancel.clone();
+        let path = dir.path().join("children");
+        tokio::task::spawn_blocking(move || {
+            wait_for_pids(&path, 1);
+            cancel.cancel();
+        })
+    };
+    let result = probe(
+        &Target::parse("h").unwrap(),
+        MachineClass::Nixos,
+        &params,
+        &cancel,
+    )
+    .await;
+    canceller.await.unwrap();
+    let pids = wait_for_pids(&dir.path().join("connections"), 1);
+    let children = wait_for_pids(&dir.path().join("children"), 1);
+    let left = still_alive_after_wait(&children);
+    cleanup(&children);
+    assert_eq!(result, Err(Cancelled));
+    assert!(!common::pid_exists(pids[0]), "approval ssh was not reaped");
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(*phases.lock().unwrap(), [true, false]);
+}
+
 async fn run_probe(
     program: &Path,
     control: &ControlDir,
@@ -57,7 +198,8 @@ async fn a_healthy_probe_gets_exactly_ssh_args_and_the_script_on_stdin() {
     // space and the `;` would split it.
     let bin = dir.path().join("bin dir; x");
     fs::create_dir(&bin).unwrap();
-    let prog = t.script(
+    let prog = warm_script(
+        &t,
         &bin,
         "ssh",
         &format!(
@@ -108,7 +250,8 @@ printf '{}'"#,
 async fn exit_255_is_unreachable_with_ssh_s_last_line() {
     let Some(t) = tools(&[]) else { return };
     let dir = tempdir();
-    let prog = t.script(
+    let prog = warm_script(
+        &t,
         dir.path(),
         "ssh",
         "printf 'Warning: something\\nHost key verification failed.\\n' >&2\nexit 255",
@@ -132,7 +275,8 @@ async fn exit_255_is_unreachable_with_ssh_s_last_line() {
 async fn a_host_that_never_answers_times_out_and_the_process_is_gone() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
-    let prog = t.script(
+    let prog = warm_script(
+        &t,
         dir.path(),
         "ssh",
         "@sleep@ 30 &\necho $! >> '@dir@/pid'\necho $$ >> '@dir@/pid'\nprintf 'connecting...\\n' >&2\nwait",
@@ -161,7 +305,8 @@ async fn a_host_that_never_answers_times_out_and_the_process_is_gone() {
 async fn a_grandchild_holding_stdout_does_not_hold_up_the_probe() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
-    let prog = t.script(
+    let prog = warm_script(
+        &t,
         dir.path(),
         "ssh",
         &format!(
@@ -192,7 +337,8 @@ async fn a_grandchild_holding_stdout_does_not_hold_up_the_probe() {
 async fn unbounded_output_is_capped_and_cut_off() {
     let Some(t) = tools(&[]) else { return };
     let dir = tempdir();
-    let prog = t.script(
+    let prog = warm_script(
+        &t,
         dir.path(),
         "ssh",
         "echo $$ > '@dir@/pid'\nprintf 'auspex_probe=1\\n'\nwhile :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\\n'; done",
@@ -225,7 +371,8 @@ async fn unbounded_output_is_capped_and_cut_off() {
 async fn invalid_utf8_is_decoded_lossily() {
     let Some(t) = tools(&[]) else { return };
     let dir = tempdir();
-    let prog = t.script(
+    let prog = warm_script(
+        &t,
         dir.path(),
         "ssh",
         &format!(
@@ -250,7 +397,8 @@ async fn invalid_utf8_is_decoded_lossily() {
 async fn cancelling_kills_ssh_and_its_children() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
-    let prog = t.script(
+    let prog = warm_script(
+        &t,
         dir.path(),
         "ssh",
         "@sleep@ 30 &\necho $! >> '@dir@/pids'\necho $$ >> '@dir@/pids'\nwait",
@@ -293,7 +441,8 @@ async fn cancelling_kills_ssh_and_its_children() {
 async fn dropping_the_future_kills_ssh_and_its_children() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
-    let prog = t.script(
+    let prog = warm_script(
+        &t,
         dir.path(),
         "ssh",
         "@sleep@ 30 &\necho $! >> '@dir@/pids'\necho $$ >> '@dir@/pids'\nwait",
@@ -321,7 +470,7 @@ async fn a_signalled_or_missing_ssh_has_a_reason() {
     let cd = control(dir.path());
     let target = Target::parse("h").unwrap();
 
-    let prog = t.script(dir.path(), "ssh", "kill -TERM $$");
+    let prog = warm_script(&t, dir.path(), "ssh", "kill -TERM $$");
     let (r, _) = run_probe(&prog, &cd, &target, Duration::from_secs(5)).await;
     let ProbeOutcome::Failed { reason } = r.unwrap() else {
         panic!()
@@ -352,7 +501,7 @@ async fn a_signalled_or_missing_ssh_has_a_reason() {
     assert_eq!(
         r.unwrap(),
         ProbeOutcome::Unreachable {
-            reason: "cannot probe: auspex-test-no-such-ssh not found on PATH".to_owned()
+            reason: "cannot connect: auspex-test-no-such-ssh not found on PATH".to_owned()
         }
     );
 
@@ -551,4 +700,42 @@ fn ssh_cannot_prompt() {
     );
     assert!(out.status.success(), "{text}");
     assert!(text.contains("1 passed"), "the inner test ran: {text}");
+}
+
+#[tokio::test]
+async fn approval_master_retaining_pipes_does_not_hold_up_the_probe() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "ssh-detach",
+        &format!(
+            r#"for arg; do
+case "$arg" in
+  -O) exit 1;;
+  -N)
+    if IFS= read -r line; then exit 75; fi
+    @sleep@ 30 &
+    echo $! > '@dir@/master.pid'
+    exit 0;;
+esac
+done
+printf '{}'"#,
+            probe_output()
+        ),
+    );
+    let (result, elapsed) = run_probe(
+        &program,
+        &control(dir.path()),
+        &Target::parse("h").unwrap(),
+        Duration::from_secs(10),
+    )
+    .await;
+    let pids = wait_for_pids(&dir.path().join("master.pid"), 1);
+    cleanup(&pids);
+    assert!(matches!(result.unwrap(), ProbeOutcome::Observed(_)));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "master held pipes: {elapsed:?}"
+    );
 }

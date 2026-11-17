@@ -1,14 +1,15 @@
 //! The ssh probe: one round trip per machine per refresh, through the system `ssh`.
 //!
-//! The argument vector is exactly `auspex_domain::fleet::ssh_args(target, …)` followed by
-//! [`PROBE_REMOTE_COMMAND`], and the probe script for the machine's class goes on stdin.
+//! Every phase's argv comes from [`ssh_args`]. A control check precedes the probe; a cold
+//! destination authenticates with `-N -f` under a separate approval deadline first.
+//! The probe then appends [`PROBE_REMOTE_COMMAND`] and sends its script on stdin.
 //! Nothing from a target, a machine name or a config value reaches argv any other way, and
 //! no shell is involved locally: the program is executed directly.
 //!
 //! ssh never prompts: it runs in a new session (no controlling terminal, so `/dev/tty`
 //! cannot be opened), with `SSH_ASKPASS` removed and `SSH_ASKPASS_REQUIRE=never`, and stdin
-//! is the pipe carrying the script. That holds for a `ProxyJump` hop from `~/.ssh/config`
-//! too, which inherits all three.
+//! is `/dev/null` for control operations or the pipe carrying the probe script.
+//! A `ProxyJump` hop from `~/.ssh/config` inherits these prompt restrictions too.
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
@@ -31,7 +32,7 @@ use crate::text::lossy;
 /// The default ssh program: `ssh`, looked up on `PATH`.
 pub const DEFAULT_SSH: &str = "ssh";
 
-/// The plan's default for the whole probe: connect, run and print, within 10 seconds.
+/// The default deadline for running the script after authentication.
 pub const DEFAULT_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
 /// How much stdout a probe keeps: 256 KiB.
@@ -169,7 +170,7 @@ impl ControlDir {
 }
 
 /// Everything a probe needs besides the target.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProbeParams<'a> {
     /// The ssh program: [`DEFAULT_SSH`] (looked up on `PATH`), or a path.
     pub ssh_program: &'a OsStr,
@@ -177,19 +178,28 @@ pub struct ProbeParams<'a> {
     pub control_dir: &'a ControlDir,
     /// ssh's `ConnectTimeout`.
     pub connect_timeout: ConnectTimeout,
-    /// The whole probe's deadline ([`DEFAULT_PROBE_DEADLINE`] by default). Past it, ssh's
-    /// process group is killed and the probe is `ProbeExit::TimedOut`.
+    /// How long an idle master remains available, in seconds.
+    pub control_persist: u64,
+    /// The separate connect/authentication allowance.
+    pub approval_deadline: Duration,
+    /// Shell-side phase signal: true on entry, false on every exit, including drop.
+    pub on_approval: Option<&'a (dyn Fn(bool) + Sync)>,
+    /// The script deadline after authentication ([`DEFAULT_PROBE_DEADLINE`] by default).
+    /// Past it, ssh's process group is killed and the probe is `ProbeExit::TimedOut`.
     pub deadline: Duration,
 }
 
 impl<'a> ProbeParams<'a> {
-    /// The defaults: `ssh` from `PATH`, a 5 s connect timeout, a 10 s deadline.
+    /// Defaults: `ssh`, 5 s connect, 60 s approval, 10 s script, 600 s persistence.
     #[must_use]
     pub fn new(control_dir: &'a ControlDir) -> Self {
         Self {
             ssh_program: OsStr::new(DEFAULT_SSH),
             control_dir,
             connect_timeout: ConnectTimeout::DEFAULT,
+            control_persist: 600,
+            approval_deadline: Duration::from_secs(60),
+            on_approval: None,
             deadline: DEFAULT_PROBE_DEADLINE,
         }
     }
@@ -204,9 +214,111 @@ impl<'a> ProbeParams<'a> {
 pub fn probe_argv(target: &Target, params: &ProbeParams<'_>) -> Result<Vec<String>, String> {
     let mut options = SshOptions::new(params.control_dir.as_str());
     options.connect_timeout = params.connect_timeout;
+    options.control_persist = params.control_persist;
     let mut args = ssh_args(target, &options).map_err(|e| e.to_string())?;
     args.push(PROBE_REMOTE_COMMAND.to_owned());
     Ok(args)
+}
+
+struct ApprovalGuard<'a>(Option<&'a (dyn Fn(bool) + Sync)>);
+
+impl Drop for ApprovalGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(signal) = self.0 {
+            signal(false);
+        }
+    }
+}
+
+/// A check never connects; only a missing master starts the separately bounded approval.
+async fn connect(
+    target: &Target,
+    params: &ProbeParams<'_>,
+    cancel: &CancellationToken,
+) -> Result<Option<ProbeOutcome>, Cancelled> {
+    use auspex_domain::fleet::SshOperation;
+
+    for operation in [SshOperation::Check, SshOperation::Connect] {
+        let mut options = SshOptions::new(params.control_dir.as_str());
+        options.connect_timeout = params.connect_timeout;
+        options.control_persist = params.control_persist;
+        options.operation = operation;
+        let args = match ssh_args(target, &options) {
+            Ok(args) => args,
+            Err(e) => {
+                return Ok(Some(ProbeOutcome::Failed {
+                    reason: e.to_string(),
+                }));
+            }
+        };
+        let _approval = if operation == SshOperation::Connect {
+            if let Some(signal) = params.on_approval {
+                signal(true);
+            }
+            Some(ApprovalGuard(params.on_approval))
+        } else {
+            None
+        };
+        let mut cmd = match command(params.ssh_program) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return Ok(Some(ProbeOutcome::Unreachable {
+                    reason: spawn_error("cannot connect", params.ssh_program, &e),
+                }));
+            }
+        };
+        cmd.args(&args)
+            .env_remove("SSH_ASKPASS")
+            .env("SSH_ASKPASS_REQUIRE", "never");
+        // -f detaches only after authentication. While waiting, the session/group guard
+        // kills ssh and its hops on cancellation. A detached master gets no script stdin;
+        // run's bounded pipe drain handles OpenSSH versions that retain output pipes.
+        let allowance = if operation == SshOperation::Check {
+            Duration::from_secs(params.connect_timeout.seconds())
+        } else {
+            params.approval_deadline
+        };
+        let ran = match run(
+            cmd,
+            None,
+            OnExit::LeaveGroup,
+            Limits {
+                stdout: STDOUT_CAP,
+                stderr: STDERR_CAP,
+                memory: None,
+            },
+            Instant::now() + allowance,
+            cancel,
+        )
+        .await
+        {
+            Ok(ran) => ran,
+            Err(e) => {
+                return Ok(Some(ProbeOutcome::Unreachable {
+                    reason: spawn_error("cannot connect", params.ssh_program, &e),
+                }));
+            }
+        };
+        match ran.end {
+            End::Cancelled => return Err(Cancelled),
+            End::Exited(status) if status.success() => return Ok(None),
+            _ if operation == SshOperation::Check => {}
+            End::TimedOut => {
+                return Ok(Some(ProbeOutcome::Unreachable {
+                    reason: "waiting for ssh approval timed out".to_owned(),
+                }));
+            }
+            End::Overflow => {
+                return Ok(Some(ProbeOutcome::Failed {
+                    reason: "ssh approval output cut off".to_owned(),
+                }));
+            }
+            End::Exited(status) => {
+                return Ok(Some(parse_probe("", &lossy(&ran.stderr), exit_of(status))));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Probes one machine. Serves the core's `Effect::Probe`.
@@ -236,6 +348,9 @@ pub async fn probe(
     params: &ProbeParams<'_>,
     cancel: &CancellationToken,
 ) -> Result<ProbeOutcome, Cancelled> {
+    if let Some(outcome) = connect(target, params, cancel).await? {
+        return Ok(outcome);
+    }
     let deadline = Instant::now() + params.deadline;
     let args = match probe_argv(target, params) {
         Ok(a) => a,

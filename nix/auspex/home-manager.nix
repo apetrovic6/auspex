@@ -46,9 +46,13 @@ in {
       default = { };
       type = table {
         flake = optional types.str "Fleet flake path; --flake and CLAN_DIR take precedence.";
+        ssh = section {
+          control_persist = optional (types.ints.between 60 3600) "Idle authenticated master lifetime in seconds (default 600); reusable by processes running as the operator.";
+        };
         timeouts = section {
           ssh_connect = timeout "SSH connection timeout in seconds.";
-          probe = timeout "Whole-machine probe timeout in seconds.";
+          ssh_approval = optional (types.ints.between 5 600) "SSH authentication/agent approval allowance in seconds (default 60), separate from the probe.";
+          probe = timeout "Probe script timeout in seconds, after authentication.";
           eval = timeout "Per-machine evaluation timeout in seconds.";
           settle = timeout "Headless fleet settling timeout in seconds.";
         };

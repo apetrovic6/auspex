@@ -28,7 +28,8 @@ let
   expected = builtins.fromTOML (builtins.readFile ./expected.toml);
   fullSettings = {
     flake = "/home/me/clan/fleet";
-    timeouts = { ssh_connect = 5; probe = 10; eval = 300; settle = 120; };
+    ssh.control_persist = 600;
+    timeouts = { ssh_connect = 5; ssh_approval = 60; probe = 10; eval = 300; settle = 120; };
     eval = { workers = 4; max_memory_mb = 4096; };
     prometheus = { url = "http://prometheus.example:9090"; stale_after = 60; };
     cache.url = "https://ncps.example";
@@ -65,6 +66,16 @@ let
       && !type.check (-1) && rejected (-1)
       && (if positive then !type.check 0 && rejected 0 else probe 0 == 0)
       && (max == null || (probe max == max && !type.check (max + 1) && rejected (max + 1)));
+  boundedOK = min: max: path:
+    let
+      type = lib.foldl' (type: name: (type.getSubOptions [ ]).${name}.type) settingsType path;
+      probe = value: lib.getAttrFromPath path (evaluate {
+        programs.auspex.settings = lib.setAttrByPath path value;
+      }).config.programs.auspex.settings;
+      rejected = value: !type.check value
+        && !(builtins.tryEval (builtins.deepSeq (probe value) true)).success;
+    in probe min == min && probe max == max
+      && rejected (min - 1) && rejected (max + 1) && rejected "ten";
   slots = map (s: "base${s}") [ "00" "01" "02" "03" "04" "05" "06" "07" "08" "09" "0A" "0B" "0C" "0D" "0E" "0F" ];
   palette = builtins.listToAttrs (lib.imap0 (index: slot: {
     name = slot;
@@ -139,7 +150,9 @@ in {
   # Positive evaluation and the declared type guard prevent an unrelated throw from passing.
   auspex-types = check "types" (builtins.all (numberOK false null) unsignedPaths
     && builtins.all (numberOK true null) positivePaths
-    && builtins.all (numberOK true 86400) timeoutPaths);
+    && builtins.all (numberOK true 86400) timeoutPaths
+    && boundedOK 60 3600 [ "ssh" "control_persist" ]
+    && boundedOK 5 600 [ "timeouts" "ssh_approval" ]);
   auspex-stylix = compareToml "stylix" [
     stylix.xdg.configFile."auspex/theme.toml".source
     prefixed.xdg.configFile."auspex/theme.toml".source

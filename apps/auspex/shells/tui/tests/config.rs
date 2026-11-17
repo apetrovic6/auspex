@@ -30,6 +30,8 @@ fn the_home_manager_contract_fixture_loads_whole() {
         (5, 10, 300, 120)
     );
     assert_eq!((s.eval.workers, s.eval.max_memory_mb), (4, 4096));
+    assert_eq!(s.ssh.control_persist, 600);
+    assert_eq!(s.timeouts.ssh_approval, 60);
     assert_eq!(
         s.prometheus,
         Some(PrometheusSettings {
@@ -203,6 +205,8 @@ fn every_number_in_the_fixture_is_read_not_defaulted() {
         (6, 11, 301, 121)
     );
     assert_eq!((s.eval.workers, s.eval.max_memory_mb), (5, 4097));
+    assert_eq!(s.ssh.control_persist, 601);
+    assert_eq!(s.timeouts.ssh_approval, 61);
     assert_eq!(s.prometheus.unwrap().stale_after, 61);
 }
 
@@ -225,6 +229,25 @@ fn timeouts_are_between_one_second_and_a_day() {
         (s.timeouts.eval, s.timeouts.settle, s.timeouts.probe),
         (86_400, 86_400, 1)
     );
+}
+
+#[test]
+fn ssh_persistence_and_approval_bounds_name_the_key() {
+    for (section, key, min, max) in [
+        ("ssh", "control_persist", 60, 3600),
+        ("timeouts", "ssh_approval", 5, 600),
+    ] {
+        for value in [min - 1, max + 1, -1] {
+            let error = config::parse(&format!("[{section}]\n{key} = {value}")).unwrap_err();
+            assert!(error.contains(&format!("`{section}.{key}`")), "{error}");
+        }
+        for value in [min, max] {
+            assert!(config::parse(&format!("[{section}]\n{key} = {value}")).is_ok());
+        }
+    }
+    let (defaults, _) = config::parse("").unwrap();
+    assert_eq!(defaults.ssh.control_persist, 600);
+    assert_eq!(defaults.timeouts.ssh_approval, 60);
 }
 
 #[test]

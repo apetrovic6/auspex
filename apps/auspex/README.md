@@ -83,6 +83,33 @@ A leading `~/` in the selected theme path uses Home Manager's home directory.
 The package is also available as `packages.<system>.auspex` (and `default`);
 `overlays.default` adds `pkgs.auspex`.
 
+## Configuration
+
+`~/.config/auspex/config.toml` (or `--config PATH`) accepts:
+
+```toml
+[ssh]
+control_persist = 600 # seconds; 60..3600
+
+[timeouts]
+ssh_connect = 5      # TCP connection timeout; 1..60 seconds
+ssh_approval = 60    # authentication/agent approval; 5..600 seconds
+probe = 10          # script execution, after authentication
+settle = 120        # global refresh deadline, including approval
+```
+
+Home Manager exposes the same keys under `programs.auspex.settings`.
+A warm control master skips authentication; a cold connection gets a separate approval
+allowance, so approving an agent request does not consume the script's probe timeout.
+Down hosts still fail at SSH's connect timeout. The status bar shows how many connections
+are waiting; headless mode writes one approval notice to stderr, never to JSON stdout.
+The global `settle` deadline still bounds the whole refresh.
+
+Masters remain reusable for ten idle minutes by default. Any process running as the
+operator can reuse that authenticated connection; the checked, operator-owned 0700
+control directory (never a symlink) restricts access to the operator. Increase persistence
+only if that longer authenticated lifetime is acceptable.
+
 Stamp deployed machines with the **fleet's** revision, not auspex's:
 
 ```nix

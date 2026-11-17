@@ -54,6 +54,8 @@ pub struct Ui {
     pub page: usize,
     /// Frames drawn, for the spinners.
     pub frame: u64,
+    /// Probes currently waiting in the SSH connect/authentication phase.
+    pub approvals: usize,
 }
 
 /// Everything that does not change frame to frame.
@@ -602,6 +604,9 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         refresh.to_owned(),
         format!("{} pending", view.refresh.pending_machines),
     ];
+    if ui.approvals != 0 {
+        parts.push(format!("ssh: waiting for {} approvals", ui.approvals));
+    }
     if let Some(p) = prometheus {
         parts.push(p);
     }

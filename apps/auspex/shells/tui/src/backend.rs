@@ -102,9 +102,10 @@ impl Backend {
         &self,
         op: &ProbeRequest,
         cancel: &CancellationToken,
+        on_approval: &(dyn Fn(bool) + Sync),
     ) -> Result<ProbeOutcome, Cancelled> {
         match self {
-            Self::Real(r) => r.probe(op, cancel).await,
+            Self::Real(r) => r.probe(op, cancel, on_approval).await,
             Self::Demo(d) => d.probe(op, cancel).await,
         }
     }
@@ -223,6 +224,8 @@ pub struct Real {
     git: OsString,
     control_dir: Result<ControlDir, String>,
     connect_timeout: ConnectTimeout,
+    control_persist: u64,
+    approval_deadline: Duration,
     probe_deadline: Duration,
     eval_timeout: Duration,
     workers: u32,
@@ -262,6 +265,8 @@ impl Real {
             git: OsString::from(cache::DEFAULT_GIT),
             control_dir: ControlDir::prepare(&ControlDir::default_path()).map_err(|e| e.0),
             connect_timeout: ConnectTimeout::new(t.ssh_connect).unwrap_or(ConnectTimeout::DEFAULT),
+            control_persist: settings.ssh.control_persist,
+            approval_deadline: Duration::from_secs(t.ssh_approval),
             probe_deadline: Duration::from_secs(t.probe),
             eval_timeout: Duration::from_secs(t.eval),
             workers: settings.eval.workers,
@@ -321,6 +326,7 @@ impl Real {
         &self,
         op: &ProbeRequest,
         cancel: &CancellationToken,
+        on_approval: &(dyn Fn(bool) + Sync),
     ) -> Result<ProbeOutcome, Cancelled> {
         let control_dir = match &self.control_dir {
             Ok(d) => d,
@@ -333,6 +339,9 @@ impl Real {
         let mut params = ProbeParams::new(control_dir);
         params.ssh_program = &self.ssh;
         params.connect_timeout = self.connect_timeout;
+        params.control_persist = self.control_persist;
+        params.approval_deadline = self.approval_deadline;
+        params.on_approval = Some(on_approval);
         params.deadline = self.probe_deadline;
         ssh::probe(&op.target, op.class, &params, cancel).await
     }

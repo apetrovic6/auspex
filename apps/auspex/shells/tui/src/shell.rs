@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,6 +71,8 @@ pub struct Shell {
     configured: Mutex<(BTreeSet<String>, bool)>,
     /// Permits for per-machine calls ([`MAX_CONCURRENT`]).
     limit: Arc<Semaphore>,
+    approvals: AtomicUsize,
+    approval_noted: AtomicBool,
 }
 
 impl Shell {
@@ -88,6 +91,8 @@ impl Shell {
             deadline: Mutex::new(None),
             configured: Mutex::new((BTreeSet::new(), false)),
             limit: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+            approvals: AtomicUsize::new(0),
+            approval_noted: AtomicBool::new(false),
         })
     }
 
@@ -116,6 +121,24 @@ impl Shell {
     #[must_use]
     pub fn view(&self) -> ViewModel {
         self.core.view()
+    }
+
+    /// Probes currently connecting/authenticating, outside the core's report contract.
+    #[must_use]
+    pub fn approvals(&self) -> usize {
+        self.approvals.load(Ordering::Relaxed)
+    }
+
+    fn approval(&self, waiting: bool) {
+        if waiting {
+            self.approvals.fetch_add(1, Ordering::Relaxed);
+            if !self.approval_noted.swap(true, Ordering::Relaxed) {
+                self.log.line("ssh: waiting for approval");
+            }
+        } else {
+            self.approvals.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.changed.notify_one();
     }
 
     /// Sends `event` to the core and fulfils whatever it asks for.
@@ -176,7 +199,10 @@ impl Shell {
                 let gate = self.gate(&token);
                 self.one_shot(op.id, request, async move {
                     let _permit = gate.await?;
-                    shell.backend.probe(&op, &token).await
+                    shell
+                        .backend
+                        .probe(&op, &token, &|waiting| shell.approval(waiting))
+                        .await
                 });
             }
             Effect::Evaluate(request) => self.evaluate(request),

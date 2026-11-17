@@ -294,6 +294,7 @@ async fn tui(
         tokio::select! {
             _ = frames.tick() => {
                 ui.frame = ui.frame.wrapping_add(1);
+                ui.approvals = shell.approvals();
                 let view = shell.view();
                 let log = shell.log.lines();
                 let ctx = Context { theme, keymap, flake, log: &log };

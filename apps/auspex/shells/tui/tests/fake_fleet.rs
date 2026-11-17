@@ -158,7 +158,7 @@ fn a_fleet_level_error_exits_1_and_says_where_the_flake_came_from() {
 
 /// An ssh that records its pid and never answers.
 fn ssh_hangs(t: &Tools, dir: &Path) -> std::path::PathBuf {
-    t.script(dir, "ssh", "echo $$ >> '@dir@/ssh.pids'\nexec @sleep@ 300")
+    t.script(dir, "ssh", "for arg; do [ \"$arg\" = '-O' ] && exit 0; done\necho $$ >> '@dir@/ssh.pids'\nexec @sleep@ 300")
 }
 
 /// An evaluator that records its pid and a worker's, and never answers.
@@ -334,7 +334,7 @@ fn the_ssh_and_evaluator_settings_reach_the_programs() {
     let ssh = ssh_recording(&t, dir.path(), &store("nixos-system-terra"));
     let cfg = config(
         dir.path(),
-        "[timeouts]\nssh_connect = 7\n[eval]\nworkers = 3\nmax_memory_mb = 1234\n",
+        "[ssh]\ncontrol_persist = 1200\n[timeouts]\nssh_connect = 7\n[eval]\nworkers = 3\nmax_memory_mb = 1234\n",
     );
     let mut cmd = auspex(dir.path());
     cmd.args(["--plain", "--config"])
@@ -351,6 +351,7 @@ fn the_ssh_and_evaluator_settings_reach_the_programs() {
     );
     let ssh_argv = std::fs::read_to_string(dir.path().join("ssh.argv")).unwrap();
     assert!(ssh_argv.contains("ConnectTimeout=7"), "{ssh_argv}");
+    assert!(ssh_argv.contains("ControlPersist=1200s"), "{ssh_argv}");
     let eval_argv: Vec<String> = std::fs::read_to_string(dir.path().join("eval.argv"))
         .unwrap()
         .lines()
@@ -656,4 +657,52 @@ fn at_most_max_concurrent_probes_run_at_once() {
     assert_eq!(all.len(), limit, "no more than {limit} probes ran at once");
     assert_eq!(status.code(), Some(128 + Signal::TERM.as_raw()));
     assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn headless_reports_approval_once_and_uses_the_configured_allowance() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let nix = nix_ok(&t, dir.path());
+    let eval = eval_ok(&t, dir.path());
+    let ssh = t.script(
+        dir.path(),
+        "ssh-approval",
+        r#"for arg; do
+case "$arg" in
+  -O) exit 1;;
+  -N) exec @sleep@ 15;;
+esac
+done
+exit 99"#,
+    );
+    let cfg = config(
+        dir.path(),
+        "[timeouts]\nssh_approval = 5\nprobe = 1\nsettle = 30\n",
+    );
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--plain", "--config"])
+        .arg(cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()));
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let start = Instant::now();
+    let out = run_within(&mut cmd, LIMIT);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(
+        stderr.matches("ssh: waiting for approval").count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        stdout.matches("waiting for ssh approval timed out").count(),
+        2,
+        "{stdout}"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(12),
+        "configured 5s approval not used"
+    );
 }
