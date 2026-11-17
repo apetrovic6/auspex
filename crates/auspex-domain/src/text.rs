@@ -203,7 +203,12 @@ mod tests {
     }
 
     #[test]
-    fn last_lines_skips_blanks() {
+    fn sanitized_tail_zero_keeps_nothing() {
+        assert_eq!(sanitized_tail("a\n\nb\n", 0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn sanitized_tail_skips_blanks() {
         assert_eq!(sanitized_tail("a\n\nb\n  \nc\n", 2), vec!["b", "c"]);
         assert_eq!(sanitized_tail("", 3), Vec::<String>::new());
     }

@@ -41,7 +41,7 @@ pub struct FleetReport {
     /// `true` exactly when the scan is over and its result is final, which is all of:
     ///
     /// - every fleet-wide request is back: the machine list, the evaluator's final answer,
-    ///   and any query for the whole fleet (Prometheus, Alertmanager);
+    ///   any query for the whole fleet (Prometheus, Alertmanager), and address resolution;
     /// - the global deadline did not cut the scan short;
     /// - `errors` is empty;
     /// - every machine's `settled` is `true`.
@@ -108,7 +108,8 @@ impl FleetError {
 pub struct FleetFacts {
     /// Every fleet-wide request is back: the machine list, the evaluator's final answer
     /// (the process exited, so no more lines are coming), and any query for the whole fleet
-    /// (Prometheus, Alertmanager). `false` while any of them is outstanding.
+    /// (Prometheus, Alertmanager). Keep this `false` while address resolution is outstanding:
+    /// its shared-IP result can still change machine lints, even for settled machines.
     pub scan_complete: bool,
     /// The global deadline passed before every machine settled.
     pub timed_out: bool,
@@ -145,13 +146,14 @@ pub struct MachineReport {
     /// the primary status. `"failed_units"` means a failed unit, systemd reporting
     /// `degraded` or `maintenance`, or an alert firing.
     pub badges: Vec<Badge>,
-    /// `true` when nothing more is coming for this machine, so its entry can no longer
-    /// change: its probe is back (or its target was refused, so it is never probed), its
-    /// evaluation is back, its ncps lookup is not pending, and neither its Prometheus nor its
-    /// Alertmanager answer is outstanding. Computed from those facts, never from the badges,
-    /// so it does not depend on the order they arrive in: an unreachable machine whose
-    /// evaluation is still running is not settled, and nor is one with an update pending whose
-    /// `cached` lookup has not answered.
+    /// `true` when this machine's probe, evaluation and applicable auxiliary answers are
+    /// final: its probe is back (or its target was refused), its evaluation is back, its
+    /// ncps lookup is not pending or no update is pending, and neither its Prometheus nor
+    /// its Alertmanager answer is outstanding. Computed from facts, never from badges:
+    /// an unreachable machine whose evaluation is still running is not settled, nor is
+    /// one with an update pending whose cache lookup has not answered. This does not cover
+    /// shared-IP resolution, which may still change `lints`; only [`FleetReport::settled`]
+    /// covers that fleet-wide work, through [`FleetFacts::scan_complete`].
     pub settled: bool,
     /// One line on why `status` is what it is, **for people**: ssh's last stderr line, nix's
     /// last error line, or what is being waited for. For `in_sync`, `update_pending` and
@@ -162,6 +164,7 @@ pub struct MachineReport {
     /// the notes behind a `failed_units` badge are added. `null` for `in_sync` with nothing
     /// to note. Programs must read `badges`, `system_state` and `failed_units` instead, never
     /// parse this text.
+    /// An update-pending row appends `cache lookup failed` when its cache lookup failed.
     pub reason: Option<String>,
     /// `/run/current-system`'s store path, or `null` when not observed or not installed.
     pub current_system: Option<String>,

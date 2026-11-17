@@ -204,11 +204,10 @@
       "status": "update_pending",
       "badges": [
         "update_pending",
-        "cached",
         "failed_units"
       ],
       "settled": true,
-      "reason": "pending nixos-system-terra-b; failed units: k3s.service",
+      "reason": "pending nixos-system-terra-b; cache lookup failed; failed units: k3s.service",
       "current_system": "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-a",
       "pending_system": "/nix/store/1123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-b",
       "deployed_revision": "c68e00a",
