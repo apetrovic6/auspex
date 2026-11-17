@@ -28,6 +28,12 @@
     inherit pkgs craneLib;
     inherit inputs;
     depsBase = ../nix/deps-base;
+    # Cross targets depend on the product's shells; L0 builds only for the host.
+    depsToolchain = import ./toolchain.nix {
+      inherit pkgs lib;
+      rust-overlay = inputs.rust-overlay;
+      hostOnly = true;
+    };
     pname = "rust-app-template";
     extraStages = import ./auspex/stages.nix { exports = import ./auspex/ci-exports.nix inputs; };
   } // import ./auspex/platform-args.nix { inherit pkgs lib; system = pkgs.stdenv.hostPlatform.system; });

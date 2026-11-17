@@ -15,7 +15,7 @@ root := source_directory() / ".."
 # dependency above the snapshot rebuilds on every Cargo.lock change, and the snapshot is what
 # does not. Run this when `just deps::drift` reports more than ~15% of the registry graph has
 # moved, or after a bump that reaches deep (syn, serde, libc, the gpui or sqlx closure) — the
-# policy is [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/9a40690b725310f872572c0b9450c35da9615e1f/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md).
+# policy is [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/8aaabf5c1f90d6a725b2f82526b55cf057a7d3da/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md).
 #
 # Only the files a dependency build reads are copied. Source bodies are NOT: `mkDummySrc`
 # replaces every target with a stub, so copying them would rebuild the bottom layer on every
@@ -75,7 +75,7 @@ rebase-deps:
 # file because just would try to interpolate the braces in an inline python heredoc.
 #
 # Advisory, never a gate: drift is expected after every lock bump until someone runs
-# `deps::rebase-deps`. The threshold and recipe for rebasing are [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/9a40690b725310f872572c0b9450c35da9615e1f/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md).
+# `deps::rebase-deps`. The threshold and recipe for rebasing are [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/8aaabf5c1f90d6a725b2f82526b55cf057a7d3da/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md).
 [script('bash')]
 drift:
     set -euo pipefail

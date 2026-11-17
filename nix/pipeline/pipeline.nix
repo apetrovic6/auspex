@@ -28,6 +28,15 @@
   # The frozen dependency snapshot (nix/deps-base). Optional: a missing snapshot falls
   # back to a full (slow) deps build, never a wrong one.
   depsBase ? null,
+  # The toolchain the bottom layer (L0) is built with: the shared toolchain without its cross
+  # targets (nix/toolchain.nix, `hostOnly`). L0 compiles for the host only, and the target list
+  # is derived from which shells and platforms a tree has, so with the full toolchain L0 was a
+  # different derivation in a product with another app set, over the same snapshot (RT-76).
+  # Every layer above keeps `craneLib`'s toolchain: the rustc and the host std are the same
+  # component either way, and cargo keys a unit by `rustc -vV`, not by the sysroot it lives in —
+  # measured upstream, the template's L1 over this L0 recompiles only the lock's drift.
+  # `null` builds L0 with `craneLib`.
+  depsToolchain ? null,
   # Name used for the crane derivations (a workspace manifest has no package.name).
   pname ? (builtins.baseNameOf (toString src)),
   # The product this tree is, from `[publish].project` in versions.toml — the value `cli new`
@@ -262,7 +271,7 @@ let
   depsHasGitSource =
     builtins.any (p: lib.hasPrefix "git+" (p.source or "")) (depsLock.package or [ ]);
 
-  # The fixed vendor path. See [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/9a40690b725310f872572c0b9450c35da9615e1f/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md): a REGISTRY crate's per-crate path depends only on
+  # The fixed vendor path. See [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/8aaabf5c1f90d6a725b2f82526b55cf057a7d3da/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md): a REGISTRY crate's per-crate path depends only on
   # its name/version/checksum, so remapping the vendor dir to a fixed sandbox path lets L0
   # and L1 (vendored from two different locks) reuse each other's units. Git crates are not
   # content-addressed, so the remap is dropped entirely when the live lock pins any.
@@ -297,18 +306,38 @@ let
 
   # Every stage that consumes the layered artifacts has to agree on the vendored source
   # path, or cargo sees a different package set and recompiles all of it.
-  hostArgs = commonArgs // stableVendorDir;
+  hostArgs = commonArgs // stableVendorDir // {
+    # Formatting does not vendor sources; keep this out of commonArgs so cargoFmt
+    # does not try offline resolution with an empty registry.
+    # A lock that does not cover the workspace fails as "no matching package named X
+    # found", which names a crate rather than the stale Cargo.lock — auspex's first ci-pure
+    # (RT-76): `add crux-app` wrote a member whose dependencies the committed lock lacked.
+    # Upstream generators now refresh the lock (`xtask::cargo_lock`); the pinned external
+    # CLI here predates that fix. Say what to do when a stale lock is committed anyway.
+    # This must reach every live-lock build, not just L1: auspex's release package builds
+    # its own dependencies and can fail before L1 gets to report the diagnosis.
+    preBuild = ''
+      if ! cargo metadata --locked --offline --format-version 1 >/dev/null 2>"$NIX_BUILD_TOP/metadata.err"; then
+        cat "$NIX_BUILD_TOP/metadata.err" >&2
+        echo "Cargo.lock does not cover the workspace: run \`cargo metadata\` (or any cargo command) and commit Cargo.lock" >&2
+        exit 1
+      fi
+    '';
+  };
 
   # The bottom layer's source: the committed snapshot, wrapped so it unpacks to the same
   # build directory name (`source`) as the real tree.
+  hasDepsBase = depsBase != null && lib.pathExists depsBase;
+
   depsBaseSrc =
-    if depsBase != null && lib.pathExists depsBase then
+    if hasDepsBase then
       lib.fileset.toSource { root = depsBase; fileset = depsBase; }
     else
       lib.warn "nix/deps-base is missing; falling back to a full (slow) deps build" srcSet;
 
-  depsVersion =
-    (builtins.fromTOML (builtins.readFile (r + "/Cargo.toml"))).workspace.package.version or "0.0.1";
+  depsVersionOf = root:
+    (builtins.fromTOML (builtins.readFile (toString root + "/Cargo.toml"))).workspace.package.version or "0.0.1";
+  depsVersion = depsVersionOf src;
 
   depsCommonArgs = hostArgs // {
     pname = pname;
@@ -319,13 +348,37 @@ let
     (m: "cargo check --locked -p ${m.name} --all-targets 2>&1 | tee -a \"$NIX_BUILD_TOP/cargo.log\" >&2")
     disc.nativeOff;
 
+  # L0's cargo command is read from the SNAPSHOT's manifests, never the live tree's (RT-76). The
+  # snapshot is the only thing L0 builds, so it is the only thing L0 may be keyed by: derived from
+  # the live tree, the `--exclude` list and the native-off `-p` passes made L0 a different
+  # derivation in every product even over a byte-identical snapshot, and no product could
+  # substitute the layer the template's CI had already pushed. Upstream `cli new` keeps that
+  # snapshot byte for byte; auspex has its own rebased snapshot instead. What still reaches
+  # L0 from the product: the pins, `pname`, and the live lock's git-source gate
+  # (`stableVendorDir`), each of which makes L0 product-private, never wrong.
+  # Upstream `check-template` asserts the two `drvPath`s agree; auspex has no such gate.
+  depsBaseDisc = if hasDepsBase then import ./discovery.nix { inherit lib; } depsBase else disc;
+  depsL0ExtraArgs =
+    let excluded = concatMapStringsSep " " (m: "--exclude ${m.name}") depsBaseDisc.hostExcluded;
+    in "--locked --workspace${optionalString (depsBaseDisc.hostExcluded != [ ]) " ${excluded}"}";
+  depsL0NativeOffCheck = concatMapStringsSep "\n"
+    (m: "cargo check --locked -p ${m.name} --all-targets") depsBaseDisc.nativeOff;
+
+  depsCraneLib =
+    if depsToolchain == null then craneLib else craneLib.overrideToolchain (_: depsToolchain);
+
   # L0 — the frozen snapshot.
-  depsL0 = craneLib.buildDepsOnly (depsCommonArgs // {
+  # The preflight is for the live workspace, not the frozen snapshot. Keep it out of
+  # L0's inputs so changing the diagnosis does not rebuild the bottom dependency layer.
+  depsL0 = depsCraneLib.buildDepsOnly ((if hasDepsBase then
+    builtins.removeAttrs depsCommonArgs [ "preBuild" ] else depsCommonArgs) // {
     src = depsBaseSrc;
+    version = if hasDepsBase then depsVersionOf depsBase else depsVersion;
+    cargoExtraArgs = depsL0ExtraArgs;
     buildPhaseCargoCommand = ''
-      cargoWithProfile check ${cargoExtraArgs} --all-targets
-      cargoWithProfile build ${cargoExtraArgs}
-      ${nativeOffCheck}
+      cargoWithProfile check ${depsL0ExtraArgs} --all-targets
+      cargoWithProfile build ${depsL0ExtraArgs}
+      ${depsL0NativeOffCheck}
     '';
   });
 
@@ -382,6 +435,7 @@ let
   # nothing else. `--locked -p <crate>` builds that one crate's binaries; a service that needs a
   # second binary adds a `[[bin]]`, not a second entry here.
   servicePackage = svc: craneLib.buildPackage (commonArgs // {
+    preBuild = hostArgs.preBuild;
     pname = svc.pname;
     version = depsVersion;
     cargoArtifacts = depsL1;
@@ -794,7 +848,7 @@ let
         echo "VM auth environments: issuer for auth; public URL and test cookie key only for web login" > $out
       '';
 
-  # The wasm closure gets the fixed vendor path but not the two-layer split ([ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/9a40690b725310f872572c0b9450c35da9615e1f/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md)).
+  # The wasm closure gets the fixed vendor path but not the two-layer split ([ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/8aaabf5c1f90d6a725b2f82526b55cf057a7d3da/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md)).
   wasmArtifacts =
     if disc.wasmCrates == [ ] then null
     else
@@ -896,7 +950,7 @@ let
       # it into an error naming the tool; and the Trunk.toml tool pins are dropped so the
       # nixpkgs tools are used whatever version nixpkgs ships (the pins are for devenv users).
       trunkExtraBuildArgs = "--offline=true";
-      preBuild = ''
+      preBuild = hostArgs.preBuild + ''
         export HOME="$NIX_BUILD_TOP/home"
         export XDG_CACHE_HOME="$HOME/.cache"
         mkdir -p "$XDG_CACHE_HOME"
@@ -1110,6 +1164,10 @@ let
 
   packages = pureSet // {
     "ci-pure" = ciPure;
+    # Not a stage: upstream exposes this so `check-template` can assert a generated product's
+    # bottom layer is the template's derivation (RT-76) — `devenv eval outputs.deps-l0.drvPath`
+    # in both trees. Auspex has no such gate; this remains available for manual inspection.
+    "deps-l0" = depsL0;
     "ci-android-generated" = ciAndroidGenerated;
   } // nonPureExtra;
 

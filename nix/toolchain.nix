@@ -8,7 +8,13 @@
 # shared discovery derives from the tree — a web shell implies wasm32, an Android project
 # the four Android triples, an Apple project the three Apple triples. No module contributes
 # targets by hand any more.
-{ pkgs, lib, rust-overlay }:
+#
+# `hostOnly` drops the cross targets: the toolchain the bottom dependency layer is built with
+# (nix/ci.nix, `depsToolchain`). That layer compiles for the host and nothing else, and the
+# target list is the one input that differs between a template with a web shell and Android
+# and a product without them — so building the layer with the full list made it a different
+# derivation in every product whose app set differed, over the same snapshot (RT-76).
+{ pkgs, lib, rust-overlay, hostOnly ? false }:
 let
   versions = import ./versions.nix;
   discovery = import ./pipeline/discovery.nix { inherit lib; } ../.;
@@ -18,5 +24,5 @@ mkToolchain {
   inherit pkgs rust-overlay;
   channel = versions.rust.channel;
   version = "latest";
-  targets = discovery.rustTargets;
+  targets = if hostOnly then [ ] else discovery.rustTargets;
 }
