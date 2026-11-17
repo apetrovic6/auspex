@@ -17,19 +17,44 @@ kind = "shell"
 [lints]
 workspace = true
 
+# A library and a thin binary over it, so the integration tests can render the demo with
+# ratatui's `TestBackend`, drive the key mapping and load the config without a terminal.
+[lib]
+name = "auspex_tui"
+
+[[bin]]
+name = "auspex-tui"
+path = "src/main.rs"
+
 [dependencies]
 auspex-core = { path = "../../core" }
-anyhow.workspace = true
-tokio.workspace = true
+auspex-domain = { path = "../../../../crates/auspex-domain" }
+auspex-effects = { path = "../../../../crates/auspex-effects" }
+clap.workspace = true
+crux_core.workspace = true
 ratatui.workspace = true
 # Inherited with `event-stream` on: see the root Cargo.toml for why the loop needs it.
 crossterm.workspace = true
+serde_json.workspace = true
+# `rt` for `TaskTracker`: on quit or a signal the shell waits for every adapter call to kill
+# and reap what it started before the runtime goes. Already in the graph (auspex-effects).
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "signal"] }
 tokio-stream.workspace = true
-# The count is a number and the sentence around it comes from `crates/i18n` (ADR 0016), so
-# a scaffolded app starts with the translations wired rather than adding them after the
-# first string. No `leptos`: a terminal shell has no business linking a web framework, and
-# this crate is the proof that the translations stand without one. `detect` is the system
-# locale reader (ADR 0015) — platform code rather than a framework, and off by default for
-# the same reason. `format` is the number formatter (ADR 0017): the count reaches the
-# sentence as an `i64`, and `Display` writes no locale's separators.
-i18n = { path = "../../../../crates/i18n", features = ["detect", "format"] }
+# The config file. The version the workspace's other TOML readers (xtask, i18n-keygen)
+# already pull in, so nothing new enters Cargo.lock.
+toml = "0.9"
+# Column widths: badge glyphs and machine names are measured in terminal cells, not bytes
+# or chars, or a long or wide name would push every column after it. ratatui's own.
+unicode-width = "0.2"
+# Opening the theme file non-blocking (`O_NONBLOCK`), so a FIFO cannot block start-up. Already in
+# the graph with `fs` (auspex-effects).
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "signal", "test-util"] }
+# Checking that a fake child is gone, by pid, without `unsafe`. Already in the graph.
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
+# Only for `tests/translations.rs`; see the comment there. `format` for `plural_key`.
+i18n = { path = "../../../../crates/i18n", features = ["format"] }

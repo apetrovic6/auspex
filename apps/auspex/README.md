@@ -17,6 +17,33 @@ just apps/auspex/dev              # format, lint, build and test every crate her
 just apps/auspex/shells/tui/run
 ```
 
+## Running it
+
+```sh
+auspex                       # the TUI, read-only (observe mode)
+auspex --plain               # scan once, print one line per machine, exit
+auspex --json                # scan once, print the fleet report (the versioned contract)
+auspex --demo                # a scripted fleet: no machine, nix, cache or network is touched
+auspex --flake ~/clan/fleet  # the fleet flake; else CLAN_DIR, then config `flake`, then .
+```
+
+Headless exit status: 0 for a scan that completed with no fleet-level error; 1 only when the
+fleet has a problem (the machine list or the evaluator failed, or `timeouts.settle` cut the
+scan short); 2 when auspex itself could not do its job (a usage or config error, no usable
+terminal, the report could not be written, a closed pipe on stdout); 128 + n after signal n.
+Unreachable or out-of-date machines are findings, not failures. With Prometheus configured
+but unreachable, headless mode says so on stderr and takes health from ssh.
+
+The package carries `nix-eval-jobs` (used only when none is on `PATH`), which with the nix
+libraries it links adds about 170 MiB to the closure: the price of `nix run` working on a
+system without it.
+
+In the TUI, `?` lists the live keymap (`[keymap]` in the config rebinds any action; an empty
+list unbinds it) and `L` shows the log: eval cache hits, caching off and why, config
+warnings. A plain-path fleet inside a git repository is evaluated as a `git+file`
+reference, so **a machine file that is not tracked yet is not evaluated** (the same rule as
+`nix build .#…`): `git add` it.
+
 ## Installing
 
 Run directly with `nix run git+https://forge.noosphere.uk/manjo/auspex`, or add

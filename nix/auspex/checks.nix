@@ -51,10 +51,10 @@ let
     "auspex-full: every fixture leaf must be covered by a declared settings option";
     full.config.xdg.configFile."auspex/config.toml".source;
   unknown = (evaluate { programs.auspex.settings.future.answer = 42; }).config;
-  unsignedPaths = map (name: [ "timeouts" name ]) [ "ssh_connect" "probe" "eval" "settle" ]
-    ++ [ [ "prometheus" "stale_after" ] ];
+  timeoutPaths = map (name: [ "timeouts" name ]) [ "ssh_connect" "probe" "eval" "settle" ];
+  unsignedPaths = [ [ "prometheus" "stale_after" ] ];
   positivePaths = [ [ "eval" "workers" ] [ "eval" "max_memory_mb" ] ];
-  numberOK = positive: path:
+  numberOK = positive: max: path:
     let
       type = lib.foldl' (type: name: (type.getSubOptions [ ]).${name}.type) settingsType path;
       probe = value: lib.getAttrFromPath path (evaluate {
@@ -63,7 +63,8 @@ let
       rejected = value: !(builtins.tryEval (builtins.deepSeq (probe value) true)).success;
     in probe 1 == 1 && !type.check "ten" && rejected "ten"
       && !type.check (-1) && rejected (-1)
-      && (if positive then !type.check 0 && rejected 0 else probe 0 == 0);
+      && (if positive then !type.check 0 && rejected 0 else probe 0 == 0)
+      && (max == null || (probe max == max && !type.check (max + 1) && rejected (max + 1)));
   slots = map (s: "base${s}") [ "00" "01" "02" "03" "04" "05" "06" "07" "08" "09" "0A" "0B" "0C" "0D" "0E" "0F" ];
   palette = builtins.listToAttrs (lib.imap0 (index: slot: {
     name = slot;
@@ -136,8 +137,9 @@ in {
   auspex-full = compareToml "full" fullSource expected;
   auspex-freeform = compareToml "freeform" unknown.xdg.configFile."auspex/config.toml".source { future.answer = 42; };
   # Positive evaluation and the declared type guard prevent an unrelated throw from passing.
-  auspex-types = check "types" (builtins.all (numberOK false) unsignedPaths
-    && builtins.all (numberOK true) positivePaths);
+  auspex-types = check "types" (builtins.all (numberOK false null) unsignedPaths
+    && builtins.all (numberOK true null) positivePaths
+    && builtins.all (numberOK true 86400) timeoutPaths);
   auspex-stylix = compareToml "stylix" [
     stylix.xdg.configFile."auspex/theme.toml".source
     prefixed.xdg.configFile."auspex/theme.toml".source

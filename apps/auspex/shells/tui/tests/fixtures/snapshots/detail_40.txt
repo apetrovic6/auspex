@@ -1,0 +1,24 @@
+┌ mars ────────────────────────────────┐
+│badges    ✗ unreachable               │
+│status    unreachable                 │
+│reason    ssh: connect to host        │
+│          192.168.1.20 port 22:       │
+│          Connection timed out        │
+│host      root@192.168.1.20 (inventory│
+│          deploy.targetHost)          │
+│build     localhost                   │
+│class     nixos  tags: k8s, k8s-master│
+│lints     none                        │
+│current   —                           │
+│pending   bp4hxan3                    │
+│          nixos-system-mars-25.11.2026│
+│          1101.6a2f1c0                │
+│revision  not set                     │
+│failed    unknown                     │
+│uptime    —                           │
+│disk      —                           │
+│load      —                           │
+│memory    —                           │
+└──────────────────────────────────────┘
+log: eval results stored in the cache: …
+OBSERVE │ settled │ 0 pending │ prom: ok

@@ -15,6 +15,9 @@ let
   };
   section = options: mkOption { type = table options; default = { }; };
   seconds = description: optional types.ints.unsigned description;
+  # auspex refuses a timeout of 0 or over a day (the shell's config loader, `MAX_TIMEOUT`); the
+  # module refuses the same, so a home-manager switch fails rather than auspex.
+  timeout = description: optional (types.ints.between 1 86400) description;
   colors = config.lib.stylix.colors or null;
   slots = map (n: "base${n}") [
     "00" "01" "02" "03" "04" "05" "06" "07"
@@ -44,10 +47,10 @@ in {
       type = table {
         flake = optional types.str "Fleet flake path; --flake and CLAN_DIR take precedence.";
         timeouts = section {
-          ssh_connect = seconds "SSH connection timeout in seconds.";
-          probe = seconds "Whole-machine probe timeout in seconds.";
-          eval = seconds "Per-machine evaluation timeout in seconds.";
-          settle = seconds "Headless fleet settling timeout in seconds.";
+          ssh_connect = timeout "SSH connection timeout in seconds.";
+          probe = timeout "Whole-machine probe timeout in seconds.";
+          eval = timeout "Per-machine evaluation timeout in seconds.";
+          settle = timeout "Headless fleet settling timeout in seconds.";
         };
         eval = section {
           workers = optional types.ints.positive "Number of nix-eval-jobs workers.";
