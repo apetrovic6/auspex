@@ -42,6 +42,11 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant unmaintained; merged into zbus 6; via the gpui desktop stack's zbus 5" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names unmaintained; merged into zbus 6; via the gpui desktop stack's zbus 5" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive unmaintained; merged into zbus 6; via the gpui desktop stack's zbus 5" },
+    # the template's translation crate: `crates/i18n` formats dates with chrono, and
+    # reaches the workspace only through `tools/xtask` and as a test dependency of the
+    # terminal shell (checked with `cargo tree -i chrono` on 2026-11-17). Published
+    # 2026-11-16; it broke `just deny` on every branch at once.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; via the template's crates/i18n" },
 ]
 
 [licenses]
