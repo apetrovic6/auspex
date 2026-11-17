@@ -365,6 +365,46 @@ async fn the_worktree_cap_is_a_total() {
     assert!(e.contains("larger than"), "{e}");
 }
 
+/// Review finding F6: the index listing is capped at 64 MiB, exactly. A git whose
+/// `ls-files` prints one byte more is "no caching"; at the cap it is read (all NULs: no
+/// records, so a key).
+///
+/// Whether the exit is seen before the last bytes are read depends on the machine (the
+/// forge runner saw it, this machine did not); both orders must give the same answer, and
+/// the unit tests in `cache.rs` force the late order. Each git command gets 60 s, not the
+/// default 2 s: piping 64 MiB through a fake on a loaded runner is not what the default is
+/// sized for, and a timeout here would hide which answer the cap gave.
+#[tokio::test]
+async fn the_index_listing_cap_is_64_mib() {
+    let Some(t) = tools(&["git", "head"]) else {
+        return;
+    };
+    let Some(r) = repo() else { return };
+    let side = tempdir();
+    for (len, over) in [(64 << 20, false), ((64 << 20) + 1, true)] {
+        let fake = t.script(
+            side.path(),
+            &format!("git{len}"),
+            &format!(
+                "case \" $* \" in *' ls-files '*) exec @head@ -c {len} /dev/zero;; esac\nexec @git@ \"$@\""
+            ),
+        );
+        let mut g = GitParams::new();
+        g.program = fake.as_os_str();
+        g.timeout = Duration::from_secs(60);
+        let start = Instant::now();
+        let k = key_for(r.path(), &g, &CancellationToken::new())
+            .await
+            .unwrap();
+        eprintln!("{len} bytes: {:?}", start.elapsed());
+        let printed = format!("git ls-files printed more than {} bytes", 64 << 20);
+        match k {
+            Err(e) => assert!(over && e == printed, "{len}: {e}"),
+            Ok(_) => assert!(!over, "{len} bytes were accepted"),
+        }
+    }
+}
+
 /// Review mutation R09: an inherited `GIT_DIR` or `GIT_INDEX_FILE` does not redirect git.
 /// Run in a child test process, since the variables must be in this crate's own
 /// environment and `set_var` is `unsafe`.
@@ -717,4 +757,57 @@ async fn no_prlimit_inner() {
     };
     let e = key(Path::new(&repo)).await.unwrap_err();
     assert!(e.contains("prlimit"), "{e}");
+}
+
+/// Review F4 (mutation M17): a git directory whose path contains a newline. `rev-parse`
+/// prints it before HEAD's id, so only the last line is the id.
+#[tokio::test]
+async fn a_git_directory_path_with_a_newline_is_keyed() {
+    if !have_git() {
+        return;
+    }
+    let base = tempdir();
+    let r = base.path().join("fleet\nrepo");
+    fs::create_dir(&r).unwrap();
+    fs::write(r.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+    git(&r, &["init", "-q"]);
+    git(&r, &["add", "flake.nix"]);
+    git(&r, &["commit", "-q", "-m", "one"]);
+    let k = key(&r).await;
+    assert!(k.is_ok(), "{k:?}");
+}
+
+/// Review F4 (mutation M18): the key of a fixed repository, pinned. The run guard must
+/// never change the key, so entries written by `master` keep hitting; this value was
+/// computed by `master` (`a818479`) and by this branch alike.
+#[tokio::test]
+async fn the_key_of_a_fixed_repository_is_pinned() {
+    if !have_git() {
+        return;
+    }
+    let r = tempdir();
+    fs::write(r.path().join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+    fs::write(r.path().join("flake.lock"), "{}\n").unwrap();
+    git(r.path(), &["init", "-q"]);
+    git(r.path(), &["add", "flake.nix", "flake.lock"]);
+    let ok = Command::new("git")
+        .current_dir(r.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00Z")
+        .args(["-c", "user.name=auspex", "-c", "user.email=auspex@invalid"])
+        .args(["commit", "-q", "-m", "pinned"])
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    assert_eq!(
+        git(r.path(), &["rev-parse", "HEAD"]).trim(),
+        "579811899085928f2cda55b0b05dae39e78bffad",
+        "the fixture commit is not the pinned one"
+    );
+    assert_eq!(
+        key(r.path()).await.unwrap().as_str(),
+        "v1-1aecae61c518e1837e9cc6720f719d1ce33bcbdbe7f1543da606d89a2d4de668"
+    );
 }

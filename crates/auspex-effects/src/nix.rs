@@ -316,7 +316,17 @@ pub async fn inventory(
             "listing machines: nix eval {}",
             describe_status(Some(s))
         ))),
-        End::Exited(_) => parse_inventory(&lossy(&ran.stdout)).map_err(|e| e.to_string()),
+        End::Exited(_) => match ran.whole_stdout() {
+            Ok(out) => parse_inventory(&lossy(out)).map_err(|e| e.to_string()),
+            Err(true) => Err(format!(
+                "listing machines: nix eval printed more than {INVENTORY_STDOUT_CAP} bytes"
+            )),
+            Err(false) => Err(
+                "listing machines: nix eval exited, but its output was not read to the end \
+                 (something still held it open)"
+                    .to_owned(),
+            ),
+        },
     })
 }
 
@@ -631,8 +641,16 @@ impl Collector<'_> {
     }
 }
 
+/// The run error of an evaluator whose output was not read to its end.
+const UNFINISHED: &str = "nix-eval-jobs exited, but its output was not read to the end \
+                          (something still held it open); machines without a result were \
+                          not evaluated";
+
 enum Stop {
     Exited(ExitStatus),
+    /// Exited 0, but its stdout was not read to the end: a process outside its group still
+    /// held it open at the deadline, or reading it failed.
+    Unfinished,
     TimedOut,
     Cancelled,
     WaitFailed(std::io::Error),
@@ -737,6 +755,7 @@ pub async fn evaluate(
             sp.kill_and_reap().await;
             return Err(Cancelled);
         }
+        Stop::Unfinished => Some(UNFINISHED.to_owned()),
         Stop::Exited(s) if s.success() => None,
         Stop::Exited(s) => Some(format!("nix-eval-jobs {}", describe_status(Some(s)))),
         Stop::TimedOut => {
@@ -759,9 +778,12 @@ pub async fn evaluate(
     Ok(())
 }
 
-/// Reads the evaluator's output until it exits and its pipes
-/// are drained (or [`PIPE_GRACE`] after exit), the deadline passes, or the call is
-/// cancelled. On exit the rest of the group has already been killed ([`Spawned::exited`]).
+/// Reads the evaluator's output until it exits and its pipes are drained, the deadline
+/// passes, or the call is cancelled. On exit the rest of the group has already been killed
+/// ([`Spawned::exited`]), so what is left is at most a pipe buffer: stdout is read until it
+/// ends or the deadline (at least [`PIPE_GRACE`] after the exit), stderr for
+/// [`PIPE_GRACE`]. A stdout that did not end is [`Stop::Unfinished`], never a complete
+/// run.
 async fn pump<R: tokio::io::AsyncRead + Unpin>(
     sp: &mut Spawned,
     lines: &mut Option<Lines<R>>,
@@ -771,16 +793,25 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Stop {
-    let mut grace: Option<Instant> = None;
+    let mut grace: Option<(Instant, Instant)> = None;
     let mut exited: Option<ExitStatus> = None;
+    let finish = |s: ExitStatus, lines: &Option<Lines<R>>| {
+        // A failed exit is reported as such; an unfinished output adds nothing to it.
+        if !s.success() || lines.as_ref().is_none_or(|l| l.eof) {
+            Stop::Exited(s)
+        } else {
+            Stop::Unfinished
+        }
+    };
     loop {
         let out_done = lines.as_ref().is_none_or(|l| l.done);
         if let Some(s) = exited
             && out_done
             && err.done
         {
-            break Stop::Exited(s);
+            break finish(s, lines);
         }
+        let (grace_at, limit_at) = grace.unwrap_or((deadline, deadline));
         tokio::select! {
             biased;
             () = cancel.cancelled() => break Stop::Cancelled,
@@ -789,13 +820,20 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
             status = sp.exited(), if exited.is_none() => match status {
                 Ok(s) => {
                     exited = Some(s);
-                    grace = Some(Instant::now() + PIPE_GRACE);
+                    let at = Instant::now() + PIPE_GRACE;
+                    grace = Some((at, at.max(deadline)));
                 }
                 Err(e) => break Stop::WaitFailed(e),
             },
-            () = sleep_until(grace.unwrap_or(deadline)), if grace.is_some() => {
+            () = sleep_until(limit_at), if grace.is_some() => {
                 if let Some(s) = exited {
-                    break Stop::Exited(s);
+                    break finish(s, lines);
+                }
+            }
+            // Past the grace, only an unfinished stdout is waited for.
+            () = sleep_until(grace_at), if grace.is_some() && out_done => {
+                if let Some(s) = exited {
+                    break finish(s, lines);
                 }
             }
             line = next_line(lines), if !out_done => {
@@ -915,6 +953,32 @@ mod tests {
             "{rel:?} under {}",
             cwd.display()
         );
+    }
+
+    /// Review item T1 (mutation X01): a `.git` *file* (a linked worktree or a submodule)
+    /// makes its directory the top, even inside another checkout.
+    #[test]
+    fn a_git_file_marks_its_own_top() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(top.join(".git")).unwrap();
+        let wt = top.join("nested-wt");
+        std::fs::create_dir(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ../.git/worktrees/nested-wt\n").unwrap();
+        let f = FlakeRef::new(wt.to_str().unwrap()).unwrap();
+        assert_eq!(f.as_str(), format!("git+file://{}/", wt.display()));
+        assert_eq!(f.repo_top(), Some(wt.as_path()));
+    }
+
+    /// Review item T2 (mutation X18): a `path:` reference is percent-encoded, so a
+    /// directory named like a query names that directory, not a `dir=` inside another.
+    #[test]
+    fn a_path_reference_encodes_query_syntax() {
+        let tmp = tempfile::tempdir().unwrap();
+        let q = tmp.path().join("q?dir=sub");
+        std::fs::create_dir(&q).unwrap();
+        let f = FlakeRef::new(q.to_str().unwrap()).unwrap();
+        assert!(f.as_str().ends_with("/q%3Fdir=sub"), "{f:?}");
     }
 
     #[test]
