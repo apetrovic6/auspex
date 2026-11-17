@@ -78,6 +78,7 @@
             pname = "cli";
             version = "0.1.0";
             src = ./. ;
+            preBuild = result.hostArgs.preBuild;
             cargoExtraArgs = "--locked -p cli";
             doCheck = false;
           };

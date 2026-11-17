@@ -32,7 +32,6 @@ authority on *what* the repository does; these are the authority on *why*.
 | [0028](0028-native-shells-log-in-with-oauth2-not-openidconnect.md) | Native shells log in with oauth2, not openidconnect | Accepted |
 | [0029](0029-web-login-bff-with-stateless-encrypted-cookie.md) | Web login through the service (BFF) with stateless encrypted cookie + Web Locks | Accepted |
 | [0031](0031-the-product-is-its-own-token-issuer.md) | The product is its own token issuer: email/password and Sign in with Google | Accepted |
-| [0100](0100-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md) | Snapshot-keyed dependency layers and generator lock refresh (RT-76) | Accepted |
 
 ## Writing one
 

@@ -5,7 +5,7 @@ Registry drift is the set difference of (name, version) pairs whose checksum dif
 between the two locks (changed + added). It is a lower bound, not an estimate: one
 changed package recompiles itself plus every crate that depends on it, so the actual
 recompile count is what the delta deps layer (L1 in nix/ci.nix) prints in CI
-("layered deps: L1 compiled N registry crates"). The rebase policy in [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/9a40690b725310f872572c0b9450c35da9615e1f/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md) is
+("layered deps: L1 compiled N registry crates"). The rebase policy in [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/8aaabf5c1f90d6a725b2f82526b55cf057a7d3da/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md) is
 written against that count; this script is the cheap, build-free "is the snapshot
 stale at all" check.
 
@@ -76,7 +76,7 @@ def main():
         print(
             "at least this many crates recompile in L1, plus their dependents; "
             "the authoritative count is the 'layered deps: L1 compiled N registry crates' "
-            "line in CI. See [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/9a40690b725310f872572c0b9450c35da9615e1f/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md) for when to run just deps::rebase-deps."
+            "line in CI. See [ADR 0025](https://forge.ugalabugala.org/manjo/rust-app-template/src/commit/8aaabf5c1f90d6a725b2f82526b55cf057a7d3da/docs/adr/0025-dependency-artifacts-are-a-frozen-layer-and-a-delta-layer.md) for when to run just deps::rebase-deps."
         )
     return 0
 
