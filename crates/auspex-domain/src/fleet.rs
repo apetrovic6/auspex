@@ -866,8 +866,9 @@ pub const PROBE_REMOTE_COMMAND: &str = "/bin/sh -s";
 ///
 /// - with no controlling terminal: in a new session (`setsid`), with stdin a pipe (the probe
 ///   script) and stdout and stderr pipes, never inherited from the TUI; and
-/// - with `SSH_ASKPASS` removed from its environment, or `SSH_ASKPASS_REQUIRE=never` set, so
-///   that ssh cannot fall back to a graphical prompt either.
+/// - with `SSH_ASKPASS_REQUIRE=never` set, so ssh cannot fall back to a graphical prompt.
+///   Removing `SSH_ASKPASS` is optional, but not sufficient: ssh has a built-in default
+///   askpass program even when that variable is absent.
 ///
 /// The effects layer's tests should check both, because nothing in this crate can.
 ///
@@ -1593,6 +1594,50 @@ mod tests {
         // Given twice: ssh would silently use the first.
         let why = forbidden_why("host?Compression=yes&compression=no");
         assert!(why.contains("twice"), "{why}");
+    }
+
+    #[test]
+    fn allowed_option_value_sets_are_exact() {
+        for (name, words) in [
+            ("AddressFamily", &["any", "inet", "inet6"][..]),
+            ("IdentitiesOnly", &["yes", "no"][..]),
+            ("PubkeyAuthentication", &["yes", "no"][..]),
+            ("Compression", &["yes", "no"][..]),
+            ("TCPKeepAlive", &["yes", "no"][..]),
+            (
+                "IPQoS",
+                &[
+                    "af11", "af12", "af13", "af21", "af22", "af23", "af31", "af32", "af33", "af41",
+                    "af42", "af43", "cs0", "cs1", "cs2", "cs3", "cs4", "cs5", "cs6", "cs7", "ef",
+                    "le", "none",
+                ][..],
+            ),
+        ] {
+            let (_, Accepts::OneOf(accepted)) = ALLOWED_OPTIONS
+                .iter()
+                .find(|(option, _)| *option == name)
+                .unwrap()
+            else {
+                panic!("{name} must accept only its enumerated words")
+            };
+            assert_eq!(*accepted, words, "{name}");
+            for word in words {
+                assert_eq!(t(&format!("host?{name}={word}")).options()[0].1, *word);
+            }
+            assert!(Target::parse(&format!("host?{name}=ask")).is_err());
+        }
+    }
+
+    #[test]
+    fn option_value_character_fence_is_independent() {
+        for c in '\0'..='\u{7f}' {
+            let expected =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-".contains(c);
+            assert_eq!(is_value_char(c), expected, "{c:?}");
+        }
+        for c in ['é', '\u{202e}', '\u{ff21}'] {
+            assert!(!is_value_char(c), "{c:?}");
+        }
     }
 
     #[test]

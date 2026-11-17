@@ -8,7 +8,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 
-use auspex_domain::eval::{EvalOutcome, parse_eval_line};
+use auspex_domain::eval::{EvalFailure, EvalOutcome, parse_eval_line};
 use auspex_domain::fleet::{
     Machine, MachineClass, SharedIp, TargetSource, parse_inventory, resolve_target, shared_ips,
 };
@@ -157,7 +157,7 @@ fn rest(
                 probe: p,
                 eval: evals.get(m.name.as_str()),
                 cache: if m.name == "terra" {
-                    NarCache::Cached
+                    NarCache::Failed
                 } else {
                     NarCache::NotApplicable
                 },
@@ -605,4 +605,44 @@ fn scan_in_progress_is_not_settled() {
     assert!(fleet_report(vec![one], vec![], complete()).settled);
     // An empty fleet whose scan really is complete is settled (and healthy).
     assert!(fleet_report(vec![], vec![], complete()).settled);
+}
+
+#[test]
+fn evaluator_exit_without_a_result_settles_as_an_error() {
+    let m = terra();
+    let p = probe(&format!(
+        "probe=nixos\ncurrent_system={TERRA_NOW}\nsystem_state=running\nfailed_units=[]\n"
+    ));
+    let e = EvalOutcome::Error(EvalFailure::no_result("terra"));
+    assert_eq!(e.machine(), Some("terra"));
+    let EvalOutcome::Error(failure) = &e else {
+        panic!()
+    };
+    assert_eq!(failure.attr, "terra");
+    let raw_machine = "te\u{1b}]0;pwn\u{7}rra\u{202e}";
+    let display_failure = EvalFailure::no_result(raw_machine);
+    assert_eq!(display_failure.attr, "terra");
+    assert_eq!(
+        EvalOutcome::Error(display_failure).machine(),
+        Some(raw_machine)
+    );
+    assert_eq!(
+        failure.error_tail,
+        ["error: evaluator exited without a result for this machine"]
+    );
+    let row = machine_report(
+        &m,
+        &resolve_target(&m, None),
+        &MachineFacts {
+            probe: Some(&p),
+            eval: Some(&e),
+            ..MachineFacts::default()
+        },
+        Health::default(),
+        &[],
+    );
+    assert_eq!(row.status, Badge::EvalError);
+    assert_eq!(row.reason.as_deref(), failure.summary());
+    assert!(row.settled);
+    assert!(fleet_report(vec![row], vec![], complete()).settled);
 }

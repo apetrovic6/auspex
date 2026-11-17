@@ -118,8 +118,8 @@ pub enum NarCache {
     /// pending, or no successful eval).
     #[default]
     NotApplicable,
-    /// The lookup was (or is about to be) sent and has not answered. The machine is not
-    /// settled.
+    /// The lookup was (or is about to be) sent and has not answered. Keeps an update-pending
+    /// machine unsettled; ignored when its answer cannot change the row.
     Pending,
     /// The lookup failed (unreachable, timed out, an HTTP error other than 404). The badge
     /// cannot be shown, but nothing more is coming.
@@ -134,7 +134,10 @@ pub enum NarCache {
 ///
 /// That is, other than its probe, eval and ncps lookup, which carry their own "not back
 /// yet". Every flag that is `true` keeps the machine from settling. The default is "nothing
-/// outstanding".
+/// outstanding". Set each applicable flag before publishing a row that can receive that
+/// answer, and clear it only when the answer or a terminal failure arrives. Leaving a
+/// flag false while its request is outstanding permits premature settlement and later
+/// changes to health or alert badges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Outstanding {
     /// The Prometheus answer that feeds this machine's health is not back.
@@ -151,6 +154,14 @@ pub struct MachineFacts<'a> {
     /// The evaluation's outcome.
     pub eval: Option<&'a EvalOutcome>,
     /// The ncps lookup for the pending toplevel.
+    ///
+    /// Defaults to [`NarCache::NotApplicable`], meaning no lookup will change this row.
+    /// With a cache configured, set [`NarCache::Pending`] in the same update that makes
+    /// an update pending (the probe or eval arriving second), before publishing the row,
+    /// even if the request has not been sent yet. It may also be set when a successful
+    /// eval arrives first. Replace it with the terminal lookup outcome when it answers.
+    /// Leaving the default when a lookup will follow allows premature settlement and a
+    /// later change to the cached badge or failure reason.
     pub cache: NarCache,
     /// Frozen in the config.
     pub frozen: bool,
@@ -165,22 +176,32 @@ pub struct MachineFacts<'a> {
 }
 
 impl MachineFacts<'_> {
-    /// Whether nothing more is coming for this machine, so its row can no longer change:
+    /// Whether this machine's probe, evaluation and applicable auxiliary answers are final:
     ///
     /// - its probe is back, or its target was refused (so it is never probed); and
     /// - its eval is back; and
-    /// - its ncps lookup is not [`NarCache::Pending`]; and
+    /// - its ncps lookup is not [`NarCache::Pending`], or no update is pending; and
     /// - no [`Outstanding`] flag is set.
     ///
     /// Computed from these facts, never from the badges, so the answer does not depend on
     /// the order in which they arrive.
+    /// Shared-IP resolution is fleet-wide: see [`crate::report::FleetFacts::scan_complete`].
     #[must_use]
     pub fn is_settled(&self) -> bool {
         (self.probe.is_some() || self.target_error.is_some())
             && self.eval.is_some()
-            && self.cache != NarCache::Pending
+            && (self.cache != NarCache::Pending || !self.update_pending())
             && !self.outstanding.prometheus
             && !self.outstanding.alerts
+    }
+
+    fn update_pending(&self) -> bool {
+        match (self.probe, self.eval) {
+            (Some(ProbeOutcome::Observed(o)), Some(EvalOutcome::Success(s))) => {
+                o.current_system.as_ref().is_some_and(|p| p != &s.out_path)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -231,7 +252,7 @@ pub fn machine_status(facts: &MachineFacts<'_>) -> MachineStatus {
     let not_installed = observation.is_some_and(|o| o.current_system.is_none());
     let current = observation.and_then(|o| o.current_system.as_ref());
     let in_sync = pending.is_some() && current == pending;
-    let update_pending = pending.is_some() && current.is_some() && !in_sync;
+    let update_pending = facts.update_pending();
 
     let (primary, reason) = if let Some(r) = unreachable_reason {
         (Badge::Unreachable, Some(r))
@@ -253,7 +274,12 @@ pub fn machine_status(facts: &MachineFacts<'_>) -> MachineStatus {
         (Badge::InSync, None)
     } else {
         let name = pending.map_or("", |p| p.name());
-        (Badge::UpdatePending, Some(format!("pending {name}")))
+        let note = if facts.cache == NarCache::Failed {
+            "; cache lookup failed"
+        } else {
+            ""
+        };
+        (Badge::UpdatePending, Some(format!("pending {name}{note}")))
     };
 
     // Health qualifies a machine that is up. All its notes are appended to the reason of a
@@ -516,6 +542,15 @@ mod tests {
             });
             assert_eq!(s.primary, B_::UpdatePending);
             assert_eq!(s.badges, want);
+            assert_eq!(
+                s.reason.as_deref(),
+                Some(if cache == NarCache::Failed {
+                    "pending nixos-system-terra-b; cache lookup failed"
+                } else {
+                    "pending nixos-system-terra-b"
+                }),
+                "{cache:?}"
+            );
         }
 
         // Cached is only shown with ↑.
@@ -955,5 +990,96 @@ mod tests {
             }
             .is_settled()
         );
+    }
+    #[test]
+    fn refused_target_preserves_observed_update_badges() {
+        let p = at(A);
+        let e = ok(B);
+        let facts = MachineFacts {
+            probe: Some(&p),
+            eval: Some(&e),
+            target_error: Some("refused"),
+            cache: NarCache::Cached,
+            ..MachineFacts::default()
+        };
+        let status = machine_status(&facts);
+        assert_eq!(status.primary, Badge::Unreachable);
+        assert_eq!(
+            status.badges,
+            [Badge::UpdatePending, Badge::Cached, Badge::Unreachable]
+        );
+        assert_eq!(status.reason.as_deref(), Some("invalid target: refused"));
+        assert!(
+            !MachineFacts {
+                cache: NarCache::Pending,
+                ..facts
+            }
+            .is_settled()
+        );
+        assert!(facts.is_settled());
+    }
+
+    #[test]
+    fn irrelevant_cache_lookup_does_not_delay_settlement() {
+        let observed = at(A);
+        let absent = probe("current_system=\n");
+        let dead = unreachable();
+        let failed = ProbeOutcome::Failed {
+            reason: "cut off".to_owned(),
+        };
+        let same = ok(A);
+        let different = ok(B);
+        let error = err();
+        for target_error in [None, Some("refused")] {
+            for p in [
+                None,
+                Some(&observed),
+                Some(&absent),
+                Some(&dead),
+                Some(&failed),
+            ] {
+                for e in [None, Some(&same), Some(&different), Some(&error)] {
+                    let facts = MachineFacts {
+                        probe: p,
+                        eval: e,
+                        target_error,
+                        cache: NarCache::Pending,
+                        ..MachineFacts::default()
+                    };
+                    let waiting_for_cache = p == Some(&observed) && e == Some(&different);
+                    let expected = (p.is_some() || target_error.is_some())
+                        && e.is_some()
+                        && !waiting_for_cache;
+                    assert_eq!(facts.is_settled(), expected, "{facts:?}");
+                    if expected {
+                        for cache in [NarCache::Cached, NarCache::NotCached, NarCache::Failed] {
+                            assert_eq!(
+                                machine_status(&facts),
+                                machine_status(&MachineFacts { cache, ..facts }),
+                                "{facts:?}: {cache:?}"
+                            );
+                        }
+                    }
+                    for outstanding in [
+                        Outstanding {
+                            prometheus: true,
+                            alerts: false,
+                        },
+                        Outstanding {
+                            prometheus: false,
+                            alerts: true,
+                        },
+                    ] {
+                        assert!(
+                            !MachineFacts {
+                                outstanding,
+                                ..facts
+                            }
+                            .is_settled()
+                        );
+                    }
+                }
+            }
+        }
     }
 }

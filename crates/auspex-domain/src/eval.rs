@@ -12,7 +12,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::observe::StorePath;
-use crate::text::sanitized_tail;
+use crate::text::{sanitize_line, sanitized_tail};
 
 // ---------------------------------------------------------------------------------------
 // nix-eval-jobs lines
@@ -26,8 +26,9 @@ pub const ERROR_TAIL_LINES: usize = 8;
 /// A machine's toplevel evaluated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalSuccess {
-    /// `attr` as nix-eval-jobs printed it, for display only. It is quoted when the name is not
-    /// a bare Nix identifier (`"\"1odd\""`), so it is never compared with a machine name.
+    /// `attr` from nix-eval-jobs, for display only. Sanitised by [`parse_eval_line`], but
+    /// not guaranteed safe for hand-built, deserialised or cache-file values. Nix quotes
+    /// non-bare identifiers (`"\"1odd\""`), so never compare this with a machine name.
     pub attr: String,
     /// `attrPath`. From [`parse_eval_line`], exactly one element: the machine's name, which
     /// [`EvalOutcome::machine`] returns.
@@ -42,8 +43,9 @@ pub struct EvalSuccess {
 /// A machine's toplevel failed to evaluate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalFailure {
-    /// `attr` as nix-eval-jobs printed it, for display only. It is quoted when the name is not
-    /// a bare Nix identifier (`"\"1odd\""`), so it is never compared with a machine name.
+    /// `attr` from nix-eval-jobs, for display only. Sanitised by [`parse_eval_line`] and
+    /// [`EvalFailure::no_result`], but not guaranteed safe for hand-built or deserialised
+    /// values. Nix quotes non-bare identifiers (`"\"1odd\""`); never use it for identity.
     pub attr: String,
     /// `attrPath`. From [`parse_eval_line`], exactly one element: the machine's name, which
     /// [`EvalOutcome::machine`] returns.
@@ -64,6 +66,22 @@ pub enum EvalOutcome {
 }
 
 impl EvalFailure {
+    /// Marks a machine for which the evaluator exited without a usable result line.
+    ///
+    /// The caller must supply this error for every such machine after draining the
+    /// evaluator's output. `error_tail` is always the single line
+    /// `"error: evaluator exited without a result for this machine"`.
+    #[must_use]
+    pub fn no_result(machine: &str) -> Self {
+        Self {
+            attr: sanitize_line(machine),
+            attr_path: vec![machine.to_owned()],
+            error_tail: vec![
+                "error: evaluator exited without a result for this machine".to_owned(),
+            ],
+        }
+    }
+
     /// One line for a status reason: the last line that starts with `error:`, or else the
     /// last line. nix prints the location (`at file.nix:12:5:`) *after* the message, so the
     /// plain last line is usually a file position rather than the reason.
@@ -154,6 +172,15 @@ fn success_fields(obj: &serde_json::Map<String, Value>) -> Result<(StorePath, St
 
 /// Parses one line of `nix-eval-jobs` output.
 ///
+/// Requires a flat attribute set mapping machine names to toplevel derivations, e.g.
+/// `nix-eval-jobs --flake .#nixosConfigurations --select
+/// 'cs: builtins.mapAttrs (_: c: c.config.system.build.toplevel) cs'`.
+/// For a single machine, still wrap its toplevel in a machine-named attribute set:
+/// never use that machine's toplevel as the root, which produces an empty `attrPath`.
+/// Nested attribute sets are not supported either. Once the evaluator exits and its
+/// output is drained, the caller must turn every machine with no usable line into an
+/// [`EvalOutcome::Error`] using [`EvalFailure::no_result`], rather than leave it waiting.
+///
 /// The line's machine is the one element of its `attrPath` (see [`EvalOutcome::machine`]);
 /// `attr` is kept for display only, and defaults to the machine when absent. Once a line
 /// names its machine, it always comes back as an [`EvalOutcome`] for it, so the machine's row
@@ -189,10 +216,10 @@ pub fn parse_eval_line(line: &str) -> Result<EvalOutcome, EvalLineError> {
         },
         _ => return Err(EvalLineError::Field("attrPath")),
     };
-    let attr = match obj.get("attr") {
-        Some(Value::String(a)) => a.clone(),
-        _ => machine.clone(),
-    };
+    let attr = sanitize_line(match obj.get("attr") {
+        Some(Value::String(a)) => a,
+        _ => &machine,
+    });
     let attr_path = vec![machine.clone()];
     let failure = |text: &str| {
         EvalOutcome::Error(EvalFailure {
@@ -423,6 +450,29 @@ mod tests {
         assert_eq!(s.attr_path, ["terra"]);
         assert_eq!(s.drv_path.as_str(), DRV);
         assert_eq!(s.out_path.as_str(), OUT);
+    }
+
+    #[test]
+    fn display_attr_is_sanitised_without_changing_machine_identity() {
+        let machine = "te\u{1b}]0;pwn\u{7}rra\u{202e}";
+        for fields in [
+            serde_json::json!({"drvPath": DRV, "outputs": {"out": OUT}}),
+            serde_json::json!({"error": "error: boom"}),
+        ] {
+            for attr in [Some(format!("\"{machine}\"")), None] {
+                let mut line = fields.clone();
+                line["attrPath"] = serde_json::json!([machine]);
+                if let Some(attr) = &attr {
+                    line["attr"] = serde_json::json!(attr);
+                }
+                let result = parse_eval_line(&line.to_string()).unwrap();
+                assert_eq!(result.machine(), Some(machine));
+                assert_eq!(
+                    result.attr(),
+                    if attr.is_some() { "\"terra\"" } else { "terra" }
+                );
+            }
+        }
     }
 
     #[test]
@@ -714,6 +764,13 @@ mod tests {
         let relabelled = CacheEntry::new(k.clone(), "luna".to_owned(), success()).to_json();
         assert_eq!(
             CacheEntry::read(relabelled.as_bytes(), &k, "terra"),
+            Err(CacheMiss::Mismatch)
+        );
+        let mut nested = success();
+        nested.attr_path.push("nested".to_owned());
+        let nested = CacheEntry::new(k.clone(), "terra".to_owned(), nested).to_json();
+        assert_eq!(
+            CacheEntry::read(nested.as_bytes(), &k, "terra"),
             Err(CacheMiss::Mismatch)
         );
         let future = bytes.replacen("\"version\":1", "\"version\":2", 1);

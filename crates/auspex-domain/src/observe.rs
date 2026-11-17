@@ -104,8 +104,8 @@ const HASH_LEN: usize = 32;
 /// nix's base-32 alphabet: digits and lowercase letters without `e`, `o`, `t` and `u`.
 const NIX32: &[u8] = b"0123456789abcdfghijklmnpqrsvwxyz";
 
-/// The longest store path name nix accepts (checked against nix 2.35.6: a 211-character
-/// derivation name evaluates, 212 is refused as invalid).
+/// The longest store path name nix accepts: 211 characters. With nix 2.35.6, the longest
+/// derivation name that evaluates is 207 characters, because `.drv` counts toward that limit.
 const MAX_NAME_LEN: usize = 211;
 
 /// The characters nix allows in a store path name, which this crate also requires of every
