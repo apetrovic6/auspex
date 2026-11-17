@@ -2412,11 +2412,16 @@ fn template_only_content_is_absent(
         }
     }
 
-    // Both copies seed a product's dependency builds. A stale snapshot must not keep an
-    // alias for a crate that the live product no longer contains.
+    // Each alias must name a crate in its own workspace. A preserved template snapshot
+    // may carry tools/cli even though the live product never does (RT-76).
     for rel in [".cargo/config.toml", "nix/deps-base/.cargo/config.toml"] {
         let path = root.join(rel);
         if !path.is_file() {
+            continue;
+        }
+        if rel.starts_with("nix/deps-base/")
+            && root.join("nix/deps-base/tools/cli/Cargo.toml").is_file()
+        {
             continue;
         }
         *checked += 1;
@@ -3148,6 +3153,25 @@ mod tests {
             assert!(problems[0].contains(rel), "{problems:#?}");
             assert!(problems[0].contains("`cargo cli` alias"), "{problems:#?}");
         }
+    }
+
+    #[test]
+    fn the_templates_snapshot_may_keep_the_cli_alias_beside_the_cli_crate() {
+        let fixture = Fixture::new("product-template-snapshot");
+        fixture
+            .file(
+                "flake.nix",
+                "template.url = \"git+https://example.com/template\";",
+            )
+            .file(
+                "nix/deps-base/.cargo/config.toml",
+                "[alias]\ncli = \"run --quiet -p cli --\"\n",
+            )
+            .file(
+                "nix/deps-base/tools/cli/Cargo.toml",
+                "[package]\nname = \"cli\"\n",
+            );
+        assert_eq!(template_only_problems(&fixture), Vec::<String>::new());
     }
 
     #[test]

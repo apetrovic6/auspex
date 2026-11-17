@@ -8,7 +8,9 @@
 # shared discovery derives from the tree — a web shell implies wasm32, an Android project
 # the four Android triples, an Apple project the three Apple triples. No module contributes
 # targets by hand any more.
-{ pkgs, lib, rust-overlay }:
+# `hostOnly` drops cross targets for the shared bottom dependency layer (RT-76).
+# A product's shell set must not change L0 over an identical dependency snapshot.
+{ pkgs, lib, rust-overlay, hostOnly ? false }:
 let
   versions = import ./versions.nix;
   discovery = import ./pipeline/discovery.nix { inherit lib; } ../.;
@@ -18,5 +20,5 @@ mkToolchain {
   inherit pkgs rust-overlay;
   channel = versions.rust.channel;
   version = "latest";
-  targets = discovery.rustTargets;
+  targets = if hostOnly then [ ] else discovery.rustTargets;
 }

@@ -28,6 +28,9 @@
   # The frozen dependency snapshot (nix/deps-base). Optional: a missing snapshot falls
   # back to a full (slow) deps build, never a wrong one.
   depsBase ? null,
+  # Keep the snapshot's host-only layer independent of the live tree's cross targets.
+  # Upper layers retain craneLib's full toolchain; cargo keys units by rustc -vV.
+  depsToolchain ? null,
   # Name used for the crane derivations (a workspace manifest has no package.name).
   pname ? (builtins.baseNameOf (toString src)),
   # The product this tree is, from `[publish].project` in versions.toml — the value `cli new`
@@ -301,14 +304,17 @@ let
 
   # The bottom layer's source: the committed snapshot, wrapped so it unpacks to the same
   # build directory name (`source`) as the real tree.
+  hasDepsBase = depsBase != null && lib.pathExists depsBase;
+
   depsBaseSrc =
-    if depsBase != null && lib.pathExists depsBase then
+    if hasDepsBase then
       lib.fileset.toSource { root = depsBase; fileset = depsBase; }
     else
       lib.warn "nix/deps-base is missing; falling back to a full (slow) deps build" srcSet;
 
-  depsVersion =
-    (builtins.fromTOML (builtins.readFile (r + "/Cargo.toml"))).workspace.package.version or "0.0.1";
+  depsVersionOf = root:
+    (builtins.fromTOML (builtins.readFile (toString root + "/Cargo.toml"))).workspace.package.version or "0.0.1";
+  depsVersion = depsVersionOf src;
 
   depsCommonArgs = hostArgs // {
     pname = pname;
@@ -319,13 +325,27 @@ let
     (m: "cargo check --locked -p ${m.name} --all-targets 2>&1 | tee -a \"$NIX_BUILD_TOP/cargo.log\" >&2")
     disc.nativeOff;
 
+  # L0 builds the snapshot, so its member selection and version must come from that
+  # snapshot, never the live product's workspace (RT-76).
+  depsBaseDisc = if hasDepsBase then import ./discovery.nix { inherit lib; } depsBase else disc;
+  depsL0ExtraArgs =
+    let excluded = concatMapStringsSep " " (m: "--exclude ${m.name}") depsBaseDisc.hostExcluded;
+    in "--locked --workspace${optionalString (depsBaseDisc.hostExcluded != [ ]) " ${excluded}"}";
+  depsL0NativeOffCheck = concatMapStringsSep "\n"
+    (m: "cargo check --locked -p ${m.name} --all-targets") depsBaseDisc.nativeOff;
+
+  depsCraneLib =
+    if depsToolchain == null then craneLib else craneLib.overrideToolchain (_: depsToolchain);
+
   # L0 — the frozen snapshot.
-  depsL0 = craneLib.buildDepsOnly (depsCommonArgs // {
+  depsL0 = depsCraneLib.buildDepsOnly (depsCommonArgs // {
     src = depsBaseSrc;
+    version = if hasDepsBase then depsVersionOf depsBase else depsVersion;
+    cargoExtraArgs = depsL0ExtraArgs;
     buildPhaseCargoCommand = ''
-      cargoWithProfile check ${cargoExtraArgs} --all-targets
-      cargoWithProfile build ${cargoExtraArgs}
-      ${nativeOffCheck}
+      cargoWithProfile check ${depsL0ExtraArgs} --all-targets
+      cargoWithProfile build ${depsL0ExtraArgs}
+      ${depsL0NativeOffCheck}
     '';
   });
 
@@ -339,6 +359,12 @@ let
     doInstallCargoArtifacts = true;
     env.CRANE_BUILD_DEPS_ONLY = 1;
     buildPhaseCargoCommand = ''
+      # Diagnose the stale lock before vendored resolution reports a missing crate.
+      if ! cargo metadata --locked --offline --format-version 1 >/dev/null 2>"$NIX_BUILD_TOP/metadata.err"; then
+        cat "$NIX_BUILD_TOP/metadata.err" >&2
+        echo "Cargo.lock does not cover the workspace: run \`cargo metadata\` (or any cargo command) and commit Cargo.lock" >&2
+        exit 1
+      fi
       cargoWithProfile check ${cargoExtraArgs} --all-targets 2>&1 | tee "$NIX_BUILD_TOP/cargo.log" >&2
       cargoWithProfile build ${cargoExtraArgs} 2>&1 | tee -a "$NIX_BUILD_TOP/cargo.log" >&2
       ${nativeOffCheckTee}
@@ -1110,6 +1136,8 @@ let
 
   packages = pureSet // {
     "ci-pure" = ciPure;
+    # Exposed for checking bottom-layer identity, not an aggregate CI stage.
+    "deps-l0" = depsL0;
     "ci-android-generated" = ciAndroidGenerated;
   } // nonPureExtra;
 

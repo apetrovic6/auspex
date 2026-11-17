@@ -22,7 +22,7 @@ mod versions;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
-use xtask::recipe;
+use xtask::{cargo_lock, recipe};
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "Repository tooling", version)]
@@ -275,10 +275,18 @@ fn main() -> Result<()> {
             | Command::AddDatabase { .. }
             | Command::AddAuthOidc { .. }
     ) && repo::is_product(&repo::root());
+    let edits_manifests = edits_manifests(&cli.command);
     if recording {
         recipe::read(&repo::root())?;
     }
     dispatch(cli.command, breakdown)?;
+    // Refresh even if recording fails, and record even if resolution fails: the
+    // generator's files already exist and a replay needs their invocation.
+    let refreshed = if edits_manifests {
+        cargo_lock::refresh(&repo::root())
+    } else {
+        Ok(())
+    };
     if recording {
         recipe::append(
             &repo::root(),
@@ -290,7 +298,16 @@ fn main() -> Result<()> {
                 .collect(),
         )?;
     }
-    Ok(())
+    refreshed
+}
+
+/// Source-only generators need no resolution; manifest writers must leave CI's
+/// `--locked` workspace complete (RT-76).
+const fn edits_manifests(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::NewFeature { .. } | Command::AddDatabase { .. } | Command::AddAuthOidc { .. }
+    )
 }
 
 fn dispatch(command: Command, breakdown: bool) -> Result<()> {
@@ -387,4 +404,44 @@ fn dispatch(command: Command, breakdown: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> Command {
+        Cli::try_parse_from(std::iter::once("xtask").chain(args.iter().copied()))
+            .expect("the arguments parse")
+            .command
+    }
+
+    #[test]
+    fn every_generator_that_writes_a_manifest_refreshes_the_lock() {
+        for args in [
+            &["new-feature", "api", "lake"][..],
+            &["add-database", "api"],
+            &["add-auth-oidc", "api"],
+        ] {
+            assert!(
+                edits_manifests(&command(args)),
+                "{args:?} writes a Cargo.toml"
+            );
+        }
+    }
+
+    #[test]
+    fn source_only_generators_and_checks_leave_the_lock_alone() {
+        for args in [
+            &["new-migration", "api", "create_lakes"][..],
+            &["new-rpc", "api", "lake", "archive-lake"],
+            &["new-domain", "api", "lake", "update-lake"],
+            &["check"],
+        ] {
+            assert!(
+                !edits_manifests(&command(args)),
+                "{args:?} writes no Cargo.toml"
+            );
+        }
+    }
 }
