@@ -9,7 +9,7 @@
 //! log closes; the narrow layout's detail view closes; a half-typed count or sequence is
 //! dropped. Only then is Esc an ordinary key (by default, quit).
 
-use auspex_core::Event;
+use auspex_core::{Event, Phase, ViewModel};
 use auspex_domain::text::sanitize_line;
 use crossterm::event::KeyCode;
 
@@ -59,6 +59,24 @@ pub struct Screen {
     pub help_open: bool,
     /// The list's visible height in rows, for half pages.
     pub page: usize,
+    /// How many rows the current search matches, so `99999n` costs at most that many steps.
+    pub matches: usize,
+    /// A refresh is starting (its machine list is being read): another `r` is dropped
+    /// rather than start one more `nix` process.
+    pub listing: bool,
+}
+
+impl Screen {
+    /// What `view` shows, with the list `page` rows high.
+    #[must_use]
+    pub fn from_view(view: &ViewModel, page: usize) -> Self {
+        Self {
+            help_open: view.help_open,
+            page,
+            matches: view.search.as_ref().map_or(0, |s| s.matches.len()),
+            listing: view.refresh.phase == Phase::ListingMachines,
+        }
+    }
 }
 
 impl Input {
@@ -72,7 +90,7 @@ impl Input {
     ) -> Vec<Event> {
         self.message = None;
         if let Some(prompt) = self.prompt.take() {
-            return self.prompt_key(prompt, key);
+            return self.prompt_key(prompt, key, screen);
         }
         let esc = key == Key::plain(KeyCode::Esc);
         if esc {
@@ -136,15 +154,16 @@ impl Input {
         match action {
             Action::Down => vec![Event::MoveDown(n)],
             Action::Up => vec![Event::MoveUp(n)],
-            Action::HalfPageDown => vec![Event::HalfPageDown(half); n],
-            Action::HalfPageUp => vec![Event::HalfPageUp(half); n],
+            // One event of `n` half pages, not `n` events (review finding 6).
+            Action::HalfPageDown => vec![Event::HalfPageDown(half.saturating_mul(n))],
+            Action::HalfPageUp => vec![Event::HalfPageUp(half.saturating_mul(n))],
             Action::Top | Action::Bottom if count.is_some() => {
                 vec![Event::MoveTop, Event::MoveDown(n.saturating_sub(1))]
             }
             Action::Top => vec![Event::MoveTop],
             Action::Bottom => vec![Event::MoveBottom],
-            Action::SearchNext => vec![Event::SearchNext; n],
-            Action::SearchPrevious => vec![Event::SearchPrevious; n],
+            Action::SearchNext => vec![Event::SearchNext; steps(n, screen.matches)],
+            Action::SearchPrevious => vec![Event::SearchPrevious; steps(n, screen.matches)],
             Action::Search => {
                 self.prompt = Some(Prompt::Search {
                     input: String::new(),
@@ -158,7 +177,7 @@ impl Input {
                 });
                 Vec::new()
             }
-            Action::Refresh => vec![Event::Refresh],
+            Action::Refresh => self.refresh(screen),
             Action::Help => vec![Event::ToggleHelp],
             Action::Detail => {
                 self.detail_open = !self.detail_open;
@@ -172,7 +191,7 @@ impl Input {
         }
     }
 
-    fn prompt_key(&mut self, prompt: Prompt, key: Key) -> Vec<Event> {
+    fn prompt_key(&mut self, prompt: Prompt, key: Key, screen: Screen) -> Vec<Event> {
         let cancel = key == Key::plain(KeyCode::Esc)
             || key
                 == (Key {
@@ -211,7 +230,7 @@ impl Input {
                     return Vec::new();
                 }
                 match key.code {
-                    KeyCode::Enter => self.command(input.trim()),
+                    KeyCode::Enter => self.command(input.trim(), screen),
                     KeyCode::Backspace if input.is_empty() => Vec::new(),
                     KeyCode::Backspace => {
                         input.pop();
@@ -231,11 +250,11 @@ impl Input {
     }
 
     /// `:q` and `:refresh`; the plan's other commands are later steps.
-    fn command(&mut self, command: &str) -> Vec<Event> {
+    fn command(&mut self, command: &str, screen: Screen) -> Vec<Event> {
         match command {
             "" => Vec::new(),
             "q" | "quit" => vec![Event::Quit],
-            "refresh" => vec![Event::Refresh],
+            "refresh" => self.refresh(screen),
             other => {
                 self.message = Some(format!(
                     "not a command in observe mode: :{} (try :q or :refresh)",
@@ -245,4 +264,29 @@ impl Input {
             }
         }
     }
+}
+
+impl Input {
+    /// A refresh, unless one is still reading its machine list: holding `r` would otherwise
+    /// start and kill one `nix` process per key repeat (review finding 6).
+    fn refresh(&mut self, screen: Screen) -> Vec<Event> {
+        if screen.listing {
+            self.message = Some("a refresh is already starting".to_owned());
+            return Vec::new();
+        }
+        vec![Event::Refresh]
+    }
+}
+
+/// How many `n` steps to send for a count of `n` over `matches` matches.
+///
+/// The matches form a cycle: the first step lands on a match and every further step moves
+/// round the cycle, so `n` and `((n - 1) % matches) + 1` land on the same row, and a count
+/// of 99 999 costs at most one lap. With no match a step does nothing, so one is enough.
+#[must_use]
+pub const fn steps(n: usize, matches: usize) -> usize {
+    if matches == 0 || n == 0 {
+        return 1;
+    }
+    (n - 1) % matches + 1
 }

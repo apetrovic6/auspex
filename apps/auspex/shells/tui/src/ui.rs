@@ -497,7 +497,10 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
         if !line.is_empty() {
             out.push(std::mem::take(&mut line));
         }
-        // A word longer than the line is split by cells.
+        // A word longer than the line is split by cells. Each piece takes at least one
+        // character: a two-cell character on a one-cell line is a piece of its own (and
+        // overflows by a cell, which the widget clips). Without that floor the split was
+        // empty and this loop never ended (review finding 1).
         let mut rest = word;
         while rest.width() > width {
             let mut cells = 0;
@@ -507,7 +510,8 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
                     cells += c.width().unwrap_or(0);
                     cells > width
                 })
-                .map_or(rest.len(), |(i, _)| i);
+                .map_or(rest.len(), |(i, _)| i)
+                .max(rest.chars().next().map_or(rest.len(), char::len_utf8));
             out.push(rest[..split].to_owned());
             rest = &rest[split..];
         }

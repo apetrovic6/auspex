@@ -19,7 +19,7 @@
 //! When a refresh starts (its machine-list request appears), the shell arms the global
 //! deadline for that generation: `timeouts.settle` later it sends `DeadlinePassed`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,6 +55,11 @@ pub struct Shell {
     changed: Notify,
     /// `timeouts.settle`.
     settle: Duration,
+    /// The current refresh's deadline timer, cancelled when the next refresh arms its own.
+    deadline: Mutex<Option<CancellationToken>>,
+    /// Machine names the config has `[machines.<name>]` for, and whether a name the fleet
+    /// does not have was already reported this run.
+    configured: Mutex<(BTreeSet<String>, bool)>,
 }
 
 impl Shell {
@@ -70,7 +75,30 @@ impl Shell {
             log,
             changed: Notify::new(),
             settle,
+            deadline: Mutex::new(None),
+            configured: Mutex::new((BTreeSet::new(), false)),
         })
+    }
+
+    /// The machine names the config has settings for. When the first machine list arrives,
+    /// any name it lacks is reported once in the log: a typo there silently drops an override.
+    pub fn expect_machines(&self, names: BTreeSet<String>) {
+        *lock(&self.configured) = (names, false);
+    }
+
+    fn check_configured(&self, listed: &[auspex_domain::fleet::Machine]) {
+        let mut configured = lock(&self.configured);
+        if configured.1 {
+            return;
+        }
+        configured.1 = true;
+        for name in &configured.0 {
+            if !listed.iter().any(|m| &m.name == name) {
+                self.log.line(&format!(
+                    "config: `machines.{name}` names no machine in the fleet, so its settings are unused"
+                ));
+            }
+        }
     }
 
     /// What to draw.
@@ -123,7 +151,11 @@ impl Shell {
                 let token = self.open(op.id);
                 let shell = Arc::clone(self);
                 self.one_shot(op.id, request, async move {
-                    shell.backend.inventory(&op, &token).await
+                    let answer = shell.backend.inventory(&op, &token).await;
+                    if let Ok(Ok(machines)) = &answer {
+                        shell.check_configured(machines);
+                    }
+                    answer
                 });
             }
             Effect::Probe(request) => {
@@ -279,12 +311,16 @@ impl Shell {
         });
     }
 
-    /// `timeouts.settle` after a refresh starts, its deadline. A deadline for an older
-    /// generation is ignored by the core, so an old timer needs no cancelling; the root token
-    /// stops them all on shutdown.
+    /// `timeouts.settle` after a refresh starts, its deadline. The previous refresh's timer
+    /// is cancelled (the core would ignore it anyway), so holding `r` does not leave a timer
+    /// per press alive for `settle` seconds; the root token stops the last one on shutdown.
     fn arm_deadline(self: &Arc<Self>, generation: Generation) {
         let shell = Arc::clone(self);
-        let root = self.root.clone();
+        let root = self.root.child_token();
+        let old = lock(&self.deadline).replace(root.clone());
+        if let Some(old) = old {
+            old.cancel();
+        }
         let settle = self.settle;
         self.tasks.spawn(async move {
             tokio::select! {
@@ -293,4 +329,8 @@ impl Shell {
             }
         });
     }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }

@@ -85,11 +85,12 @@ async fn a_refresh_cancels_what_is_in_flight_and_the_late_answers_change_nothing
     // Every old token is cancelled and forgotten; only the new list request is out.
     assert_eq!(shell.in_flight(), 1);
     // And the cancelled calls really stopped: without the cancel, luna's probe alone would
-    // run on for another 3.5 s. Left: the new list request and the two deadline timers.
+    // run on for another 3.5 s. Left: the new list request and the new deadline timer (the
+    // old one is cancelled, so holding `r` does not pile timers up).
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(shell.tasks(), 3, "only the new refresh's work is running");
+    assert_eq!(shell.tasks(), 2, "only the new refresh's work is running");
     settle(&shell).await;
     let view = shell.view();
     assert!(view.report.settled, "the second scan completes cleanly");

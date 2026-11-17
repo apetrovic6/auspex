@@ -155,15 +155,49 @@ fn hex(s: &str) -> Option<Color> {
     Some(Color::Rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
+/// The largest theme file read. A base16 file is sixteen short lines.
+pub const MAX_BYTES: usize = 64 * 1024;
+
+/// Reads `file` if it is a regular file of at most [`MAX_BYTES`].
+///
+/// Checked before opening, so a FIFO or a device is never opened; opened non-blocking, so a
+/// file swapped for a FIFO in between cannot block either; checked again on the open file;
+/// and read through a cap, so a file that grows cannot run on.
+fn read_bounded(file: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let not_regular = || "it is not a regular file".to_owned();
+    let meta = std::fs::metadata(file).map_err(|e| format!("cannot read it: {e}"))?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    let nonblock = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).unwrap_or(0);
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nonblock)
+        .open(file)
+        .map_err(|e| format!("cannot read it: {e}"))?;
+    let meta = f.metadata().map_err(|e| format!("cannot read it: {e}"))?;
+    if !meta.is_file() {
+        return Err(not_regular());
+    }
+    let mut bytes = Vec::new();
+    f.take(MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read it: {e}"))?;
+    if bytes.len() > MAX_BYTES {
+        return Err(format!("it is larger than {MAX_BYTES} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|_| "it is not UTF-8".to_owned())
+}
+
 /// The theme for `file`: base16 when it reads, otherwise ANSI and a note saying why.
 #[must_use]
 pub fn load(file: Option<&Path>) -> (Theme, Option<String>) {
     let Some(file) = file else {
         return (Theme::Ansi, None);
     };
-    let read = std::fs::read_to_string(file)
-        .map_err(|e| format!("cannot read it: {e}"))
-        .and_then(|t| parse_base16(&t));
+    let read = read_bounded(file).and_then(|t| parse_base16(&t));
     match read {
         Ok(p) => (Theme::Base16(p), None),
         Err(why) => (

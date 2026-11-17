@@ -99,6 +99,9 @@ pub struct MachineSettings {
     pub prometheus_instance: Option<String>,
 }
 
+/// The longest timeout accepted, in seconds: a day.
+pub const MAX_TIMEOUT: u64 = 86_400;
+
 /// The default `stale_after`: about two scrape intervals at Prometheus's default 30 s.
 pub const DEFAULT_STALE_AFTER: u64 = 60;
 
@@ -210,10 +213,10 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                 for (k, v) in t {
                     let name = format!("timeouts.{k}");
                     match k.as_str() {
-                        "ssh_connect" => s.timeouts.ssh_connect = w.seconds(v, &name)?,
-                        "probe" => s.timeouts.probe = w.seconds(v, &name)?,
-                        "eval" => s.timeouts.eval = w.seconds(v, &name)?,
-                        "settle" => s.timeouts.settle = w.seconds(v, &name)?,
+                        "ssh_connect" => s.timeouts.ssh_connect = w.timeout(v, &name)?,
+                        "probe" => s.timeouts.probe = w.timeout(v, &name)?,
+                        "eval" => s.timeouts.eval = w.timeout(v, &name)?,
+                        "settle" => s.timeouts.settle = w.timeout(v, &name)?,
                         _ => w.unknown(&name),
                     }
                 }
@@ -221,6 +224,13 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                 // naming the key, rather than on every probe.
                 auspex_domain::fleet::ConnectTimeout::new(s.timeouts.ssh_connect)
                     .map_err(|e| format!("`timeouts.ssh_connect`: {e}"))?;
+                if s.timeouts.settle < s.timeouts.probe {
+                    w.warnings.push(format!(
+                        "`timeouts.settle` ({} s) is shorter than `timeouts.probe` ({} s), so a slow \
+                         host is cut off by the global deadline before its own probe timeout",
+                        s.timeouts.settle, s.timeouts.probe
+                    ));
+                }
             }
             "eval" => {
                 let t = w.table(value, "eval")?;
@@ -244,6 +254,13 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                         "stale_after" => stale_after = w.seconds(v, &name)?,
                         _ => w.unknown(&name),
                     }
+                }
+                if url.is_none() && !t.is_empty() {
+                    w.warnings.push(
+                        "`[prometheus]` has settings but no `prometheus.url`, so Prometheus is \
+                         off and they are ignored"
+                            .to_owned(),
+                    );
                 }
                 s.prometheus = url.map(|url| PrometheusSettings { url, stale_after });
             }
@@ -360,6 +377,20 @@ impl Walk {
         v.as_str()
             .map(str::to_owned)
             .ok_or_else(|| wrong(key, "a string", v))
+    }
+
+    /// A timeout: whole seconds, at least 1 (0 would fail or settle everything at once) and
+    /// at most a day. The cap keeps `Instant::now() + timeout` in the adapters far from
+    /// overflowing (review finding 2), and no scan step is meant to take longer.
+    fn timeout(&self, v: &Value, key: &str) -> Result<u64, String> {
+        let s = self.seconds(v, key)?;
+        if (1..=MAX_TIMEOUT).contains(&s) {
+            Ok(s)
+        } else {
+            Err(format!(
+                "`{key}` must be between 1 and {MAX_TIMEOUT} seconds (a day), not {s}"
+            ))
+        }
     }
 
     #[expect(

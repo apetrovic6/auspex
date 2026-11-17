@@ -374,6 +374,18 @@ impl Keymap {
                 }
             }
         }
+        // Raw mode makes Ctrl-C a key, so with neither a quit key nor the `:` prompt (for
+        // `:q`) only a signal from another terminal could end the TUI (review finding 6).
+        if !bindings
+            .iter()
+            .any(|(_, a)| matches!(a, Action::Quit | Action::Command))
+        {
+            return Err(
+                "`keymap.quit`: no key quits and `keymap.command` is unbound too (so no `:q`); \
+                 keep at least one of them"
+                    .to_owned(),
+            );
+        }
         Ok(Self { bindings })
     }
 

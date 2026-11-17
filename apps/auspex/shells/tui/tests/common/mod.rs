@@ -74,10 +74,7 @@ pub fn press(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, key: Key) {
         .as_ref()
         .map(|s| s.query.clone())
         .unwrap_or_default();
-    let screen = Screen {
-        help_open: view.help_open,
-        page: ui.page.max(1),
-    };
+    let screen = Screen::from_view(&view, ui.page.max(1));
     for e in ui.input.key(key, screen, keymap, &query) {
         shell.send(e);
     }

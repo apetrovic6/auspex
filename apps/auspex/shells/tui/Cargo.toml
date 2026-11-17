@@ -47,6 +47,9 @@ toml = "0.9"
 # Column widths: badge glyphs and machine names are measured in terminal cells, not bytes
 # or chars, or a long or wide name would push every column after it. ratatui's own.
 unicode-width = "0.2"
+# Opening the theme file non-blocking (`O_NONBLOCK`), so a FIFO cannot block start-up. Already in
+# the graph with `fs` (auspex-effects).
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -205,3 +205,92 @@ fn every_number_in_the_fixture_is_read_not_defaulted() {
     assert_eq!((s.eval.workers, s.eval.max_memory_mb), (5, 4097));
     assert_eq!(s.prometheus.unwrap().stale_after, 61);
 }
+
+/// Review finding 2: a huge timeout overflowed `Instant + Duration` inside an adapter and
+/// panicked its task. Every timeout is between 1 s and a day, and the error names the key.
+#[test]
+fn timeouts_are_between_one_second_and_a_day() {
+    for key in ["ssh_connect", "probe", "eval", "settle"] {
+        for bad in ["0", "86401", "9223372036854775807"] {
+            let e = config::parse(&format!("[timeouts]\n{key} = {bad}\n")).unwrap_err();
+            assert!(
+                e.contains(&format!("`timeouts.{key}`")),
+                "{key} = {bad}: {e}"
+            );
+        }
+    }
+    let (s, _) = config::parse("[timeouts]\neval = 86400\nsettle = 86400\nprobe = 1\n").unwrap();
+    assert_eq!(
+        (s.timeouts.eval, s.timeouts.settle, s.timeouts.probe),
+        (86_400, 86_400, 1)
+    );
+}
+
+#[test]
+fn a_settle_shorter_than_the_probe_is_a_warning() {
+    let (_, w) = config::parse("[timeouts]\nsettle = 5\nprobe = 10\n").unwrap();
+    assert!(
+        w.iter()
+            .any(|w| w.contains("timeouts.settle") && w.contains("timeouts.probe")),
+        "{w:?}"
+    );
+    let (_, w) = config::parse("[timeouts]\nsettle = 10\nprobe = 10\n").unwrap();
+    assert_eq!(w, Vec::<String>::new());
+}
+
+/// Review finding 6: `stale_after` without a `url` was dropped silently.
+#[test]
+fn prometheus_settings_without_a_url_are_a_warning() {
+    let (s, w) = config::parse("[prometheus]\nstale_after = 30\n").unwrap();
+    assert_eq!(s.prometheus, None);
+    assert!(w.iter().any(|w| w.contains("prometheus.url")), "{w:?}");
+}
+
+/// Review finding 4: config, keymap and argument errors quote the operator's text, and were
+/// printed raw. An escape sequence or a control character there must not reach the terminal.
+#[test]
+fn errors_on_stderr_carry_no_escape_sequences() {
+    let dir = tempdir();
+    let cases = [
+        // A quoted TOML key with an escape, holding the wrong type: an error naming it.
+        (
+            "key.toml",
+            "[machines.\"evil\\u001b]0;pwned\\u0007\"]\ntarget = 1\n",
+        ),
+        // A keymap value that is an OSC sequence: an error quoting it.
+        (
+            "keymap.toml",
+            "[keymap]\ndown = \"\\u001b]0;pwned\\u0007\"\n",
+        ),
+        // An unknown key with an escape: a warning (the run goes on).
+        ("warn.toml", "\"x\\u001b[31my\" = 1\n"),
+    ];
+    for (name, text) in cases {
+        let file = dir.path().join(name);
+        std::fs::write(&file, text).unwrap();
+        let out = run_within(
+            auspex(dir.path())
+                .args(["--demo", "--plain", "--config"])
+                .arg(&file),
+            std::time::Duration::from_secs(60),
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.is_empty(), "{name}: something is said");
+        assert!(
+            !stderr.chars().any(|c| c == '\u{1b}' || c == '\u{7}'),
+            "{name}: {stderr:?}"
+        );
+    }
+    let out = run_within(
+        auspex(dir.path()).arg("--\u{1b}]0;pwned\u{7}"),
+        std::time::Duration::from_secs(60),
+    );
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The sanitiser drops an OSC sequence whole, payload included.
+    assert!(stderr.contains("unexpected argument"), "{stderr:?}");
+    assert!(
+        !stderr.chars().any(|c| c == '\u{1b}' || c == '\u{7}'),
+        "{stderr:?}"
+    );
+}

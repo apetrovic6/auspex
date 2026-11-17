@@ -21,6 +21,8 @@ const NOTHING: [String; 0] = [];
 const SCREEN: Screen = Screen {
     help_open: false,
     page: 20,
+    matches: 3,
+    listing: false,
 };
 
 const fn ctrl(c: char) -> Key {
@@ -82,11 +84,8 @@ fn a_count_multiplies_a_move() {
     );
     assert_eq!(
         feed(&mut i, &km, SCREEN, &[Key::char('3'), ctrl('d')]),
-        ev(&[
-            Event::HalfPageDown(20),
-            Event::HalfPageDown(20),
-            Event::HalfPageDown(20)
-        ])
+        ev(&[Event::HalfPageDown(60)]),
+        "three half pages are one event"
     );
     assert_eq!(
         feed(&mut i, &km, SCREEN, &chars("999999999j")),
@@ -315,4 +314,65 @@ fn a_bound_digit_is_an_action_not_a_count() {
         feed(&mut i, &km, SCREEN, &chars("0")),
         ev(&[Event::MoveBottom])
     );
+}
+
+/// Review finding 6: a count of 99 999 on a half page or `n` expanded into that many core
+/// events per key press. A half page is one event of `count` half pages; `n` and `N` step
+/// at most once round the matches (the result is the same, the matches being a cycle).
+#[test]
+fn repeat_counts_stay_cheap() {
+    let km = Keymap::defaults();
+    let mut i = Input::default();
+    let mut keys = chars("99999");
+    keys.push(ctrl('d'));
+    assert_eq!(
+        feed(&mut i, &km, SCREEN, &keys),
+        ev(&[Event::HalfPageDown(20 * 99_999)])
+    );
+    // 3 matches: 5n lands where 2n does; 99999n where 3n does.
+    assert_eq!(
+        feed(&mut i, &km, SCREEN, &chars("5n")),
+        ev(&[Event::SearchNext, Event::SearchNext])
+    );
+    assert_eq!(feed(&mut i, &km, SCREEN, &chars("99999N")).len(), 3);
+    let none = Screen {
+        matches: 0,
+        ..SCREEN
+    };
+    assert_eq!(
+        feed(&mut i, &km, none, &chars("99999n")),
+        ev(&[Event::SearchNext])
+    );
+}
+
+/// Review finding 6: holding `r` started (and killed) one `nix` per key repeat. While a
+/// refresh is still reading the machine list, another is dropped, from the key and from `:`.
+#[test]
+fn a_refresh_while_one_is_starting_is_dropped() {
+    let km = Keymap::defaults();
+    let mut i = Input::default();
+    let starting = Screen {
+        listing: true,
+        ..SCREEN
+    };
+    assert_eq!(feed(&mut i, &km, starting, &chars("r")), NOTHING);
+    let mut keys = chars(":refresh");
+    keys.push(Key::plain(KeyCode::Enter));
+    assert_eq!(feed(&mut i, &km, starting, &keys), NOTHING);
+    assert_eq!(
+        feed(&mut i, &km, SCREEN, &chars("r")),
+        ev(&[Event::Refresh])
+    );
+}
+
+/// Review finding 6: `quit = []` with `command = []` left no key that exits (raw mode makes
+/// Ctrl-C a key). Refused, naming `keymap.quit`; either one alone is fine.
+#[test]
+fn a_keymap_with_no_way_to_quit_is_refused() {
+    let mut w = Vec::new();
+    let e =
+        Keymap::with_overrides(&overrides(&[("quit", &[]), ("command", &[])]), &mut w).unwrap_err();
+    assert!(e.contains("keymap.quit"), "{e}");
+    assert!(Keymap::with_overrides(&overrides(&[("quit", &[])]), &mut w).is_ok());
+    assert!(Keymap::with_overrides(&overrides(&[("command", &[])]), &mut w).is_ok());
 }

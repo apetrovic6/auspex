@@ -87,13 +87,23 @@ fn a_clean_scan_exits_0_and_an_unreachable_machine_is_a_finding() {
         eval_ok(&t, dir.path()),
         ssh_ok(&t, dir.path()),
     );
+    // An override for a machine the fleet does not have: said once, once the list is in.
+    let cfg = config(
+        dir.path(),
+        "[machines.ghost]\ntarget = \"root@192.0.2.50\"\n[machines.luna]\nprometheus_instance = \"luna:9100\"\n",
+    );
     let mut cmd = auspex(dir.path());
-    cmd.args(["--plain", "--flake"]).arg(flake_dir(dir.path()));
+    cmd.args(["--plain", "--config"])
+        .arg(&cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()));
     with_fakes(&mut cmd, &nix, &eval, &ssh);
     let out = run_within(&mut cmd, LIMIT);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(stderr.matches("`machines.ghost`").count(), 1, "{stderr}");
+    assert!(!stderr.contains("`machines.luna`"), "{stderr}");
     let luna = stdout.lines().find(|l| l.contains("luna")).unwrap();
     assert!(
         luna.contains("unreachable") && luna.contains("No route to host"),

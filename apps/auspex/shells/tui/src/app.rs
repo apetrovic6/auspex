@@ -34,7 +34,7 @@ use crate::demo::{self, Demo};
 use crate::headless;
 use crate::input::Screen;
 use crate::keymap::{Key, Keymap};
-use crate::log::Log;
+use crate::log::{Log, say};
 use crate::shell::Shell;
 use crate::theme::{self, Theme};
 use crate::ui::{self, Context, Ui};
@@ -85,7 +85,12 @@ pub fn main() -> ExitCode {
     let args = match Args::try_parse() {
         Ok(a) => a,
         Err(e) => {
-            let _ = e.print();
+            if e.use_stderr() {
+                // clap quotes the offending argument; plain text, sanitised (finding 4).
+                eprintln!("{}", crate::log::clean(&e.render().to_string()));
+            } else {
+                let _ = e.print(); // --help, --version: our own text
+            }
             return if e.use_stderr() {
                 ExitCode::from(USAGE)
             } else {
@@ -96,7 +101,7 @@ pub fn main() -> ExitCode {
     let loaded = match config::load(args.config.as_deref()) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("auspex: {e}");
+            say(&e.to_string());
             return ExitCode::from(USAGE);
         }
     };
@@ -108,7 +113,7 @@ pub fn main() -> ExitCode {
                 .path
                 .as_ref()
                 .map_or_else(String::new, |p| format!("config file {}: ", p.display()));
-            eprintln!("auspex: {file}{e}");
+            say(&format!("{file}{e}"));
             return ExitCode::from(USAGE);
         }
     };
@@ -124,10 +129,19 @@ pub fn main() -> ExitCode {
     {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("auspex: cannot start the async runtime: {e}");
+            say(&format!("cannot start the async runtime: {e}"));
             return ExitCode::FAILURE;
         }
     };
+    // Synchronously and before the runtime exists, so before `Termination` takes the signals
+    // over: the read is bounded now (review finding 3), and even so nothing slow may sit
+    // between taking SIGINT and the first place that listens for it.
+    let (theme, theme_note) = if args.mode() == Mode::Tui {
+        theme::load(loaded.settings.theme_file.as_deref())
+    } else {
+        (Theme::Ansi, None)
+    };
+    warnings.extend(theme_note);
     let run = Run {
         args,
         settings: loaded.settings,
@@ -135,6 +149,7 @@ pub fn main() -> ExitCode {
         keymap,
         flake,
         source,
+        theme,
     };
     let code = runtime.block_on(run.run());
     // A DNS lookup cannot be interrupted, only abandoned: do not wait for its thread.
@@ -149,6 +164,7 @@ struct Run {
     keymap: Keymap,
     flake: String,
     source: FlakeSource,
+    theme: Theme,
 }
 
 impl Run {
@@ -158,7 +174,7 @@ impl Run {
         let mut term = match Termination::new() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("auspex: cannot handle termination signals: {e}");
+                say(&format!("cannot handle termination signals: {e}"));
                 return ExitCode::FAILURE;
             }
         };
@@ -190,15 +206,12 @@ impl Run {
         };
         let settle = self.settings.timeouts.settle;
         let shell = Shell::new(backend, log, Duration::from_secs(settle));
+        if !self.args.demo {
+            shell.expect_machines(self.settings.machines.keys().cloned().collect());
+        }
         match mode {
             Mode::Plain | Mode::Json => headless(&shell, config, mode, &mut term, settle).await,
-            Mode::Tui => {
-                let (theme, note) = theme::load(self.settings.theme_file.as_deref());
-                if let Some(n) = note {
-                    shell.log.line(&n);
-                }
-                tui(&shell, config, &self.keymap, &theme, &shown, &mut term).await
-            }
+            Mode::Tui => tui(&shell, config, &self.keymap, &self.theme, &shown, &mut term).await,
         }
     }
 }
@@ -235,7 +248,7 @@ async fn headless(
     {
         // A closed pipe (`| head`) is not worth a second message on a broken stream.
         if e.kind() != std::io::ErrorKind::BrokenPipe {
-            eprintln!("auspex: cannot write the report: {e}");
+            say(&format!("cannot write the report: {e}"));
         }
         return ExitCode::FAILURE;
     }
@@ -253,7 +266,9 @@ async fn tui(
     let mut terminal = match ratatui::try_init() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("auspex: cannot use the terminal ({e}); try --plain or --json");
+            say(&format!(
+                "cannot use the terminal ({e}); try --plain or --json"
+            ));
             return ExitCode::FAILURE;
         }
     };
@@ -261,6 +276,7 @@ async fn tui(
     let mut ui = Ui::default();
     let mut events = EventStream::new();
     let mut frames = tokio::time::interval(FRAME);
+    let mut failure: Option<String> = None;
     let mut code = ExitCode::SUCCESS;
     while !shell.view().quit {
         tokio::select! {
@@ -270,7 +286,7 @@ async fn tui(
                 let log = shell.log.lines();
                 let ctx = Context { theme, keymap, flake, log: &log };
                 if let Err(e) = terminal.draw(|f| ui::draw(f, &view, &mut ui, &ctx)) {
-                    shell.log.line(&format!("cannot draw: {e}"));
+                    failure = Some(format!("cannot draw: {e}"));
                     code = ExitCode::FAILURE;
                     break;
                 }
@@ -282,7 +298,7 @@ async fn tui(
                     };
                     let view = shell.view();
                     let query = view.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
-                    let screen = Screen { help_open: view.help_open, page: ui.page };
+                    let screen = Screen::from_view(&view, ui.page);
                     for e in ui.input.key(key, screen, keymap, &query) {
                         shell.send(e);
                     }
@@ -290,7 +306,9 @@ async fn tui(
                 // Matched here rather than as a `Some(Ok(..))` pattern on the arm, which
                 // `select!` answers by disabling the branch: the frame timer would go on
                 // painting a screen no key can reach.
-                Some(Err(_)) => {
+                Some(Err(e)) => {
+                    // Said after the terminal is restored, so it is readable (review finding 6).
+                    failure = Some(format!("cannot read the terminal: {e}"));
                     code = ExitCode::FAILURE;
                     break;
                 }
@@ -306,5 +324,8 @@ async fn tui(
     shell.send(Event::Quit);
     shell.shutdown().await;
     ratatui::restore();
+    if let Some(f) = failure {
+        say(&f);
+    }
     code
 }

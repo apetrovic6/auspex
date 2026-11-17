@@ -10,6 +10,22 @@ use std::sync::Mutex;
 
 use auspex_domain::text::sanitize_line;
 
+/// `text` with every line sanitised (escape sequences, control and format characters gone) and
+/// the line breaks kept: for multi-line messages such as clap's.
+#[must_use]
+pub fn clean(text: &str) -> String {
+    text.lines()
+        .map(sanitize_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Writes one message to stderr, sanitised: config, keymap and argument errors quote the
+/// operator's own text, which may hold escape sequences (review finding 4).
+pub fn say(text: &str) {
+    eprintln!("auspex: {}", clean(text));
+}
+
 /// How many lines the TUI keeps. Older ones are dropped.
 pub const KEEP: usize = 500;
 

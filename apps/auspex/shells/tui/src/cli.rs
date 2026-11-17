@@ -13,8 +13,8 @@ use clap::Parser;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "auspex", version, about, long_about)]
 pub struct Args {
-    /// The fleet flake. Default: the config file's `flake`, then the `CLAN_DIR` environment
-    /// variable, then the current directory; this flag overrides them all.
+    /// The fleet flake. Overrides everything; otherwise the `CLAN_DIR` environment variable,
+    /// then the config file's `flake`, then the current directory.
     #[arg(long, value_name = "PATH")]
     pub flake: Option<String>,
 
