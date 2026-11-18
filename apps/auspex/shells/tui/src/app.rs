@@ -120,11 +120,17 @@ pub fn main() -> ExitCode {
         }
     };
     let clan_dir = std::env::var("CLAN_DIR").ok();
-    let (flake, source) = config::resolve_flake(
+    let (flake, source) = match config::resolve_flake(
         args.flake.as_deref(),
         clan_dir.as_deref(),
         loaded.settings.flake.as_deref(),
-    );
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            say(&e);
+            return ExitCode::from(USAGE);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

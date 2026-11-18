@@ -20,7 +20,7 @@ use toml::{Table, Value};
 /// Everything `config.toml` can say, with the defaults filled in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
-    /// `flake`: the fleet flake. `CLAN_DIR` and `--flake` override it.
+    /// `flake`: the fleet flake, `~/` already expanded. `CLAN_DIR` and `--flake` override it.
     pub flake: Option<String>,
     /// `[timeouts]`.
     pub timeouts: Timeouts,
@@ -227,7 +227,7 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
     let mut s = Settings::default();
     for (key, value) in &root {
         match key.as_str() {
-            "flake" => s.flake = Some(w.string(value, "flake")?),
+            "flake" => s.flake = Some(expand_flake(&w.string(value, "flake")?, "flake")?),
             "ssh" => {
                 for (k, v) in w.table(value, "ssh")? {
                     let name = format!("ssh.{k}");
@@ -374,6 +374,33 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
+/// A fleet flake from the config file or `CLAN_DIR`: a leading `~/` becomes `$HOME/`.
+/// Only that form: `~user/…` and a bare `~` are refused, and so is `~/` with no absolute
+/// `HOME`, each naming `key`.
+fn expand_flake(value: &str, key: &str) -> Result<String, String> {
+    expand_flake_in(value, key, std::env::var_os("HOME").as_deref())
+}
+
+fn expand_flake_in(
+    value: &str,
+    key: &str,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<String, String> {
+    if let Some(rest) = value.strip_prefix("~/") {
+        let home = home
+            .map(Path::new)
+            .filter(|h| h.is_absolute())
+            .ok_or_else(|| format!("`{key}` starts with `~/`, but HOME is not an absolute path"))?;
+        return Ok(home.join(rest).to_string_lossy().into_owned());
+    }
+    if value.starts_with('~') {
+        return Err(format!(
+            "`{key}` may start with `~/` only; `{value}` is not expanded (use an absolute path)"
+        ));
+    }
+    Ok(value.to_owned())
+}
+
 const fn type_name(v: &Value) -> &'static str {
     match v {
         Value::String(_) => "a string",
@@ -502,23 +529,38 @@ impl FlakeSource {
 }
 
 /// The fleet flake and where it came from: `--flake`, then `CLAN_DIR`, then the config
-/// file's `flake`, then `.`. An empty `CLAN_DIR` counts as unset.
-#[must_use]
+/// file's `flake`, then `.`.
+///
+/// An empty `CLAN_DIR` counts as unset. `CLAN_DIR` expands a leading `~/` like the config
+/// file's `flake` (already expanded by `parse`); `--flake` is left to the shell.
+///
+/// # Errors
+///
+/// `CLAN_DIR` starts with `~` but not `~/`, or with `~/` while `HOME` is not absolute.
 pub fn resolve_flake(
     flag: Option<&str>,
     clan_dir: Option<&str>,
     config: Option<&str>,
-) -> (String, FlakeSource) {
+) -> Result<(String, FlakeSource), String> {
+    resolve_flake_in(flag, clan_dir, config, std::env::var_os("HOME").as_deref())
+}
+
+fn resolve_flake_in(
+    flag: Option<&str>,
+    clan_dir: Option<&str>,
+    config: Option<&str>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<(String, FlakeSource), String> {
     if let Some(f) = flag {
-        return (f.to_owned(), FlakeSource::Flag);
+        return Ok((f.to_owned(), FlakeSource::Flag));
     }
     if let Some(d) = clan_dir.filter(|d| !d.is_empty()) {
-        return (d.to_owned(), FlakeSource::ClanDir);
+        return Ok((expand_flake_in(d, "CLAN_DIR", home)?, FlakeSource::ClanDir));
     }
     if let Some(c) = config {
-        return (c.to_owned(), FlakeSource::ConfigFile);
+        return Ok((c.to_owned(), FlakeSource::ConfigFile));
     }
-    (".".to_owned(), FlakeSource::Default)
+    Ok((".".to_owned(), FlakeSource::Default))
 }
 
 #[cfg(test)]
@@ -556,6 +598,60 @@ mod tests {
                 .unwrap_err()
                 .contains("`timeouts.ssh_connect`")
         );
+    }
+
+    fn home(h: &str) -> &std::ffi::OsStr {
+        std::ffi::OsStr::new(h)
+    }
+
+    #[test]
+    fn a_tilde_slash_flake_resolves_against_home() {
+        assert_eq!(
+            expand_flake_in("~/clan/fleet", "flake", Some(home("/home/me"))).unwrap(),
+            "/home/me/clan/fleet"
+        );
+        assert_eq!(
+            expand_flake_in("/abs/fleet", "flake", None).unwrap(),
+            "/abs/fleet"
+        );
+    }
+
+    #[test]
+    fn other_tilde_forms_are_refused_naming_the_key() {
+        for bad in ["~user/x", "~"] {
+            let e = expand_flake_in(bad, "flake", Some(home("/home/me"))).unwrap_err();
+            assert!(e.contains("`flake`"), "{e}");
+        }
+        assert!(
+            parse("flake = \"~user/x\"\n")
+                .unwrap_err()
+                .contains("`flake`")
+        );
+        assert!(parse("flake = \"~\"\n").unwrap_err().contains("`flake`"));
+    }
+
+    #[test]
+    fn a_relative_or_missing_home_is_refused() {
+        for h in [Some(home("relative/home")), None] {
+            let e = expand_flake_in("~/x", "flake", h).unwrap_err();
+            assert!(e.contains("`flake`") && e.contains("HOME"), "{e}");
+        }
+    }
+
+    #[test]
+    fn clan_dir_expands_a_tilde_slash() {
+        let (flake, source) =
+            resolve_flake_in(None, Some("~/clan"), Some("/cfg"), Some(home("/home/me"))).unwrap();
+        assert_eq!(
+            (flake.as_str(), source),
+            ("/home/me/clan", FlakeSource::ClanDir)
+        );
+        let e = resolve_flake_in(None, Some("~root/x"), None, Some(home("/home/me"))).unwrap_err();
+        assert!(e.contains("`CLAN_DIR`"), "{e}");
+        // --flake is the shell's to expand.
+        let (flake, _) =
+            resolve_flake_in(Some("~/x"), Some("~/y"), None, Some(home("/h"))).unwrap();
+        assert_eq!(flake, "~/x");
     }
 
     #[test]

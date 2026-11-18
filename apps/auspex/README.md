@@ -67,7 +67,7 @@ Import its Home Manager module (no Home Manager input is required by auspex):
   imports = [ inputs.auspex.homeManagerModules.auspex ];
   programs.auspex = {
     enable = true;
-    settings.flake = "/home/me/clan/fleet";
+    settings.flake = "~/clan/fleet"; # ~/ is your home directory; a path value is not copied to the store
     settings.timeouts.probe = 10;
     # stylix.enable = true; # optional, requires Stylix colours
   };
@@ -79,7 +79,7 @@ The module installs `auspex` and writes only configured settings to
 `stylix.enable` selects a generated Base16 `theme.toml`, unless you set another
 `settings.theme.file` (then no unused theme is written); without a theme, auspex uses
 the terminal's ANSI colours. A hand-written config works without Home Manager.
-A leading `~/` in the selected theme path uses Home Manager's home directory.
+A leading `~/` in `settings.flake` or the selected theme path uses Home Manager's home directory.
 The package is also available as `packages.<system>.auspex` (and `default`);
 `overlays.default` adds `pkgs.auspex`.
 
@@ -97,6 +97,9 @@ ssh_approval = 60    # authentication/agent approval; 5..600 seconds
 probe = 10          # script execution, after authentication
 settle = 120        # global refresh deadline, including approval
 ```
+
+The config file's `flake` and `CLAN_DIR` take a leading `~/` (your `$HOME`; `~user/` is refused);
+`--flake` is left to your shell. Precedence: `--flake`, then `CLAN_DIR`, then `flake`, then `.`.
 
 Home Manager exposes the same keys under `programs.auspex.settings`.
 A warm control master skips authentication; a cold connection gets a separate approval
