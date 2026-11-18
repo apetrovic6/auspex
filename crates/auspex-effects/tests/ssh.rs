@@ -47,7 +47,7 @@ fn cold_script(t: &common::Tools, dir: &Path, delay: u64) -> std::path::PathBuf 
             r#"for arg; do
   case "$arg" in
     -O) [ -f '@dir@/master' ]; exit $?;;
-    -N)
+    true)
       [ "${{SSH_ASKPASS-unset}}|${{SSH_ASKPASS_REQUIRE-unset}}" = 'unset|never' ] || exit 73
       if (exec 3</dev/tty) 2>/dev/null; then exit 74; fi
       echo $$ >> '@dir@/connections'
@@ -127,7 +127,8 @@ async fn approval_timeout_is_distinct_and_reaps_the_waiter() {
     assert_eq!(
         result,
         ProbeOutcome::Unreachable {
-            reason: "waiting for ssh approval timed out".to_owned()
+            reason: "ssh connection/authentication timed out (agent approval may be pending)"
+                .to_owned()
         }
     );
 }
@@ -168,6 +169,209 @@ async fn cancelling_approval_kills_and_reaps_and_clears_the_signal() {
     assert!(!common::pid_exists(pids[0]), "approval ssh was not reaped");
     assert!(left.is_empty(), "{left:?}");
     assert_eq!(*phases.lock().unwrap(), [true, false]);
+}
+
+#[tokio::test]
+async fn review_two_concurrent_probes_to_one_destination_start_one_approval() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "ssh-concurrent",
+        &format!(
+            r#"echo "$*" >> '@dir@/argv'
+for arg; do
+  case "$arg" in
+    -O) [ -f '@dir@/master' ]; exit $?;;
+    true)
+      echo $$ >> '@dir@/connections'
+      @sleep@ 2
+      : > '@dir@/master'
+      exit 0;;
+  esac
+done
+[ -f '@dir@/master' ] || exit 255
+printf '{}'"#,
+            probe_output()
+        ),
+    );
+    let cd = control(dir.path());
+    let target = Target::parse("root@h").unwrap();
+    // A second prepared handle and different transport options still name the same socket.
+    let cd2 = ControlDir::prepare(Path::new(cd.as_str())).unwrap();
+    let target2 = Target::parse("root@h?Compression=yes").unwrap();
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    let mut params2 = params.clone();
+    params2.control_dir = &cd2;
+    let cancel = CancellationToken::new();
+    let (a, b) = tokio::join!(
+        probe(&target, MachineClass::Nixos, &params, &cancel),
+        probe(&target2, MachineClass::Nixos, &params2, &cancel),
+    );
+    assert!(matches!(a.unwrap(), ProbeOutcome::Observed(_)));
+    assert!(matches!(b.unwrap(), ProbeOutcome::Observed(_)));
+    let argv = fs::read_to_string(dir.path().join("argv")).unwrap();
+    let connections = fs::read_to_string(dir.path().join("connections"))
+        .unwrap()
+        .lines()
+        .count();
+    assert_eq!(connections, 1, "two approvals for one destination:\n{argv}");
+}
+
+#[tokio::test]
+async fn control_persist_reaches_every_phase_and_stale_sockets_recover() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    fs::write(dir.path().join("master"), "stale\n").unwrap();
+    let program = t.script(
+        dir.path(),
+        "ssh-stale",
+        &format!(
+            r#"echo "$*" >> '@dir@/argv'
+for arg; do
+case "$arg" in
+  -O) IFS= read -r state < '@dir@/master'; [ "$state" = live ]; exit $?;;
+  true)
+    case "$*" in *'ControlMaster=auto'*) ;; *) exit 76;; esac
+    printf 'live\n' > '@dir@/master'
+    exit 0;;
+esac
+done
+IFS= read -r state < '@dir@/master'
+[ "$state" = live ] || exit 255
+printf '{}'"#,
+            probe_output()
+        ),
+    );
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    params.control_persist = 1234;
+    let result = probe(
+        &Target::parse("h").unwrap(),
+        MachineClass::Nixos,
+        &params,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(matches!(result, ProbeOutcome::Observed(_)), "{result:?}");
+    let argv = fs::read_to_string(dir.path().join("argv")).unwrap();
+    let lines: Vec<_> = argv.lines().collect();
+    assert_eq!(lines.len(), 3, "{argv}");
+    assert!(lines[0].contains(" -O check "), "{argv}");
+    assert!(lines[1].ends_with(" -- h true"), "{argv}");
+    assert!(lines[2].ends_with(" -- h /bin/sh -s"), "{argv}");
+    for line in lines {
+        assert!(line.contains(" -o ControlPersist=1234s "), "{line}");
+    }
+}
+
+#[tokio::test]
+async fn review_a_down_host_fails_at_connect_timeout_not_approval() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "ssh-down",
+        r#"echo "$*" >> '@dir@/argv'
+for arg; do
+case "$arg" in
+  -O) exit 255;;
+  ConnectTimeout=1) timeout=1;;
+esac
+done
+if [ "$timeout" != 1 ]; then exit 77; fi
+echo attempt >> '@dir@/attempts'
+@sleep@ 1
+echo 'ssh: connect to host h port 22: Connection timed out' >&2
+exit 255"#,
+    );
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    params.connect_timeout = ConnectTimeout::new(1).unwrap();
+    params.approval_deadline = Duration::from_secs(60);
+    let start = Instant::now();
+    let result = probe(
+        &Target::parse("h").unwrap(),
+        MachineClass::Nixos,
+        &params,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        result,
+        ProbeOutcome::Unreachable {
+            reason: "ssh: connect to host h port 22: Connection timed out".to_owned()
+        }
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("attempts")).unwrap(),
+        "attempt\n",
+        "failed Connect must not fall through to a second connection attempt"
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_single_flight_waiter_does_not_cancel_the_owner() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "ssh-waiter",
+        &format!(
+            r#"for arg; do
+case "$arg" in
+  -O) [ -f '@dir@/master' ]; exit $?;;
+  true)
+    echo $$ >> '@dir@/connections'
+    while [ ! -f '@dir@/release' ]; do @sleep@ 0.01; done
+    : > '@dir@/master'
+    exit 0;;
+esac
+done
+printf '{}'"#,
+            probe_output()
+        ),
+    );
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    let target = Target::parse("h").unwrap();
+    let owner = CancellationToken::new();
+    let waiter = CancellationToken::new();
+    let connections = dir.path().join("connections");
+    let (a, b) = tokio::join!(
+        probe(&target, MachineClass::Nixos, &params, &owner),
+        async {
+            tokio::task::spawn_blocking(move || wait_for_pids(&connections, 1))
+                .await
+                .unwrap();
+            let result = probe(&target, MachineClass::Nixos, &params, &waiter);
+            tokio::pin!(result);
+            tokio::select! {
+                result = &mut result => panic!("waiter finished before cancellation: {result:?}"),
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            waiter.cancel();
+            let result = result.await;
+            fs::write(dir.path().join("release"), "").unwrap();
+            result
+        },
+    );
+    assert!(matches!(a.unwrap(), ProbeOutcome::Observed(_)));
+    assert_eq!(b, Err(Cancelled));
+    assert_eq!(
+        fs::read_to_string(dir.path().join("connections"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
 }
 
 async fn run_probe(
@@ -713,7 +917,7 @@ async fn approval_master_retaining_pipes_does_not_hold_up_the_probe() {
             r#"for arg; do
 case "$arg" in
   -O) exit 1;;
-  -N)
+  true)
     if IFS= read -r line; then exit 75; fi
     @sleep@ 30 &
     echo $! > '@dir@/master.pid'

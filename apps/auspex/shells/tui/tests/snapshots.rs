@@ -162,8 +162,8 @@ async fn approval_note_appears_and_disappears_on_the_status_bar() {
     };
     let km = Keymap::defaults();
     let frame = render(&shell.view(), &mut ui, &km, &[], 160, 24);
-    assert!(frame.contains("ssh: waiting for 3 approvals"), "{frame}");
+    assert!(frame.contains("ssh: connecting 3 hosts"), "{frame}");
     ui.approvals = 0;
     let frame = render(&shell.view(), &mut ui, &km, &[], 160, 24);
-    assert!(!frame.contains("ssh: waiting"), "{frame}");
+    assert!(!frame.contains("ssh: connecting"), "{frame}");
 }

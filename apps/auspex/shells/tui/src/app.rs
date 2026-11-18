@@ -37,7 +37,7 @@ use crate::keymap::{Key, Keymap};
 use crate::log::{Log, say};
 use crate::shell::Shell;
 use crate::theme::{self, Theme};
-use crate::ui::{self, Context, Ui};
+use crate::ui::{Context, Ui};
 
 /// The TUI's frame rate. The frame timer repaints whether or not anything changed, so
 /// answers arriving on other tasks never touch the terminal themselves.
@@ -294,11 +294,9 @@ async fn tui(
         tokio::select! {
             _ = frames.tick() => {
                 ui.frame = ui.frame.wrapping_add(1);
-                ui.approvals = shell.approvals();
-                let view = shell.view();
                 let log = shell.log.lines();
                 let ctx = Context { theme, keymap, flake, log: &log };
-                if let Err(e) = terminal.draw(|f| ui::draw(f, &view, &mut ui, &ctx)) {
+                if let Err(e) = terminal.draw(|f| shell.draw(f, &mut ui, &ctx)) {
                     failure = Some(format!("cannot draw: {e}"));
                     code = ExitCode::from(USAGE);
                     break;

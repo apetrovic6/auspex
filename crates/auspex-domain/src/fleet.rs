@@ -827,7 +827,7 @@ pub enum SshOperation {
     Probe,
     /// Check for an existing master without opening a connection.
     Check,
-    /// Authenticate, then detach a persistent master without a remote command.
+    /// Authenticate by running `true`, letting `ControlPersist` detach a reusable master.
     Connect,
 }
 
@@ -864,7 +864,7 @@ impl<'a> SshOptions<'a> {
 /// never passes through the remote login shell's quoting.
 pub const PROBE_REMOTE_COMMAND: &str = "/bin/sh -s";
 
-/// ssh's arguments for `target`, without the program name and without the remote command:
+/// ssh's arguments for `target`, without the program name or probe script command:
 ///
 /// ```text
 /// -T -o BatchMode=yes -o ConnectTimeout=<connect_timeout> -o ServerAliveInterval=5
@@ -878,8 +878,9 @@ pub const PROBE_REMOTE_COMMAND: &str = "/bin/sh -s";
 /// connection for `control_persist` seconds. The control directory's ownership and 0700
 /// permissions are what restrict that access to the operator.
 ///
-/// [`SshOperation::Check`] adds `-O check`; [`SshOperation::Connect`] uses
-/// `ControlMaster=yes -N -f`. Both use this same destination and safety options.
+/// [`SshOperation::Check`] adds `-O check`; [`SshOperation::Connect`] appends `true`.
+/// Connect uses `ControlMaster=auto`: a race loser runs the command and exits rather
+/// than detaching a socketless `-N -f` process without an idle timeout.
 ///
 /// # What the caller must do
 ///
@@ -923,20 +924,14 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
         "-o".to_owned(),
         "ServerAliveInterval=5".to_owned(),
         "-o".to_owned(),
-        match options.operation {
-            SshOperation::Connect => "ControlMaster=yes",
-            SshOperation::Probe | SshOperation::Check => "ControlMaster=auto",
-        }
-        .to_owned(),
+        "ControlMaster=auto".to_owned(),
         "-o".to_owned(),
         format!("ControlPath={dir}/%C"),
         "-o".to_owned(),
         format!("ControlPersist={}s", options.control_persist),
     ];
-    match options.operation {
-        SshOperation::Probe => {}
-        SshOperation::Check => args.extend(["-O".to_owned(), "check".to_owned()]),
-        SshOperation::Connect => args.extend(["-N".to_owned(), "-f".to_owned()]),
+    if options.operation == SshOperation::Check {
+        args.extend(["-O".to_owned(), "check".to_owned()]);
     }
     for (k, v) in &target.options {
         args.push("-o".to_owned());
@@ -948,6 +943,9 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
     }
     args.push("--".to_owned());
     args.push(target.destination());
+    if options.operation == SshOperation::Connect {
+        args.push("true".to_owned());
+    }
     Ok(args)
 }
 
@@ -1264,6 +1262,40 @@ mod tests {
         assert_eq!(&plain[plain.len() - 2..], ["--", "terra"]);
         assert!(plain.contains(&"ControlPath=/run/user/1000/auspex/%C".to_owned()));
         assert!(!plain.contains(&"-p".to_owned()));
+    }
+
+    #[test]
+    fn ssh_control_operations_have_exact_argv() {
+        for operation in [SshOperation::Check, SshOperation::Connect] {
+            let mut options = SshOptions::new(DIR);
+            options.connect_timeout = ConnectTimeout::new(7).unwrap();
+            options.control_persist = 1200;
+            options.operation = operation;
+            let mut expected = vec![
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=7",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/run/user/1000/auspex/%C",
+                "-o",
+                "ControlPersist=1200s",
+            ];
+            if operation == SshOperation::Check {
+                expected.extend(["-O", "check"]);
+            }
+            expected.extend(["-o", "Compression=yes", "-p", "2222", "--", "root@fd00::1"]);
+            if operation == SshOperation::Connect {
+                expected.push("true");
+            }
+            let actual = ssh_args(&t("root@[fd00::1]:2222?Compression=yes"), &options).unwrap();
+            assert_eq!(actual, expected, "{operation:?}");
+        }
     }
 
     /// Whatever a target string is, if it parses, then in argv: the destination is the

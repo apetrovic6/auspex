@@ -1,7 +1,7 @@
 //! The ssh probe: one round trip per machine per refresh, through the system `ssh`.
 //!
 //! Every phase's argv comes from [`ssh_args`]. A control check precedes the probe; a cold
-//! destination authenticates with `-N -f` under a separate approval deadline first.
+//! destination authenticates by running `true` under a separate approval deadline first.
 //! The probe then appends [`PROBE_REMOTE_COMMAND`] and sends its script on stdin.
 //! Nothing from a target, a machine name or a config value reaches argv any other way, and
 //! no shell is involved locally: the program is executed directly.
@@ -11,10 +11,12 @@
 //! is `/dev/null` for control operations or the pipe carrying the probe script.
 //! A `ProxyJump` hop from `~/.ssh/config` inherits these prompt restrictions too.
 
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 use std::{fmt, fs, io};
 
@@ -230,8 +232,105 @@ impl Drop for ApprovalGuard<'_> {
     }
 }
 
-/// A check never connects; only a missing master starts the separately bounded approval.
+// The directory and destination inputs identify the control path; query options do not.
+// Keep coordination process-wide so separately prepared handles for the same directory
+// still share an approval. Entries exist only while calls hold the flight.
+#[derive(PartialEq, Eq, Hash)]
+struct ControlKey {
+    directory: String,
+    destination: String,
+    port: Option<u16>,
+}
+
+enum ConnectionResult {
+    Pending,
+    Finished(Option<ProbeOutcome>),
+}
+
+struct ConnectionFlight {
+    key: Arc<ControlKey>,
+    // A cancelled/dropped initializer leaves Pending so another caller can retry.
+    result: tokio::sync::Mutex<ConnectionResult>,
+}
+
+static CONNECTIONS: LazyLock<Mutex<HashMap<Arc<ControlKey>, Weak<ConnectionFlight>>>> =
+    LazyLock::new(Mutex::default);
+
+impl Drop for ConnectionFlight {
+    fn drop(&mut self) {
+        let mut connections = CONNECTIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if connections
+            .get(&self.key)
+            .is_some_and(|entry| entry.strong_count() == 0)
+        {
+            connections.remove(&self.key);
+        }
+    }
+}
+
+fn connection_flight(target: &Target, control_dir: &ControlDir) -> Arc<ConnectionFlight> {
+    let key = Arc::new(ControlKey {
+        directory: control_dir.as_str().to_owned(),
+        destination: target.destination(),
+        port: target.port(),
+    });
+    let mut connections = CONNECTIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = connections.entry(Arc::clone(&key)).or_default();
+    if let Some(flight) = entry.upgrade() {
+        drop(connections);
+        return flight;
+    }
+    let flight = Arc::new(ConnectionFlight {
+        key,
+        result: tokio::sync::Mutex::new(ConnectionResult::Pending),
+    });
+    *entry = Arc::downgrade(&flight);
+    drop(connections);
+    flight
+}
+
+fn approval_timeout() -> ProbeOutcome {
+    ProbeOutcome::Unreachable {
+        reason: "ssh connection/authentication timed out (agent approval may be pending)"
+            .to_owned(),
+    }
+}
+
 async fn connect(
+    target: &Target,
+    params: &ProbeParams<'_>,
+    cancel: &CancellationToken,
+) -> Result<Option<ProbeOutcome>, Cancelled> {
+    let flight = connection_flight(target, params.control_dir);
+    // Only the initializer runs ssh. Cancelling a waiter never drops the owner's run;
+    // cancelling the owner goes through run's explicit kill-and-reap before unlocking.
+    let mut result = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(Cancelled),
+        result = tokio::time::timeout(params.approval_deadline, flight.result.lock()) => {
+            match result {
+                Ok(result) => result,
+                Err(_) => return Ok(Some(approval_timeout())),
+            }
+        }
+    };
+    match &*result {
+        ConnectionResult::Pending => {
+            let outcome = connect_once(target, params, cancel).await?;
+            *result = ConnectionResult::Finished(outcome.clone());
+            drop(result);
+            Ok(outcome)
+        }
+        ConnectionResult::Finished(outcome) => Ok(outcome.clone()),
+    }
+}
+
+/// A check never connects; only a missing master starts the separately bounded approval.
+async fn connect_once(
     target: &Target,
     params: &ProbeParams<'_>,
     cancel: &CancellationToken,
@@ -270,9 +369,9 @@ async fn connect(
         cmd.args(&args)
             .env_remove("SSH_ASKPASS")
             .env("SSH_ASKPASS_REQUIRE", "never");
-        // -f detaches only after authentication. While waiting, the session/group guard
-        // kills ssh and its hops on cancellation. A detached master gets no script stdin;
-        // run's bounded pipe drain handles OpenSSH versions that retain output pipes.
+        // `auto` recovers stale sockets and lets cross-process race losers run `true`
+        // and exit. Only ssh's own ControlPersist path detaches a reusable master;
+        // unlike -N -f, there is no socketless, unbounded background fallback.
         let allowance = if operation == SshOperation::Check {
             Duration::from_secs(params.connect_timeout.seconds())
         } else {
@@ -304,9 +403,7 @@ async fn connect(
             End::Exited(status) if status.success() => return Ok(None),
             _ if operation == SshOperation::Check => {}
             End::TimedOut => {
-                return Ok(Some(ProbeOutcome::Unreachable {
-                    reason: "waiting for ssh approval timed out".to_owned(),
-                }));
+                return Ok(Some(approval_timeout()));
             }
             End::Overflow => {
                 return Ok(Some(ProbeOutcome::Failed {

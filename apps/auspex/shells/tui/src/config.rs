@@ -263,6 +263,14 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                         s.timeouts.settle, s.timeouts.probe
                     ));
                 }
+                if s.timeouts.settle < s.timeouts.ssh_approval + s.timeouts.probe {
+                    w.warnings.push(format!(
+                        "`timeouts.settle` ({} s) is shorter than `timeouts.ssh_approval` ({} s) \
+                         plus `timeouts.probe` ({} s), so the global deadline can cut off \
+                         connection/authentication or the probe",
+                        s.timeouts.settle, s.timeouts.ssh_approval, s.timeouts.probe
+                    ));
+                }
             }
             "eval" => {
                 let t = w.table(value, "eval")?;

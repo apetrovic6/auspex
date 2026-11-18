@@ -605,7 +605,8 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         format!("{} pending", view.refresh.pending_machines),
     ];
     if ui.approvals != 0 {
-        parts.push(format!("ssh: waiting for {} approvals", ui.approvals));
+        let noun = if ui.approvals == 1 { "host" } else { "hosts" };
+        parts.push(format!("ssh: connecting {} {noun}", ui.approvals));
     }
     if let Some(p) = prometheus {
         parts.push(p);

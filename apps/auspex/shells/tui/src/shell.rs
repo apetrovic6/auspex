@@ -123,6 +123,17 @@ impl Shell {
         self.core.view()
     }
 
+    /// Draws the core view together with the current shell-only connection count.
+    pub fn draw(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        ui: &mut crate::ui::Ui,
+        ctx: &crate::ui::Context<'_>,
+    ) {
+        ui.approvals = self.approvals();
+        crate::ui::draw(frame, &self.view(), ui, ctx);
+    }
+
     /// Probes currently connecting/authenticating, outside the core's report contract.
     #[must_use]
     pub fn approvals(&self) -> usize {
@@ -133,7 +144,8 @@ impl Shell {
         if waiting {
             self.approvals.fetch_add(1, Ordering::Relaxed);
             if !self.approval_noted.swap(true, Ordering::Relaxed) {
-                self.log.line("ssh: waiting for approval");
+                self.log
+                    .line("ssh: connecting/authenticating (agent approval may be pending)");
             }
         } else {
             self.approvals.fetch_sub(1, Ordering::Relaxed);

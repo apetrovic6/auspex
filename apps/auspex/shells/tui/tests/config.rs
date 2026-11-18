@@ -258,8 +258,23 @@ fn a_settle_shorter_than_the_probe_is_a_warning() {
             .any(|w| w.contains("timeouts.settle") && w.contains("timeouts.probe")),
         "{w:?}"
     );
-    let (_, w) = config::parse("[timeouts]\nsettle = 10\nprobe = 10\n").unwrap();
+    let (_, w) = config::parse("[timeouts]\nsettle = 70\nprobe = 10\n").unwrap();
     assert_eq!(w, Vec::<String>::new());
+}
+
+#[test]
+fn settle_warns_when_it_cuts_off_connection_or_authentication() {
+    let (_, warnings) = config::parse("[timeouts]\nssh_approval = 600\nsettle = 120\n").unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("timeouts.ssh_approval")
+                && warning.contains("timeouts.settle")),
+        "{warnings:?}"
+    );
+    let (_, warnings) =
+        config::parse("[timeouts]\nssh_approval = 5\nprobe = 10\nsettle = 15\n").unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
 }
 
 /// Review finding 6: `stale_after` without a `url` was dropped silently.

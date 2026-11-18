@@ -671,7 +671,7 @@ fn headless_reports_approval_once_and_uses_the_configured_allowance() {
         r#"for arg; do
 case "$arg" in
   -O) exit 1;;
-  -N) exec @sleep@ 15;;
+  true) exec @sleep@ 15;;
 esac
 done
 exit 99"#,
@@ -692,12 +692,16 @@ exit 99"#,
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     assert_eq!(
-        stderr.matches("ssh: waiting for approval").count(),
+        stderr
+            .matches("ssh: connecting/authenticating (agent approval may be pending)")
+            .count(),
         1,
         "{stderr}"
     );
     assert_eq!(
-        stdout.matches("waiting for ssh approval timed out").count(),
+        stdout
+            .matches("ssh connection/authentication timed out (agent approval may be pending)")
+            .count(),
         2,
         "{stdout}"
     );
