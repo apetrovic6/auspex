@@ -13,6 +13,7 @@
 //! Modules, one per adapter:
 //!
 //! - [`ssh`]: the probe, and the control-socket directory it needs.
+//! - [`clan`]: which `clan` binary the fleet pins (built from its lock), and running it.
 //! - [`nix`]: the machine list (`nix eval`) and the evaluation (`nix-eval-jobs`).
 //! - [`cache`]: the evaluation cache under `$XDG_CACHE_HOME/auspex/`, and
 //!   [`cache::evaluate_cached`], which puts it in front of [`nix::evaluate`].
@@ -94,6 +95,7 @@
 #![feature(process_setsid)]
 
 pub mod cache;
+pub mod clan;
 pub mod dns;
 pub mod http;
 pub mod narinfo;

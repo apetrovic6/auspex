@@ -165,3 +165,19 @@ pub fn runtime_dir() -> PathBuf {
     }
     DIR.with(|dir| dir.path().join("rt"))
 }
+
+/// `ResolveParams` for a test: with a private GC root directory, so that a test whose
+/// resolution goes further than it should (a refusal that regressed) cannot create
+/// `$XDG_STATE_HOME/auspex/gcroots` on the developer's machine. Every test builds its
+/// parameters from this, never from `ResolveParams::new()` (a test in `clan_fake.rs` checks).
+pub fn resolve_params() -> auspex_effects::clan::ResolveParams<'static> {
+    thread_local! {
+        static DIR: tempfile::TempDir = tempdir();
+    }
+    // The leaked path string is a few bytes; the directory goes with the thread's guard.
+    let dir: &'static Path = Box::leak(DIR.with(|d| d.path().join("gcroots")).into_boxed_path());
+    auspex_effects::clan::ResolveParams {
+        gcroot_dir: Some(dir),
+        ..auspex_effects::clan::ResolveParams::new()
+    }
+}

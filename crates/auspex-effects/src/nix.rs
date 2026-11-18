@@ -124,6 +124,18 @@ impl FlakeRef {
     ///
     /// When it is empty, starts with `-`, contains `#`, or contains a control character.
     pub fn new(s: &str) -> Result<Self, FlakeRefError> {
+        let cwd = std::env::current_dir()
+            .map_err(|e| FlakeRefError(format!("cannot find the working directory: {e}")))?;
+        Self::new_in(s, &cwd)
+    }
+
+    /// As [`Self::new`], with relative paths taken from `cwd` instead of the process's working
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn new_in(s: &str, cwd: &Path) -> Result<Self, FlakeRefError> {
         if s.is_empty() {
             return Err(FlakeRefError("the flake reference is empty".to_owned()));
         }
@@ -142,6 +154,8 @@ impl FlakeRef {
                 "flake reference contains a control character".to_owned(),
             ));
         }
+        let absolute = absolute_local_scheme(s, cwd)?;
+        let s = absolute.as_str();
         let queried = has_scheme(s) && s.contains('?');
         let local = if let Some(file) = s.strip_prefix("git+") {
             (!queried)
@@ -151,7 +165,7 @@ impl FlakeRef {
             None
         } else {
             Some(
-                std::path::absolute(Path::new(s))
+                std::path::absolute(cwd.join(s))
                     .map_err(|e| FlakeRefError(format!("cannot make {s:?} absolute: {e}")))?,
             )
         };
@@ -237,6 +251,58 @@ impl FlakeRef {
         }
     }
 
+    /// The reference for a command that reads the flake's *metadata* (`nix flake metadata`,
+    /// `nix build --inputs-from`): [`Self::as_str`], plus `shallow=1` for a local git
+    /// reference.
+    ///
+    /// Without it nix refuses a shallow clone outright ("is a shallow Git repository, so
+    /// 'revCount' is not available"), because metadata always includes `revCount`. A fleet
+    /// checked out with `--depth` is an ordinary setup. Merged into an existing query rather
+    /// than appended blindly, and left alone when the operator already chose a `shallow`
+    /// value. Not used by evaluation: `nix eval` does not ask for `revCount` and works on a
+    /// shallow clone as it is.
+    #[must_use]
+    pub fn shallow_safe(&self) -> String {
+        if !self.reference.starts_with("git+file:") {
+            return self.reference.clone();
+        }
+        match self.reference.split_once('?') {
+            None => format!("{}?shallow=1", self.reference),
+            Some((_, query)) if query.split('&').any(|p| p.starts_with("shallow=")) => {
+                self.reference.clone()
+            }
+            Some(_) => format!("{}&shallow=1", self.reference),
+        }
+    }
+
+    /// Whether this names something on this machine (`path:` or `git+file:`), as opposed to a
+    /// remote flake.
+    pub(crate) fn is_local(&self) -> bool {
+        self.reference.starts_with("path:") || self.reference.starts_with("git+file:")
+    }
+
+    /// The flake's directory on this machine, when it has one: the worktree of a git
+    /// reference, or the path of a `path:` reference. What `clan` is run from and given as
+    /// `--flake`, since it takes a directory, not a normalised `git+file://` URL.
+    ///
+    /// `None` for a reference the operator wrote with a query (`?dir=`, `?ref=`, anything):
+    /// the directory it names is not the path before the `?` (`path:/x?dir=sub` is `/x/sub`),
+    /// and guessing would run clan against the wrong flake. See [`Self::has_query`].
+    pub(crate) fn local_dir(&self) -> Option<std::path::PathBuf> {
+        if self.queried {
+            return None;
+        }
+        if let Some(dir) = &self.worktree {
+            return Some(dir.clone());
+        }
+        let rest = self.reference.strip_prefix("path:")?;
+        // `path:` references are built by `new` from `Url::path()`, which percent-encodes.
+        url::Url::parse(&format!("file://{rest}"))
+            .ok()?
+            .to_file_path()
+            .ok()
+    }
+
     pub(crate) fn worktree_dir(&self) -> Option<&Path> {
         self.worktree.as_deref()
     }
@@ -244,6 +310,53 @@ impl FlakeRef {
     pub(crate) fn repo_top(&self) -> Option<&Path> {
         self.top.as_deref()
     }
+}
+
+/// `path:` and `git+file:` references that name a directory relative to `cwd` (`path:./fleet`,
+/// `path:fleet`, `git+file:fleet`) made absolute, the way a plain path already is.
+///
+/// Left alone they are not a directory auspex can find: nix resolves them against its own
+/// working directory, which is neither where `clan` would be run from nor where the lock file
+/// is looked for. Anything else comes back unchanged. The path is taken as written (not
+/// percent-decoded) and the query, if any, is kept.
+fn absolute_local_scheme(s: &str, cwd: &Path) -> Result<String, FlakeRefError> {
+    let (git, rest) = if let Some(rest) = s.strip_prefix("path:") {
+        (false, rest)
+    } else if let Some(rest) = s.strip_prefix("git+file:") {
+        // `git+file://…` has an authority (a host, normally empty) and is a URL already.
+        if rest.starts_with("//") {
+            return Ok(s.to_owned());
+        }
+        (true, rest)
+    } else {
+        return Ok(s.to_owned());
+    };
+    let (path, query) = rest
+        .split_once('?')
+        .map_or((rest, None), |(p, q)| (p, Some(q)));
+    if !git && path.starts_with('/') {
+        return Ok(s.to_owned());
+    }
+    if path.is_empty() {
+        return Err(FlakeRefError(format!(
+            "flake reference {s:?} names no path"
+        )));
+    }
+    let abs = std::path::absolute(cwd.join(path))
+        .map_err(|e| FlakeRefError(format!("cannot make {s:?} absolute: {e}")))?;
+    let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+    let file = url::Url::from_file_path(&abs)
+        .map_err(|()| FlakeRefError(format!("cannot encode the path of {s:?}")))?;
+    let mut out = if git {
+        format!("git+file://{}", file.path())
+    } else {
+        format!("path:{}", file.path())
+    };
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    Ok(out)
 }
 
 /// `scheme:` at the start, as in a URL: a letter, then letters, digits, `+`, `-`, `.`.
@@ -882,6 +995,74 @@ async fn drain<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_local_scheme_references_are_made_absolute() {
+        let base = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(base.path()).unwrap();
+        let plain = cwd.join("plain");
+        let repo = cwd.join("repo");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let abs = |p: &Path| format!("path:{}", p.display());
+        let new = |s: &str| FlakeRef::new_in(s, &cwd).unwrap();
+
+        // The four forms the review found: with a scheme, and not absolute.
+        for form in ["path:./plain", "path:plain"] {
+            let f = new(form);
+            assert_eq!(f.as_str(), abs(&plain), "{form}");
+            assert_eq!(f.local_dir(), Some(plain.clone()), "{form}");
+            assert!(!f.has_query(), "{form}");
+        }
+        for form in [
+            "git+file:./repo",
+            "git+file:repo",
+            "git+file:/abs/not/relative",
+        ] {
+            let f = new(form);
+            if form.ends_with("relative") {
+                // Absolute already, with one slash: made a URL, and not a repository.
+                assert_eq!(f.as_str(), "git+file:///abs/not/relative", "{form}");
+                assert_eq!(f.local_dir(), None, "{form}");
+                continue;
+            }
+            // A git repository: normalised like a plain path inside one.
+            assert!(
+                f.as_str().starts_with("git+file://"),
+                "{form}: {}",
+                f.as_str()
+            );
+            assert_eq!(f.local_dir(), Some(repo.clone()), "{form}");
+        }
+        // A query is kept, and still a query.
+        let q = new("path:./plain?dir=sub");
+        assert_eq!(q.as_str(), format!("{}?dir=sub", abs(&plain)));
+        assert!(q.has_query() && q.is_local());
+        // Already absolute, or not local: untouched.
+        assert_eq!(new("path:/x/y").as_str(), "path:/x/y");
+        assert_eq!(new("git+file:///x/y").as_str(), "git+file:///x/y");
+        assert_eq!(new("git+file://host/x").as_str(), "git+file://host/x");
+        assert_eq!(new("github:o/r").as_str(), "github:o/r");
+        // And a plain relative path is relative to `cwd`, as it always was.
+        assert_eq!(new("plain").as_str(), abs(&plain));
+        assert!(FlakeRef::new_in("path:", &cwd).is_err());
+    }
+
+    #[test]
+    fn metadata_references_are_shallow_safe_only_for_local_git() {
+        let s = |r: &str| FlakeRef::new(r).unwrap().shallow_safe();
+        assert_eq!(s("git+file:///x"), "git+file:///x?shallow=1");
+        // Merged into the query the reference already has, not appended as a second one.
+        assert_eq!(s("git+file:///x?dir=a"), "git+file:///x?dir=a&shallow=1");
+        // The operator's own choice stays.
+        assert_eq!(
+            s("git+file:///x?shallow=0&dir=a"),
+            "git+file:///x?shallow=0&dir=a"
+        );
+        for other in ["path:/x", "github:o/r", "git+https://h/r"] {
+            assert_eq!(s(other), other);
+        }
+    }
 
     #[test]
     fn flake_refs() {

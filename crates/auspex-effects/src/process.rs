@@ -164,6 +164,25 @@ impl Spawned {
         Ok(status)
     }
 
+    /// Whether the leader has exited already: if so, does what [`Self::exited`] does and
+    /// returns its status; `None` when it is still running. Never waits.
+    ///
+    /// For a caller that has just been told to stop and wants to know whether there is
+    /// anything left to stop. [`Self::exited`] cannot answer that: it is woken by `SIGCHLD` and
+    /// a timer, which the runtime only delivers when it next looks, so an exit that happened
+    /// just before a cancellation can still be invisible to it while the cancellation is ready.
+    pub async fn exited_now(&mut self) -> Option<ExitStatus> {
+        use rustix::process::{WaitId, WaitIdOptions, waitid};
+        let pid = self.watch.pid?;
+        match waitid(
+            WaitId::Pid(pid),
+            WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG,
+        ) {
+            Ok(Some(_)) => self.exited().await.ok(),
+            _ => None,
+        }
+    }
+
     /// Kills the group, then the leader, and reaps it. Returns its status when reaped in
     /// time.
     pub async fn kill_and_reap(&mut self) -> Option<ExitStatus> {
@@ -194,7 +213,7 @@ pub fn command(program: &OsStr) -> io::Result<Command> {
     resolve_in(program, std::env::var_os("PATH").as_deref()).map(Command::new)
 }
 
-fn resolve_in(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
+pub fn resolve_in(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
     let p = Path::new(program);
     if program.as_encoded_bytes().contains(&b'/') {
         if p.is_absolute() {
@@ -806,6 +825,38 @@ mod tests {
         assert!(matches!(ran.end, End::Overflow), "{:?}", ran.end);
         assert!(ran.stdout_truncated && !ran.stdout_eof);
         assert!(ran.status.is_some_and(|s| s.success()), "{:?}", ran.status);
+    }
+
+    /// `exited_now` never waits: a running child is `None`, an exited one (still a zombie, no
+    /// runtime turn in between) is its status, and its group is gone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exited_now_reports_an_exit_without_waiting_for_the_runtime() {
+        let mut cmd = command(OsStr::new("sh")).unwrap();
+        cmd.args(["-c", "while [ ! -e \"$1\" ]; do :; done; exit 3", "sh"]);
+        let dir = tempfile::tempdir().unwrap();
+        let go = dir.path().join("go");
+        cmd.arg(&go);
+        let mut sp = spawn(cmd, false, OnExit::KillGroup, None).unwrap();
+        assert!(sp.exited_now().await.is_none(), "it is still running");
+        std::fs::write(&go, "").unwrap();
+        // Block the runtime's only thread until the child is a zombie: nothing woke `exited`.
+        let began = std::time::Instant::now();
+        loop {
+            let pid = sp.child.id().unwrap();
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            if stat
+                .rsplit(')')
+                .next()
+                .is_some_and(|r| r.trim_start().starts_with('Z'))
+            {
+                break;
+            }
+            assert!(began.elapsed() < Duration::from_secs(10), "never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let status = sp.exited_now().await.expect("it has exited");
+        assert_eq!(status.code(), Some(3));
     }
 
     /// Review finding F6: empty and relative `PATH` entries are never searched, so a
