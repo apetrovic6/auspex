@@ -22,8 +22,7 @@ use std::time::Duration;
 
 use auspex_effects::CancellationToken;
 use auspex_effects::clan::{
-    ClanBinary, ClanError, ClanLocator, ClanSource, ClanStep, PathClan, ResolveParams,
-    current_system,
+    ClanBinary, ClanError, ClanLocator, ClanSource, ClanStep, PathClan, current_system,
 };
 use auspex_effects::nix::FlakeRef;
 use common::{Tools, find_on_path, tempdir, tools};
@@ -201,7 +200,7 @@ impl Fixture {
         locator: &ClanLocator,
         search: &Path,
     ) -> Result<ClanBinary, ClanError> {
-        let mut p = ResolveParams::new();
+        let mut p = common::resolve_params();
         p.nix = nix.as_os_str();
         p.search_path = Some(search.as_os_str());
         p.gcroot_dir = Some(&self.gcroots);
@@ -246,6 +245,8 @@ async fn the_locked_clan_core_is_built_and_reported() {
         .unwrap_or_else(|e| panic!("{e}"));
     assert!(got.path.starts_with("/nix/store/"), "{:?}", got.path);
     assert!(got.path.ends_with("bin/clan"), "{:?}", got.path);
+    // The canonical path is what is reported, not `<out>/bin/clan` (a symlink here).
+    assert_eq!(got.path, fs::canonicalize(&got.path).unwrap());
     assert_eq!(output_of(&got.path), "fake clan A");
     assert_eq!(got.revision.as_deref(), Some(rev.as_str()));
     assert_eq!(
@@ -428,7 +429,7 @@ async fn a_clan_core_without_a_clan_cli_fails_the_build_step_with_nixs_reason() 
 #[tokio::test]
 async fn a_system_that_is_not_a_system_name_is_refused_before_anything_runs() {
     let Some(f) = fixture(true) else { return };
-    let mut p = ResolveParams::new();
+    let mut p = common::resolve_params();
     p.nix = f.nix.as_os_str();
     p.system = Some("x86_64-linux.evil\"");
     let e = ClanLocator::new()
@@ -714,7 +715,7 @@ async fn the_cache_key_has_the_system_and_the_nix_program_in_it() {
 
     // Another system is another build. The fake core has only this machine's, so it fails:
     // it must not be answered with this machine's binary from the cache.
-    let mut p = ResolveParams::new();
+    let mut p = common::resolve_params();
     p.nix = f.nix.as_os_str();
     p.search_path = Some(f.empty.as_os_str());
     p.gcroot_dir = Some(&f.gcroots);
@@ -828,8 +829,78 @@ async fn a_built_clan_is_rooted_by_one_link_per_lock_and_system() {
     f.resolve(&ClanLocator::new(), &f.empty).await.unwrap();
     assert_eq!(links(&f.gcroots), one);
     assert_eq!(fs::read_link(&one[0]).unwrap(), Path::new(&out));
+}
 
-    // Another lock is another link, and the first stays.
+/// D: the root is named after the clan-core node, so a lock change that is not clan-core's
+/// keeps the link; a new clan-core gets a new link and the older ones of ours go, and nothing
+/// that is not ours does.
+#[tokio::test]
+async fn a_new_clan_core_replaces_the_old_root_and_only_ours_go() {
+    let Some(f) = fixture(true) else { return };
+    let locator = ClanLocator::new();
+    f.resolve(&locator, &f.empty).await.unwrap();
+    let outs = fs::read_to_string(f.nix.parent().unwrap().join("outs")).unwrap();
+    let out = outs.lines().next().unwrap().to_owned();
+    let links = |dir: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        v.sort();
+        v
+    };
+    let one = links(&f.gcroots);
+    assert_eq!(one.len(), 1, "{one:?}");
+
+    // The fleet gains an unrelated input: the lock changes, the clan-core node does not, so it
+    // is the same link (and the same build), not a second root.
+    let unrelated = f.fleet.parent().unwrap().join("unrelated");
+    fs::create_dir(&unrelated).unwrap();
+    fs::write(unrelated.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+    git(&unrelated, &["init", "-q"]);
+    git(&unrelated, &["add", "-A"]);
+    git(&unrelated, &["commit", "-q", "-m", "x"]);
+    let flake_nix = fs::read_to_string(f.fleet.join("flake.nix")).unwrap();
+    fs::write(
+        f.fleet.join("flake.nix"),
+        flake_nix.replace(
+            "outputs",
+            &format!(
+                "inputs.unrelated.url = \"git+file://{}\";\n  outputs",
+                unrelated.display()
+            ),
+        ),
+    )
+    .unwrap();
+    lock(&f.fleet);
+    f.resolve(&locator, &f.empty).await.unwrap();
+    assert_eq!(
+        links(&f.gcroots),
+        one,
+        "a lock change that is not clan-core's made a link"
+    );
+
+    // Things in the directory that are not auspex's links, and links that are.
+    let system = current_system();
+    let decoys: Vec<PathBuf> = [
+        "notes.txt".to_owned(),
+        format!("0123456789abcdef-{system}-dev"),
+        "0123456789abcdef-aarch64-plan9".to_owned(),
+    ]
+    .iter()
+    .map(|n| f.gcroots.join(n))
+    .collect();
+    fs::write(&decoys[0], "mine").unwrap();
+    symlink("/nowhere", &decoys[1]).unwrap();
+    symlink("/nowhere", &decoys[2]).unwrap();
+    // A regular file with exactly the name of a link is not one.
+    let regular = f.gcroots.join(format!("1111111111111111-{system}"));
+    fs::write(&regular, "mine").unwrap();
+    // An older build of ours for this system, left by an earlier clan-core.
+    let older = f.gcroots.join(format!("2222222222222222-{system}"));
+    symlink(&out, &older).unwrap();
+
+    // Another clan-core: a new link, and the links of the builds before it are gone.
     write_core(&f.core, "B", true);
     git(&f.core, &["add", "-A"]);
     git(&f.core, &["commit", "-q", "-m", "B"]);
@@ -840,8 +911,100 @@ async fn a_built_clan_is_rooted_by_one_link_per_lock_and_system() {
         &format!("path:{}", f.fleet.display()),
         "clan-core",
     ]);
-    f.resolve(&locator, &f.empty).await.unwrap();
-    let two = links(&f.gcroots);
-    assert_eq!(two.len(), 2, "{two:?}");
-    assert!(two.contains(&one[0]));
+    let second = f.resolve(&locator, &f.empty).await.unwrap();
+    let now = links(&f.gcroots);
+    let newest: Vec<_> = now
+        .iter()
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_str().unwrap();
+            name.ends_with(&format!("-{system}"))
+                && name.len() == 16 + 1 + system.len()
+                && p.symlink_metadata().unwrap().file_type().is_symlink()
+        })
+        .collect();
+    assert_eq!(newest.len(), 1, "{now:?}");
+    assert_ne!(newest[0], &one[0], "the link of the old clan-core was kept");
+    assert!(!one[0].exists() && one[0].symlink_metadata().is_err());
+    assert!(
+        older.symlink_metadata().is_err(),
+        "an older link of ours was kept"
+    );
+    for survivor in decoys.iter().chain([&regular]) {
+        assert!(
+            survivor.symlink_metadata().is_ok(),
+            "{survivor:?} was removed"
+        );
+    }
+    assert!(
+        second.trail.iter().any(|l| l.contains("removed 2 GC root")),
+        "{:?}",
+        second.trail
+    );
+    assert_eq!(output_of(&second.path), "fake clan B");
+}
+
+/// B: with another input of the fleet unlocked (a `git+file` input whose tree is dirty, as when
+/// an input is checked out for development), `--no-update-lock-file` is not a refusal: nix warns,
+/// exits 0, and has relocked `clan-core` in memory to whatever `flake.nix` now names. The check
+/// of the lock file on disk is then the only thing between auspex and a clan-core that is not
+/// the pinned one.
+#[tokio::test]
+async fn with_an_unlocked_input_the_disk_check_is_what_refuses_a_stale_lock() {
+    let Some(f) = fixture(true) else { return };
+    // The fleet is locked (by the fixture) with `clan-core` only. Then `flake.nix` gains a second
+    // input, a git repository whose tree is dirty, that the lock does not have: nix locks it in
+    // memory, as an unlocked input.
+    let dirty = f.fleet.parent().unwrap().join("dirty-input");
+    fs::create_dir(&dirty).unwrap();
+    fs::write(dirty.join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+    fs::write(dirty.join("data"), "committed\n").unwrap();
+    git(&dirty, &["init", "-q"]);
+    git(&dirty, &["add", "-A"]);
+    git(&dirty, &["commit", "-q", "-m", "x"]);
+    let flake_nix = fs::read_to_string(f.fleet.join("flake.nix")).unwrap();
+    fs::write(
+        f.fleet.join("flake.nix"),
+        flake_nix.replace(
+            "outputs",
+            &format!(
+                "inputs.dirty.url = \"git+file://{}\";\n  outputs",
+                dirty.display()
+            ),
+        ),
+    )
+    .unwrap();
+    let lock_file = f.fleet.join("flake.lock");
+    let before = fs::read(&lock_file).unwrap();
+    // And `flake.nix` names another clan-core than the lock does.
+    fs::write(dirty.join("data"), "edited, not committed\n").unwrap();
+    point_flake_nix_elsewhere(&f, &f.fleet);
+
+    // The premise: nix itself does not refuse here. It exits 0, with clan-core relocked.
+    let metadata = Command::new("nix")
+        .args([
+            "flake",
+            "metadata",
+            "--json",
+            "--no-update-lock-file",
+            &format!("path:{}", f.fleet.display()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        metadata.status.success(),
+        "nix refused after all (a different nix?): {}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+
+    // auspex does, by the lock file on disk, not by nix's own error.
+    let e = f.resolve(&ClanLocator::new(), &f.empty).await.unwrap_err();
+    assert_eq!(e.step, ClanStep::Lock, "{e}");
+    assert!(e.reason.contains("out of date"), "{e}");
+    assert!(!e.reason.contains("nix flake metadata exited"), "{e}");
+    assert_eq!(
+        fs::read(&lock_file).unwrap(),
+        before,
+        "the lock was rewritten"
+    );
+    assert_eq!(f.calls("build"), 0);
 }

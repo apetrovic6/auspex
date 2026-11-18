@@ -124,6 +124,18 @@ impl FlakeRef {
     ///
     /// When it is empty, starts with `-`, contains `#`, or contains a control character.
     pub fn new(s: &str) -> Result<Self, FlakeRefError> {
+        let cwd = std::env::current_dir()
+            .map_err(|e| FlakeRefError(format!("cannot find the working directory: {e}")))?;
+        Self::new_in(s, &cwd)
+    }
+
+    /// As [`Self::new`], with relative paths taken from `cwd` instead of the process's working
+    /// directory.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`].
+    pub fn new_in(s: &str, cwd: &Path) -> Result<Self, FlakeRefError> {
         if s.is_empty() {
             return Err(FlakeRefError("the flake reference is empty".to_owned()));
         }
@@ -142,6 +154,8 @@ impl FlakeRef {
                 "flake reference contains a control character".to_owned(),
             ));
         }
+        let absolute = absolute_local_scheme(s, cwd)?;
+        let s = absolute.as_str();
         let queried = has_scheme(s) && s.contains('?');
         let local = if let Some(file) = s.strip_prefix("git+") {
             (!queried)
@@ -151,7 +165,7 @@ impl FlakeRef {
             None
         } else {
             Some(
-                std::path::absolute(Path::new(s))
+                std::path::absolute(cwd.join(s))
                     .map_err(|e| FlakeRefError(format!("cannot make {s:?} absolute: {e}")))?,
             )
         };
@@ -296,6 +310,53 @@ impl FlakeRef {
     pub(crate) fn repo_top(&self) -> Option<&Path> {
         self.top.as_deref()
     }
+}
+
+/// `path:` and `git+file:` references that name a directory relative to `cwd` (`path:./fleet`,
+/// `path:fleet`, `git+file:fleet`) made absolute, the way a plain path already is.
+///
+/// Left alone they are not a directory auspex can find: nix resolves them against its own
+/// working directory, which is neither where `clan` would be run from nor where the lock file
+/// is looked for. Anything else comes back unchanged. The path is taken as written (not
+/// percent-decoded) and the query, if any, is kept.
+fn absolute_local_scheme(s: &str, cwd: &Path) -> Result<String, FlakeRefError> {
+    let (git, rest) = if let Some(rest) = s.strip_prefix("path:") {
+        (false, rest)
+    } else if let Some(rest) = s.strip_prefix("git+file:") {
+        // `git+file://…` has an authority (a host, normally empty) and is a URL already.
+        if rest.starts_with("//") {
+            return Ok(s.to_owned());
+        }
+        (true, rest)
+    } else {
+        return Ok(s.to_owned());
+    };
+    let (path, query) = rest
+        .split_once('?')
+        .map_or((rest, None), |(p, q)| (p, Some(q)));
+    if !git && path.starts_with('/') {
+        return Ok(s.to_owned());
+    }
+    if path.is_empty() {
+        return Err(FlakeRefError(format!(
+            "flake reference {s:?} names no path"
+        )));
+    }
+    let abs = std::path::absolute(cwd.join(path))
+        .map_err(|e| FlakeRefError(format!("cannot make {s:?} absolute: {e}")))?;
+    let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
+    let file = url::Url::from_file_path(&abs)
+        .map_err(|()| FlakeRefError(format!("cannot encode the path of {s:?}")))?;
+    let mut out = if git {
+        format!("git+file://{}", file.path())
+    } else {
+        format!("path:{}", file.path())
+    };
+    if let Some(q) = query {
+        out.push('?');
+        out.push_str(q);
+    }
+    Ok(out)
 }
 
 /// `scheme:` at the start, as in a URL: a letter, then letters, digits, `+`, `-`, `.`.
@@ -934,6 +995,58 @@ async fn drain<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_local_scheme_references_are_made_absolute() {
+        let base = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(base.path()).unwrap();
+        let plain = cwd.join("plain");
+        let repo = cwd.join("repo");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let abs = |p: &Path| format!("path:{}", p.display());
+        let new = |s: &str| FlakeRef::new_in(s, &cwd).unwrap();
+
+        // The four forms the review found: with a scheme, and not absolute.
+        for form in ["path:./plain", "path:plain"] {
+            let f = new(form);
+            assert_eq!(f.as_str(), abs(&plain), "{form}");
+            assert_eq!(f.local_dir(), Some(plain.clone()), "{form}");
+            assert!(!f.has_query(), "{form}");
+        }
+        for form in [
+            "git+file:./repo",
+            "git+file:repo",
+            "git+file:/abs/not/relative",
+        ] {
+            let f = new(form);
+            if form.ends_with("relative") {
+                // Absolute already, with one slash: made a URL, and not a repository.
+                assert_eq!(f.as_str(), "git+file:///abs/not/relative", "{form}");
+                assert_eq!(f.local_dir(), None, "{form}");
+                continue;
+            }
+            // A git repository: normalised like a plain path inside one.
+            assert!(
+                f.as_str().starts_with("git+file://"),
+                "{form}: {}",
+                f.as_str()
+            );
+            assert_eq!(f.local_dir(), Some(repo.clone()), "{form}");
+        }
+        // A query is kept, and still a query.
+        let q = new("path:./plain?dir=sub");
+        assert_eq!(q.as_str(), format!("{}?dir=sub", abs(&plain)));
+        assert!(q.has_query() && q.is_local());
+        // Already absolute, or not local: untouched.
+        assert_eq!(new("path:/x/y").as_str(), "path:/x/y");
+        assert_eq!(new("git+file:///x/y").as_str(), "git+file:///x/y");
+        assert_eq!(new("git+file://host/x").as_str(), "git+file://host/x");
+        assert_eq!(new("github:o/r").as_str(), "github:o/r");
+        // And a plain relative path is relative to `cwd`, as it always was.
+        assert_eq!(new("plain").as_str(), abs(&plain));
+        assert!(FlakeRef::new_in("path:", &cwd).is_err());
+    }
 
     #[test]
     fn metadata_references_are_shallow_safe_only_for_local_git() {
