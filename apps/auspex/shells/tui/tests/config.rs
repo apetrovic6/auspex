@@ -155,24 +155,24 @@ fn a_config_error_exits_2_before_anything_runs() {
 #[test]
 fn the_flake_comes_from_the_flag_then_clan_dir_then_the_file_then_the_current_directory() {
     assert_eq!(
-        resolve_flake(Some("/f"), Some("/c"), Some("/k")),
+        resolve_flake(Some("/f"), Some("/c"), Some("/k")).unwrap(),
         ("/f".to_owned(), FlakeSource::Flag)
     );
     assert_eq!(
-        resolve_flake(None, Some("/c"), Some("/k")),
+        resolve_flake(None, Some("/c"), Some("/k")).unwrap(),
         ("/c".to_owned(), FlakeSource::ClanDir)
     );
     assert_eq!(
-        resolve_flake(None, Some(""), Some("/k")),
+        resolve_flake(None, Some(""), Some("/k")).unwrap(),
         ("/k".to_owned(), FlakeSource::ConfigFile),
         "an empty CLAN_DIR is unset"
     );
     assert_eq!(
-        resolve_flake(None, None, Some("/k")),
+        resolve_flake(None, None, Some("/k")).unwrap(),
         ("/k".to_owned(), FlakeSource::ConfigFile)
     );
     assert_eq!(
-        resolve_flake(None, None, None),
+        resolve_flake(None, None, None).unwrap(),
         (".".to_owned(), FlakeSource::Default)
     );
 }

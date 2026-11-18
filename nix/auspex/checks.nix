@@ -93,6 +93,15 @@ let
   customTheme = withTheme "/mine.toml";
   tildeTheme = withTheme "~/.config/auspex/theme.toml";
   absoluteTheme = withTheme "/home/test/.config/auspex/theme.toml";
+  withFlake = flake: (evaluate { programs.auspex.settings = { inherit flake; }; }).config;
+  tildeFlake = withFlake "~/clan/fleet";
+  # A Nix path value must be written as its string; interpolating it would copy it into the
+  # store and write a /nix/store path.
+  pathFlake = withFlake /home/me/clan/fleet;
+  # What a relative `./fleet` becomes in a flake: a path in the store.
+  storeFlake = withFlake "${pkgs.hello}/fleet";
+  storeFlakeRejected = !(builtins.tryEval (builtins.deepSeq (checked storeFlake).assertions true)).success
+    && builtins.any (a: !a.assertion && lib.hasInfix "store" a.message) storeFlake.assertions;
   absent = (evaluate { programs.auspex.stylix.enable = true; }).config;
   partialPalettes = map (slot: (evaluate {
     programs.auspex.stylix.enable = true;
@@ -182,6 +191,20 @@ in {
           customTheme.xdg.configFile."auspex/config.toml".source) { theme.file = "/mine.toml"; };
     }
   ];
+  auspex-flake-path = pkgs.linkFarm "auspex-flake-path" [
+    {
+      name = "tilde";
+      path = compareToml "flake-tilde" tildeFlake.xdg.configFile."auspex/config.toml".source
+        { flake = "/home/test/clan/fleet"; };
+    }
+    {
+      name = "path-value";
+      path = compareToml "flake-path" pathFlake.xdg.configFile."auspex/config.toml".source
+        { flake = "/home/me/clan/fleet"; };
+    }
+  ];
+  auspex-flake-store-path = check "flake-store-path" (storeFlakeRejected
+    && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeFlake pathFlake ]);
   auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision

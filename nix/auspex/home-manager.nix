@@ -30,7 +30,15 @@ let
   prune = value: if builtins.isAttrs value then
     lib.filterAttrs (_: v: v != null && v != { }) (lib.mapAttrs (_: prune) value)
     else value;
-  settings = prune cfg.settings;
+  pruned = prune cfg.settings;
+  # A path value is written as its string, never copied into the store: `toString`, not
+  # interpolation of the path. `~/` is the home directory, as for `theme.file`.
+  flakePath = toString pruned.flake;
+  settings = pruned // lib.optionalAttrs (pruned ? flake) {
+    flake = if lib.hasPrefix "~/" flakePath
+      then "${config.home.homeDirectory}/${lib.removePrefix "~/" flakePath}"
+      else flakePath;
+  };
   themePath = "${config.xdg.configHome}/auspex/theme.toml";
   selectedThemePath =
     if cfg.settings.theme.file != null && lib.hasPrefix "~/" cfg.settings.theme.file
@@ -45,7 +53,7 @@ in {
       description = "auspex config.toml settings; unknown keys pass through for newer versions. Unset optional values and empty tables are omitted recursively, including explicitly supplied empty tables.";
       default = { };
       type = table {
-        flake = optional types.str "Fleet flake path; --flake and CLAN_DIR take precedence.";
+        flake = optional (types.either types.str types.path) "Fleet flake path; a leading ~/ is your home directory. A path value is written as its string, not copied into the store; a path inside the Nix store (such as a relative ./path in a flake) is refused as a stale copy. --flake and CLAN_DIR take precedence.";
         ssh = section {
           control_persist = optional (types.ints.between 60 3600) "Idle authenticated master lifetime in seconds (default 600); reusable by processes running as the operator.";
         };
@@ -94,6 +102,10 @@ in {
       assertions = [{
         assertion = !cfg.stylix.enable || hasColors;
         message = "programs.auspex.stylix.enable requires Stylix with config.lib.stylix.colors (base00 through base0F).";
+      }
+      {
+        assertion = !(settings ? flake) || !lib.hasPrefix "${builtins.storeDir}/" settings.flake;
+        message = "programs.auspex.settings.flake is a ${builtins.storeDir} path, a frozen copy of the fleet (a relative path literal in a flake is evaluated from the flake's store copy). Use an absolute path or a string such as \"~/clan/fleet\".";
       }];
       xdg.configFile = lib.mkIf (settings != { }) {
         "auspex/config.toml".source = toml.generate "auspex-config.toml" settings;
