@@ -32,7 +32,7 @@ fn locks(with_clan_core: bool) -> String {
         r#""nixpkgs":"nixpkgs""#
     };
     format!(
-        r#"{{"nodes":{{"clan-core":{{"locked":{{"rev":"{REV}","type":"github"}}}},"nixpkgs":{{"locked":{{"rev":"abc","type":"github"}}}},"root":{{"inputs":{{{inputs}}}}}}},"root":"root","version":7}}"#
+        r#"{{"nodes":{{"clan-core":{{"locked":{{"rev":"{REV}","narHash":"sha256-core","type":"github"}}}},"nixpkgs":{{"locked":{{"rev":"abc","type":"github"}}}},"root":{{"inputs":{{{inputs}}}}}}},"root":"root","version":7}}"#
     )
 }
 
@@ -77,7 +77,11 @@ async fn resolve<'a>(
     p.lock_timeout = Duration::from_secs(10);
     p.build_timeout = Duration::from_secs(10);
     tweak(&mut p);
-    let (_fleet, flake) = fleet();
+    let (fleet, flake) = fleet();
+    // Never the operator's own state directory. (The leaked path string is a few bytes; the
+    // directory goes with the fleet's temporary directory.)
+    let roots: &'a Path = Box::leak(fleet.path().join("gcroots").into_boxed_path());
+    p.gcroot_dir = Some(roots);
     ClanLocator::new().resolve(&p, &flake, cancel).await
 }
 
@@ -291,7 +295,7 @@ async fn a_build_past_its_deadline_is_killed_with_its_children() {
     let began = Instant::now();
     let e = resolve(
         &nix,
-        |p| p.build_timeout = Duration::from_millis(500),
+        |p| p.build_timeout = Duration::from_secs(2),
         &CancellationToken::new(),
     )
     .await
@@ -315,6 +319,7 @@ async fn reading_the_lock_past_its_deadline_is_a_lock_timeout() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
     let nix = fake_nix(&t, dir.path(), "@sleep@ 60", "echo /nix/store/x");
+    let began = Instant::now();
     let e = resolve(
         &nix,
         |p| p.lock_timeout = Duration::from_millis(300),
@@ -323,6 +328,12 @@ async fn reading_the_lock_past_its_deadline_is_a_lock_timeout() {
     .await
     .unwrap()
     .unwrap_err();
+    // The lock read's own deadline (the build's is 10 s here), not the build's.
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        began.elapsed()
+    );
     assert_eq!(e.step, ClanStep::Lock);
     assert!(e.reason.contains("timed out"), "{e}");
 }
@@ -522,18 +533,21 @@ async fn cancelling_a_run_kills_the_process_group_and_reaps_it() {
     );
     let cancel = CancellationToken::new();
     let pids_file = dir.path().join("pids");
-    let canceller = {
-        let cancel = cancel.clone();
-        let pids_file = pids_file.clone();
-        tokio::task::spawn_blocking(move || {
-            wait_for_pids(&pids_file, 3);
-            cancel.cancel();
-        })
-    };
     let (tx, mut rx) = unbounded_channel();
     let began = Instant::now();
-    let r = run(&clan, &flake, &[], &RunParams::new(), &cancel, tx).await;
-    canceller.await.unwrap();
+    let params = RunParams::new();
+    let fut = run(&clan, &flake, &[], &params, &cancel, tx);
+    // The script writes its three pids and then prints `started`: once that line is here the
+    // group is all there, and the cancel cannot race the line.
+    let driver = async {
+        let first = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a line within 10 s")
+            .unwrap();
+        assert_eq!(first.text, "started");
+        cancel.cancel();
+    };
+    let (r, ()) = tokio::join!(fut, driver);
     assert_eq!(r.unwrap_err(), Cancelled);
     assert!(
         began.elapsed() < Duration::from_secs(10),
@@ -544,11 +558,6 @@ async fn cancelling_a_run_kills_the_process_group_and_reaps_it() {
     let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     assert!(left.is_empty(), "still alive after the cancel: {left:?}");
-    // What was printed before the cancel was delivered.
-    assert_eq!(
-        collect(&mut rx).await.first().map(|l| l.text.as_str()),
-        Some("started")
-    );
 }
 
 #[tokio::test]
@@ -564,7 +573,7 @@ async fn a_run_past_its_deadline_is_killed_with_its_children_and_keeps_its_outpu
     );
     let (tx, mut rx) = unbounded_channel();
     let params = RunParams {
-        timeout: Duration::from_millis(600),
+        timeout: Duration::from_secs(2),
         ..RunParams::new()
     };
     let ran = run(&clan, &flake, &[], &params, &CancellationToken::new(), tx)
@@ -595,15 +604,19 @@ async fn a_dropped_receiver_stops_the_run_like_a_cancel() {
         // One line, then nobody is listening.
         rx.recv().await;
     });
-    let r = run(
-        &clan,
-        &flake,
-        &[],
-        &RunParams::new(),
-        &CancellationToken::new(),
-        tx,
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        run(
+            &clan,
+            &flake,
+            &[],
+            &RunParams::new(),
+            &CancellationToken::new(),
+            tx,
+        ),
     )
-    .await;
+    .await
+    .expect("the run did not stop when its receiver went");
     reader.await.unwrap();
     assert_eq!(r.unwrap_err(), Cancelled);
     let pids = wait_for_pids(&dir.path().join("pids"), 1);
@@ -644,4 +657,352 @@ async fn a_program_that_cannot_run_is_a_run_error() {
         assert_eq!(e.step, ClanStep::Run);
         assert!(e.reason.contains(why), "{e}");
     }
+}
+
+// --- Fix round 2 ---
+
+/// A fake clan that prints `deployed`, exits 0, and leaves a descendant in a session of its
+/// own holding stdout open: the plan's `ControlPersist` trap, the ssh master that outlives the
+/// command that started it.
+fn deploy_with_lingering_master(t: &Tools, dir: &Path) -> PathBuf {
+    t.script(
+        dir,
+        "clan",
+        "@setsid@ @sh@ -c 'echo $$ >> \"@dir@/pids\"; exec @sleep@ 3' &\nwhile [ ! -s '@dir@/pids' ]; do @sleep@ 0.02; done\necho deployed\nexit 0",
+    )
+}
+
+/// F6 (R5): once clan has exited its status is known, and a cancel after that only cuts the
+/// drain of the pipes short. The status is what step 2 writes into its log.
+#[tokio::test]
+async fn a_cancel_after_clan_has_exited_keeps_its_exit_status() {
+    let Some(t) = tools(&["setsid", "sleep"]) else {
+        return;
+    };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let flake = FlakeRef::new(fleet.path().to_str().unwrap()).unwrap();
+    let clan = deploy_with_lingering_master(&t, dir.path());
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = unbounded_channel();
+    let params = RunParams::new();
+    let fut = run(&clan, &flake, &[], &params, &cancel, tx);
+    let driver = async {
+        let line = rx.recv().await.unwrap();
+        assert_eq!(line.text, "deployed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+    };
+    let (r, ()) = tokio::join!(fut, driver);
+    let pids = wait_for_pids(&dir.path().join("pids"), 1);
+    cleanup(&pids);
+    let ran = r.expect("cancelled after the exit was known").unwrap();
+    assert_eq!(
+        ran.end,
+        RunEnd::Exited {
+            code: Some(0),
+            signal: None
+        }
+    );
+}
+
+/// F6, the same for a receiver that goes away after the exit.
+#[tokio::test]
+async fn a_receiver_that_goes_after_clan_has_exited_keeps_its_exit_status() {
+    let Some(t) = tools(&["setsid", "sleep"]) else {
+        return;
+    };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let flake = FlakeRef::new(fleet.path().to_str().unwrap()).unwrap();
+    let clan = deploy_with_lingering_master(&t, dir.path());
+    let (tx, mut rx) = unbounded_channel::<ClanLine>();
+    let reader = tokio::spawn(async move {
+        let line = rx.recv().await.unwrap();
+        assert_eq!(line.text, "deployed");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // `rx` is dropped here: nobody is listening any more.
+    });
+    let r = run(
+        &clan,
+        &flake,
+        &[],
+        &RunParams::new(),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await;
+    reader.await.unwrap();
+    let pids = wait_for_pids(&dir.path().join("pids"), 1);
+    cleanup(&pids);
+    assert!(
+        r.expect("cancelled after the exit was known")
+            .unwrap()
+            .end
+            .success()
+    );
+}
+
+/// F7: a flake reference with a query is refused by `run`, not guessed at.
+#[tokio::test]
+async fn run_refuses_a_flake_reference_with_a_query() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let clan = t.script(dir.path(), "clan", "echo x > '@dir@/ran'");
+    for reference in [
+        "path:/fleet?dir=sub",
+        "git+file:///fleet?dir=sub",
+        "github:o/r?dir=x",
+    ] {
+        let (tx, _rx) = unbounded_channel();
+        let e = run(
+            &clan,
+            &FlakeRef::new(reference).unwrap(),
+            &argv(&["machines", "update", "m"]),
+            &RunParams::new(),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(e.step, ClanStep::Run, "{reference}: {e}");
+        assert!(e.reason.contains("query"), "{reference}: {e}");
+    }
+    assert!(
+        !dir.path().join("ran").exists(),
+        "clan ran with a guessed flake"
+    );
+}
+
+/// F7: and by the resolution, for a local flake whose lock file it could not find.
+#[tokio::test]
+async fn resolve_refuses_a_local_flake_reference_with_a_query_before_running_nix() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let nix = fake_nix(&t, dir.path(), &metadata_ok(), "echo /nix/store/x");
+    let fleet = tempdir();
+    for reference in [
+        format!("path:{}?dir=sub", fleet.path().display()),
+        format!("git+file://{}?dir=sub", fleet.path().display()),
+    ] {
+        let flake = FlakeRef::new(&reference).unwrap();
+        let mut p = ResolveParams::new();
+        p.nix = nix.as_os_str();
+        let e = ClanLocator::new()
+            .resolve(&p, &flake, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(e.step, ClanStep::Lock, "{reference}: {e}");
+        assert!(e.reason.contains("query"), "{reference}: {e}");
+    }
+    assert!(
+        !dir.path().join("argv").exists(),
+        "nix ran for a reference it cannot check"
+    );
+}
+
+/// F8: clan runs with no askpass program and `SSH_ASKPASS_REQUIRE=never` (the probe's policy),
+/// and no input: stdin is `/dev/null`, so a prompt fails rather than hangs.
+#[tokio::test]
+async fn clan_runs_with_no_askpass_and_no_stdin() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let flake = FlakeRef::new(fleet.path().to_str().unwrap()).unwrap();
+    let clan = t.script(
+        dir.path(),
+        "clan",
+        "printf 'askpass=%s\\n' \"${SSH_ASKPASS-unset}\"\nprintf 'require=%s\\n' \"${SSH_ASKPASS_REQUIRE-unset}\"\nif read -r x; then echo \"stdin=$x\"; else echo stdin=eof; fi",
+    );
+    let (tx, mut rx) = unbounded_channel();
+    run(
+        &clan,
+        &flake,
+        &[],
+        &RunParams::new(),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let lines = collect(&mut rx).await;
+    assert_eq!(
+        of(&lines, Stream::Stdout),
+        ["askpass=unset", "require=never", "stdin=eof"]
+    );
+}
+
+/// Survivor M4: a git fleet is run from, and given, its worktree.
+#[tokio::test]
+async fn run_in_a_git_fleet_uses_its_worktree_as_directory_and_flake() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let fleet = tempdir();
+    fs::create_dir(fleet.path().join(".git")).unwrap();
+    let flake = FlakeRef::new(fleet.path().to_str().unwrap()).unwrap();
+    assert!(
+        flake.as_str().starts_with("git+file://"),
+        "{}",
+        flake.as_str()
+    );
+    let clan = t.script(
+        dir.path(),
+        "clan",
+        "printf 'cwd=%s\\n' \"$PWD\"\nfor a in \"$@\"; do printf 'arg=%s\\n' \"$a\"; done",
+    );
+    let (tx, mut rx) = unbounded_channel();
+    run(
+        &clan,
+        &flake,
+        &argv(&["machines", "update"]),
+        &RunParams::new(),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let wt = fs::canonicalize(fleet.path()).unwrap();
+    assert_eq!(
+        of(&collect(&mut rx).await, Stream::Stdout),
+        [
+            format!("cwd={}", wt.display()),
+            "arg=machines".to_owned(),
+            "arg=update".to_owned(),
+            "arg=--flake".to_owned(),
+            format!("arg={}", wt.display()),
+        ]
+    );
+}
+
+/// Survivor M4: the lock file of a git fleet is checked on disk too.
+#[tokio::test]
+async fn the_lock_file_of_a_git_fleet_is_checked_on_disk() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let nix = fake_nix(&t, dir.path(), &metadata_ok(), "echo /nix/store/x");
+    let fleet = tempdir();
+    fs::create_dir(fleet.path().join(".git")).unwrap();
+    fs::write(
+        fleet.path().join("flake.lock"),
+        locks(true).replace(REV, &"0".repeat(40)),
+    )
+    .unwrap();
+    let flake = FlakeRef::new(fleet.path().to_str().unwrap()).unwrap();
+    assert!(
+        flake.as_str().starts_with("git+file://"),
+        "{}",
+        flake.as_str()
+    );
+    let mut p = ResolveParams::new();
+    p.nix = nix.as_os_str();
+    let e = ClanLocator::new()
+        .resolve(&p, &flake, &CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(e.step, ClanStep::Lock);
+    assert!(e.reason.contains("out of date"), "{e}");
+}
+
+/// Survivor M13: lines already waiting in the pipe when the deadline passes are still
+/// delivered. The order is forced: the runtime's only thread is blocked past the deadline
+/// while the child prints, so when `run` next looks, the deadline and the line are both ready.
+#[tokio::test]
+async fn output_waiting_in_the_pipe_at_the_deadline_is_still_delivered() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let flake = FlakeRef::new(fleet.path().to_str().unwrap()).unwrap();
+    let clan = t.script(
+        dir.path(),
+        "clan",
+        "while [ ! -e '@dir@/go' ]; do @sleep@ 0.02; done\necho late\n@sleep@ 60",
+    );
+    let (tx, mut rx) = unbounded_channel();
+    let params = RunParams {
+        timeout: Duration::from_millis(300),
+        ..RunParams::new()
+    };
+    let cancel = CancellationToken::new();
+    let fut = run(&clan, &flake, &[], &params, &cancel, tx);
+    tokio::pin!(fut);
+    std::future::poll_fn(|cx| {
+        assert!(fut.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    fs::write(dir.path().join("go"), "").unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    let ran = fut.await.unwrap().unwrap();
+    assert_eq!(ran.end, RunEnd::TimedOut);
+    assert_eq!(of(&collect(&mut rx).await, Stream::Stdout), ["late"]);
+}
+
+/// Survivor M15: when clan exits on its own, whatever it left running in its group is killed
+/// (step 2's acceptance: clan is not orphaned).
+#[tokio::test]
+async fn a_normal_exit_kills_what_clan_left_in_its_group() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let flake = FlakeRef::new(fleet.path().to_str().unwrap()).unwrap();
+    let clan = t.script(
+        dir.path(),
+        "clan",
+        "@sleep@ 60 &\necho $! >> '@dir@/pids'\necho done\nexit 0",
+    );
+    let (tx, _rx) = unbounded_channel();
+    let ran = run(
+        &clan,
+        &flake,
+        &[],
+        &RunParams::new(),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(ran.end.success());
+    let pids = wait_for_pids(&dir.path().join("pids"), 1);
+    let left = still_alive_after_wait(&pids);
+    cleanup(&pids);
+    assert!(left.is_empty(), "left running after clan exited: {left:?}");
+}
+
+/// F6: an exit that is already there wins over a cancellation that is ready at the same moment.
+/// The order is forced: the runtime's only thread is blocked while clan exits and the token is
+/// cancelled, so when `run` next looks, both are ready.
+#[tokio::test]
+async fn an_exit_that_is_already_there_wins_over_a_cancel_ready_with_it() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let flake = FlakeRef::new(fleet.path().to_str().unwrap()).unwrap();
+    let clan = t.script(dir.path(), "clan", "echo done\nexit 7");
+    let (tx, _rx) = unbounded_channel();
+    let cancel = CancellationToken::new();
+    let params = RunParams::new();
+    let fut = run(&clan, &flake, &[], &params, &cancel, tx);
+    tokio::pin!(fut);
+    std::future::poll_fn(|cx| {
+        assert!(fut.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    // Long enough for the script to have exited; the runtime has not looked.
+    std::thread::sleep(Duration::from_millis(500));
+    cancel.cancel();
+    let ran = fut.await.expect("an exit that was already there").unwrap();
+    assert_eq!(
+        ran.end,
+        RunEnd::Exited {
+            code: Some(7),
+            signal: None
+        }
+    );
 }

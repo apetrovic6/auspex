@@ -12,54 +12,93 @@
 //!    an executable regular file. Nothing else is consulted, and no nix runs.
 //! 2. **The clan-core input pinned in the fleet's lock.** Two nix calls, both through the
 //!    process supervisor with a timeout and cancellation:
-//!    - `nix flake metadata --json --no-write-lock-file --no-update-lock-file <flake>`
-//!      reads the lock, and the node behind the root input `clan-core` gives the revision
-//!      (`locked.rev`, or `locked.narHash` for an input with no revision, such as a path or
-//!      a tarball). `--no-update-lock-file` makes a lock that does not match `flake.nix` an
-//!      error instead of a silent re-lock: the point is to run what the lock says.
-//!    - `nix build --no-link --print-out-paths --inputs-from <flake>
-//!      clan-core#packages.<system>.clan-cli` builds it. `--inputs-from` resolves the
-//!      indirect reference `clan-core` through *the fleet's own lock*, with the lock's
-//!      `narHash`, so a newer upstream commit can never be built in its place.
+//!    - `nix flake metadata --json --no-update-lock-file <flake>` reads the lock. The node
+//!      behind the root input `clan-core` gives the revision (`locked.rev`, or
+//!      `locked.narHash` for an input with no revision) and its `locked` attributes, which
+//!      must include a `narHash`. `--no-update-lock-file` *without* `--no-write-lock-file`:
+//!      with both, nix only warns ("not writing modified lock file") and carries on with a
+//!      lock it changed in memory; with this alone it refuses a lock that `flake.nix`
+//!      disagrees with, and writes nothing. That is verified for local flakes. For a remote
+//!      flake (`github:…`) there is no local file to write, so nix may take its warning
+//!      branch instead; that could not be checked without a network, and is why the build
+//!      below does not rely on this call alone.
+//!    - `nix build --print-out-paths --out-link <root> --expr <BUILD_EXPR>` builds
+//!      `packages.<system>.clan-cli` **of that locked node itself**: the expression is a
+//!      constant that takes the node's `locked` attributes as a JSON string (`--argstr`),
+//!      renders them with nix's own `builtins.flakeRefToString` into a fully locked flake
+//!      reference (type, url, rev, `narHash`) and `builtins.getFlake`s it. There is no second
+//!      look at the fleet's lock and no registry lookup: a `git pull` or `nix flake update`
+//!      during a build that takes minutes changes nothing, and a user or global registry
+//!      entry named `clan-core` is never consulted, because the reference is not indirect.
+//!      nix checks what it fetched against what is locked: the `narHash` for a tarball,
+//!      path or similar input, the commit `rev` for a git input.
 //!
-//!    The binary is `<out>/bin/clan`.
+//!    The binary is `<out>/bin/clan`, canonicalised, and the canonical path must be inside
+//!    the nix store: a `bin/clan` that is a symlink out of it is an error, so the file that
+//!    runs is the file that was locked. That canonical path is what is reported.
+//!
+//!    **Not the fleet's dev shell's closure, possibly.** The build uses clan-core's *own*
+//!    `flake.lock` for clan-cli's dependencies (nixpkgs, python). A fleet that overrides
+//!    them (`inputs.clan-core.inputs.nixpkgs.follows = "nixpkgs"`) gets a clan-cli in its dev
+//!    shell that is the same revision with a different closure. The real fleet's lock has no
+//!    such override (its `clan-core` node's `inputs` are all node names, no `follows`), so
+//!    this is the right binary for it; a fleet that does override needs the configured path.
 //! 3. **Nothing.** `PATH` is never a fallback. A `clan` on `PATH` is compared with the
 //!    built one by canonical path (a store path names its contents), and the verdict is
 //!    recorded as [`PathClan`]: [`PathClan::Same`], or [`PathClan::Different`] with the
-//!    message "clan on PATH is a different clan-core than the fleet pins". Either way the
-//!    binary used is the fleet's.
+//!    message "clan on PATH is a different clan-cli derivation than the fleet's locked
+//!    clan-core builds". It says *derivation*, not clan-core: the revision may be the same
+//!    with another closure (see above). Either way the binary used is the fleet's.
 //!
-//! **Why `nix flake metadata` and not parsing `flake.lock`.** The lock file on disk is only
-//! the fleet's lock for a local checkout, and for a git checkout nix reads the *committed*
-//! one, not the working tree's. The metadata call asks nix, which is also what the build
-//! then uses, so the revision shown is by construction the revision built. It costs one
-//! process and is not an evaluation of the fleet's outputs: the fleet's dev shell is never
-//! evaluated, and nothing here builds or evaluates a machine.
+//! **Why `nix flake metadata` and not parsing `flake.lock`.** The metadata call asks nix what
+//! the lock is, for any kind of flake (a local checkout, a git reference, a remote one), and
+//! nix is what builds, so no second implementation of how a lock is found and followed
+//! (`follows`, a dirty git tree: nix reads the working tree's lock for tracked files, which
+//! is also what the check below reads). It costs one process and is not an evaluation of the
+//! fleet's outputs: the fleet's dev shell is never evaluated, and nothing here builds or
+//! evaluates a machine.
 //!
-//! **The lock file on disk is checked too**, for a local fleet: `--no-update-lock-file`
-//! stops nix changing an entry, but not locking a *new* input in memory to whatever its URL
-//! points at today. So the revision nix reports must equal the one in the fleet's own
-//! `flake.lock`, or resolution fails saying the lock is out of date (`check_lock_file`).
+//! **The lock file on disk is checked too**, for a local fleet: the revision nix reports must
+//! equal the one in the fleet's own `flake.lock`, or resolution fails saying the lock is out
+//! of date (`check_lock_file`). A second line of defence behind `--no-update-lock-file`, and
+//! the only one for a lock with no `clan-core` entry at all. A local reference that carries a
+//! query (`?dir=`, or any other) is refused outright, with an error that says so: the lock
+//! file, and the directory `clan` is run from, cannot be found from it without guessing.
 //!
 //! Every step is recorded in [`ClanBinary::trail`], so the operator can see why this
-//! binary and not another. The result is cached per `(flake, lock hash)` for the life of a
-//! [`ClanLocator`], which the shell keeps for the whole run: the lock is read each time
-//! (it is what the key is made of), the build only when the lock changed.
+//! binary and not another. The result is cached per `(flake, lock hash, system, nix program)`
+//! for the life of a [`ClanLocator`], which the shell keeps for the whole run: the lock is read
+//! each time (it is what the key is made of), the build only when the key is new or the build
+//! has been garbage collected. Each build is rooted by a symlink in
+//! `$XDG_STATE_HOME/auspex/gcroots/` (default `~/.local/state/auspex/gcroots/`, never inside
+//! the fleet), one per `(lock hash, system)`, which `nix build --out-link` replaces
+//! atomically (it creates a temporary link and renames it), so a garbage collection between
+//! [`ClanLocator::resolve`] and [`run`] cannot take the binary away.
 //!
 //! # Running it
 //!
-//! [`run`] runs `clan <args> --flake <flake>` in the fleet's directory, in a session of its
-//! own with no terminal, and streams each stdout and stderr line to a channel as it is
-//! printed. Cancelling kills the whole process group (ssh and nixos-rebuild included) and
-//! reaps it before returning. Output is capped without ever stopping the process: a deploy
-//! killed because it was chatty would be worse than a log that stops showing lines. A line
-//! longer than [`RunParams::line_cap`] is replaced by a note, and lines past
-//! [`RunParams::max_lines`] are counted but not sent.
+//! [`run`] runs `clan <args> --flake <dir>` in the fleet's directory, in a session of its
+//! own with no terminal and **stdin on `/dev/null`**, and streams each stdout and stderr
+//! line to a channel as it is printed. Cancelling kills the whole process group (ssh and
+//! nixos-rebuild included) and reaps it before returning. Once clan has exited, though, its
+//! status is known, and a cancellation or a dropped receiver only cuts short the wait for
+//! the pipes to drain: the status is returned, because it is what gets logged. Output is
+//! capped without ever stopping the process: a deploy killed because it was chatty would be
+//! worse than a log that stops showing lines. A line longer than [`RunParams::line_cap`] is
+//! replaced by a note, and lines past [`RunParams::max_lines`] are counted but not sent.
+//!
+//! The environment follows the probe's policy (`ssh::probe`): `SSH_ASKPASS` is removed and
+//! `SSH_ASKPASS_REQUIRE=never` is set, so no askpass window opens on the operator's screen
+//! for a prompt nobody expects, while `SSH_AUTH_SOCK` is inherited untouched: approval of a
+//! key by an agent (the operator's Bitwarden SSH agent, say) goes through the agent socket,
+//! not askpass. **A step of clan that prompts on stdin therefore fails instead of hanging**
+//! (`clan vars` generators ask for secrets this way), because stdin is `/dev/null`: step 2
+//! must check the vars before it deploys, not discover a missing one in the middle.
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{self, Write as _};
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::Mutex;
@@ -76,7 +115,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Cancelled;
 use crate::nix::{DEFAULT_NIX, FlakeRef, STDERR_CAP};
 use crate::process::{
-    End, Limits, Line, Lines, OnExit, PIPE_GRACE, command, describe_status, resolve_in,
+    End, Limits, Line, Lines, OnExit, PIPE_GRACE, Spawned, command, describe_status, resolve_in,
     run as run_process, spawn, spawn_error,
 };
 use crate::text::{lossy, reason};
@@ -95,6 +134,21 @@ const BUILD_STDOUT_CAP: usize = 64 * 1024;
 /// Every store path starts with this. The check on what `nix build` printed, not a claim
 /// about where a store may live.
 const STORE_PREFIX: &str = "/nix/store/";
+/// The store directory the canonical binary must be inside.
+const STORE_DIR: &str = "/nix/store";
+
+/// What `nix build` evaluates.
+///
+/// A function of `locked` (the `locked` attributes of the lock's `clan-core` node, as a JSON
+/// string) and `system`. `flakeRefToString` is nix's own rendering
+/// of those attributes into a locked flake reference (with `narHash`), `getFlake` of a locked
+/// reference needs neither `--impure` nor a registry, and the package is
+/// `packages.<system>.clan-cli` of exactly that node. Both arguments are data (`--argstr`),
+/// never spliced into this text.
+pub const BUILD_EXPR: &str = r"{ locked, system }:
+let f = builtins.getFlake (builtins.flakeRefToString (builtins.fromJSON locked));
+in f.packages.${system}.clan-cli
+";
 
 /// The step of resolving or running `clan` that failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +275,9 @@ pub struct ResolveParams<'a> {
     pub system: Option<&'a str>,
     /// The `PATH` to look for `clan` in, for the comparison only; `None` for the process's.
     pub search_path: Option<&'a OsStr>,
+    /// Where the GC root links go; `None` for `$XDG_STATE_HOME/auspex/gcroots`
+    /// ([`default_gcroot_dir`]). Created private (0700) when missing.
+    pub gcroot_dir: Option<&'a Path>,
     /// `nix flake metadata`'s deadline.
     pub lock_timeout: Duration,
     /// `nix build`'s deadline. Building is the long part when the binary is not cached.
@@ -237,6 +294,7 @@ impl ResolveParams<'_> {
             config_path: None,
             system: None,
             search_path: None,
+            gcroot_dir: None,
             lock_timeout: Duration::from_secs(120),
             build_timeout: Duration::from_secs(30 * 60),
         }
@@ -268,6 +326,8 @@ pub struct LockedClanCore {
     /// A digest of the whole lock (`locks` of the metadata), so any change to any input
     /// changes it.
     pub lock_hash: String,
+    /// The node's `locked` attributes as compact JSON: what [`BUILD_EXPR`] builds from.
+    pub locked: String,
 }
 
 /// The `clan-core` input of the fleet's lock, from the output of `nix flake metadata --json`.
@@ -285,18 +345,32 @@ pub fn clan_core_lock(metadata_json: &str) -> Result<LockedClanCore, String> {
     let locks = meta
         .get("locks")
         .ok_or_else(|| "nix flake metadata printed no `locks`".to_owned())?;
-    let revision = locked_revision(locks)?;
+    let (revision, locked) = locked_node(locks)?;
+    // What nix verifies the fetched tree against. A lock entry without one is not something
+    // to build: the content would be whatever the URL serves.
+    if !locked.get("narHash").is_some_and(Value::is_string) {
+        return Err(format!(
+            "the locked {CLAN_CORE_INPUT} has no narHash, so what is fetched could not be \
+             checked against the lock"
+        ));
+    }
     let mut hash = Sha256::new();
     hash.update(locks.to_string().as_bytes());
     Ok(LockedClanCore {
         revision,
         lock_hash: hex(&hash.finalize()),
+        locked: locked.to_string(),
     })
 }
 
 /// The revision of the root `clan-core` input of a lock (`locks` of the metadata, or the
 /// whole of a `flake.lock`, which is the same shape).
 fn locked_revision(locks: &Value) -> Result<String, String> {
+    locked_node(locks).map(|(revision, _)| revision)
+}
+
+/// The revision and the `locked` attributes of the root `clan-core` input of a lock.
+fn locked_node(locks: &Value) -> Result<(String, &Value), String> {
     let nodes = locks
         .get("nodes")
         .and_then(Value::as_object)
@@ -322,7 +396,7 @@ fn locked_revision(locks: &Value) -> Result<String, String> {
         .iter()
         .find_map(|k| locked.get(*k).and_then(Value::as_str))
         .ok_or_else(|| format!("the locked {CLAN_CORE_INPUT} has neither a rev nor a narHash"))?;
-    Ok(sanitize_line(revision))
+    Ok((sanitize_line(revision), locked))
 }
 
 /// Checks that the `flake.lock` file in `dir` pins `clan-core` at `revision`, the one nix
@@ -449,8 +523,8 @@ fn compare_path_clan(search_path: Option<&OsStr>, pinned: &Path) -> PathClan {
         PathClan::Same
     } else {
         PathClan::Different(format!(
-            "clan on PATH is a different clan-core than the fleet pins ({} is not {}); \
-             auspex uses the pinned one",
+            "clan on PATH is a different clan-cli derivation than the fleet's locked clan-core \
+             builds ({} is not {}); auspex uses the one the fleet's lock builds",
             found.display(),
             pinned.display()
         ))
@@ -459,11 +533,59 @@ fn compare_path_clan(search_path: Option<&OsStr>, pinned: &Path) -> PathClan {
 
 /// Resolves `clan` for a fleet, and remembers the answer.
 ///
-/// Keep one for the whole run. The cache is per `(flake, lock hash)`, so a fleet whose lock
-/// is updated meanwhile is resolved afresh, and the old entry is simply never asked for.
+/// Keep one for the whole run. The cache is per `(flake, lock hash, system, nix program)`:
+/// a fleet whose lock is updated meanwhile is resolved afresh (the old entry is simply never
+/// asked for), and so is another system or another `nix`, which may be another store.
 #[derive(Debug, Default)]
 pub struct ClanLocator {
-    cache: Mutex<HashMap<(String, String), ClanBinary>>,
+    cache: Mutex<HashMap<CacheKey, ClanBinary>>,
+}
+
+/// `(flake, lock hash, system, nix program)`.
+type CacheKey = (String, String, String, OsString);
+
+/// Where GC root links go by default.
+///
+/// `$XDG_STATE_HOME/auspex/gcroots` when that variable is an absolute path, else
+/// `$HOME/.local/state/auspex/gcroots`; `None` when neither is usable. The one place this
+/// module reads the environment for it.
+#[must_use]
+pub fn default_gcroot_dir() -> Option<PathBuf> {
+    gcroot_dir_from(
+        std::env::var_os("XDG_STATE_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn gcroot_dir_from(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    let state = xdg_state_home
+        .map(Path::new)
+        .filter(|p| p.is_absolute())
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            home.map(Path::new)
+                .filter(|p| p.is_absolute())
+                .map(|h| h.join(".local").join("state"))
+        })?;
+    Some(state.join("auspex").join("gcroots"))
+}
+
+/// Creates `dir` and any missing parents, private (0700), and checks that `dir` is a real
+/// directory of ours and still private: a link directory others could write to would let them
+/// point a root anywhere.
+fn prepare_gcroot_dir(dir: &Path) -> Result<(), String> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("cannot create the GC root directory {}: {e}", dir.display()))?;
+    crate::ssh::prepare_private_dir(dir, "GC root directory")
+}
+
+/// The root link for one build: a file name made of the lock digest and the system, which are
+/// both hex or `[A-Za-z0-9_-]` (see [`bad_system`]).
+fn gcroot_link(dir: &Path, lock_hash: &str, system: &str) -> PathBuf {
+    dir.join(format!("{}-{system}", &lock_hash[..16]))
 }
 
 impl ClanLocator {
@@ -489,49 +611,22 @@ impl ClanLocator {
             return Ok(from_config(path));
         }
         let system = params.system.map_or_else(current_system, str::to_owned);
-        if let Some(e) = bad_system(&system) {
+        if let Some(e) = bad_system(&system).or_else(|| refuse_local_query(flake)) {
             return Ok(Err(e));
         }
 
         let mut trail = vec!["no explicit clan path configured".to_owned()];
-        let metadata = match nix_step(
-            params.nix,
-            ClanStep::Lock,
-            metadata_argv(flake),
-            METADATA_STDOUT_CAP,
-            params.lock_timeout,
-            cancel,
-        )
-        .await?
-        {
-            Ok(out) => out,
+        let locked = match read_lock(params, flake, cancel, &mut trail).await? {
+            Ok(l) => l,
             Err(e) => return Ok(Err(e)),
         };
-        let locked = match clan_core_lock(&metadata) {
-            Ok(l) => l,
-            Err(e) => return Ok(Err(ClanError::new(ClanStep::Lock, e))),
-        };
-        trail.push(format!(
-            "fleet lock {}: {CLAN_CORE_INPUT} pinned at {} (lock {})",
-            flake.as_str(),
-            locked.revision,
-            &locked.lock_hash[..12]
-        ));
 
-        // A local flake's lock file must say the same; see `check_lock_file`. A remote one
-        // (`github:…`) has no file to look at: nix read the committed lock of that revision.
-        if let Some(dir) = flake.local_dir() {
-            if let Err(e) = check_lock_file(&dir, &locked.revision).await {
-                return Ok(Err(ClanError::new(ClanStep::Lock, e)));
-            }
-            trail.push("flake.lock on disk agrees".to_owned());
-        } else {
-            trail.push(
-                "flake.lock not checked on disk: the flake is not a local directory".to_owned(),
-            );
-        }
-
-        let key = (flake.as_str().to_owned(), locked.lock_hash.clone());
+        let key: CacheKey = (
+            flake.as_str().to_owned(),
+            locked.lock_hash.clone(),
+            system.clone(),
+            params.nix.to_owned(),
+        );
         let cached = self
             .cache
             .lock()
@@ -544,27 +639,10 @@ impl ClanLocator {
             b.trail = trail;
             b
         } else {
-            let out = match nix_step(
-                params.nix,
-                ClanStep::Build,
-                build_argv(flake, &system),
-                BUILD_STDOUT_CAP,
-                params.build_timeout,
-                cancel,
-            )
-            .await?
-            {
-                Ok(out) => out,
-                Err(e) => return Ok(Err(e)),
-            };
-            let path = match binary_in(&out) {
+            let path = match build(params, &locked, &system, cancel, &mut trail).await? {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e)),
             };
-            trail.push(format!(
-                "nix build packages.{system}.{CLAN_CLI_PACKAGE} of the locked input: {}",
-                path.display()
-            ));
             let b = ClanBinary {
                 path,
                 source: ClanSource::FleetLock {
@@ -589,6 +667,113 @@ impl ClanLocator {
         });
         Ok(Ok(found))
     }
+}
+
+/// A local reference with a query has a lock file and a directory that cannot be found from it
+/// without guessing (`path:/x?dir=sub` is `/x/sub`, not `/x`).
+fn refuse_local_query(flake: &FlakeRef) -> Option<ClanError> {
+    (flake.has_query() && flake.is_local()).then(|| {
+        ClanError::new(
+            ClanStep::Lock,
+            format!(
+                "the flake reference {:?} has a query, so its flake.lock and directory \
+                 cannot be found from it; give the fleet as a plain directory",
+                sanitize_line(flake.as_str())
+            ),
+        )
+    })
+}
+
+/// Reads the fleet's lock, and checks it against the file on disk for a local fleet.
+async fn read_lock(
+    params: &ResolveParams<'_>,
+    flake: &FlakeRef,
+    cancel: &CancellationToken,
+    trail: &mut Vec<String>,
+) -> Result<Result<LockedClanCore, ClanError>, Cancelled> {
+    let metadata = match nix_step(
+        params.nix,
+        ClanStep::Lock,
+        metadata_argv(flake),
+        METADATA_STDOUT_CAP,
+        params.lock_timeout,
+        cancel,
+    )
+    .await?
+    {
+        Ok(out) => out,
+        Err(e) => return Ok(Err(e)),
+    };
+    let locked = match clan_core_lock(&metadata) {
+        Ok(l) => l,
+        Err(e) => return Ok(Err(ClanError::new(ClanStep::Lock, e))),
+    };
+    trail.push(format!(
+        "fleet lock {}: {CLAN_CORE_INPUT} pinned at {} (lock {})",
+        flake.as_str(),
+        locked.revision,
+        &locked.lock_hash[..12]
+    ));
+    // A local flake's lock file must say the same; see `check_lock_file`. A remote one
+    // (`github:…`) has no file to look at.
+    if let Some(dir) = flake.local_dir() {
+        if let Err(e) = check_lock_file(&dir, &locked.revision).await {
+            return Ok(Err(ClanError::new(ClanStep::Lock, e)));
+        }
+        trail.push("flake.lock on disk agrees".to_owned());
+    } else {
+        trail.push("flake.lock not checked on disk: the flake is not a local directory".to_owned());
+    }
+    Ok(Ok(locked))
+}
+
+/// Builds `clan-cli` of the locked node, rooted by a link under the GC root directory, and
+/// returns its canonical `bin/clan`.
+async fn build(
+    params: &ResolveParams<'_>,
+    locked: &LockedClanCore,
+    system: &str,
+    cancel: &CancellationToken,
+    trail: &mut Vec<String>,
+) -> Result<Result<PathBuf, ClanError>, Cancelled> {
+    let Some(root_dir) = params
+        .gcroot_dir
+        .map(Path::to_path_buf)
+        .or_else(default_gcroot_dir)
+    else {
+        return Ok(Err(ClanError::new(
+            ClanStep::Build,
+            "no directory for the GC root: neither XDG_STATE_HOME nor HOME is an absolute path",
+        )));
+    };
+    if let Err(e) = prepare_gcroot_dir(&root_dir) {
+        return Ok(Err(ClanError::new(ClanStep::Build, e)));
+    }
+    let link = gcroot_link(&root_dir, &locked.lock_hash, system);
+    let out = match nix_step(
+        params.nix,
+        ClanStep::Build,
+        build_argv(&locked.locked, system, &link),
+        BUILD_STDOUT_CAP,
+        params.build_timeout,
+        cancel,
+    )
+    .await?
+    {
+        Ok(out) => out,
+        Err(e) => return Ok(Err(e)),
+    };
+    let path = match binary_in(&out) {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
+    trail.push(format!(
+        "nix build packages.{system}.{CLAN_CLI_PACKAGE} of the locked {CLAN_CORE_INPUT} node \
+         itself (rooted by {}): {}",
+        link.display(),
+        path.display()
+    ));
+    Ok(Ok(path))
 }
 
 /// Refuses a system that is not a nix system name. It becomes part of an attribute path, one
@@ -628,7 +813,6 @@ pub fn metadata_argv(flake: &FlakeRef) -> Vec<OsString> {
         "flake",
         "metadata",
         "--json",
-        "--no-write-lock-file",
         "--no-update-lock-file",
         "--",
         &flake.shallow_safe(),
@@ -637,26 +821,31 @@ pub fn metadata_argv(flake: &FlakeRef) -> Vec<OsString> {
     .to_vec()
 }
 
-/// The exact argv (after the program) of the build.
+/// The exact argv (after the program) of the build: [`BUILD_EXPR`] with the node's `locked`
+/// attributes and the system as strings, the result rooted by `out_link`.
 #[must_use]
-pub fn build_argv(flake: &FlakeRef, system: &str) -> Vec<OsString> {
-    let attr = format!("{CLAN_CORE_INPUT}#packages.{system}.{CLAN_CLI_PACKAGE}");
-    [
+pub fn build_argv(locked: &str, system: &str, out_link: &Path) -> Vec<OsString> {
+    let mut argv: Vec<OsString> = [
         "build",
-        "--no-link",
         "--print-out-paths",
         "--no-write-lock-file",
-        "--no-update-lock-file",
-        "--inputs-from",
-        &flake.shallow_safe(),
-        "--",
-        &attr,
+        "--out-link",
     ]
     .map(OsString::from)
-    .to_vec()
+    .to_vec();
+    argv.push(out_link.as_os_str().to_owned());
+    argv.extend(
+        [
+            "--expr", BUILD_EXPR, "--argstr", "locked", locked, "--argstr", "system", system,
+        ]
+        .map(OsString::from),
+    );
+    argv
 }
 
-/// `bin/clan` of the first printed output that has one.
+/// `bin/clan` of the first printed output that has one, canonicalised, which must be inside the
+/// nix store: a symlink out of it is refused, so the file that runs is the file that was
+/// locked.
 fn binary_in(printed: &str) -> Result<PathBuf, ClanError> {
     let outs: Vec<&str> = printed.lines().filter(|l| !l.is_empty()).collect();
     if outs.is_empty() {
@@ -678,9 +867,29 @@ fn binary_in(printed: &str) -> Result<PathBuf, ClanError> {
         }
         let candidate = Path::new(out).join("bin").join(CLAN_PROGRAM);
         match check_executable(&candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(e) => last = e,
+            Ok(()) => {}
+            Err(e) => {
+                last = e;
+                continue;
+            }
         }
+        let canonical = std::fs::canonicalize(&candidate).map_err(|e| {
+            ClanError::new(ClanStep::Binary, format!("{}: {e}", candidate.display()))
+        })?;
+        let store = std::fs::canonicalize(STORE_DIR).unwrap_or_else(|_| PathBuf::from(STORE_DIR));
+        if !canonical.starts_with(&store) {
+            return Err(ClanError::new(
+                ClanStep::Binary,
+                format!(
+                    "{} resolves to {}, which is outside the nix store {}: the file that would \
+                     run is not the one that was locked",
+                    candidate.display(),
+                    canonical.display(),
+                    store.display()
+                ),
+            ));
+        }
+        return Ok(canonical);
     }
     Err(ClanError::new(
         ClanStep::Binary,
@@ -869,27 +1078,9 @@ pub async fn run(
     cancel: &CancellationToken,
     tx: UnboundedSender<ClanLine>,
 ) -> Result<Result<ClanRun, ClanError>, Cancelled> {
-    let mut cmd = match command(program.as_os_str()) {
-        Ok(c) => c,
-        Err(e) => {
-            return Ok(Err(ClanError::new(
-                ClanStep::Run,
-                spawn_error("cannot run clan", program.as_os_str(), &e),
-            )));
-        }
-    };
-    cmd.args(run_argv(flake, args));
-    if let Some(dir) = flake.local_dir() {
-        cmd.current_dir(dir);
-    }
-    let mut sp = match spawn(cmd, false, OnExit::KillGroup, None) {
+    let mut sp = match start(program, flake, args) {
         Ok(s) => s,
-        Err(e) => {
-            return Ok(Err(ClanError::new(
-                ClanStep::Run,
-                spawn_error("cannot run clan", program.as_os_str(), &e),
-            )));
-        }
+        Err(e) => return Ok(Err(e)),
     };
     let mut out = sp
         .child
@@ -921,20 +1112,8 @@ pub async fn run(
         }
         tokio::select! {
             biased;
-            () = cancel.cancelled() => {
-                sp.kill_and_reap().await;
-                return Err(Cancelled);
-            }
-            // Nobody is listening any more: the same as being told to stop.
-            () = tx.closed() => {
-                sp.kill_and_reap().await;
-                return Err(Cancelled);
-            }
-            () = sleep_until(deadline), if exited.is_none() => {
-                sp.kill_and_reap().await;
-                timed_out = true;
-                break;
-            }
+            // First: an exit that is already there wins over a cancellation that is ready at
+            // the same moment, because the status is known and is what gets logged.
             status = sp.exited(), if exited.is_none() => match status {
                 Ok(s) => {
                     exited = Some(s);
@@ -945,6 +1124,24 @@ pub async fn run(
                     return Ok(Err(ClanError::new(ClanStep::Run, format!("waiting for clan failed: {e}"))));
                 }
             },
+            () = cancel.cancelled(), if exited.is_none() => {
+                exited = Some(stop(&mut sp).await?);
+                break;
+            }
+            // Nobody is listening any more: the same as being told to stop.
+            () = tx.closed(), if exited.is_none() => {
+                exited = Some(stop(&mut sp).await?);
+                break;
+            }
+            // After the exit the same two only cut the drain of the pipes short: clan is gone
+            // (its group was killed at the exit), the status is known, and it is returned.
+            () = cancel.cancelled(), if exited.is_some() => break,
+            () = tx.closed(), if exited.is_some() => break,
+            () = sleep_until(deadline), if exited.is_none() => {
+                sp.kill_and_reap().await;
+                timed_out = true;
+                break;
+            }
             () = sleep_until(grace.unwrap_or(deadline)), if grace.is_some() => break,
             line = next_line(&mut out), if !out_done => sink.line(Stream::Stdout, line),
             line = next_line(&mut err), if !err_done => sink.line(Stream::Stderr, line),
@@ -963,6 +1160,54 @@ pub async fn run(
         lines_dropped: sink.dropped,
         long_lines: sink.long,
     }))
+}
+
+/// Spawns `<program> <args> --flake <dir>` in the fleet's directory, refusing a flake
+/// reference `clan` cannot be given safely.
+fn start(program: &Path, flake: &FlakeRef, args: &[OsString]) -> Result<Spawned, ClanError> {
+    // `clan` takes a directory (or a URL), and a query cannot be turned into either without
+    // guessing: `path:/x?dir=sub` would run clan against `/x`, the wrong flake.
+    if flake.has_query() {
+        return Err(ClanError::new(
+            ClanStep::Run,
+            format!(
+                "the flake reference {:?} has a query, which clan cannot be given safely; \
+                 give the fleet as a plain directory",
+                sanitize_line(flake.as_str())
+            ),
+        ));
+    }
+    let cannot = |e: &std::io::Error| {
+        ClanError::new(
+            ClanStep::Run,
+            spawn_error("cannot run clan", program.as_os_str(), e),
+        )
+    };
+    let mut cmd = command(program.as_os_str()).map_err(|e| cannot(&e))?;
+    cmd.args(run_argv(flake, args));
+    apply_run_environment(&mut cmd);
+    if let Some(dir) = flake.local_dir() {
+        cmd.current_dir(dir);
+    }
+    spawn(cmd, false, OnExit::KillGroup, None).map_err(|e| cannot(&e))
+}
+
+/// The probe's policy for ssh prompts (`ssh::probe`), for what `clan` starts: no askpass
+/// program and `SSH_ASKPASS_REQUIRE=never`, so nothing opens a window on the operator's
+/// screen. `SSH_AUTH_SOCK` is deliberately left alone: an agent's approval goes through it.
+fn apply_run_environment(cmd: &mut tokio::process::Command) {
+    cmd.env_remove("SSH_ASKPASS")
+        .env("SSH_ASKPASS_REQUIRE", "never");
+}
+
+/// Told to stop: the exit status when clan has in fact exited already (it is what gets logged),
+/// else kills the whole group and reaps it, and says so.
+async fn stop(sp: &mut Spawned) -> Result<ExitStatus, Cancelled> {
+    if let Some(status) = sp.exited_now().await {
+        return Ok(status);
+    }
+    sp.kill_and_reap().await;
+    Err(Cancelled)
 }
 
 /// Reads what is left in the pipes of a killed process, for at most [`PIPE_GRACE`].
@@ -1109,7 +1354,7 @@ mod tests {
         // The root's clan-core follows other/clan-core.
         let nodes = format!(
             r#""other":{{"inputs":{{"clan-core":"deep"}}}},{}"#,
-            node("deep", &format!(r#""rev":"{REV}""#))
+            node("deep", &format!(r#""rev":"{REV}","narHash":"sha256-d""#),)
         );
         let json = metadata(
             r#""other":"other","clan-core":["other","clan-core"]"#,
@@ -1143,7 +1388,7 @@ mod tests {
             r#""clan-core":"c""#,
             &format!(
                 "{},{}",
-                node("c", r#""rev":"1""#),
+                node("c", r#""rev":"1","narHash":"sha256-1""#),
                 node("n", r#""rev":"1""#)
             ),
         );
@@ -1151,7 +1396,7 @@ mod tests {
             r#""clan-core":"c""#,
             &format!(
                 "{},{}",
-                node("c", r#""rev":"1""#),
+                node("c", r#""rev":"1","narHash":"sha256-1""#),
                 node("n", r#""rev":"2""#)
             ),
         );
@@ -1171,15 +1416,41 @@ mod tests {
             .collect();
         assert_eq!(m.last().map(String::as_str), Some("path:/fleet"));
         assert_eq!(m[m.len() - 2], "--");
-        let b: Vec<_> = build_argv(&f, "x86_64-linux")
-            .into_iter()
-            .map(|s| s.into_string().unwrap())
-            .collect();
-        assert_eq!(
-            b.last().map(String::as_str),
-            Some("clan-core#packages.x86_64-linux.clan-cli")
+        // `--no-update-lock-file` alone: next to `--no-write-lock-file` nix only warns.
+        assert!(m.contains(&"--no-update-lock-file".to_owned()), "{m:?}");
+        assert!(!m.contains(&"--no-write-lock-file".to_owned()), "{m:?}");
+
+        // The build is of the locked node, by value: no fleet, no registry name.
+        let locked = r#"{"narHash":"sha256-x","rev":"abc","type":"git","url":"file:///c"}"#;
+        let b: Vec<_> = build_argv(
+            locked,
+            "x86_64-linux",
+            Path::new("/state/gcroots/k-x86_64-linux"),
+        )
+        .into_iter()
+        .map(|s| s.into_string().unwrap())
+        .collect();
+        for pair in [
+            ["--out-link", "/state/gcroots/k-x86_64-linux"],
+            ["--expr", BUILD_EXPR],
+        ] {
+            assert!(b.windows(2).any(|w| w == pair), "{pair:?} not in {b:?}");
+        }
+        assert!(
+            b.windows(3).any(|w| w == ["--argstr", "locked", locked]),
+            "{b:?}"
         );
-        assert!(b.windows(2).any(|w| w == ["--inputs-from", "path:/fleet"]));
+        assert!(
+            b.windows(3)
+                .any(|w| w == ["--argstr", "system", "x86_64-linux"]),
+            "{b:?}"
+        );
+        assert!(
+            !b.iter()
+                .any(|a| a.contains("inputs-from") || a.contains("clan-core#")),
+            "{b:?}"
+        );
+        assert!(!b.contains(&"--no-link".to_owned()), "{b:?}");
     }
 
     #[test]
@@ -1247,6 +1518,133 @@ mod tests {
     }
 
     #[test]
+    fn a_locked_clan_core_without_a_nar_hash_is_refused_and_the_node_is_kept_whole() {
+        let json = metadata(
+            r#""clan-core":"c""#,
+            &node("c", r#""rev":"abc","type":"git""#),
+        );
+        let e = clan_core_lock(&json).unwrap_err();
+        assert!(e.contains("no narHash"), "{e}");
+        let json = metadata(
+            r#""clan-core":"c""#,
+            &node("c", r#""rev":"abc","narHash":"sha256-n","type":"git""#),
+        );
+        let locked: Value = serde_json::from_str(&clan_core_lock(&json).unwrap().locked).unwrap();
+        assert_eq!(locked["type"], "git");
+        assert_eq!(locked["narHash"], "sha256-n");
+    }
+
+    #[test]
+    fn the_gc_root_directory_is_under_the_state_directory() {
+        let dir = |xdg: Option<&str>, home: Option<&str>| {
+            gcroot_dir_from(xdg.map(OsStr::new), home.map(OsStr::new))
+        };
+        assert_eq!(
+            dir(Some("/state"), Some("/home/u")),
+            Some(PathBuf::from("/state/auspex/gcroots"))
+        );
+        assert_eq!(
+            dir(None, Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/state/auspex/gcroots"))
+        );
+        // Relative values are ignored, as the cache directory does.
+        assert_eq!(
+            dir(Some("rel"), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/state/auspex/gcroots"))
+        );
+        assert_eq!(dir(Some("rel"), Some("also-rel")), None);
+        assert_eq!(dir(None, None), None);
+    }
+
+    #[test]
+    fn one_gc_root_link_per_lock_and_system() {
+        let d = Path::new("/g");
+        let hash = "0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            gcroot_link(d, hash, "x86_64-linux"),
+            Path::new("/g/0123456789abcdef-x86_64-linux")
+        );
+        assert_ne!(
+            gcroot_link(d, hash, "x86_64-linux"),
+            gcroot_link(d, hash, "aarch64-linux")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_gc_root_directory_is_private_and_not_a_symlink() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("a").join("gcroots");
+        prepare_gcroot_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Run again: an existing private directory is fine.
+        prepare_gcroot_dir(&dir).unwrap();
+        // One that others could write to is refused.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(prepare_gcroot_dir(&dir).unwrap_err().contains("0700"));
+        // And a symlink is not followed.
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(base.path(), &link).unwrap();
+        assert!(prepare_gcroot_dir(&link).is_err());
+    }
+
+    #[test]
+    fn clan_gets_no_askpass_but_keeps_the_agent_socket() {
+        let mut cmd = tokio::process::Command::new("/bin/true");
+        apply_run_environment(&mut cmd);
+        let envs: Vec<_> = cmd
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| (k.to_owned(), v.map(OsStr::to_owned)))
+            .collect();
+        // SSH_ASKPASS is removed, SSH_ASKPASS_REQUIRE is `never`, SSH_AUTH_SOCK is not touched.
+        assert!(
+            envs.contains(&(OsString::from("SSH_ASKPASS"), None)),
+            "{envs:?}"
+        );
+        assert!(
+            envs.contains(&(
+                OsString::from("SSH_ASKPASS_REQUIRE"),
+                Some(OsString::from("never"))
+            )),
+            "{envs:?}"
+        );
+        assert!(envs.iter().all(|(k, _)| k != "SSH_AUTH_SOCK"), "{envs:?}");
+    }
+
+    #[test]
+    fn a_different_clan_on_path_is_described_as_a_different_derivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let theirs = dir.path().join("clan");
+        std::fs::write(&theirs, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ours = dir.path().join("ours");
+        std::fs::write(&ours, "x").unwrap();
+        let path = std::env::join_paths([dir.path()]).unwrap();
+        let PathClan::Different(msg) = compare_path_clan(Some(path.as_os_str()), &ours) else {
+            panic!("not different");
+        };
+        // Not "a different clan-core": the same revision may build another closure.
+        assert!(
+            msg.contains(
+                "a different clan-cli derivation than the fleet's locked clan-core builds"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("different clan-core than"), "{msg}");
+        assert_eq!(
+            compare_path_clan(Some(path.as_os_str()), &theirs),
+            PathClan::Same
+        );
+        assert_eq!(
+            compare_path_clan(Some(OsStr::new("")), &ours),
+            PathClan::Absent
+        );
+    }
+
+    #[test]
     fn the_local_flake_directory_is_what_clan_is_given() {
         let f = FlakeRef::new("path:/fleet").unwrap();
         assert_eq!(f.local_dir(), Some(PathBuf::from("/fleet")));
@@ -1259,5 +1657,10 @@ mod tests {
         let r = FlakeRef::new("github:o/r").unwrap();
         assert_eq!(r.local_dir(), None);
         assert_eq!(run_argv(&r, &[]).last().unwrap(), "github:o/r");
+        // A reference with a query names a directory this cannot work out: none is guessed.
+        let q = FlakeRef::new("path:/fleet?dir=sub").unwrap();
+        assert!(q.has_query() && q.is_local());
+        assert_eq!(q.local_dir(), None);
+        assert!(!r.is_local());
     }
 }

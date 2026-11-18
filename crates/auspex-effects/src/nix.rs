@@ -261,10 +261,23 @@ impl FlakeRef {
         }
     }
 
+    /// Whether this names something on this machine (`path:` or `git+file:`), as opposed to a
+    /// remote flake.
+    pub(crate) fn is_local(&self) -> bool {
+        self.reference.starts_with("path:") || self.reference.starts_with("git+file:")
+    }
+
     /// The flake's directory on this machine, when it has one: the worktree of a git
     /// reference, or the path of a `path:` reference. What `clan` is run from and given as
     /// `--flake`, since it takes a directory, not a normalised `git+file://` URL.
+    ///
+    /// `None` for a reference the operator wrote with a query (`?dir=`, `?ref=`, anything):
+    /// the directory it names is not the path before the `?` (`path:/x?dir=sub` is `/x/sub`),
+    /// and guessing would run clan against the wrong flake. See [`Self::has_query`].
     pub(crate) fn local_dir(&self) -> Option<std::path::PathBuf> {
+        if self.queried {
+            return None;
+        }
         if let Some(dir) = &self.worktree {
             return Some(dir.clone());
         }

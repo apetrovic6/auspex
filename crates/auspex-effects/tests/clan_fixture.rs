@@ -60,6 +60,8 @@ struct Fixture {
     empty: PathBuf,
     /// A `nix` that logs its subcommand and runs the real one.
     nix: PathBuf,
+    /// Where the GC root links go: never the operator's own state directory.
+    gcroots: PathBuf,
 }
 
 /// `None` (after saying why) when the fixture cannot be built here.
@@ -70,6 +72,16 @@ fn fixture(core_has_package: bool) -> Option<Fixture> {
 /// With `tarball`, the fleet pins clan-core as a tarball with a `rev`, the shape of the real
 /// fleet's lock entry (`{type: tarball, rev, narHash}`), instead of a git input.
 fn fixture_as(core_has_package: bool, tarball: bool) -> Option<Fixture> {
+    fixture_hook(core_has_package, tarball, |_, _| {})
+}
+
+/// As [`fixture_as`], with `hook(core, root)` run on the clan-core checkout before its first
+/// commit.
+fn fixture_hook(
+    core_has_package: bool,
+    tarball: bool,
+    hook: impl FnOnce(&Path, &Path),
+) -> Option<Fixture> {
     for tool in ["nix", "git"] {
         if find_on_path(tool).is_none() {
             eprintln!("SKIPPED: {tool} is not on PATH (as inside the ci-pure sandbox)");
@@ -78,15 +90,17 @@ fn fixture_as(core_has_package: bool, tarball: bool) -> Option<Fixture> {
     }
     let tools = tools(&["nix"])?;
     let root = tempdir();
-    let (core, fleet, empty) = (
+    let (core, fleet, empty, gcroots) = (
         root.path().join("core"),
         root.path().join("fleet"),
         root.path().join("empty"),
+        root.path().join("gcroots"),
     );
     for d in [&core, &fleet, &empty] {
         fs::create_dir(d).unwrap();
     }
     write_core(&core, "A", core_has_package);
+    hook(&core, root.path());
     git(&core, &["init", "-q"]);
     git(&core, &["add", "-A"]);
     git(&core, &["commit", "-q", "-m", "A"]);
@@ -112,11 +126,7 @@ fn fixture_as(core_has_package: bool, tarball: bool) -> Option<Fixture> {
     )
     .unwrap();
     lock(&fleet);
-    let wrapper = tools.script(
-        root.path(),
-        "nix",
-        "echo \"$1\" >> '@dir@/calls'\nexec @nix@ \"$@\"",
-    );
+    let wrapper = tools.script(root.path(), "nix", &wrapper_body(""));
     Some(Fixture {
         _root: root,
         tools,
@@ -124,6 +134,7 @@ fn fixture_as(core_has_package: bool, tarball: bool) -> Option<Fixture> {
         fleet,
         empty,
         nix: wrapper,
+        gcroots,
     })
 }
 
@@ -159,16 +170,41 @@ fn write_core(core: &Path, tag: &str, with_package: bool) {
     fs::set_permissions(&clan, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A `nix` that logs its subcommand (`calls`), logs what `nix build` printed (`outs`), runs
+/// `before` (shell) first, and then runs the real one.
+fn wrapper_body(before: &str) -> String {
+    format!(
+        "echo \"$1\" >> '@dir@/calls'\n{before}\nif [ \"$1\" = build ]; then\n  out=$(@nix@ \"$@\") || exit $?\n  printf '%s\\n' \"$out\" >> '@dir@/outs'\n  printf '%s\\n' \"$out\"\nelse\n  exec @nix@ \"$@\"\nfi"
+    )
+}
+
 impl Fixture {
+    /// Another wrapper, in the same directory, that runs `before` first.
+    fn wrapper(&self, name: &str, before: &str) -> PathBuf {
+        self.tools
+            .script(self.nix.parent().unwrap(), name, &wrapper_body(before))
+    }
+
     async fn resolve_flake(
         &self,
         flake: &FlakeRef,
         locator: &ClanLocator,
         search: &Path,
     ) -> Result<ClanBinary, ClanError> {
+        self.resolve_via(&self.nix, flake, locator, search).await
+    }
+
+    async fn resolve_via(
+        &self,
+        nix: &Path,
+        flake: &FlakeRef,
+        locator: &ClanLocator,
+        search: &Path,
+    ) -> Result<ClanBinary, ClanError> {
         let mut p = ResolveParams::new();
-        p.nix = self.nix.as_os_str();
+        p.nix = nix.as_os_str();
         p.search_path = Some(search.as_os_str());
+        p.gcroot_dir = Some(&self.gcroots);
         p.lock_timeout = Duration::from_secs(120);
         p.build_timeout = Duration::from_secs(300);
         locator
@@ -315,13 +351,17 @@ async fn clan_on_path_is_accepted_only_as_the_same_store_path() {
         panic!("{:?}", got.path_clan)
     };
     assert!(
-        msg.contains("clan on PATH is a different clan-core than the fleet pins"),
+        msg.contains(
+            "clan on PATH is a different clan-cli derivation than the fleet's locked clan-core builds"
+        ),
         "{msg}"
     );
     assert!(msg.contains(&theirs.display().to_string()), "{msg}");
     assert_eq!(got.path, pinned.path, "the pinned clan is used, not PATH's");
     assert!(
-        got.trail.iter().any(|l| l.contains("different clan-core")),
+        got.trail
+            .iter()
+            .any(|l| l.contains("different clan-cli derivation")),
         "{:?}",
         got.trail
     );
@@ -366,7 +406,9 @@ async fn a_lock_that_nix_would_have_to_extend_is_refused_not_silently_relocked()
     let before = fs::read(f.fleet.join("flake.lock")).unwrap();
     let e = f.resolve(&ClanLocator::new(), &f.empty).await.unwrap_err();
     assert_eq!(e.step, ClanStep::Lock);
-    assert!(e.reason.contains("not a pin"), "{e}");
+    // nix itself refuses (`--no-update-lock-file` without `--no-write-lock-file`); the disk check
+    // behind it would say "not a pin" for a nix that only warned.
+    assert!(e.reason.contains("requires lock file changes"), "{e}");
     assert_eq!(
         fs::read(f.fleet.join("flake.lock")).unwrap(),
         before,
@@ -467,4 +509,339 @@ async fn a_tarball_clan_core_with_a_rev_is_pinned_and_built() {
     );
     assert_eq!(got.source.to_string(), "fleet lock ae4bb5d");
     assert_eq!(output_of(&got.path), "fake clan A");
+}
+
+// --- Fix round 2 ---
+
+/// Commits a later clan-core ("B"), locks the fleet to it, and returns (lock A, lock B,
+/// rev A, rev B), with lock A restored on disk.
+fn lock_a_and_b(f: &Fixture) -> (Vec<u8>, Vec<u8>, String, String) {
+    let lock_file = f.fleet.join("flake.lock");
+    let (lock_a, rev_a) = (
+        fs::read(&lock_file).unwrap(),
+        git(&f.core, &["rev-parse", "HEAD"]),
+    );
+    write_core(&f.core, "B", true);
+    git(&f.core, &["add", "-A"]);
+    git(&f.core, &["commit", "-q", "-m", "B"]);
+    let rev_b = git(&f.core, &["rev-parse", "HEAD"]);
+    nix(&[
+        "flake",
+        "update",
+        "--flake",
+        &format!("path:{}", f.fleet.display()),
+        "clan-core",
+    ]);
+    let lock_b = fs::read(&lock_file).unwrap();
+    fs::write(&lock_file, &lock_a).unwrap();
+    assert_ne!(lock_a, lock_b);
+    (lock_a, lock_b, rev_a, rev_b)
+}
+
+/// F1 (the review's R1): the lock changes while `nix build` is starting. What is reported
+/// and cached for lock A must be A's binary, never B's under A's name.
+#[tokio::test]
+async fn a_lock_swapped_just_before_the_build_is_never_built_as_the_old_one() {
+    let Some(f) = fixture(true) else { return };
+    let (lock_a, lock_b, rev_a, rev_b) = lock_a_and_b(&f);
+    let root = f.nix.parent().unwrap();
+    fs::write(root.join("lockB"), &lock_b).unwrap();
+    // Once, just before `nix build`, a `git pull` or `nix flake update` lands lock B.
+    let swap = f.wrapper(
+        "nix-swap",
+        &format!(
+            "if [ \"$1\" = build ] && [ ! -e '@dir@/swapped' ]; then\n  cat '@dir@/lockB' > '{}'\n  echo x > '@dir@/swapped'\nfi",
+            f.fleet.join("flake.lock").display()
+        ),
+    );
+    let locator = ClanLocator::new();
+    let first = f
+        .resolve_via(&swap, &f.flake(), &locator, &f.empty)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(root.join("swapped").exists(), "the swap never happened");
+    // What it says it is, it is: A, labelled A.
+    assert_eq!(first.revision.as_deref(), Some(rev_a.as_str()));
+    assert_eq!(output_of(&first.path), "fake clan A");
+
+    // Lock B is on disk now: B is resolved as B.
+    let second = f
+        .resolve_via(&swap, &f.flake(), &locator, &f.empty)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(second.revision.as_deref(), Some(rev_b.as_str()));
+    assert_eq!(output_of(&second.path), "fake clan B");
+
+    // And back to A: the cache entry for lock A holds A's binary.
+    fs::write(f.fleet.join("flake.lock"), &lock_a).unwrap();
+    let third = f
+        .resolve_via(&swap, &f.flake(), &locator, &f.empty)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(third.revision.as_deref(), Some(rev_a.as_str()));
+    assert_eq!(output_of(&third.path), "fake clan A");
+}
+
+/// F1, the registry experiment: when the fleet has no `clan-core` input at the moment of the
+/// build, `--inputs-from` registered nothing and `clan-core` fell through to the registry.
+/// A registry entry named `clan-core` must never be used.
+#[tokio::test]
+async fn a_registry_entry_named_clan_core_is_never_used() {
+    let Some(f) = fixture(true) else { return };
+    let root = f.nix.parent().unwrap().to_owned();
+    let evil = root.join("evil");
+    fs::create_dir(&evil).unwrap();
+    write_core(&evil, "EVIL", true);
+    fs::write(
+        root.join("registry.json"),
+        format!(
+            r#"{{"version":2,"flakes":[{{"from":{{"type":"indirect","id":"clan-core"}},"to":{{"type":"path","path":"{}"}}}}]}}"#,
+            evil.display()
+        ),
+    )
+    .unwrap();
+    let fleet = f.fleet.display();
+    // The registry applies to every nix call, and the fleet loses its input just before the
+    // build.
+    let wrapper = f.wrapper(
+        "nix-reg",
+        &format!(
+            "export NIX_CONFIG=\"${{NIX_CONFIG-}}\nflake-registry = @dir@/registry.json\"\nif [ \"$1\" = build ]; then\n  printf '{{ outputs = _: {{}}; }}\\n' > '{fleet}/flake.nix'\n  printf '{{\"nodes\":{{\"root\":{{}}}},\"root\":\"root\",\"version\":7}}\\n' > '{fleet}/flake.lock'\nfi"
+        ),
+    );
+    let rev = git(&f.core, &["rev-parse", "HEAD"]);
+    let got = f
+        .resolve_via(&wrapper, &f.flake(), &ClanLocator::new(), &f.empty)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got.revision.as_deref(), Some(rev.as_str()));
+    assert_eq!(
+        output_of(&got.path),
+        "fake clan A",
+        "the registry's clan-core was used"
+    );
+}
+
+/// F3 (R2): `bin/clan` that is a symlink out of the store is not a store path.
+#[tokio::test]
+async fn a_bin_clan_that_leaves_the_store_is_refused() {
+    let Some(f) = fixture_hook(true, false, |core, root| {
+        let outside = root.join("outside-clan");
+        fs::write(&outside, "#!/bin/sh\necho mutable file outside the store\n").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
+        let clan = core.join("pkg/bin/clan");
+        fs::remove_file(&clan).unwrap();
+        symlink(&outside, &clan).unwrap();
+    }) else {
+        return;
+    };
+    let e = f.resolve(&ClanLocator::new(), &f.empty).await.unwrap_err();
+    assert_eq!(e.step, ClanStep::Binary, "{e}");
+    assert!(e.reason.contains("outside the nix store"), "{e}");
+}
+
+/// The fleet's `flake.nix` names a different `clan-core` than its lock does. nix itself must
+/// refuse (`--no-update-lock-file` alone), and must not rewrite the lock.
+async fn nix_refuses_a_stale_lock(f: &Fixture, flake: &FlakeRef, lock_file: &Path) {
+    let before = fs::read(lock_file).unwrap();
+    let e = f
+        .resolve_flake(flake, &ClanLocator::new(), &f.empty)
+        .await
+        .unwrap_err();
+    assert_eq!(e.step, ClanStep::Lock, "{e}");
+    // The error is nix's own, not auspex's after the fact (that is `check_lock_file`'s).
+    assert!(e.reason.contains("nix flake metadata exited"), "{e}");
+    assert_eq!(
+        fs::read(lock_file).unwrap(),
+        before,
+        "the lock was rewritten"
+    );
+    assert_eq!(f.calls("build"), 0);
+}
+
+fn point_flake_nix_elsewhere(f: &Fixture, dir: &Path) {
+    // A second clan-core, not the locked one.
+    let other = f.fleet.parent().unwrap().join("other-core");
+    fs::create_dir(&other).unwrap();
+    write_core(&other, "OTHER", true);
+    git(&other, &["init", "-q"]);
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "-q", "-m", "other"]);
+    let text = fs::read_to_string(dir.join("flake.nix")).unwrap();
+    fs::write(
+        dir.join("flake.nix"),
+        text.replace(
+            &format!("file://{}", f.core.display()),
+            &format!("file://{}", other.display()),
+        ),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_path_fleet_whose_flake_nix_disagrees_with_its_lock_is_refused_by_nix() {
+    let Some(f) = fixture(true) else { return };
+    point_flake_nix_elsewhere(&f, &f.fleet);
+    let flake = f.flake();
+    assert!(flake.as_str().starts_with("path:"), "{}", flake.as_str());
+    nix_refuses_a_stale_lock(&f, &flake, &f.fleet.join("flake.lock")).await;
+}
+
+#[tokio::test]
+async fn a_git_fleet_whose_flake_nix_disagrees_with_its_lock_is_refused_by_nix() {
+    let Some(f) = fixture(true) else { return };
+    git(&f.fleet, &["init", "-q"]);
+    git(&f.fleet, &["add", "flake.nix", "flake.lock"]);
+    git(&f.fleet, &["commit", "-q", "-m", "one"]);
+    point_flake_nix_elsewhere(&f, &f.fleet);
+    git(&f.fleet, &["commit", "-q", "-am", "two"]);
+    let flake = f.flake();
+    assert!(
+        flake.as_str().starts_with("git+file:"),
+        "{}",
+        flake.as_str()
+    );
+    nix_refuses_a_stale_lock(&f, &flake, &f.fleet.join("flake.lock")).await;
+}
+
+/// F5 (R3): the cache key has the system and the nix program in it.
+#[tokio::test]
+async fn the_cache_key_has_the_system_and_the_nix_program_in_it() {
+    let Some(f) = fixture(true) else { return };
+    let locator = ClanLocator::new();
+    f.resolve(&locator, &f.empty).await.unwrap();
+    assert_eq!(f.calls("build"), 1);
+
+    // Another system is another build. The fake core has only this machine's, so it fails:
+    // it must not be answered with this machine's binary from the cache.
+    let mut p = ResolveParams::new();
+    p.nix = f.nix.as_os_str();
+    p.search_path = Some(f.empty.as_os_str());
+    p.gcroot_dir = Some(&f.gcroots);
+    p.system = Some("aarch64-plan9");
+    let other = locator
+        .resolve(&p, &f.flake(), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(other.is_err(), "answered from the cache: {other:?}");
+    assert_eq!(f.calls("build"), 2);
+
+    // Another nix program is another build too.
+    let nix2 = f.wrapper("nix2", "");
+    let again = f
+        .resolve_via(&nix2, &f.flake(), &locator, &f.empty)
+        .await
+        .unwrap();
+    assert_eq!(f.calls("build"), 3, "{:?}", again.trail);
+}
+
+/// Survivor M3: a cached build that has since been garbage collected is built again, and
+/// `run` is never handed a path that is gone.
+#[tokio::test]
+async fn a_garbage_collected_cache_entry_is_built_again() {
+    let unique = format!("GC-{}", std::process::id());
+    let Some(f) = fixture_hook(true, false, |core, _| {
+        // A derivation of its own, so that deleting it cannot touch another test's.
+        // (its source directory too: a comment line in the script changes nothing it prints)
+        let clan = core.join("pkg/bin/clan");
+        let script = fs::read_to_string(&clan).unwrap();
+        fs::write(&clan, format!("{script}# {unique}\n")).unwrap();
+        let flake = fs::read_to_string(core.join("flake.nix")).unwrap();
+        fs::write(
+            core.join("flake.nix"),
+            flake.replace(
+                "name = \"clan-cli\"",
+                &format!("name = \"clan-cli-{unique}\""),
+            ),
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    let locator = ClanLocator::new();
+    let first = f.resolve(&locator, &f.empty).await.unwrap();
+    assert_eq!(f.calls("build"), 1);
+    // Unroot it first: the build is held by its link in the GC root directory.
+    let links: Vec<_> = fs::read_dir(&f.gcroots)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(links.len(), 1, "{links:?}");
+    fs::remove_file(&links[0]).unwrap();
+    // Collect it: the build's output, and the store path its bin/clan lives in.
+    let outs = fs::read_to_string(f.nix.parent().unwrap().join("outs")).unwrap();
+    let out = outs.lines().next().unwrap().to_owned();
+    let canonical = fs::canonicalize(&first.path).unwrap();
+    let home: PathBuf = canonical.components().take(4).collect();
+    // The derivation refers to its source too, so it goes with them.
+    let drv = Command::new("nix")
+        .args(["path-info", "--derivation", &out])
+        .output()
+        .unwrap();
+    let drv = String::from_utf8(drv.stdout).unwrap().trim().to_owned();
+    nix(&["store", "delete", &out, home.to_str().unwrap(), &drv]);
+    assert!(!first.path.exists(), "the store path is still there");
+    let second = f.resolve(&locator, &f.empty).await.unwrap();
+    assert_eq!(f.calls("build"), 2, "the vanished build was trusted");
+    assert_eq!(output_of(&second.path), "fake clan A");
+}
+
+/// F9: each build is rooted by a link in the GC root directory, one per (lock, system), so a
+/// garbage collection between `resolve` and `run` cannot take the binary away.
+#[tokio::test]
+async fn a_built_clan_is_rooted_by_one_link_per_lock_and_system() {
+    let Some(f) = fixture(true) else { return };
+    let locator = ClanLocator::new();
+    let first = f.resolve(&locator, &f.empty).await.unwrap();
+    let outs = fs::read_to_string(f.nix.parent().unwrap().join("outs")).unwrap();
+    let out = outs.lines().next().unwrap().to_owned();
+
+    let links = |dir: &Path| -> Vec<PathBuf> {
+        let mut v: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        v.sort();
+        v
+    };
+    let one = links(&f.gcroots);
+    assert_eq!(one.len(), 1, "{one:?}");
+    let name = one[0].file_name().unwrap().to_str().unwrap().to_owned();
+    assert!(
+        name.ends_with(&format!("-{}", current_system())) && name.len() > 20,
+        "{name}"
+    );
+    // A symlink to what was built, in a directory only we can use, outside the fleet.
+    assert_eq!(fs::read_link(&one[0]).unwrap(), Path::new(&out));
+    assert_eq!(
+        fs::metadata(&f.gcroots).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert!(!f.gcroots.starts_with(&f.fleet));
+    assert!(
+        first.trail.iter().any(|l| l.contains(&name)),
+        "{:?}",
+        first.trail
+    );
+
+    // The same lock again, with an empty cache: the same link, replaced, not a second one.
+    f.resolve(&ClanLocator::new(), &f.empty).await.unwrap();
+    assert_eq!(links(&f.gcroots), one);
+    assert_eq!(fs::read_link(&one[0]).unwrap(), Path::new(&out));
+
+    // Another lock is another link, and the first stays.
+    write_core(&f.core, "B", true);
+    git(&f.core, &["add", "-A"]);
+    git(&f.core, &["commit", "-q", "-m", "B"]);
+    nix(&[
+        "flake",
+        "update",
+        "--flake",
+        &format!("path:{}", f.fleet.display()),
+        "clan-core",
+    ]);
+    f.resolve(&locator, &f.empty).await.unwrap();
+    let two = links(&f.gcroots);
+    assert_eq!(two.len(), 2, "{two:?}");
+    assert!(two.contains(&one[0]));
 }
