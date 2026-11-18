@@ -21,7 +21,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use auspex_core::{Config, Event, PrometheusConfig, PrometheusStatus};
+use auspex_core::{Config, DiffConfig, Event, PrometheusConfig, PrometheusStatus};
 use auspex_effects::Termination;
 use clap::Parser as _;
 use crossterm::event::EventStream;
@@ -69,6 +69,9 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
             max_age_seconds: p.stale_after,
         }),
         binary_cache: settings.cache_url.is_some(),
+        diff: settings.diff.enabled.then_some(DiffConfig {
+            timeout_seconds: settings.timeouts.diff,
+        }),
     }
 }
 

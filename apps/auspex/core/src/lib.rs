@@ -26,7 +26,7 @@ pub use app::{
     PROMETHEUS_TIMED_OUT,
 };
 pub use auspex_domain::report::{FleetError, FleetErrorKind};
-pub use config::{Config, PrometheusConfig};
+pub use config::{Config, DiffConfig, PrometheusConfig};
 pub use crux_core::Core;
 pub use effects::{Effect, Generation, RequestId};
 pub use view::{Mode, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel};

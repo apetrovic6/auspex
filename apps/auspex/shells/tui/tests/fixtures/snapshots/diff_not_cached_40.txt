@@ -1,0 +1,40 @@
+┌ cypramundi ──────────────────────────┐
+│badges    ↑ update pending            │
+│status    update pending              │
+│reason    pending                     │
+│          nixos-system-cypramundi-25.1│
+│          1.20261101.6a2f1c0          │
+│host      root@198.51.100.4:2222      │
+│          (config override)           │
+│class     nixos  tags: base, server   │
+│lints     none                        │
+│current   i4payi4p                    │
+│          nixos-system-cypramundi-25.1│
+│          1.20261019.b81e2d4          │
+│pending   8jx7iv6h                    │
+│          nixos-system-cypramundi-25.1│
+│          1.20261101.6a2f1c0          │
+│diff      not cached: the pending     │
+│          closure is not in the binary│
+│          cache (or no cache is       │
+│          configured), so there is no │
+│          preview until it is built   │
+│          and pushed                  │
+│revision  6a2f1c0e9d                  │
+│systemd   running                     │
+│failed    none                        │
+│uptime    14d 0h (prometheus)         │
+│disk      93.5 GiB of 233.7 GiB used, │
+│          128.3 GiB free (prometheus) │
+│load      0.40 0.35 0.30 (prometheus) │
+│memory    20.0 GiB of 32.0 GiB free   │
+│          (prometheus)                │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+log: eval results stored in the cache: …
+OBSERVE │ settled │ 0 pending │ prom: ok

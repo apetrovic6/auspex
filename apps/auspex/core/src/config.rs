@@ -20,6 +20,9 @@ pub struct Config {
     /// Whether a binary cache (ncps) is configured. Without one the "already cached" question
     /// is never asked.
     pub binary_cache: bool,
+    /// The package preview, or `None` for none (the default: a core that is not told to
+    /// preview never asks for a closure).
+    pub diff: Option<DiffConfig>,
 }
 
 /// Prometheus settings the core decides with. The URL is the adapter's, not the core's.
@@ -39,4 +42,13 @@ impl PrometheusConfig {
     pub fn instance_for<'a>(&'a self, machine: &'a str) -> &'a str {
         self.instances.get(machine).map_or(machine, String::as_str)
     }
+}
+
+/// The package preview's settings. `None` in [`Config::diff`] means the preview is off: no
+/// closure is ever queried and `package_diff` stays `null`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffConfig {
+    /// `timeouts.diff`: how long one machine's preview may take, from the moment its queries
+    /// are requested. Carried on each request, enforced by the shell.
+    pub timeout_seconds: u64,
 }

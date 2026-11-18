@@ -22,6 +22,7 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crate::input::{Input, Prompt};
 use crate::keymap::{Action, Keymap};
+use crate::packages::{self, Kind};
 use crate::theme::{Role, Theme};
 
 /// At this width or more, list and detail sit side by side.
@@ -160,6 +161,9 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
 
     if ui.input.log_open {
         draw_log(frame, main, ctx);
+    }
+    if ui.input.diff_open {
+        draw_diff(frame, main, view, ui, ctx);
     }
     if view.help_open {
         draw_help(frame, main, ctx);
@@ -359,6 +363,9 @@ pub fn detail_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
             .as_deref()
             .map_or_else(|| "—".to_owned(), short_path),
     ));
+    // The package preview sits with the two systems it compares, ahead of the health
+    // values, which a pending update makes less urgent.
+    out.extend(packages::panel_lines(m));
     out.push((
         "revision",
         m.deployed_revision
@@ -759,6 +766,83 @@ fn draw_log(frame: &mut Frame, area: Rect, ctx: &Context<'_>) {
         .iter()
         .skip(lines.len().saturating_sub(height))
         .map(|l| Line::from(Span::styled(cut(l, width), theme.style(Role::Text))))
+        .collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// The package diff overlay (`d`): the selected machine's full list, scrollable.
+///
+/// `ui.input.diff_scroll` is clamped here, to the last page of the list, and written back:
+/// the keys only add to it (`G` sets it to the maximum), so the drawing is what knows how
+/// long the list is.
+fn draw_diff(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>) {
+    let theme = ctx.theme;
+    let machine = view.selected.and_then(|i| view.report.machines.get(i));
+    let rect = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    frame.render_widget(Clear, rect);
+    let lines = machine.map_or_else(
+        || vec![(Kind::Note, "no machine selected".to_owned())],
+        packages::full_lines,
+    );
+    let inner_height = usize::from(rect.height.saturating_sub(2));
+    let last_start = lines.len().saturating_sub(inner_height.max(1));
+    ui.input.diff_scroll = ui.input.diff_scroll.min(last_start);
+    let start = ui.input.diff_scroll;
+    let position = if lines.len() > inner_height {
+        format!(
+            " {}–{}/{} ",
+            start + 1,
+            (start + inner_height).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        String::new()
+    };
+    let close = ctx
+        .keymap
+        .keys_for(Action::Quit)
+        .into_iter()
+        .find(|k| k == "q")
+        .map_or_else(
+            || ctx.keymap.keys_for(Action::Diff).join(" "),
+            |_| "q".to_owned(),
+        );
+    let title = format!(
+        " package diff: {} ",
+        machine.map_or("—", |m| m.name.as_str())
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            cut(&title, usize::from(rect.width.saturating_sub(4))),
+            theme.style(Role::Title),
+        ))
+        .title_bottom(Span::styled(
+            format!("{position}{close}/esc close "),
+            theme.style(Role::Dim),
+        ))
+        .border_style(theme.style(Role::Dim))
+        .style(theme.base());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let width = usize::from(inner.width);
+    let shown: Vec<Line> = lines
+        .iter()
+        .skip(start)
+        .take(inner_height)
+        .map(|(kind, text)| match kind {
+            Kind::Heading => Line::from(Span::styled(cut(text, width), theme.style(Role::Title))),
+            Kind::Item => Line::from(Span::styled(
+                format!("  {}", cut(text, width.saturating_sub(2))),
+                theme.style(Role::Text),
+            )),
+            Kind::Note => Line::from(Span::styled(cut(text, width), theme.style(Role::Dim))),
+        })
         .collect();
     frame.render_widget(Paragraph::new(shown), inner);
 }

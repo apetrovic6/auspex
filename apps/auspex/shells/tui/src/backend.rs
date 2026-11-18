@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use auspex_core::effects::{
-    CacheRequest, EvalRequest, InventoryAnswer, InventoryRequest, ProbeRequest, PrometheusAnswer,
-    PrometheusRequest, ResolveRequest,
+    CacheRequest, ClosureAnswer, DeployedClosureRequest, EvalRequest, InventoryAnswer,
+    InventoryRequest, PendingClosureRequest, ProbeRequest, PrometheusAnswer, PrometheusRequest,
+    ResolveRequest,
 };
 use auspex_domain::fleet::ConnectTimeout;
 use auspex_domain::observe::ProbeOutcome;
 use auspex_domain::status::NarCache;
 use auspex_effects::cache::{self, CacheParams, GitParams};
+use auspex_effects::closure::{self, PendingParams};
 use auspex_effects::http::HttpClient;
 use auspex_effects::nix::{self, EvalItem, EvalMachine, EvalParams, FlakeRef};
 use auspex_effects::ssh::{self, ControlDir, ProbeParams};
@@ -174,6 +176,39 @@ impl Backend {
             Self::Demo(d) => d.resolve(op, cancel).await,
         }
     }
+
+    /// `Effect::DeployedClosure`.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn deployed_closure(
+        &self,
+        op: &DeployedClosureRequest,
+        cancel: &CancellationToken,
+        on_approval: &(dyn Fn(bool) + Sync),
+    ) -> Result<ClosureAnswer, Cancelled> {
+        match self {
+            Self::Real(r) => r.deployed_closure(op, cancel, on_approval).await,
+            Self::Demo(d) => d.deployed_closure(op, cancel).await,
+        }
+    }
+
+    /// `Effect::PendingClosure`.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn pending_closure(
+        &self,
+        op: &PendingClosureRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ClosureAnswer, Cancelled> {
+        match self {
+            Self::Real(r) => r.pending_closure(op, cancel).await,
+            Self::Demo(d) => d.pending_closure(op, cancel).await,
+        }
+    }
 }
 
 /// An absolute path to `name` on an absolute `PATH` entry, as `auspex-effects` would find
@@ -220,6 +255,7 @@ fn program(variable: &str, default: OsString) -> OsString {
 pub struct Real {
     ssh: OsString,
     nix: OsString,
+    nix_store: OsString,
     nix_eval_jobs: OsString,
     git: OsString,
     control_dir: Result<ControlDir, String>,
@@ -261,6 +297,7 @@ impl Real {
         Self {
             ssh: program("AUSPEX_SSH", OsString::from(ssh::DEFAULT_SSH)),
             nix: program("AUSPEX_NIX", OsString::from(nix::DEFAULT_NIX)),
+            nix_store: program("AUSPEX_NIX_STORE", OsString::from(nix::DEFAULT_NIX_STORE)),
             nix_eval_jobs: program("AUSPEX_NIX_EVAL_JOBS", nix_eval_jobs()),
             git: OsString::from(cache::DEFAULT_GIT),
             control_dir: ControlDir::prepare(&ControlDir::default_path()).map_err(|e| e.0),
@@ -427,6 +464,45 @@ impl Real {
         cancel: &CancellationToken,
     ) -> Result<BTreeMap<String, Vec<std::net::IpAddr>>, Cancelled> {
         dns::resolve(&op.hosts, self.dns_timeout, cancel).await
+    }
+
+    async fn deployed_closure(
+        &self,
+        op: &DeployedClosureRequest,
+        cancel: &CancellationToken,
+        on_approval: &(dyn Fn(bool) + Sync),
+    ) -> Result<ClosureAnswer, Cancelled> {
+        let control_dir = match &self.control_dir {
+            Ok(d) => d,
+            Err(why) => {
+                return Ok(Err(format!("cannot query the deployed closure: {why}")));
+            }
+        };
+        // The probe's parameters: the same ssh, control directory and approval phase, so a
+        // warm master is reused and a cold one authenticates once, for both. Only the script
+        // deadline differs: `timeouts.diff`.
+        let mut params = ProbeParams::new(control_dir);
+        params.ssh_program = &self.ssh;
+        params.connect_timeout = self.connect_timeout;
+        params.control_persist = self.control_persist;
+        params.approval_deadline = self.approval_deadline;
+        params.on_approval = Some(on_approval);
+        params.deadline = Duration::from_secs(op.timeout_seconds);
+        closure::deployed(&op.target, &params, cancel).await
+    }
+
+    async fn pending_closure(
+        &self,
+        op: &PendingClosureRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ClosureAnswer, Cancelled> {
+        let params = PendingParams {
+            nix: &self.nix,
+            nix_store: &self.nix_store,
+            cache_url: self.cache_url.as_deref(),
+            timeout: Duration::from_secs(op.timeout_seconds),
+        };
+        closure::pending(&op.store_path, &params, cancel).await
     }
 }
 

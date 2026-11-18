@@ -234,6 +234,7 @@ pub fn auspex(home: &Path) -> Command {
         .env_remove("CLAN_DIR")
         .env_remove("AUSPEX_SSH")
         .env_remove("AUSPEX_NIX")
+        .env_remove("AUSPEX_NIX_STORE")
         .env_remove("AUSPEX_NIX_EVAL_JOBS")
         .stdin(Stdio::null());
     cmd

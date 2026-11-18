@@ -19,11 +19,13 @@
 //!   ssh argument vector, and the homelab-safety lints.
 //! - [`observe`]: the probe scripts, their parser, and merging Prometheus samples.
 //! - [`eval`]: `nix-eval-jobs` lines, the eval cache key and the cache entry.
+//! - [`closure`]: the two closure queries' script and output parser.
 //! - [`diff`]: bounded package previews from two runtime closures.
 //! - [`status`]: the status-badge rules.
 //! - [`report`]: the versioned `--json` contract.
 //! - [`text`]: making remote-controlled text safe for a terminal, for adapters too.
 
+pub mod closure;
 pub mod diff;
 pub mod eval;
 pub mod fleet;

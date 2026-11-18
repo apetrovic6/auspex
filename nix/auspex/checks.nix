@@ -29,7 +29,8 @@ let
   fullSettings = {
     flake = "/home/me/clan/fleet";
     ssh.control_persist = 600;
-    timeouts = { ssh_connect = 5; ssh_approval = 60; probe = 10; eval = 300; settle = 120; };
+    timeouts = { ssh_connect = 5; ssh_approval = 60; probe = 10; eval = 300; settle = 120; diff = 120; };
+    diff.enabled = false;
     eval = { workers = 4; max_memory_mb = 4096; };
     prometheus = { url = "http://prometheus.example:9090"; stale_after = 60; };
     cache.url = "https://ncps.example";
@@ -52,7 +53,7 @@ let
     "auspex-full: every fixture leaf must be covered by a declared settings option";
     full.config.xdg.configFile."auspex/config.toml".source;
   unknown = (evaluate { programs.auspex.settings.future.answer = 42; }).config;
-  timeoutPaths = map (name: [ "timeouts" name ]) [ "ssh_connect" "probe" "eval" "settle" ];
+  timeoutPaths = map (name: [ "timeouts" name ]) [ "ssh_connect" "probe" "eval" "settle" "diff" ];
   unsignedPaths = [ [ "prometheus" "stale_after" ] ];
   positivePaths = [ [ "eval" "workers" ] [ "eval" "max_memory_mb" ] ];
   numberOK = positive: max: path:
@@ -152,6 +153,17 @@ let
   # Another system's package set can force source-patching IFD on that architecture.
   # Keep CI checks native to the package set supplied by the caller.
   overlayPackage = (exports.overlays.default pkgs pkgs).auspex;
+  # `diff.enabled` is a boolean: a number or a string is refused at evaluation, naming nothing
+  # else, and `false` (the opposite of the default) is what the fixture says.
+  diffEnabledOK =
+    let
+      type = lib.foldl' (type: name: (type.getSubOptions [ ]).${name}.type) settingsType [ "diff" "enabled" ];
+      probe = value: (evaluate {
+        programs.auspex.settings.diff.enabled = value;
+      }).config.programs.auspex.settings.diff.enabled;
+      rejected = value: !(builtins.tryEval (builtins.deepSeq (probe value) true)).success;
+    in probe true == true && probe false == false
+      && !type.check 1 && rejected 1 && !type.check "yes" && rejected "yes";
 in {
   auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;
@@ -205,6 +217,7 @@ in {
   ];
   auspex-flake-store-path = check "flake-store-path" (storeFlakeRejected
     && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeFlake pathFlake ]);
+  auspex-diff-types = check "diff-types" diffEnabledOK;
   auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision

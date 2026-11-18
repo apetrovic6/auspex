@@ -17,10 +17,11 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use auspex_core::effects::{
-    CacheRequest, EvalRequest, InventoryAnswer, ProbeRequest, PrometheusAnswer, PrometheusRequest,
-    ResolveRequest,
+    CacheRequest, ClosureAnswer, DeployedClosureRequest, EvalRequest, InventoryAnswer,
+    PendingClosureRequest, ProbeRequest, PrometheusAnswer, PrometheusRequest, ResolveRequest,
 };
-use auspex_core::{Config, PrometheusConfig};
+use auspex_core::{Config, DiffConfig, PrometheusConfig};
+use auspex_domain::closure::ClosurePaths;
 use auspex_domain::eval::{EvalFailure, EvalOutcome, EvalSuccess};
 use auspex_domain::fleet::parse_inventory;
 use auspex_domain::observe::{
@@ -49,6 +50,9 @@ pub fn config() -> Config {
             max_age_seconds: 60,
         }),
         binary_cache: true,
+        diff: Some(DiffConfig {
+            timeout_seconds: 120,
+        }),
     }
 }
 
@@ -140,7 +144,10 @@ const FLEET: &[Script] = &[
         0,
     ),
     m("phobos", Probe::InSync, 410, 0),
-    m("sol", Probe::Behind, 420, 0),
+    Script {
+        cached: true,
+        ..m("sol", Probe::Behind, 420, 0)
+    },
     m("terra", Probe::InSync, 430, 0),
     m("titan", Probe::InSync, 440, 0),
     Script {
@@ -302,6 +309,92 @@ fn outcome(s: &Script) -> EvalOutcome {
     })
 }
 
+// ---------------------------------------------------------------------------------------
+// The package preview's closures
+// ---------------------------------------------------------------------------------------
+
+/// Packages both closures hold, at the same version.
+const SHARED: &[&str] = &[
+    "bash-5.2p37",
+    "coreutils-9.5",
+    "util-linux-2.40.2",
+    "zlib-1.3.1",
+    "xz-5.6.3",
+    "gcc-14.2.1.20250322-lib",
+    "openresolv-3.13.2",
+    "iproute2-6.12.0",
+    "dbus-1.14.10",
+    "shadow-4.16.0",
+    "perl-5.40.0",
+    "gnugrep-3.11",
+    "findutils-4.10.0",
+    "nixos-option",
+];
+
+/// Packages whose version changed: deployed, then pending. The first four are the ones the
+/// preview always shows first; the rest are major-version bumps, which collapse into a count.
+const CHANGED: &[(&str, &str, &str)] = &[
+    ("linux", "6.12.38", "6.12.41"),
+    ("systemd", "256.10", "257.2"),
+    ("glibc", "2.40-66", "2.40-77"),
+    ("openssl", "3.4.1", "3.4.2"),
+    ("openssh", "9.9p1", "9.9p2"),
+    ("curl", "8.11.1", "8.12.0"),
+    ("postgresql", "16.6", "17.2"),
+    ("nodejs", "20.18.1", "22.12.0"),
+    ("firefox", "133.0", "134.0"),
+    ("python3", "3.12.8", "3.13.1"),
+];
+
+/// Same version, different build: `nix` is rebuilt, which the preview says in its own line.
+const REBUILT: &[(&str, &str)] = &[("nix", "2.28.3")];
+
+const ADDED: &[(&str, &str)] = &[
+    ("ripgrep", "14.1.1"),
+    ("fd", "10.2.0"),
+    ("tailscale", "1.80.0"),
+];
+
+const REMOVED: &[(&str, &str)] = &[("htop", "3.3.0"), ("nano", "8.3")];
+
+/// `/nix/store/<hash>-<name>`, with a hash made from the name and a salt: a different salt is
+/// the same package built differently.
+fn store_path(name: &str, salt: u8) -> StorePath {
+    StorePath::new(format!("/nix/store/{}-{name}", hash(name, salt)))
+        .expect("the demo's paths are store paths")
+}
+
+fn closure(machine: &str, pending: bool) -> ClosurePaths {
+    let mut paths: Vec<StorePath> = SHARED.iter().map(|n| store_path(n, 0)).collect();
+    paths.push(
+        StorePath::new(system(machine, u8::from(!pending)))
+            .expect("the demo's paths are store paths"),
+    );
+    for (name, before, after) in CHANGED {
+        paths.push(store_path(
+            &format!("{name}-{}", if pending { after } else { before }),
+            0,
+        ));
+    }
+    for (name, version) in REBUILT {
+        paths.push(store_path(&format!("{name}-{version}"), u8::from(pending)));
+    }
+    let (only_here, unversioned) = if pending {
+        (ADDED, "boot.json")
+    } else {
+        (REMOVED, "kbd-layout")
+    };
+    for (name, version) in only_here {
+        paths.push(store_path(&format!("{name}-{version}"), 0));
+    }
+    paths.push(store_path(unversioned, 0));
+    // A line a machine's login banner could print on stdout: dropped, and counted.
+    ClosurePaths {
+        paths,
+        dropped: usize::from(!pending),
+    }
+}
+
 /// The script. `Demo::default()` is what `--demo` runs; the two fields exist for the shell's
 /// own tests, to make the evaluator misbehave in the two ways the shell must not hide.
 #[derive(Debug, Default)]
@@ -429,5 +522,30 @@ impl Demo {
             .keys()
             .map(|machine| (machine.clone(), vec![shared]))
             .collect())
+    }
+
+    pub(crate) async fn deployed_closure(
+        &self,
+        op: &DeployedClosureRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ClosureAnswer, Cancelled> {
+        after(300, cancel).await?;
+        Ok(match op.machine.as_str() {
+            // The slow, failing one: what a hung `nix-store` over ssh looks like.
+            "sol" => Err(format!(
+                "deployed closure query timed out after {:?}",
+                Duration::from_secs(op.timeout_seconds)
+            )),
+            machine => Ok(closure(machine, false)),
+        })
+    }
+
+    pub(crate) async fn pending_closure(
+        &self,
+        op: &PendingClosureRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ClosureAnswer, Cancelled> {
+        after(500, cancel).await?;
+        Ok(Ok(closure(&op.machine, true)))
     }
 }

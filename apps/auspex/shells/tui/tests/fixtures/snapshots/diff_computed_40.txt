@@ -1,0 +1,40 @@
+┌ luna ────────────────────────────────┐
+│badges    ↑ update pending  ◆ cached  │
+│status    update pending              │
+│reason    pending                     │
+│          nixos-system-luna-25.11.2026│
+│          1101.6a2f1c0; linux 6.12.38 │
+│          → 6.12.41, +3 −2 ~10        │
+│host      root@192.168.1.11 (inventory│
+│          deploy.targetHost)          │
+│build     localhost                   │
+│class     nixos  tags: k8s, k8s-server│
+│lints     none                        │
+│current   0357acgi                    │
+│          nixos-system-luna-25.11.2026│
+│          1019.b81e2d4                │
+│pending   g1j4m7qa                    │
+│          nixos-system-luna-25.11.2026│
+│          1101.6a2f1c0                │
+│diff      linux 6.12.38 → 6.12.41, +3 │
+│          −2 ~10                      │
+│critical  linux 6.12.38 → 6.12.41     │
+│          systemd 256.10 → 257.2      │
+│          glibc 2.40-66 → 2.40-77     │
+│          nix rebuilt (same version,  │
+│          new build)                  │
+│major     3 other major-version       │
+│          changes                     │
+│counts    +3 added  −2 removed  ~10   │
+│          changed  1 rebuilt          │
+│          unversioned +1 −1           │
+│          1 unreadable path (1        │
+│          deployed, 0 pending)        │
+│revision  6a2f1c0e9d                  │
+│systemd   running                     │
+│failed    none                        │
+│uptime    14d 0h (prometheus)         │
+│disk      93.5 GiB of 233.7 GiB used, │
+└──────────────────────────────────────┘
+log: eval results stored in the cache: …
+OBSERVE │ settled │ 0 pending │ prom: ok

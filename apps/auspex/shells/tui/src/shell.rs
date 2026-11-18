@@ -18,6 +18,12 @@
 //!
 //! When a refresh starts (its machine-list request appears), the shell arms the global
 //! deadline for that generation: `timeouts.settle` later it sends `DeadlinePassed`.
+//!
+//! The package preview's two closure queries are the exception: the core leaves them
+//! running past that deadline, and the shell bounds each by `timeouts.diff` instead
+//! ([`within`]): waiting for a permit, ssh's approval phase and the query itself all count,
+//! and when it passes the adapter kills and reaps what it started and the request is answered
+//! as a failure, which the core turns into a `failed` preview.
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
@@ -244,6 +250,43 @@ impl Shell {
                     shell.backend.resolve(&op, &token).await
                 });
             }
+            Effect::DeployedClosure(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                self.one_shot(op.id, request, async move {
+                    let timeout = Duration::from_secs(op.timeout_seconds);
+                    within(&token, timeout, "deployed closure query", |token| {
+                        let shell = Arc::clone(&shell);
+                        let op = op.clone();
+                        async move {
+                            let _permit = shell.gate(&token).await?;
+                            shell
+                                .backend
+                                .deployed_closure(&op, &token, &|waiting| shell.approval(waiting))
+                                .await
+                        }
+                    })
+                    .await
+                });
+            }
+            Effect::PendingClosure(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                self.one_shot(op.id, request, async move {
+                    let timeout = Duration::from_secs(op.timeout_seconds);
+                    within(&token, timeout, "pending closure query", |token| {
+                        let shell = Arc::clone(&shell);
+                        let op = op.clone();
+                        async move {
+                            let _permit = shell.gate(&token).await?;
+                            shell.backend.pending_closure(&op, &token).await
+                        }
+                    })
+                    .await
+                });
+            }
             Effect::Cancel(request) => self.cancel(request.operation.id),
         }
     }
@@ -384,6 +427,40 @@ impl Shell {
     }
 }
 
+/// Runs `work` under `timeout`, answering with a failure when it passes.
+///
+/// `timeouts.diff` bounds the whole of one preview query: waiting for a permit, ssh's
+/// approval phase and the query itself, not only the query's own deadline. `work` gets a
+/// child of `token`; on the timeout that child is cancelled, which makes the adapter kill and
+/// reap its process group and return `Cancelled`, and that is then answered as the timeout it
+/// was. A cancellation from the core (a refresh, a quit) cancels `token` itself, and stays a
+/// cancellation: `Err(Cancelled)`, no answer.
+async fn within<T, Fut>(
+    token: &CancellationToken,
+    timeout: Duration,
+    what: &str,
+    work: impl FnOnce(CancellationToken) -> Fut,
+) -> Result<Result<T, String>, Cancelled>
+where
+    Fut: Future<Output = Result<Result<T, String>, Cancelled>>,
+{
+    let inner = token.child_token();
+    let work = work(inner.clone());
+    tokio::pin!(work);
+    tokio::select! {
+        answer = &mut work => answer,
+        () = tokio::time::sleep(timeout) => {
+            inner.cancel();
+            match work.await {
+                Err(Cancelled) if !token.is_cancelled() => {
+                    Ok(Err(format!("{what} timed out after {timeout:?}")))
+                }
+                finished_anyway => finished_anyway,
+            }
+        }
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -410,5 +487,100 @@ impl Shell {
     #[must_use]
     pub fn running_per_machine(&self) -> usize {
         MAX_CONCURRENT - self.limit.available_permits()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Work that runs until its token is cancelled, then reports having been cancelled.
+    async fn until_cancelled(token: CancellationToken) -> Result<Result<u32, String>, Cancelled> {
+        token.cancelled().await;
+        Err(Cancelled)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_that_outlives_timeouts_diff_is_cancelled_and_answered_as_a_timeout() {
+        let outer = CancellationToken::new();
+        // Bounded from outside too, so a `within` that never times out fails this test
+        // instead of hanging it.
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1000),
+            within(
+                &outer,
+                Duration::from_secs(90),
+                "deployed closure query",
+                until_cancelled,
+            ),
+        )
+        .await
+        .expect("within returns once timeouts.diff has passed");
+        assert_eq!(
+            answer,
+            Ok(Err("deployed closure query timed out after 90s".to_owned()))
+        );
+        assert!(
+            !outer.is_cancelled(),
+            "the timeout cancels the work, not the request's token"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancellation_from_the_core_stays_a_cancellation() {
+        let outer = CancellationToken::new();
+        let canceller = outer.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            canceller.cancel();
+        });
+        let answer = within(&outer, Duration::from_secs(90), "q", until_cancelled).await;
+        assert_eq!(
+            answer,
+            Err(Cancelled),
+            "no answer: the core dropped the request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn work_that_finishes_in_time_is_answered_as_it_is() {
+        let outer = CancellationToken::new();
+        let answer = within(&outer, Duration::from_secs(90), "q", |_| async {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            Ok(Ok(7))
+        })
+        .await;
+        assert_eq!(answer, Ok(Ok(7)));
+        let failed = within(&outer, Duration::from_secs(90), "q", |_| async {
+            Ok::<Result<u32, String>, Cancelled>(Err("no".to_owned()))
+        })
+        .await;
+        assert_eq!(failed, Ok(Err("no".to_owned())));
+    }
+
+    /// The bound covers the whole request, not only the adapter's own deadline: work that is
+    /// still waiting (for a permit, or ssh's approval) when `timeouts.diff` passes is cut.
+    #[tokio::test(start_paused = true)]
+    async fn the_bound_covers_waiting_as_well_as_running() {
+        let outer = CancellationToken::new();
+        let semaphore = Arc::new(Semaphore::new(0));
+        let waiting = Arc::clone(&semaphore);
+        let answer = tokio::time::timeout(
+            Duration::from_secs(1000),
+            within(
+                &outer,
+                Duration::from_secs(10),
+                "q",
+                move |token| async move {
+                    tokio::select! {
+                        () = token.cancelled() => Err(Cancelled),
+                        _ = waiting.acquire_owned() => Ok(Ok(1u32)),
+                    }
+                },
+            ),
+        )
+        .await
+        .expect("within returns once timeouts.diff has passed");
+        assert_eq!(answer, Ok(Err("q timed out after 10s".to_owned())));
     }
 }

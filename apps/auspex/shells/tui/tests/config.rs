@@ -32,6 +32,9 @@ fn the_home_manager_contract_fixture_loads_whole() {
     assert_eq!((s.eval.workers, s.eval.max_memory_mb), (4, 4096));
     assert_eq!(s.ssh.control_persist, 600);
     assert_eq!(s.timeouts.ssh_approval, 60);
+    assert_eq!(s.timeouts.diff, 120);
+    // The fixture says `false`, the opposite of the default, so a key never read fails here.
+    assert!(!s.diff.enabled);
     assert_eq!(
         s.prometheus,
         Some(PrometheusSettings {
@@ -78,6 +81,10 @@ fn the_home_manager_contract_fixture_loads_whole() {
     assert_eq!(prom.instances["terra"], "terra:9100");
     assert_eq!(prom.max_age_seconds, 60);
     assert!(core.binary_cache);
+    assert_eq!(
+        core.diff, None,
+        "diff.enabled = false switches the preview off"
+    );
 }
 
 #[test]
@@ -207,6 +214,7 @@ fn every_number_in_the_fixture_is_read_not_defaulted() {
     assert_eq!((s.eval.workers, s.eval.max_memory_mb), (5, 4097));
     assert_eq!(s.ssh.control_persist, 601);
     assert_eq!(s.timeouts.ssh_approval, 61);
+    assert_eq!(s.timeouts.diff, 121);
     assert_eq!(s.prometheus.unwrap().stale_after, 61);
 }
 
@@ -214,7 +222,7 @@ fn every_number_in_the_fixture_is_read_not_defaulted() {
 /// panicked its task. Every timeout is between 1 s and a day, and the error names the key.
 #[test]
 fn timeouts_are_between_one_second_and_a_day() {
-    for key in ["ssh_connect", "probe", "eval", "settle"] {
+    for key in ["ssh_connect", "probe", "eval", "settle", "diff"] {
         for bad in ["0", "86401", "9223372036854775807", "-1"] {
             let e = config::parse(&format!("[timeouts]\n{key} = {bad}\n")).unwrap_err();
             assert!(e.contains("between 1"), "{key} = {bad}: {e}");
@@ -335,6 +343,47 @@ fn errors_on_stderr_carry_no_escape_sequences() {
 }
 
 /// Review mutation A: `stale_after` was parsed but nothing checked it reaches the core.
+#[test]
+fn the_package_preview_is_on_by_default_with_a_two_minute_budget() {
+    let (s, w) = config::parse("").unwrap();
+    assert_eq!(w, Vec::<String>::new());
+    assert!(s.diff.enabled);
+    assert_eq!(s.timeouts.diff, 120);
+    let core = core_config(&s, ".".to_owned());
+    assert_eq!(
+        core.diff,
+        Some(auspex_core::DiffConfig {
+            timeout_seconds: 120
+        })
+    );
+}
+
+#[test]
+fn timeouts_diff_reaches_the_core_and_enabled_false_switches_it_off() {
+    let (s, _) = config::parse("[timeouts]\ndiff = 45\n").unwrap();
+    assert_eq!(
+        core_config(&s, ".".to_owned()).diff,
+        Some(auspex_core::DiffConfig {
+            timeout_seconds: 45
+        })
+    );
+    let (s, _) = config::parse("[diff]\nenabled = false\n[timeouts]\ndiff = 45\n").unwrap();
+    assert_eq!(core_config(&s, ".".to_owned()).diff, None);
+}
+
+#[test]
+fn diff_enabled_must_be_a_boolean_and_an_unknown_diff_key_is_a_warning() {
+    for bad in ["1", "\"yes\"", "[true]"] {
+        let e = config::parse(&format!("[diff]\nenabled = {bad}\n")).unwrap_err();
+        assert!(e.contains("`diff.enabled`"), "{bad}: {e}");
+        assert!(e.contains("true or false"), "{bad}: {e}");
+    }
+    assert!(config::parse("diff = 5\n").unwrap_err().contains("`diff`"));
+    let (_, w) = config::parse("[diff]\nenabled = true\nverbose = 1\n").unwrap();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("`diff.verbose`"));
+}
+
 #[test]
 fn stale_after_reaches_the_core() {
     let (s, _) = config::parse("[prometheus]\nurl = \"http://p\"\nstale_after = 33\n").unwrap();

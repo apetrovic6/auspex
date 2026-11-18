@@ -50,6 +50,9 @@ pub struct RefreshView {
     pub phase: Phase,
     /// Machines still showing a spinner (checking or evaluating).
     pub pending_machines: usize,
+    /// Machines whose package preview is still being collected (their closure queries are
+    /// out). Not part of `pending_machines`: the status and badges are final already.
+    pub diffs_pending: usize,
     /// `Model::fleet_settled`: headless mode prints the report once this is `true`.
     pub settled: bool,
     /// The global deadline passed with something still outstanding, which was then marked as

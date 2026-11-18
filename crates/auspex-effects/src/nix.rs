@@ -44,6 +44,10 @@ use crate::text::{lossy, reason};
 
 /// The default `nix` program, looked up on `PATH`.
 pub const DEFAULT_NIX: &str = "nix";
+
+/// The default `nix-store` program, looked up on `PATH`: the local closure query.
+pub const DEFAULT_NIX_STORE: &str = "nix-store";
+
 /// The default `nix-eval-jobs` program, looked up on `PATH`.
 pub const DEFAULT_NIX_EVAL_JOBS: &str = "nix-eval-jobs";
 

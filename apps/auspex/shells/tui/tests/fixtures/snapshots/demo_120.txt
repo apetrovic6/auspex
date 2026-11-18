@@ -1,30 +1,30 @@
 ┌ machines (18) ─────────────────────────────────────┐┌ luna ──────────────────────────────────────────────────────────┐
 │ ✓    alfrost              in sync                  ││badges    ↑ update pending  ◆ cached                            │
 │ ✓    callisto             in sync                  ││status    update pending                                        │
-│ ✓⚠   cerberus             in sync                  ││reason    pending nixos-system-luna-25.11.20261101.6a2f1c0      │
-│ ↑    cypramundi           update pending           ││host      root@192.168.1.11 (inventory deploy.targetHost)       │
-│ ?    deimos               not installed            ││build     localhost                                             │
-│ ✓    europa               in sync                  ││class     nixos  tags: k8s, k8s-server                          │
-│ ✓⟳   ganymede             in sync                  ││lints     none                                                  │
-│ ✓    genetor              in sync                  ││current   0357acgi nixos-system-luna-25.11.20261019.b81e2d4     │
-│ ✓    io                   in sync                  ││pending   g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0     │
-│›↑◆   luna                 update pending           ││revision  6a2f1c0e9d                                            │
-│ ✗    mars                 unreachable              ││systemd   running                                               │
-│ ✓    mechanicus-forge-wo… in sync                  ││failed    none                                                  │
-│ ✓    phobos               in sync                  ││uptime    14d 0h (prometheus)                                   │
-│ ↑    sol                  update pending           ││disk      93.5 GiB of 233.7 GiB used, 128.3 GiB free            │
-│ ✓    terra                in sync                  ││          (prometheus)                                          │
-│ ✓    titan                in sync                  ││load      0.40 0.35 0.30 (prometheus)                           │
-│ ✗    triton               unreachable              ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
-│ !    vulcan               eval error               ││                                                                │
-│                                                    ││                                                                │
-│                                                    ││                                                                │
-│                                                    ││                                                                │
-│                                                    ││                                                                │
-│                                                    ││                                                                │
-│                                                    ││                                                                │
-│                                                    ││                                                                │
-│                                                    ││                                                                │
+│ ✓⚠   cerberus             in sync                  ││reason    pending nixos-system-luna-25.11.20261101.6a2f1c0;     │
+│ ↑    cypramundi           update pending           ││          linux 6.12.38 → 6.12.41, +3 −2 ~10                    │
+│ ?    deimos               not installed            ││host      root@192.168.1.11 (inventory deploy.targetHost)       │
+│ ✓    europa               in sync                  ││build     localhost                                             │
+│ ✓⟳   ganymede             in sync                  ││class     nixos  tags: k8s, k8s-server                          │
+│ ✓    genetor              in sync                  ││lints     none                                                  │
+│ ✓    io                   in sync                  ││current   0357acgi nixos-system-luna-25.11.20261019.b81e2d4     │
+│›↑◆   luna                 update pending           ││pending   g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0     │
+│ ✗    mars                 unreachable              ││diff      linux 6.12.38 → 6.12.41, +3 −2 ~10                    │
+│ ✓    mechanicus-forge-wo… in sync                  ││critical  linux 6.12.38 → 6.12.41                               │
+│ ✓    phobos               in sync                  ││          systemd 256.10 → 257.2                                │
+│ ↑◆   sol                  update pending           ││          glibc 2.40-66 → 2.40-77                               │
+│ ✓    terra                in sync                  ││          nix rebuilt (same version, new build)                 │
+│ ✓    titan                in sync                  ││major     3 other major-version changes                         │
+│ ✗    triton               unreachable              ││counts    +3 added  −2 removed  ~10 changed  1 rebuilt          │
+│ !    vulcan               eval error               ││          unversioned +1 −1                                     │
+│                                                    ││          1 unreadable path (1 deployed, 0 pending)             │
+│                                                    ││revision  6a2f1c0e9d                                            │
+│                                                    ││systemd   running                                               │
+│                                                    ││failed    none                                                  │
+│                                                    ││uptime    14d 0h (prometheus)                                   │
+│                                                    ││disk      93.5 GiB of 233.7 GiB used, 128.3 GiB free            │
+│                                                    ││          (prometheus)                                          │
+│                                                    ││load      0.40 0.35 0.30 (prometheus)                           │
 └────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
 log: eval results stored in the cache: cypramundi, deimos, luna
 OBSERVE │ settled │ 0 pending │ prom: ok                                                                          ? help

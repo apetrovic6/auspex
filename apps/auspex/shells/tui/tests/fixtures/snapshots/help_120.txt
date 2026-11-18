@@ -11,12 +11,13 @@
 │ ↑◆   luna                 upda│N             previous match                          │                               │
 │ ✗    mars                 unre│enter tab     machine detail (narrow)                 │                               │
 │ ✓    mechanicus-forge-wo… in s│L             log                                     │                               │
-│ ✓    phobos               in s│r             scan again                              │sed, 128.3 GiB free            │
-│ ↑    sol                  upda│:             command (:q, :refresh)                  │                               │
-│ ✓    terra                in s│?             this help                               │eus)                           │
-│ ✓    titan                in s│q esc ctrl-c  quit                                    │ee (prometheus)                │
-│ ✗    triton               unre│:q            quit                                    │                               │
-│ !    vulcan               eval│:refresh      scan again                              │                               │
+│ ✓    phobos               in s│d             package diff (q closes)                 │sed, 128.3 GiB free            │
+│ ↑◆   sol                  upda│r             scan again                              │                               │
+│ ✓    terra                in s│:             command (:q, :refresh)                  │eus)                           │
+│ ✓    titan                in s│?             this help                               │ee (prometheus)                │
+│ ✗    triton               unre│q esc ctrl-c  quit                                    │                               │
+│ !    vulcan               eval│:q            quit                                    │                               │
+│                               │:refresh      scan again                              │                               │
 │                               │                                                      │                               │
 │                               │⠋ checking                                            │                               │
 │                               │⠋ evaluating                                          │                               │
@@ -30,7 +31,6 @@
 │                               │! eval error                                          │                               │
 │                               │❄ frozen                                              │                               │
 │                               └──────────────────────────────────────────────────────┘                               │
-│                                                    ││                                                                │
 └────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
 log: eval results stored in the cache: cypramundi, deimos, luna
 OBSERVE │ settled │ 0 pending │ prom: ok                                                                          ? help

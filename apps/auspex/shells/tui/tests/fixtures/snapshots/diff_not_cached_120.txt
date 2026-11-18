@@ -1,0 +1,30 @@
+┌ machines (18) ─────────────────────────────────────┐┌ cypramundi ────────────────────────────────────────────────────┐
+│ ✓    alfrost              in sync                  ││badges    ↑ update pending                                      │
+│ ✓    callisto             in sync                  ││status    update pending                                        │
+│ ✓⚠   cerberus             in sync                  ││reason    pending nixos-system-cypramundi-25.11.20261101.6a2f1c0│
+│›↑    cypramundi           update pending           ││host      root@198.51.100.4:2222 (config override)              │
+│ ?    deimos               not installed            ││class     nixos  tags: base, server                             │
+│ ✓    europa               in sync                  ││lints     none                                                  │
+│ ✓⟳   ganymede             in sync                  ││current   i4payi4p                                              │
+│ ✓    genetor              in sync                  ││          nixos-system-cypramundi-25.11.20261019.b81e2d4        │
+│ ✓    io                   in sync                  ││pending   8jx7iv6h                                              │
+│ ↑◆   luna                 update pending           ││          nixos-system-cypramundi-25.11.20261101.6a2f1c0        │
+│ ✗    mars                 unreachable              ││diff      not cached: the pending closure is not in the binary  │
+│ ✓    mechanicus-forge-wo… in sync                  ││          cache (or no cache is configured), so there is no     │
+│ ✓    phobos               in sync                  ││          preview until it is built and pushed                  │
+│ ↑◆   sol                  update pending           ││revision  6a2f1c0e9d                                            │
+│ ✓    terra                in sync                  ││systemd   running                                               │
+│ ✓    titan                in sync                  ││failed    none                                                  │
+│ ✗    triton               unreachable              ││uptime    14d 0h (prometheus)                                   │
+│ !    vulcan               eval error               ││disk      93.5 GiB of 233.7 GiB used, 128.3 GiB free            │
+│                                                    ││          (prometheus)                                          │
+│                                                    ││load      0.40 0.35 0.30 (prometheus)                           │
+│                                                    ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+log: eval results stored in the cache: cypramundi, deimos, luna
+OBSERVE │ settled │ 0 pending │ prom: ok                                                                          ? help
