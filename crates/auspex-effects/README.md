@@ -70,10 +70,16 @@ directly, so what follows is a stable, versioned contract**, like the `--json` o
 
 **Location.** `$XDG_STATE_HOME/auspex/log.sqlite`, else `~/.local/state/auspex/log.sqlite`
 (a relative `XDG_STATE_HOME` is ignored). The directory is 0700 and owned by the user, the
-file 0600 (so are its `-wal` and `-shm`); a symlink in place of either is refused. Never inside
-the fleet repository. The file is in WAL mode: read it with a read-only connection
-(`file:…/log.sqlite?mode=ro`), never write to it, and never `VACUUM` or change its journal
-mode.
+file 0600 with no hard link besides its own; a symlink in place of either is refused. Never
+inside the fleet repository (checked before any directory is created). The `-wal` and `-shm`
+files auspex creates take the database's mode from SQLite; an existing one is not checked. The
+file is in WAL mode: read it with a read-only connection (`file:…/log.sqlite?mode=ro`), never
+write to it, and never `VACUUM` or change its journal mode.
+
+**Local file systems only.** WAL keeps an index in shared memory, which does not work across
+hosts: two machines writing one log over NFS can corrupt it. auspex refuses a directory on NFS,
+SMB/CIFS, FUSE or 9p. Do not put the file on one, and do not share it between machines. On a
+read-only file system it opens read-only: history is shown, `start` and `finish` fail.
 
 **Version.** `PRAGMA user_version` is the schema version, currently **1**. An empty file is
 created at 1. auspex refuses (and does not touch) a file with a higher version, and a file with
@@ -81,7 +87,11 @@ tables but version 0. The rule for changes: a **new nullable column** is additiv
 version 1 (a reader must name the columns it wants, never `SELECT *` by position); **anything
 else** (renaming, removing or retyping a column, changing a value set, a new `NOT NULL`
 column) bumps the version, and ships with a migration that runs on open. Rows are never
-deleted by auspex.
+deleted by auspex. *Known gap:* the version is checked when a process opens the file, not on
+every write, so an older auspex that is still running when a newer one migrates the file keeps
+inserting rows in the old shape. Before the first migration exists, writes must check the
+version (or the migration must keep old-shape inserts valid); until then, stop every auspex
+before upgrading one.
 
 **Table `actions`**, one row per action:
 
@@ -98,36 +108,50 @@ deleted by auspex.
 | `exit_code` | integer | The process's exit code, when there was one (never set before `ended_at`). |
 | `who` | text, not null | The operator (`$USER`). It records, it does not authenticate. |
 | `host` | text, not null | The host auspex ran on. |
-| `detail` | text | A short summary of the outcome: the last lines of the error, sanitised, at most 4096 bytes (cut ones end in `…`). **Never clan's output**: the caller passes a summary, because output can hold whatever a machine prints. |
-| `auspex_version` | text, not null | The auspex that wrote the row. |
-| `pid`, `pid_start` | integer, text | The writing process, for auspex's own interrupted-row check. **Ignore them**: not part of the contract's meaning, and `pid_start` is `<boot id>/<start time>`. |
+| `detail` | text | A short summary of the outcome, sanitised line by line (control characters removed, empty lines dropped), at most 4096 bytes. **If it was longer, its end was kept** and it starts with `…`: the cause of a failure is last. **Never clan's output**: the caller passes a summary, because output can hold whatever a machine prints. |
+| `auspex_version` | text, not null | The auspex that wrote the row, sanitised, at most 255 bytes. |
+| `pid`, `pid_start`, `machine_id`, `pid_ns` | integer, text, text, text | The writing process, for auspex's own interrupted-row check: its pid; `<boot id>/<start time>`; `/etc/machine-id` (the host name on macOS); the pid-namespace link (`pid:[<inode>]`). **Ignore them**: not part of the contract's meaning. |
 
 **An unfinished row.** `result IS NULL` means *running*, or *auspex died before it
-finished*. auspex's own queries tell the two apart (a row of this host whose writing process,
-pid plus start time, is gone is reported `interrupted`) and write nothing back. SQL cannot
-look at processes, so the digest should read a row with `result IS NULL` and `started_at` more
-than 24 hours old as interrupted.
+finished*. auspex's own queries tell the two apart (a row whose writing process is gone is
+reported `interrupted`) and write nothing back. They judge only a row whose writer they can
+see: same `host`, same `machine_id`, same `pid_ns`. A writer in a container (another pid
+namespace) or on another machine that shares the host name stays *running* for ever, never
+dead. SQL cannot look at processes, so **the digest reads a row with `result IS NULL` and
+`started_at` more than 24 hours old as interrupted**, and a younger one as running.
 
 **Indexes.** `actions_machine_started (machine, started_at DESC, id DESC)` answers "the last N
 actions of machine M" without a sort; `actions_started (started_at, id)` answers "everything in
 the last 7 days" with a range scan. The log gains a handful of rows a day; nothing else is
 indexed.
 
-**The digest's week**, for example:
+**The digest's week**, for example (`the_readmes_digest_query_runs_and_counts_what_it_says`
+runs it against a fixture):
 
 ```sql
 SELECT machine,
-       count(*)                                       AS actions,
-       sum(kind = 'deploy' AND result = 'succeeded')  AS deploys_ok,
-       sum(result IN ('failed', 'timed_out'))         AS failures,
-       sum(result IS NULL
-           OR result = 'interrupted')                 AS unfinished
+       count(*)                                                       AS actions,
+       coalesce(sum(kind = 'deploy' AND result = 'succeeded'), 0)     AS deploys_ok,
+       coalesce(sum(result IN ('failed', 'timed_out')), 0)            AS failures,
+       coalesce(sum(result = 'interrupted'
+                    OR (result IS NULL
+                        AND started_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-24 hours'))), 0)
+                                                                      AS interrupted
 FROM actions
 WHERE started_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-7 days')
 GROUP BY machine
 ORDER BY machine;
 ```
 
-**Concurrency.** Two auspex processes (the TUI and a `--json` run) may write at once: WAL, a
-5-second busy timeout, one short statement per transaction. All of it runs on tokio's
-blocking pool.
+**Concurrency and failure.** Two auspex processes (the TUI and a `--json` run) may write at
+once: WAL, a 5-second busy timeout, one short statement per transaction, all on tokio's
+blocking pool. Every call has **one total deadline, 2 seconds by default**, covering its wait
+for the shared connection, for the lock and the statement, so a burst of calls (one per machine
+for `U`) waits 2 seconds in all, not once per call. A call that misses it fails with `Timeout`
+and writes nothing. A call whose future is dropped before it begins its statement never
+begins it; one already in its statement completes atomically.
+
+**The log must never hold up or decide a deploy.** Callers do not await a log call on a deploy's
+critical path (start the deploy, and write the row beside it), and never turn a log error into
+the action's result: a full disk, a locked file, a read-only file system or a timeout fail the
+log call, and the deploy that ran still succeeded or failed on its own.

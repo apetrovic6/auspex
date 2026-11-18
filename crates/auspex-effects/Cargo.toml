@@ -25,9 +25,10 @@ sha2 = "0.10"
 tokio = { workspace = true, features = ["process", "io-util", "net", "fs", "sync"] }
 # `CancellationToken`: the one way a caller cancels any function here. Already in the graph.
 tokio-util = { version = "0.7", default-features = false }
-# Safe wrappers for the three syscalls std does not offer: kill a whole process group,
-# getuid (the control directory's owner check) and, in tests, probing a pid. The workspace
-# forbids `unsafe`, so libc is not an option. Already in the graph.
+# Safe wrappers for the syscalls std does not offer: kill a whole process group, getuid (the
+# owner checks), `statfs` (refusing a network file system for the action log), `uname` (the
+# `system` feature: the host name) and probing a pid with signal 0 (the action log, tests).
+# The workspace forbids `unsafe`, so libc is not an option. Already in the graph.
 rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "system"] }
 # The local action log (`deploylog`). `bundled` compiles SQLite from source into the binary:
 # no system libsqlite3 is needed on NixOS or macOS, and every build has the same SQLite (WAL

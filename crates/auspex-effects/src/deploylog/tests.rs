@@ -35,10 +35,25 @@ fn db_in(dir: &Path) -> PathBuf {
     dir.join("state").join(FILE_NAME)
 }
 
+/// A fleet that no test directory is inside (it does not exist: `refuse_inside` resolves what
+/// does not exist yet).
+fn elsewhere() -> PathBuf {
+    PathBuf::from("/nonexistent-auspex-test-fleet")
+}
+
+fn params(path: PathBuf, host: &str) -> OpenParams {
+    OpenParams::new(path, identity(host), elsewhere())
+}
+
 async fn open_at(path: &Path, host: &str) -> ActionLog {
-    ActionLog::open(OpenParams::new(path.to_owned(), identity(host)))
+    ActionLog::open(params(path.to_owned(), host))
         .await
         .unwrap()
+}
+
+/// A call with all the time in the world, for the tests that call `Inner` directly.
+fn call() -> Call {
+    Call::within(Duration::from_secs(60))
 }
 
 async fn open_in(dir: &Path) -> ActionLog {
@@ -148,16 +163,16 @@ async fn recent_and_since_order_and_bound_their_rows() {
     // Times chosen by hand: the third action of "a" shares its millisecond with the second,
     // so the id breaks the tie.
     let a1 = i
-        .start(&new_action(ActionKind::Deploy, "a"), ts(1_000))
+        .start(&new_action(ActionKind::Deploy, "a"), ts(1_000), &call())
         .unwrap();
     let a2 = i
-        .start(&new_action(ActionKind::Build, "a"), ts(2_000))
+        .start(&new_action(ActionKind::Build, "a"), ts(2_000), &call())
         .unwrap();
     let a3 = i
-        .start(&new_action(ActionKind::Reboot, "a"), ts(2_000))
+        .start(&new_action(ActionKind::Reboot, "a"), ts(2_000), &call())
         .unwrap();
     let b1 = i
-        .start(&new_action(ActionKind::Deploy, "b"), ts(3_000))
+        .start(&new_action(ActionKind::Deploy, "b"), ts(3_000), &call())
         .unwrap();
 
     let ids = |rows: Vec<Action>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
@@ -282,6 +297,8 @@ async fn the_schema_is_pinned() {
     auspex_version TEXT NOT NULL,
     pid INTEGER NOT NULL,
     pid_start TEXT,
+    machine_id TEXT,
+    pid_ns TEXT,
     CHECK ((ended_at IS NULL) = (result IS NULL)),
     CHECK (exit_code IS NULL OR ended_at IS NOT NULL)
 )",
@@ -325,7 +342,9 @@ async fn the_schema_is_pinned() {
             "detail",
             "auspex_version",
             "pid",
-            "pid_start"
+            "pid_start",
+            "machine_id",
+            "pid_ns"
         ]
     );
 }
@@ -440,7 +459,7 @@ async fn a_newer_schema_version_refuses_and_leaves_the_file_alone() {
     std::fs::set_permissions(&path, PermissionsExt::from_mode(0o600)).unwrap();
     let before = std::fs::read(&path).unwrap();
 
-    let e = ActionLog::open(OpenParams::new(path.clone(), identity(HOST)))
+    let e = ActionLog::open(params(path.clone(), HOST))
         .await
         .unwrap_err();
     assert!(matches!(e, Error::NewerSchema { found: 2, .. }), "{e}");
@@ -475,10 +494,22 @@ async fn a_database_that_is_not_ours_refuses() {
         .execute_batch("CREATE TABLE notes (t TEXT)")
         .unwrap();
     std::fs::set_permissions(&path, PermissionsExt::from_mode(0o600)).unwrap();
-    let e = ActionLog::open(OpenParams::new(path.clone(), identity(HOST)))
+    let before = std::fs::read(&path).unwrap();
+    let e = ActionLog::open(params(path.clone(), HOST))
         .await
         .unwrap_err();
     assert!(matches!(e, Error::NotOurs(_)), "{e}");
+    // Refused before anything was done to it: not rewritten, not switched to WAL, no side
+    // files.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let journal: String = raw(&path)
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(journal, "delete");
+    assert_eq!(
+        std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+        1
+    );
 
     // Not a database at all.
     std::fs::write(
@@ -486,11 +517,7 @@ async fn a_database_that_is_not_ours_refuses() {
         b"this is not sqlite, it is a text file of some length\n",
     )
     .unwrap();
-    assert!(
-        ActionLog::open(OpenParams::new(path.clone(), identity(HOST)))
-            .await
-            .is_err()
-    );
+    assert!(ActionLog::open(params(path.clone(), HOST)).await.is_err());
     assert_eq!(
         std::fs::read(&path).unwrap(),
         b"this is not sqlite, it is a text file of some length\n"
@@ -598,7 +625,7 @@ async fn a_directory_or_file_with_the_wrong_mode_is_refused() {
     let state = path.parent().unwrap();
 
     std::fs::set_permissions(&path, PermissionsExt::from_mode(0o644)).unwrap();
-    let e = ActionLog::open(OpenParams::new(path.clone(), identity(HOST)))
+    let e = ActionLog::open(params(path.clone(), HOST))
         .await
         .unwrap_err();
     assert!(
@@ -608,7 +635,7 @@ async fn a_directory_or_file_with_the_wrong_mode_is_refused() {
     std::fs::set_permissions(&path, PermissionsExt::from_mode(0o600)).unwrap();
 
     std::fs::set_permissions(state, PermissionsExt::from_mode(0o755)).unwrap();
-    let e = ActionLog::open(OpenParams::new(path.clone(), identity(HOST)))
+    let e = ActionLog::open(params(path.clone(), HOST))
         .await
         .unwrap_err();
     assert!(
@@ -627,7 +654,7 @@ async fn a_symlinked_directory_is_refused() {
     std::fs::set_permissions(&real, PermissionsExt::from_mode(0o700)).unwrap();
     let link = d.path().join("link");
     symlink(&real, &link).unwrap();
-    let e = ActionLog::open(OpenParams::new(link.join(FILE_NAME), identity(HOST)))
+    let e = ActionLog::open(params(link.join(FILE_NAME), HOST))
         .await
         .unwrap_err();
     assert!(
@@ -647,7 +674,7 @@ async fn a_symlinked_database_file_is_refused_and_not_created_through() {
 
     // Dangling: opening must not create the target.
     symlink(&elsewhere, state.join(FILE_NAME)).unwrap();
-    let e = ActionLog::open(OpenParams::new(state.join(FILE_NAME), identity(HOST)))
+    let e = ActionLog::open(params(state.join(FILE_NAME), HOST))
         .await
         .unwrap_err();
     assert!(
@@ -659,7 +686,7 @@ async fn a_symlinked_database_file_is_refused_and_not_created_through() {
     // To a real, private file: refused all the same, and not touched.
     std::fs::write(&elsewhere, b"").unwrap();
     std::fs::set_permissions(&elsewhere, PermissionsExt::from_mode(0o600)).unwrap();
-    let e = ActionLog::open(OpenParams::new(state.join(FILE_NAME), identity(HOST)))
+    let e = ActionLog::open(params(state.join(FILE_NAME), HOST))
         .await
         .unwrap_err();
     assert!(
@@ -674,25 +701,35 @@ async fn a_log_inside_the_fleet_is_refused() {
     let d = dir();
     let fleet = d.path().join("fleet");
     std::fs::create_dir(&fleet).unwrap();
-    let mut p = OpenParams::new(fleet.join("sub").join(FILE_NAME), identity(HOST));
-    p.fleet = Some(fleet.clone());
+    let mut p = params(fleet.join("sub").join(FILE_NAME), HOST);
+    p.fleet = fleet.clone();
     let e = ActionLog::open(p).await.unwrap_err();
     assert!(
         matches!(&e, Error::Unusable(m) if m.contains("inside the fleet")),
         "{e}"
     );
     assert!(!fleet.join("sub").join(FILE_NAME).exists());
+    // Refused before anything was created: no directory appeared in the fleet.
+    assert!(!fleet.join("sub").exists());
+    let mut p = params(fleet.join("a").join("b").join(FILE_NAME), HOST);
+    p.fleet = fleet.clone();
+    assert!(ActionLog::open(p).await.is_err());
+    assert_eq!(
+        std::fs::read_dir(&fleet).unwrap().count(),
+        0,
+        "the fleet was touched"
+    );
 
     // Through a symlink to it, too.
     let alias = d.path().join("alias");
     symlink(&fleet, &alias).unwrap();
-    let mut p = OpenParams::new(alias.join("sub").join(FILE_NAME), identity(HOST));
-    p.fleet = Some(fleet.clone());
+    let mut p = params(alias.join("sub").join(FILE_NAME), HOST);
+    p.fleet = fleet.clone();
     assert!(ActionLog::open(p).await.is_err());
 
     // Outside it, fine.
-    let mut p = OpenParams::new(db_in(d.path()), identity(HOST));
-    p.fleet = Some(fleet);
+    let mut p = params(db_in(d.path()), HOST);
+    p.fleet = fleet;
     ActionLog::open(p).await.unwrap();
 }
 
@@ -812,13 +849,16 @@ async fn values_are_capped_on_a_character_boundary() {
         "{}",
         detail.len()
     );
-    assert!(detail.ends_with('…'));
+    // The end is kept, so the cut is at the front.
+    assert!(detail.starts_with('…') && !detail.ends_with('…'));
 
     // Text that fits is not touched, to the byte.
     assert_eq!(cap(&"x".repeat(DETAIL_CAP), DETAIL_CAP).len(), DETAIL_CAP);
     assert_eq!(cap("abc", 3), "abc");
     assert_eq!(cap("abcd", 4), "abcd");
     assert_eq!(cap("abcde", 4), "a…");
+    assert_eq!(cap_end("abcde", 4), "…e");
+    assert_eq!(cap_end("abcd", 4), "abcd");
 }
 
 #[tokio::test]
@@ -1067,7 +1107,7 @@ async fn child() {
             touch(format!("ready-{who}"));
             wait_for(&dir.join("go"));
             let mut errors = Vec::new();
-            match ActionLog::open(OpenParams::new(path, identity(HOST))).await {
+            match ActionLog::open(params(path, HOST)).await {
                 Err(e) => errors.push(format!("open: {e}")),
                 Ok(log) => {
                     let rounds = std::env::var(ROUNDS)
@@ -1238,7 +1278,7 @@ async fn ticks_while_locked<T>(log: &ActionLog, fut: impl Future<Output = T>) ->
     let (held_tx, held_rx) = std::sync::mpsc::channel();
     let inner = Arc::clone(&log.inner);
     let holder = std::thread::spawn(move || {
-        let _guard = inner.lock();
+        let _guard = inner.conn.lock().unwrap();
         held_tx.send(()).unwrap();
         std::thread::sleep(Duration::from_millis(300));
     });
@@ -1285,10 +1325,7 @@ fn opening_the_default_location_panics_in_a_test_build() {
     let d = dir();
     let stand_in = db_in(d.path());
     let caught = std::panic::catch_unwind(|| {
-        let _ = Inner::open_guarded(
-            OpenParams::new(stand_in.clone(), identity(HOST)),
-            Some(&stand_in),
-        );
+        let _ = Inner::open_guarded(params(stand_in.clone(), HOST), Some(&stand_in));
     });
     assert!(
         caught.is_err(),
@@ -1338,4 +1375,906 @@ async fn processes_that_create_the_database_together_do_not_fail() {
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
     }
+}
+
+// =======================================================================================
+// Fix round 1 (review of PR #18)
+// =======================================================================================
+
+/// Another connection takes the write lock for `how_long`, then lets go. Returns once it
+/// holds it.
+fn hold_write_lock(path: &Path, how_long: Duration) -> std::thread::JoinHandle<()> {
+    let path = path.to_owned();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let c = raw(&path);
+        c.execute_batch("BEGIN IMMEDIATE").unwrap();
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(how_long);
+        c.execute_batch("ROLLBACK").unwrap();
+    });
+    ready_rx.recv().unwrap();
+    holder
+}
+
+fn params_with(path: PathBuf, busy: Duration, call: Duration) -> OpenParams {
+    OpenParams {
+        busy_timeout: busy,
+        call_timeout: call,
+        ..params(path, HOST)
+    }
+}
+
+// ----- F1: `detail` keeps the cause -----
+
+/// The review's first reproduction: seven long lines of context, then the cause. The cause is
+/// last and must survive; the front is what goes.
+#[tokio::test]
+async fn a_long_detail_keeps_its_end_where_the_cause_is() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let id = log
+        .start(new_action(ActionKind::Deploy, "d"))
+        .await
+        .unwrap();
+    let mut text = String::new();
+    for _ in 0..7 {
+        text.push_str(&"x".repeat(900));
+        text.push('\n');
+    }
+    text.push_str("error: activation failed on d: THE REAL CAUSE");
+    log.finish(
+        id,
+        Outcome {
+            result: ActionResult::Failed,
+            exit_code: Some(4),
+            detail: Some(text),
+        },
+    )
+    .await
+    .unwrap();
+    let detail = log.recent("d", 1).await.unwrap()[0].detail.clone().unwrap();
+    assert_eq!(detail.len(), DETAIL_CAP, "cut to exactly the cap");
+    assert!(detail.starts_with('…'), "{:?}", &detail[..10]);
+    assert!(
+        detail.ends_with("error: activation failed on d: THE REAL CAUSE"),
+        "{:?}",
+        &detail[detail.len() - 50..]
+    );
+}
+
+/// The second: a summary of twelve lines is a summary, and nothing takes its tail by lines.
+#[tokio::test]
+async fn a_summary_of_many_lines_keeps_all_of_them() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let id = log
+        .start(new_action(ActionKind::Deploy, "d"))
+        .await
+        .unwrap();
+    let lines: Vec<String> = (1..=12).map(|n| format!("summary line {n}")).collect();
+    log.finish(
+        id,
+        Outcome {
+            result: ActionResult::Failed,
+            exit_code: Some(1),
+            detail: Some(lines.join("\n")),
+        },
+    )
+    .await
+    .unwrap();
+    let detail = log.recent("d", 1).await.unwrap()[0].detail.clone().unwrap();
+    assert_eq!(detail, lines.join("\n"));
+}
+
+#[test]
+fn the_cut_never_splits_a_multibyte_character() {
+    // Three-byte characters, so that the cut offset is inside one for two of every three
+    // positions: whatever the cap, the result is valid, within the cap, and the end of the
+    // text.
+    let text = "€".repeat(2000) + "end";
+    for max in [4096, 4095, 4094, 101, 100, 99, 7, 6] {
+        let cut = cap_end(&text, max);
+        assert!(cut.len() <= max, "{max}: {}", cut.len());
+        assert!(cut.starts_with('…') && cut.ends_with("end"), "{max}");
+    }
+    // The same through the whole pipeline, with a character straddling the cut.
+    let piped = clean_detail(&format!("{}\n{}", "€".repeat(2000), "last line")).unwrap();
+    assert!(piped.len() <= DETAIL_CAP && piped.starts_with('…') && piped.ends_with("last line"));
+    // What fits is untouched, and empty lines and escapes are gone.
+    assert_eq!(
+        clean_detail("a\n\n\u{1b}[31mb\u{1b}[0m\n").as_deref(),
+        Some("a\nb")
+    );
+    assert_eq!(clean_detail("\n \n"), None);
+}
+
+// ----- F2: a call has one deadline -----
+
+/// The review's reproduction: busy timeout 1 s, another process holding the write lock, five
+/// `start`s at once (one per machine, as `U` does). Each used to wait its own busy timeout in
+/// turn, five seconds in all; now all five are over within one call deadline.
+#[tokio::test]
+async fn queued_calls_share_one_deadline() {
+    let d = dir();
+    let path = db_in(d.path());
+    let log = ActionLog::open(params_with(
+        path.clone(),
+        Duration::from_secs(1),
+        Duration::from_millis(400),
+    ))
+    .await
+    .unwrap();
+    let holder = hold_write_lock(&path, Duration::from_secs(3));
+
+    let began = Instant::now();
+    let tasks: Vec<_> = (0..5)
+        .map(|n| {
+            let log = log.clone();
+            tokio::spawn(async move {
+                let t = Instant::now();
+                let r = log
+                    .start(new_action(ActionKind::Deploy, &format!("m{n}")))
+                    .await;
+                (t.elapsed(), r)
+            })
+        })
+        .collect();
+    for t in tasks {
+        let (took, r) = t.await.unwrap();
+        assert!(matches!(r, Err(Error::Timeout)), "{r:?}");
+        assert!(took < Duration::from_millis(1200), "one call took {took:?}");
+    }
+    assert!(
+        began.elapsed() < Duration::from_millis(1500),
+        "five calls took {:?}, not one deadline",
+        began.elapsed()
+    );
+    holder.join().unwrap();
+    // They wrote nothing, and the log works again once the lock is gone.
+    assert_eq!(log.since(ts(0)).await.unwrap().len(), 0);
+    log.start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+}
+
+/// `OpenParams::busy_timeout` is what a statement waits for another process's lock, when the
+/// call's own deadline allows it.
+#[tokio::test]
+async fn the_busy_timeout_bounds_a_statement() {
+    let d = dir();
+    let path = db_in(d.path());
+    let log = ActionLog::open(params_with(
+        path.clone(),
+        Duration::from_millis(300),
+        Duration::from_secs(30),
+    ))
+    .await
+    .unwrap();
+    let holder = hold_write_lock(&path, Duration::from_secs(4));
+    let t = Instant::now();
+    let r = log.start(new_action(ActionKind::Deploy, "m")).await;
+    let took = t.elapsed();
+    assert!(matches!(r, Err(Error::Timeout)), "{r:?}");
+    assert!(
+        took >= Duration::from_millis(250) && took < Duration::from_millis(1500),
+        "waited {took:?} for a busy timeout of 300 ms"
+    );
+    holder.join().unwrap();
+}
+
+/// The deadline covers the wait for the shared connection too, not only SQLite's lock.
+#[tokio::test]
+async fn the_deadline_covers_the_wait_for_the_connection() {
+    let d = dir();
+    let log = ActionLog::open(params_with(
+        db_in(d.path()),
+        Duration::from_secs(5),
+        Duration::from_millis(300),
+    ))
+    .await
+    .unwrap();
+    let inner = Arc::clone(&log.inner);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _guard = inner.conn.lock().unwrap();
+        held_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+    });
+    held_rx.recv().unwrap();
+    let t = Instant::now();
+    let r = log.recent("m", 5).await;
+    let took = t.elapsed();
+    assert!(matches!(r, Err(Error::Timeout)), "{r:?}");
+    assert!(took < Duration::from_millis(1000), "{took:?}");
+    holder.join().unwrap();
+}
+
+/// Dropping the future of a call that has not begun its statement means it never begins it:
+/// the write does not land later, after the caller stopped listening.
+#[tokio::test]
+async fn a_dropped_call_that_has_not_begun_writes_nothing() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let inner = Arc::clone(&log.inner);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let _guard = inner.conn.lock().unwrap();
+        held_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    held_rx.recv().unwrap();
+
+    // The call is queued behind the held connection; the caller gives up after 100 ms.
+    let gave_up = tokio::time::timeout(
+        Duration::from_millis(100),
+        log.start(new_action(ActionKind::Deploy, "m")),
+    )
+    .await;
+    assert!(gave_up.is_err(), "the call should still have been waiting");
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        log.since(ts(0)).await.unwrap().len(),
+        0,
+        "a call dropped before it began wrote its row later"
+    );
+}
+
+// ----- F3: whose process is it? -----
+
+/// A running row of ours whose recorded start time says its writer is gone: dead, if this
+/// process is the one to judge. (Shared by the tests below, which each change one more thing.)
+async fn dead_writer_row(d: &Path) -> ActionLog {
+    let log = open_in(d).await;
+    log.start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+    raw(log.path())
+        .execute("UPDATE actions SET pid_start = 'gone/1'", [])
+        .unwrap();
+    log
+}
+
+#[tokio::test]
+async fn a_writer_in_another_pid_namespace_is_never_called_dead() {
+    let d = dir();
+    let log = dead_writer_row(d.path()).await;
+    // The control: with our own namespace the row reads as interrupted.
+    assert_eq!(
+        log.recent("m", 1).await.unwrap()[0].result,
+        Some(ActionResult::Interrupted)
+    );
+    // Its writer was in another pid namespace (a container): its pid means something else
+    // here, so the row is left as running.
+    raw(log.path())
+        .execute("UPDATE actions SET pid_ns = 'pid:[1]'", [])
+        .unwrap();
+    assert_eq!(log.recent("m", 1).await.unwrap()[0].result, None);
+    // Nothing known about it (a row from before the column): left alone too.
+    raw(log.path())
+        .execute("UPDATE actions SET pid_ns = NULL", [])
+        .unwrap();
+    assert_eq!(log.recent("m", 1).await.unwrap()[0].result, None);
+}
+
+#[tokio::test]
+async fn a_writer_on_another_machine_with_our_host_name_is_never_called_dead() {
+    let d = dir();
+    let log = dead_writer_row(d.path()).await;
+    assert_eq!(
+        log.recent("m", 1).await.unwrap()[0].result,
+        Some(ActionResult::Interrupted)
+    );
+    raw(log.path())
+        .execute("UPDATE actions SET machine_id = 'some-other-machine'", [])
+        .unwrap();
+    assert_eq!(log.recent("m", 1).await.unwrap()[0].result, None);
+}
+
+/// The two halves of a process's stamp, each alone. (Changed together, as the recycled-pid
+/// test does, a mistake in one half hides behind the other.)
+#[tokio::test]
+async fn a_reboot_alone_and_a_new_start_time_alone_each_make_the_writer_dead() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    log.start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+    let ours = process_stamp("self").unwrap().1;
+    let (boot, ticks) = ours.split_once('/').unwrap();
+    let state = |stamp: &str| {
+        raw(log.path())
+            .execute("UPDATE actions SET pid_start = ?1", [stamp])
+            .unwrap();
+    };
+    // Our own stamp: alive.
+    state(&ours);
+    assert_eq!(log.recent("m", 1).await.unwrap()[0].result, None);
+    // Another boot, the same start time: the machine rebooted since.
+    state(&format!("another-boot/{ticks}"));
+    assert_eq!(
+        log.recent("m", 1).await.unwrap()[0].result,
+        Some(ActionResult::Interrupted)
+    );
+    // The same boot, another start time: another process with the pid.
+    let later: u64 = ticks.parse::<u64>().unwrap() + 1;
+    state(&format!("{boot}/{later}"));
+    assert_eq!(
+        log.recent("m", 1).await.unwrap()[0].result,
+        Some(ActionResult::Interrupted)
+    );
+}
+
+/// The review's scenario for real: a live writer in a pid namespace of its own (`unshare -p`).
+/// Skipped where unprivileged user namespaces are not available.
+#[tokio::test]
+async fn a_live_writer_in_another_pid_namespace_stays_running() {
+    let probe = Command::new("unshare")
+        .args(["-r", "-p", "-f", "--mount-proc", "true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if !probe.is_ok_and(|s| s.success()) {
+        eprintln!("skipped: no unprivileged user and pid namespaces here");
+        return;
+    }
+    let d = dir();
+    let work = d.path();
+    let mut live = Command::new("unshare");
+    live.args(["-r", "-p", "-f", "--mount-proc"])
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "deploylog::tests::child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(MODE, "live")
+        .env(WORK, work)
+        .env(WHO, "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null());
+    let mut live = live.spawn().unwrap();
+    wait_for(&work.join("started"));
+    let log = open_in(work).await;
+
+    let row = log.recent("m", 1).await.unwrap().remove(0);
+    assert_eq!(
+        row.result, None,
+        "a live writer in another pid namespace was called dead"
+    );
+    std::fs::write(work.join("stop"), "").unwrap();
+    assert!(live.wait().unwrap().success());
+    // After it has gone nobody here can tell either way: still left alone.
+    assert_eq!(log.recent("m", 1).await.unwrap()[0].result, None);
+}
+
+// ----- F4: local file systems only -----
+
+#[test]
+fn network_and_userspace_file_systems_are_named() {
+    // `linux/magic.h`.
+    for (magic, name) in [
+        (0x6969, "NFS"),
+        (0x517B, "SMB"),
+        (0xFF53_4D42, "CIFS/SMB"),
+        (0xFE53_4D42, "CIFS/SMB"),
+        (0x6573_5546, "FUSE"),
+        (0x0102_1997, "9p"),
+    ] {
+        assert_eq!(network_fs_name(magic), Some(name), "{magic:#x}");
+        // A 32-bit `f_type` read as signed is the same number.
+        assert_eq!(
+            network_fs_name(i128::from(i32::from_ne_bytes(
+                u32::try_from(magic).unwrap().to_ne_bytes()
+            ))),
+            Some(name),
+            "{magic:#x} as i32"
+        );
+    }
+    // ext4, tmpfs (one off from 9p), btrfs, xfs, overlayfs, zfs, 0.
+    for local in [
+        0xEF53,
+        0x0102_1994,
+        0x9123_683E,
+        0x5846_5342,
+        0x794C_7630,
+        0x2FC1_2FC1,
+        0,
+    ] {
+        assert_eq!(network_fs_name(local), None, "{local:#x}");
+    }
+}
+
+#[tokio::test]
+async fn a_log_on_a_network_file_system_is_refused_before_anything_is_created() {
+    let d = dir();
+    let path = db_in(d.path());
+    tests_hook::pretend(&path, tests_hook::Pretend::Network);
+    let e = ActionLog::open(params(path.clone(), HOST))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, Error::Unusable(m) if m.contains("NFS") && m.contains("local file system")),
+        "{e}"
+    );
+    assert!(
+        !path.exists(),
+        "the file was created on the refused file system"
+    );
+    // A real, local directory is not refused: every other test opens one.
+}
+
+#[test]
+fn a_journal_mode_other_than_wal_is_refused() {
+    let p = Path::new("/x/log.sqlite");
+    assert!(require_wal("wal", p).is_ok());
+    assert!(require_wal("WAL", p).is_ok());
+    for mode in ["delete", "memory", "truncate", "persist", "off", ""] {
+        let e = require_wal(mode, p).unwrap_err();
+        assert!(
+            matches!(&e, Error::Unusable(m) if m.contains("write-ahead")),
+            "{mode}: {e}"
+        );
+    }
+}
+
+// ----- F5: the connection is closed off the runtime -----
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_the_log_closes_the_connection_on_the_blocking_pool() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let path = log.path().to_str().unwrap().to_owned();
+    log.start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+    let here = std::thread::current().id();
+    drop(log);
+    let end = Instant::now() + Duration::from_secs(10);
+    let closed_on = loop {
+        let found = tests_hook::CLOSED_ON
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, t)| *t);
+        if let Some(t) = found {
+            break t;
+        }
+        assert!(Instant::now() < end, "the connection was never closed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert_ne!(
+        closed_on, here,
+        "the connection was closed on the runtime's thread"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_waits_for_the_close_and_does_it_on_the_blocking_pool() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let path = log.path().to_str().unwrap().to_owned();
+    let other_handle = log.clone();
+    let here = std::thread::current().id();
+    // Not the last handle: nothing is closed yet.
+    log.close().await;
+    assert!(
+        !tests_hook::CLOSED_ON
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(p, _)| *p == path),
+        "closed while another handle was alive"
+    );
+    other_handle.close().await;
+    let closed = tests_hook::CLOSED_ON.lock().unwrap().clone();
+    let (_, thread) = closed
+        .iter()
+        .find(|(p, _)| *p == path)
+        .expect("closed by close()");
+    assert_ne!(*thread, here);
+    // The WAL is gone: it was checkpointed and deleted by that close.
+    assert!(!PathBuf::from(format!("{path}-wal")).exists());
+}
+
+// ----- F8: the README's query -----
+
+/// The digest query, from `tests/fixtures/digest-week.sql`: the file is what the test runs, and
+/// the README's first `sql` code block must be the same text. (The README is not in the Nix
+/// build's source tree, which holds only a crate's sources and `tests/fixtures`: there the
+/// comparison is skipped, and `just ci` and `cargo test` make it.)
+fn readme_query() -> String {
+    let query = include_str!("../../tests/fixtures/digest-week.sql");
+    let readme_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md");
+    let Ok(readme) = std::fs::read_to_string(&readme_path) else {
+        eprintln!("skipped: the README is not in this source tree");
+        return query.to_owned();
+    };
+    let section = readme.split("## The action log").nth(1).unwrap();
+    let start = section.find("```sql\n").unwrap() + "```sql\n".len();
+    let end = section[start..].find("```").unwrap();
+    assert_eq!(
+        section[start..start + end].trim(),
+        query.trim(),
+        "the README's query is not tests/fixtures/digest-week.sql"
+    );
+    query.to_owned()
+}
+
+#[tokio::test]
+async fn the_readmes_digest_query_runs_and_counts_what_it_says() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let c = raw(log.path());
+    let row = |machine: &str, kind: &str, ago: &str, result: Option<&str>| {
+        let ended =
+            result.map(|_| format!("strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '{ago}', '+1 minute')"));
+        c.execute(
+            &format!(
+                "INSERT INTO actions (kind, machine, started_at, ended_at, result, who, host, \
+                 auspex_version, pid) VALUES ('{kind}', '{machine}', \
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '{ago}'), {}, {}, 'w', 'h', 'v', 1)",
+                ended.unwrap_or_else(|| "NULL".to_owned()),
+                result.map_or_else(|| "NULL".to_owned(), |r| format!("'{r}'")),
+            ),
+            [],
+        )
+        .unwrap();
+    };
+    row("a", "deploy", "-1 hours", Some("succeeded"));
+    row("a", "deploy", "-2 hours", Some("failed"));
+    row("a", "build", "-3 hours", Some("timed_out"));
+    row("a", "deploy", "-30 minutes", None); // running, started recently
+    row("a", "deploy", "-48 hours", None); // unfinished for two days: interrupted
+    row("a", "reboot", "-4 hours", Some("interrupted"));
+    row("b", "deploy", "-10 minutes", None); // only a running row
+    row("c", "deploy", "-10 days", Some("succeeded")); // outside the week
+
+    let sql = readme_query();
+    let mut stmt = c.prepare(&sql).unwrap();
+    let names: Vec<String> = stmt.column_names().map(str::to_owned).collect();
+    assert_eq!(
+        names,
+        [
+            "machine",
+            "actions",
+            "deploys_ok",
+            "failures",
+            "interrupted"
+        ]
+    );
+    // Integers, never NULL: `sum` over nothing is NULL, which is what the old query returned.
+    let rows: Vec<(String, i64, i64, i64, i64)> = stmt
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        [("a".to_owned(), 6, 1, 2, 2), ("b".to_owned(), 1, 0, 0, 0),]
+    );
+}
+
+// ----- F9 and the review's surviving mutants -----
+
+#[test]
+fn what_makes_a_database_file_unusable() {
+    let ok = |is_file, owner, mode, links| check_file_facts("f", is_file, owner, 1000, mode, links);
+    assert!(ok(true, 1000, 0o600, 1).is_ok());
+    assert!(
+        ok(true, 1000, 0o100_600, 1).is_ok(),
+        "file type bits are not permission bits"
+    );
+    assert!(ok(true, 1000, 0o400, 1).is_ok());
+    // Not a regular file (a FIFO would block SQLite's read; a directory is nonsense).
+    let e = ok(false, 1000, 0o600, 1).unwrap_err();
+    assert!(e.to_string().contains("not a regular file"), "{e}");
+    // Somebody else's.
+    let e = ok(true, 0, 0o600, 1).unwrap_err();
+    assert!(e.to_string().contains("owned by uid 0"), "{e}");
+    // Every group and other bit counts, each alone.
+    for bit in [0o040, 0o020, 0o010, 0o004, 0o002, 0o001] {
+        let e = ok(true, 1000, 0o600 | bit, 1).unwrap_err();
+        assert!(e.to_string().contains("expected 0600"), "{bit:o}: {e}");
+    }
+    // A second name for the file.
+    let e = ok(true, 1000, 0o600, 2).unwrap_err();
+    assert!(e.to_string().contains("2 hard links"), "{e}");
+}
+
+#[tokio::test]
+async fn a_hard_linked_database_is_refused() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let path = log.path().to_owned();
+    log.close().await;
+    std::fs::hard_link(&path, path.with_file_name("other-name.sqlite")).unwrap();
+    let e = ActionLog::open(params(path, HOST)).await.unwrap_err();
+    assert!(
+        matches!(&e, Error::Unusable(m) if m.contains("hard links")),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn a_database_that_is_a_fifo_is_refused_and_does_not_hang() {
+    let d = dir();
+    let path = db_in(d.path());
+    std::fs::create_dir(path.parent().unwrap()).unwrap();
+    std::fs::set_permissions(path.parent().unwrap(), PermissionsExt::from_mode(0o700)).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &path,
+        rustix::fs::FileType::Fifo,
+        Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+    let e = tokio::time::timeout(Duration::from_secs(10), ActionLog::open(params(path, HOST)))
+        .await
+        .expect("opening a FIFO hung")
+        .unwrap_err();
+    assert!(
+        matches!(&e, Error::Unusable(m) if m.contains("not a regular file")),
+        "{e}"
+    );
+}
+
+#[tokio::test]
+async fn any_group_or_other_permission_on_the_file_is_refused() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let path = log.path().to_owned();
+    log.close().await;
+    for bad in [0o640, 0o604, 0o660, 0o606, 0o620, 0o602] {
+        std::fs::set_permissions(&path, PermissionsExt::from_mode(bad)).unwrap();
+        let e = ActionLog::open(params(path.clone(), HOST))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, Error::Unusable(m) if m.contains("expected 0600")),
+            "{bad:o}: {e}"
+        );
+    }
+    std::fs::set_permissions(&path, PermissionsExt::from_mode(0o600)).unwrap();
+    open_at(&path, HOST).await;
+}
+
+#[tokio::test]
+async fn finish_needs_the_host_and_the_start_time_of_the_row_as_well_as_its_pid() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    for (what, sql) in [
+        (
+            "another host",
+            "UPDATE actions SET host = 'elsewhere' WHERE id = ?1",
+        ),
+        (
+            "another start time",
+            "UPDATE actions SET pid_start = 'x/1' WHERE id = ?1",
+        ),
+        (
+            "no start time",
+            "UPDATE actions SET pid_start = NULL WHERE id = ?1",
+        ),
+    ] {
+        let id = log
+            .start(new_action(ActionKind::Deploy, "m"))
+            .await
+            .unwrap();
+        raw(log.path()).execute(sql, [id.get()]).unwrap();
+        let e = log
+            .finish(id, outcome(ActionResult::Failed))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::NotRunning(_)), "{what}: {e}");
+        let ended: Option<String> = raw(log.path())
+            .query_row(
+                "SELECT ended_at FROM actions WHERE id = ?1",
+                [id.get()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ended, None, "{what}: the row was finished");
+    }
+}
+
+#[tokio::test]
+async fn the_row_limit_and_the_ordering_do_not_depend_on_ids() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    // Times that do not follow the ids (a clock that stepped back): ordering is by time,
+    // the id only breaks a tie.
+    let i = &log.inner;
+    let first = i
+        .start(&new_action(ActionKind::Deploy, "m"), ts(3_000), &call())
+        .unwrap();
+    let second = i
+        .start(&new_action(ActionKind::Deploy, "m"), ts(1_000), &call())
+        .unwrap();
+    let third = i
+        .start(&new_action(ActionKind::Deploy, "m"), ts(2_000), &call())
+        .unwrap();
+    let ids = |rows: Vec<Action>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+    assert_eq!(ids(log.since(ts(0)).await.unwrap()), [second, third, first]);
+    assert_eq!(
+        ids(log.recent("m", 10).await.unwrap()),
+        [first, third, second]
+    );
+
+    // More rows than the cap: a caller asking for more than `RECENT_CAP` gets `RECENT_CAP`.
+    raw(log.path())
+        .execute_batch(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1005) \
+             INSERT INTO actions (kind, machine, started_at, who, host, auspex_version, pid) \
+             SELECT 'build', 'many', strftime('%Y-%m-%dT%H:%M:%fZ', 1700000000 + i, 'unixepoch'), \
+             'w', 'h', 'v', 1 FROM n",
+        )
+        .unwrap();
+    assert_eq!(log.recent("many", 5000).await.unwrap().len(), RECENT_CAP);
+    assert_eq!(
+        log.recent("many", usize::MAX).await.unwrap().len(),
+        RECENT_CAP
+    );
+    assert_eq!(log.recent("many", 7).await.unwrap().len(), 7);
+}
+
+#[tokio::test]
+async fn who_host_and_version_are_sanitised_when_the_log_is_opened() {
+    let d = dir();
+    let path = db_in(d.path());
+    let log = ActionLog::open(OpenParams::new(
+        path.clone(),
+        Identity {
+            who: "\u{1b}[31mal\0ice\u{202e}".to_owned(),
+            host: "ho\u{200b}st\n".to_owned(),
+            auspex_version: format!("1.2.3\u{1b}[0m{}", "v".repeat(400)),
+        },
+        elsewhere(),
+    ))
+    .await
+    .unwrap();
+    log.start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+    let row = log.recent("m", 1).await.unwrap().remove(0);
+    assert_eq!((row.who.as_str(), row.host.as_str()), ("alice", "host"));
+    assert!(row.auspex_version.starts_with("1.2.3vvv") && row.auspex_version.len() <= NAME_CAP);
+    assert!(row.auspex_version.ends_with('…'));
+    // Nothing is left of an identity that is all escapes.
+    let e = ActionLog::open(OpenParams::new(
+        db_in(dir().path()),
+        Identity {
+            who: "\u{1b}[0m".to_owned(),
+            host: "h".to_owned(),
+            auspex_version: "1".to_owned(),
+        },
+        elsewhere(),
+    ))
+    .await
+    .unwrap_err();
+    assert!(matches!(e, Error::Invalid(_)), "{e}");
+}
+
+// ----- F9: a read-only file system -----
+
+#[tokio::test]
+async fn a_read_only_file_system_still_shows_the_history() {
+    let d = dir();
+    let path = db_in(d.path());
+    let log = open_at(&path, HOST).await;
+    let id = log
+        .start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+    log.finish(id, outcome(ActionResult::Succeeded))
+        .await
+        .unwrap();
+    log.close().await;
+
+    tests_hook::pretend(&path, tests_hook::Pretend::ReadOnly);
+    let log = open_at(&path, HOST).await;
+    assert!(log.is_read_only());
+    let rows = log.recent("m", 5).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].result, Some(ActionResult::Succeeded));
+    assert_eq!(log.since(ts(0)).await.unwrap().len(), 1);
+    // Writes fail, say why, and change nothing.
+    let e = log
+        .start(new_action(ActionKind::Build, "m"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::ReadOnly), "{e}");
+    let e = log
+        .finish(id, outcome(ActionResult::Failed))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::ReadOnly), "{e}");
+    assert_eq!(log.since(ts(0)).await.unwrap().len(), 1);
+    // A newer schema is refused read-only too, and nothing there is made.
+    let empty = db_in(dir().path());
+    tests_hook::pretend(&empty, tests_hook::Pretend::ReadOnly);
+    assert!(ActionLog::open(params(empty.clone(), HOST)).await.is_err());
+}
+
+/// SQLite cannot read a WAL database in a directory it cannot write (no `-shm`); the open
+/// then reads it as immutable, which is right where nothing writes.
+#[tokio::test]
+async fn a_database_in_a_directory_that_cannot_be_written_is_read_as_immutable() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let id = log
+        .start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+    log.finish(id, outcome(ActionResult::Succeeded))
+        .await
+        .unwrap();
+    let path = log.path().to_owned();
+    log.close().await;
+    let state = path.parent().unwrap().to_owned();
+    std::fs::set_permissions(&state, PermissionsExt::from_mode(0o500)).unwrap();
+
+    let conn = open_read_only(&path, Duration::from_secs(1));
+    std::fs::set_permissions(&state, PermissionsExt::from_mode(0o700)).unwrap();
+    let conn = conn.unwrap();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM actions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(
+        percent_encode("/a b/c%d/é".as_bytes()),
+        "/a%20b/c%25d/%C3%A9"
+    );
+}
+
+/// A deadline of nothing is a deadline that has passed: the call fails even though the
+/// database is free, and writes nothing.
+#[tokio::test]
+async fn a_call_with_no_time_left_fails_without_writing() {
+    let d = dir();
+    let log = ActionLog::open(params_with(
+        db_in(d.path()),
+        Duration::from_secs(5),
+        Duration::ZERO,
+    ))
+    .await
+    .unwrap();
+    let e = log
+        .start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Timeout), "{e}");
+    let rows: i64 = raw(log.path())
+        .query_row("SELECT count(*) FROM actions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+#[test]
+fn a_path_that_does_not_exist_yet_is_resolved_through_what_does() {
+    let d = dir();
+    let real = d.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = d.path().join("link");
+    symlink(&real, &link).unwrap();
+    let canonical = real.canonicalize().unwrap();
+    // The existing prefix is resolved through the symlink; the rest is appended as it is.
+    assert_eq!(
+        resolve_through_existing(&link.join("a").join("b")).unwrap(),
+        canonical.join("a").join("b")
+    );
+    // A relative path is made absolute.
+    let relative = resolve_through_existing(Path::new("auspex-no-such-dir/x")).unwrap();
+    assert!(relative.is_absolute() && relative.starts_with(std::env::current_dir().unwrap()));
+    // Where a `..` in the part that does not exist points cannot be said.
+    assert!(resolve_through_existing(&link.join("a").join("..").join("b")).is_err());
 }
