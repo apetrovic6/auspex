@@ -819,6 +819,18 @@ impl Default for ConnectTimeout {
     }
 }
 
+/// Which SSH operation to perform, using the same destination and control socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SshOperation {
+    /// Run a remote probe.
+    #[default]
+    Probe,
+    /// Check for an existing master without opening a connection.
+    Check,
+    /// Authenticate by running `true`, letting `ControlPersist` detach a reusable master.
+    Connect,
+}
+
 /// What [`ssh_args`] needs besides the target: the effects layer's settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SshOptions<'a> {
@@ -827,6 +839,10 @@ pub struct SshOptions<'a> {
     pub control_dir: &'a str,
     /// `ConnectTimeout`, from the config's `timeouts.ssh_connect`.
     pub connect_timeout: ConnectTimeout,
+    /// `ControlPersist` in seconds, from `ssh.control_persist` (default 600).
+    pub control_persist: u64,
+    /// The operation, defaulting to a remote probe.
+    pub operation: SshOperation,
 }
 
 impl<'a> SshOptions<'a> {
@@ -836,6 +852,8 @@ impl<'a> SshOptions<'a> {
         Self {
             control_dir,
             connect_timeout: ConnectTimeout::DEFAULT,
+            control_persist: 600,
+            operation: SshOperation::Probe,
         }
     }
 }
@@ -846,15 +864,23 @@ impl<'a> SshOptions<'a> {
 /// never passes through the remote login shell's quoting.
 pub const PROBE_REMOTE_COMMAND: &str = "/bin/sh -s";
 
-/// ssh's arguments for `target`, without the program name and without the remote command:
+/// ssh's arguments for `target`, without the program name or probe script command:
 ///
 /// ```text
 /// -T -o BatchMode=yes -o ConnectTimeout=<connect_timeout> -o ServerAliveInterval=5
-///    -o ControlMaster=auto -o ControlPath=<control_dir>/%C -o ControlPersist=60s
+///    -o ControlMaster=auto -o ControlPath=<control_dir>/%C -o ControlPersist=<seconds>s
 ///    [-o Opt=val]… [-p port] -- [user@]host
 /// ```
 ///
 /// auspex's own options come first because ssh keeps the first value it sees for an option.
+///
+/// A live master lets any process running as the operator reuse the authenticated
+/// connection for `control_persist` seconds. The control directory's ownership and 0700
+/// permissions are what restrict that access to the operator.
+///
+/// [`SshOperation::Check`] adds `-O check`; [`SshOperation::Connect`] appends `true`.
+/// Connect uses `ControlMaster=auto`: a race loser runs the command and exits rather
+/// than detaching a socketless `-N -f` process without an idle timeout.
 ///
 /// # What the caller must do
 ///
@@ -902,8 +928,11 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
         "-o".to_owned(),
         format!("ControlPath={dir}/%C"),
         "-o".to_owned(),
-        "ControlPersist=60s".to_owned(),
+        format!("ControlPersist={}s", options.control_persist),
     ];
+    if options.operation == SshOperation::Check {
+        args.extend(["-O".to_owned(), "check".to_owned()]);
+    }
     for (k, v) in &target.options {
         args.push("-o".to_owned());
         args.push(format!("{k}={v}"));
@@ -914,6 +943,9 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
     }
     args.push("--".to_owned());
     args.push(target.destination());
+    if options.operation == SshOperation::Connect {
+        args.push("true".to_owned());
+    }
     Ok(args)
 }
 
@@ -1217,7 +1249,7 @@ mod tests {
                 "-o",
                 "ControlPath=/run/user/1000/auspex/%C",
                 "-o",
-                "ControlPersist=60s",
+                "ControlPersist=600s",
                 "-o",
                 "Compression=yes",
                 "-p",
@@ -1230,6 +1262,40 @@ mod tests {
         assert_eq!(&plain[plain.len() - 2..], ["--", "terra"]);
         assert!(plain.contains(&"ControlPath=/run/user/1000/auspex/%C".to_owned()));
         assert!(!plain.contains(&"-p".to_owned()));
+    }
+
+    #[test]
+    fn ssh_control_operations_have_exact_argv() {
+        for operation in [SshOperation::Check, SshOperation::Connect] {
+            let mut options = SshOptions::new(DIR);
+            options.connect_timeout = ConnectTimeout::new(7).unwrap();
+            options.control_persist = 1200;
+            options.operation = operation;
+            let mut expected = vec![
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=7",
+                "-o",
+                "ServerAliveInterval=5",
+                "-o",
+                "ControlMaster=auto",
+                "-o",
+                "ControlPath=/run/user/1000/auspex/%C",
+                "-o",
+                "ControlPersist=1200s",
+            ];
+            if operation == SshOperation::Check {
+                expected.extend(["-O", "check"]);
+            }
+            expected.extend(["-o", "Compression=yes", "-p", "2222", "--", "root@fd00::1"]);
+            if operation == SshOperation::Connect {
+                expected.push("true");
+            }
+            let actual = ssh_args(&t("root@[fd00::1]:2222?Compression=yes"), &options).unwrap();
+            assert_eq!(actual, expected, "{operation:?}");
+        }
     }
 
     /// Whatever a target string is, if it parses, then in argv: the destination is the
@@ -1809,9 +1875,15 @@ mod tests {
         let opts = SshOptions {
             control_dir: DIR,
             connect_timeout: ConnectTimeout::new(12).unwrap(),
+            control_persist: 1200,
+            operation: SshOperation::Probe,
         };
         let args = ssh_args(&t("terra"), &opts).unwrap();
         assert!(args.contains(&"ConnectTimeout=12".to_owned()), "{args:?}");
+        assert!(
+            args.contains(&"ControlPersist=1200s".to_owned()),
+            "{args:?}"
+        );
         assert!(!args.contains(&"ConnectTimeout=5".to_owned()));
         assert_eq!(
             args.iter()

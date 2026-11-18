@@ -1,7 +1,11 @@
 flake = "/home/me/clan/fleet"
 
+[ssh]
+control_persist = 600
+
 [timeouts]
 ssh_connect = 5
+ssh_approval = 60
 probe = 10
 eval = 300
 settle = 120

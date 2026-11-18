@@ -24,6 +24,8 @@ pub struct Settings {
     pub flake: Option<String>,
     /// `[timeouts]`.
     pub timeouts: Timeouts,
+    /// `[ssh]`.
+    pub ssh: SshSettings,
     /// `[eval]`.
     pub eval: EvalSettings,
     /// `[prometheus]`, or `None` when there is no `url` (then health comes from ssh).
@@ -39,11 +41,28 @@ pub struct Settings {
     pub theme_file: Option<PathBuf>,
 }
 
+/// SSH connection reuse settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshSettings {
+    /// Idle master lifetime in seconds.
+    pub control_persist: u64,
+}
+
+impl Default for SshSettings {
+    fn default() -> Self {
+        Self {
+            control_persist: 600,
+        }
+    }
+}
+
 /// `[timeouts]`, in seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     /// ssh's `ConnectTimeout`.
     pub ssh_connect: u64,
+    /// Connect/authentication allowance, separate from the script deadline.
+    pub ssh_approval: u64,
     /// The whole probe of one machine; past it the row is unreachable.
     pub probe: u64,
     /// One evaluation run (and the machine-list eval, which is the same kind of work).
@@ -56,6 +75,7 @@ impl Default for Timeouts {
     fn default() -> Self {
         Self {
             ssh_connect: 5,
+            ssh_approval: 60,
             probe: 10,
             eval: 300,
             settle: 120,
@@ -208,12 +228,24 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
     for (key, value) in &root {
         match key.as_str() {
             "flake" => s.flake = Some(w.string(value, "flake")?),
+            "ssh" => {
+                for (k, v) in w.table(value, "ssh")? {
+                    let name = format!("ssh.{k}");
+                    match k.as_str() {
+                        "control_persist" => {
+                            s.ssh.control_persist = w.bounded(v, &name, 60, 3600)?;
+                        }
+                        _ => w.unknown(&name),
+                    }
+                }
+            }
             "timeouts" => {
                 let t = w.table(value, "timeouts")?;
                 for (k, v) in t {
                     let name = format!("timeouts.{k}");
                     match k.as_str() {
                         "ssh_connect" => s.timeouts.ssh_connect = w.timeout(v, &name)?,
+                        "ssh_approval" => s.timeouts.ssh_approval = w.bounded(v, &name, 5, 600)?,
                         "probe" => s.timeouts.probe = w.timeout(v, &name)?,
                         "eval" => s.timeouts.eval = w.timeout(v, &name)?,
                         "settle" => s.timeouts.settle = w.timeout(v, &name)?,
@@ -229,6 +261,14 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                         "`timeouts.settle` ({} s) is shorter than `timeouts.probe` ({} s), so a slow \
                          host is cut off by the global deadline before its own probe timeout",
                         s.timeouts.settle, s.timeouts.probe
+                    ));
+                }
+                if s.timeouts.settle < s.timeouts.ssh_approval + s.timeouts.probe {
+                    w.warnings.push(format!(
+                        "`timeouts.settle` ({} s) is shorter than `timeouts.ssh_approval` ({} s) \
+                         plus `timeouts.probe` ({} s), so the global deadline can cut off \
+                         connection/authentication or the probe",
+                        s.timeouts.settle, s.timeouts.ssh_approval, s.timeouts.probe
                     ));
                 }
             }
@@ -377,6 +417,14 @@ impl Walk {
         v.as_str()
             .map(str::to_owned)
             .ok_or_else(|| wrong(key, "a string", v))
+    }
+
+    fn bounded(&self, v: &Value, key: &str, min: u64, max: u64) -> Result<u64, String> {
+        let seconds = self.seconds(v, key)?;
+        if !(min..=max).contains(&seconds) {
+            return Err(format!("`{key}` must be between {min} and {max} seconds"));
+        }
+        Ok(seconds)
     }
 
     /// A timeout: whole seconds, at least 1 (0 would fail or settle everything at once) and

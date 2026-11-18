@@ -152,3 +152,18 @@ async fn spinners_animate_from_the_frame_counter_not_the_clock() {
         "and nothing else did"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn approval_note_appears_and_disappears_on_the_status_bar() {
+    let shell = settled_demo().await;
+    let mut ui = Ui {
+        approvals: 3,
+        ..Ui::default()
+    };
+    let km = Keymap::defaults();
+    let frame = render(&shell.view(), &mut ui, &km, &[], 160, 24);
+    assert!(frame.contains("ssh: connecting 3 hosts"), "{frame}");
+    ui.approvals = 0;
+    let frame = render(&shell.view(), &mut ui, &km, &[], 160, 24);
+    assert!(!frame.contains("ssh: connecting"), "{frame}");
+}

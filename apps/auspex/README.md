@@ -83,6 +83,39 @@ A leading `~/` in the selected theme path uses Home Manager's home directory.
 The package is also available as `packages.<system>.auspex` (and `default`);
 `overlays.default` adds `pkgs.auspex`.
 
+## Configuration
+
+`~/.config/auspex/config.toml` (or `--config PATH`) accepts:
+
+```toml
+[ssh]
+control_persist = 600 # seconds; 60..3600
+
+[timeouts]
+ssh_connect = 5      # TCP connection timeout; 1..60 seconds
+ssh_approval = 60    # authentication/agent approval; 5..600 seconds
+probe = 10          # script execution, after authentication
+settle = 120        # global refresh deadline, including approval
+```
+
+Home Manager exposes the same keys under `programs.auspex.settings`.
+A warm control master skips authentication; a cold connection gets a separate approval
+allowance, so approving an agent request does not consume the script's probe timeout.
+Down hosts still fail at SSH's connect timeout. The status bar counts connecting hosts;
+the phase includes DNS and authentication, not just agent approval. Headless mode writes
+one connection notice to stderr, never to JSON stdout. A stalled DNS lookup or
+authentication can use the entire `ssh_approval` allowance. The global `settle` deadline
+still bounds the whole refresh; the loader warns when it is shorter than approval plus probe.
+
+Masters remain reusable for ten idle minutes by default. Any process running as the
+operator can reuse that authenticated connection; the checked, operator-owned 0700
+control directory (never a symlink) restricts access to the operator. Increase persistence
+only if that longer authenticated lifetime is acceptable.
+These SSH connections stay open for up to `ssh.control_persist` idle seconds **after
+auspex quits**. Lower the value to shorten that window, or close a known master explicitly:
+`ssh -S "$XDG_RUNTIME_DIR/auspex/<socket-hash>" -O exit -- user@host` (use its actual
+socket path and destination).
+
 Stamp deployed machines with the **fleet's** revision, not auspex's:
 
 ```nix

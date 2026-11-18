@@ -173,8 +173,10 @@ remote), parsed in Rust. There are two variants:
 ssh options:
 - `BatchMode=yes`, `ConnectTimeout=5`, `ServerAliveInterval=5`, `-T`;
 - `ControlMaster=auto`, `ControlPath=$XDG_RUNTIME_DIR/auspex/%C` (directory mode 0700),
-  `ControlPersist=60s`;
+  `ControlPersist=600s` by default (`ssh.control_persist`, 60..3600 seconds);
 - `--` before the destination.
+- cold destinations authenticate separately (`timeouts.ssh_approval`, default 60 s,
+  5..600 s), then run the script under `timeouts.probe`; warm masters skip authentication.
 
 Exit code 255 means ssh itself failed. Show ssh's last stderr line ("Host key verification
 failed"), not a bare `✗`.

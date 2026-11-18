@@ -179,3 +179,125 @@ async fn quitting_cancels_everything_in_flight() {
     assert!(shell.view().quit);
     shell.shutdown().await;
 }
+
+fn connection_status(shell: &Shell, ui: &mut auspex_tui::ui::Ui) -> String {
+    use auspex_tui::keymap::Keymap;
+    use auspex_tui::theme::Theme;
+    use auspex_tui::ui::Context;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+    let ctx = Context {
+        theme: &Theme::Ansi,
+        keymap: &Keymap::defaults(),
+        flake: "fake",
+        log: &[],
+    };
+    terminal.draw(|frame| shell.draw(frame, ui, &ctx)).unwrap();
+    (0..160)
+        .map(|x| terminal.backend().buffer()[(x, 23)].symbol())
+        .collect()
+}
+
+#[test]
+fn approval_count_tracks_real_connection_and_reaches_the_frame() {
+    use std::fs;
+    use std::process::Command;
+
+    let Some(t) = common::tools(&["sleep"]) else {
+        return;
+    };
+    let dir = common::tempdir();
+    fs::create_dir(dir.path().join("run")).unwrap();
+    let nix = t.script(
+        dir.path(),
+        "nix",
+        r#"printf '%s\n' '{"terra":{"deploy":{"targetHost":"root@192.0.2.10"}}}'"#,
+    );
+    let eval = t.script(dir.path(), "eval", r#"printf '%s\n' '{"attr":"terra","attrPath":["terra"],"drvPath":"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-system.drv","outputs":{"out":"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-system"}}'"#);
+    let ssh = t.script(dir.path(), "ssh", r#"for arg; do
+case "$arg" in
+  -O) exit 1;;
+  true)
+    while [ ! -f '@dir@/release' ]; do @sleep@ 0.01; done
+    exit 0;;
+esac
+done
+printf 'auspex_probe=1\nprobe=nixos\ncurrent_system=/nix/store/0123456789abcdfghijklmnpqrsvwxyz-system\nauspex_end=1\n'"#);
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([
+        "--exact",
+        "approval_count_tracks_real_connection_inner",
+        "--nocapture",
+    ])
+    .env("AUSPEX_TEST_APPROVAL_DIR", dir.path())
+    .env("AUSPEX_NIX", nix)
+    .env("AUSPEX_NIX_EVAL_JOBS", eval)
+    .env("AUSPEX_SSH", ssh)
+    .env("HOME", dir.path())
+    .env("XDG_CACHE_HOME", dir.path().join("cache"))
+    .env("XDG_RUNTIME_DIR", dir.path().join("run"));
+    let out = common::run_within(&mut cmd, Duration::from_secs(30));
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+}
+
+#[tokio::test]
+async fn approval_count_tracks_real_connection_inner() {
+    use auspex_tui::app::core_config;
+    use auspex_tui::backend::Real;
+    use auspex_tui::config::{FlakeSource, Settings};
+    use auspex_tui::ui::Ui;
+
+    let Some(dir) = std::env::var_os("AUSPEX_TEST_APPROVAL_DIR").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let settings = Settings::default();
+    let shell = Shell::new(
+        Backend::Real(Box::new(Real::new(&settings, FlakeSource::Flag))),
+        Log::memory(),
+        Duration::from_secs(20),
+    );
+    assert_eq!(shell.approvals(), 0);
+    let mut ui = Ui::default();
+    assert!(!connection_status(&shell, &mut ui).contains("ssh: connecting"));
+    shell.send(Event::Start(core_config(
+        &settings,
+        format!("path:{}", dir.display()),
+    )));
+    let waiting = tokio::time::timeout(Duration::from_secs(10), async {
+        while shell.approvals() != 1 {
+            shell.changed().await;
+        }
+    })
+    .await
+    .is_ok();
+    let active_status = connection_status(&shell, &mut ui);
+    std::fs::write(dir.join("release"), "").unwrap();
+    let settled = tokio::time::timeout(Duration::from_secs(10), async {
+        while !shell.view().refresh.settled {
+            shell.changed().await;
+        }
+    })
+    .await
+    .is_ok();
+    let final_count = shell.approvals();
+    let final_status = connection_status(&shell, &mut ui);
+    shell.shutdown().await;
+    assert!(waiting, "never entered connection phase");
+    assert!(
+        active_status.contains("ssh: connecting 1 host"),
+        "{active_status}"
+    );
+    assert!(!active_status.contains("1 hosts"), "{active_status}");
+    assert!(settled, "scan did not settle");
+    assert_eq!(final_count, 0);
+    assert!(!final_status.contains("ssh: connecting"), "{final_status}");
+}
