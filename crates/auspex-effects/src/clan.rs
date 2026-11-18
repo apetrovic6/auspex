@@ -586,6 +586,17 @@ pub fn default_gcroot_dir() -> Option<PathBuf> {
 }
 
 fn gcroot_dir_from(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    Some(state_dir_from(xdg_state_home, home)?.join("gcroots"))
+}
+
+/// auspex's own state directory: `$XDG_STATE_HOME/auspex` when that variable is an absolute
+/// path (a relative one is ignored, as the XDG specification says), else
+/// `$HOME/.local/state/auspex`; `None` when neither is usable. The GC roots and the action
+/// log (`deploylog`) both live under it.
+pub(crate) fn state_dir_from(
+    xdg_state_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
     let state = xdg_state_home
         .map(Path::new)
         .filter(|p| p.is_absolute())
@@ -595,7 +606,7 @@ fn gcroot_dir_from(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Opti
                 .filter(|p| p.is_absolute())
                 .map(|h| h.join(".local").join("state"))
         })?;
-    Some(state.join("auspex").join("gcroots"))
+    Some(state.join("auspex"))
 }
 
 /// Creates `dir` and any missing parents, private (0700), and checks that `dir` is a real

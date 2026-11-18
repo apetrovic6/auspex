@@ -19,6 +19,8 @@
 //!   [`cache::evaluate_cached`], which puts it in front of [`nix::evaluate`].
 //! - [`prometheus`]: the fleet-wide health query.
 //! - [`narinfo`]: the "already cached" badge.
+//! - [`deploylog`]: the local SQLite log of every action (deploy, build, reboot, …), a documented
+//!   schema the weekly digest reads, under `$XDG_STATE_HOME/auspex/log.sqlite`.
 //! - [`dns`]: hostname resolution for the shared-IP lint.
 //! - [`http`]: the one HTTP client the two HTTP adapters share.
 //!
@@ -96,6 +98,7 @@
 
 pub mod cache;
 pub mod clan;
+pub mod deploylog;
 pub mod dns;
 pub mod http;
 pub mod narinfo;
