@@ -98,6 +98,10 @@ let
   # A Nix path value must be written as its string; interpolating it would copy it into the
   # store and write a /nix/store path.
   pathFlake = withFlake /home/me/clan/fleet;
+  # What a relative `./fleet` becomes in a flake: a path in the store.
+  storeFlake = withFlake "${pkgs.hello}/fleet";
+  storeFlakeRejected = !(builtins.tryEval (builtins.deepSeq (checked storeFlake).assertions true)).success
+    && builtins.any (a: !a.assertion && lib.hasInfix "store" a.message) storeFlake.assertions;
   absent = (evaluate { programs.auspex.stylix.enable = true; }).config;
   partialPalettes = map (slot: (evaluate {
     programs.auspex.stylix.enable = true;
@@ -199,7 +203,9 @@ in {
         { flake = "/home/me/clan/fleet"; };
     }
   ];
-  auspex-no-stylix =check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
+  auspex-flake-store-path = check "flake-store-path" (storeFlakeRejected
+    && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeFlake pathFlake ]);
+  auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision
     && builtins.all (self: revision (exports.lib.mkConfigurationRevisionModule self) { } { }
