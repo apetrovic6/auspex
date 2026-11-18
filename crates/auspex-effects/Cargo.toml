@@ -28,7 +28,13 @@ tokio-util = { version = "0.7", default-features = false }
 # Safe wrappers for the three syscalls std does not offer: kill a whole process group,
 # getuid (the control directory's owner check) and, in tests, probing a pid. The workspace
 # forbids `unsafe`, so libc is not an option. Already in the graph.
-rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs", "system"] }
+# The local action log (`deploylog`). `bundled` compiles SQLite from source into the binary:
+# no system libsqlite3 is needed on NixOS or macOS, and every build has the same SQLite (WAL
+# behaviour and the `user_version` pragma are what the schema contract leans on). It adds a C
+# build (`cc`, `libsqlite3-sys`), which the Nix sandbox's stdenv already supplies. Default
+# features are off: nothing beyond the bundled library.
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 
 # --- HTTP (Prometheus and narinfo) ---
 #
