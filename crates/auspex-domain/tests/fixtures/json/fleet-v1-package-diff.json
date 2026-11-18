@@ -212,12 +212,14 @@
         "failed_units"
       ],
       "settled": true,
-      "reason": "pending nixos-system-terra-b; cache lookup failed; failed units: k3s.service; packages +1 −1 ~4",
+      "reason": "pending nixos-system-terra-b; linux 6.18.59 → 6.18.63, +1 −1 ~4; cache lookup failed; failed units: k3s.service",
       "current_system": "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-a",
       "pending_system": "/nix/store/1123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-b",
       "package_diff": {
         "state": "computed",
         "reason": null,
+        "deployed": "/nix/store/f123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-26.11.20261113.d5cc683",
+        "pending": "/nix/store/h123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-26.11.20261116.abcdef0",
         "added": [
           {
             "name": "ripgrep",
@@ -244,10 +246,21 @@
           {
             "name": "linux",
             "before": [
-              "6.12.58"
+              "6.18.59"
             ],
             "after": [
-              "6.18.2"
+              "6.18.63"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "systemd",
+            "before": [
+              "262"
+            ],
+            "after": [
+              "263"
             ],
             "before_truncated": false,
             "after_truncated": false
@@ -275,17 +288,6 @@
             ],
             "before_truncated": false,
             "after_truncated": false
-          },
-          {
-            "name": "systemd",
-            "before": [
-              "257.5"
-            ],
-            "after": [
-              "258.1"
-            ],
-            "before_truncated": false,
-            "after_truncated": false
           }
         ],
         "highlights": [
@@ -293,22 +295,57 @@
             "name": "linux",
             "kinds": [
               "kernel"
-            ]
-          },
-          {
-            "name": "openssh",
-            "kinds": [
-              "major_version"
-            ]
+            ],
+            "before": [
+              "6.18.59"
+            ],
+            "after": [
+              "6.18.63"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
           },
           {
             "name": "systemd",
             "kinds": [
               "systemd",
               "major_version"
-            ]
+            ],
+            "before": [
+              "262"
+            ],
+            "after": [
+              "263"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "openssh",
+            "kinds": [
+              "major_version"
+            ],
+            "before": [
+              "9.9p2"
+            ],
+            "after": [
+              "10.0p1"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
           }
         ],
+        "rebuilt": [
+          "glibc"
+        ],
+        "unversioned": {
+          "added": 17,
+          "removed": 3
+        },
+        "invalid": {
+          "deployed": 0,
+          "pending": 0
+        },
         "counts": {
           "added": 1,
           "removed": 1,
@@ -318,7 +355,9 @@
           "added": false,
           "removed": false,
           "changed": false,
-          "highlights": false
+          "highlights": false,
+          "rebuilt": false,
+          "bytes": false
         }
       },
       "deployed_revision": "c68e00a",

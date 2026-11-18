@@ -20,3 +20,10 @@ Layout (driven by `tests/golden.rs`):
 
 To regenerate every expected file after an intended change, run the tests with
 `AUSPEX_BLESS=1` and review the diff. A missing expected file is a failure, not a pass.
+
+The closure pair is hand-assembled from public nixpkgs names and versions, with
+**synthetic store hashes**, not copied machine closures. It includes split outputs
+(`modules`, `getent`, `sandbox`, `xxd`, `env` and others), a generated `dbus-1`
+directory alongside the real version, an unversioned `systemd` directory, grammar
+git revisions and generic generated filename shapes. Generic filenames and the
+example toplevel are invented; no operator-specific filenames are included.

@@ -285,10 +285,7 @@ fn package_diff_report_headline_and_legacy() {
     let attached = base.clone().with_package_diff(diff.clone());
     assert_eq!(
         attached.reason,
-        Some(format!(
-            "{}; packages +0 −0 ~0",
-            base.reason.as_deref().unwrap()
-        ))
+        Some("pending nixos-system-terra-b; packages unchanged (configuration only); cache lookup failed; failed units: k3s.service".to_owned())
     );
     assert_eq!(attached.status, base.status);
     assert_eq!(attached.badges, base.badges);
@@ -313,6 +310,29 @@ fn package_diff_report_headline_and_legacy() {
     json.as_object_mut().unwrap().remove("package_diff");
     let legacy: auspex_domain::report::MachineReport = serde_json::from_value(json).unwrap();
     assert_eq!(legacy.package_diff, None);
+}
+
+#[test]
+fn review_headline_names_highlight_and_configuration_only() {
+    use auspex_domain::diff::diff_closures;
+    let base = snapshot_report()
+        .machines
+        .into_iter()
+        .find(|m| m.name == "terra")
+        .unwrap();
+    let path = |n| format!("/nix/store/0123456789abcdfghijklmnpqrsvwxyz-{n}");
+    let diff = diff_closures(&[path("linux-6.18.60")], Some(&[path("linux-6.18.63")]))
+        .unwrap()
+        .unwrap();
+    let reason = base.clone().with_package_diff(diff).reason.unwrap();
+    assert!(reason.contains("linux 6.18.60 → 6.18.63"));
+    let empty = diff_closures::<&str>(&[], Some(&[])).unwrap().unwrap();
+    assert!(
+        base.with_package_diff(empty)
+            .reason
+            .unwrap()
+            .contains("configuration only")
+    );
 }
 
 /// A machine list that could not be read: no machines, one fleet error, not settled. It
@@ -473,8 +493,6 @@ fn fleet_report_sorts_machines() {
     assert_eq!(got, want);
 }
 
-/// Correctness 2, M65 to M68: every published enum spelling, including the ones the
-/// snapshot happens not to contain. The match makes a new variant a compile error here.
 #[test]
 #[expect(
     clippy::items_after_statements,
@@ -512,6 +530,8 @@ fn package_diff_enum_spellings_are_pinned() {
     }
 }
 
+/// Correctness 2, M65 to M68: every published enum spelling, including the ones the
+/// snapshot happens not to contain. The match makes a new variant a compile error here.
 #[test]
 #[expect(
     clippy::items_after_statements,

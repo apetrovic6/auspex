@@ -208,13 +208,52 @@ impl MachineReport {
     pub fn with_package_diff(mut self, diff: PackageDiff) -> Self {
         if self.status == Badge::UpdatePending && diff.state == DiffState::Computed {
             let counts = diff.counts;
-            let headline = format!(
-                "packages +{} −{} ~{}",
-                counts.added, counts.removed, counts.changed
-            );
+            let detail = diff
+                .highlights
+                .iter()
+                .find(|h| h.name == "linux")
+                .or_else(|| diff.highlights.first())
+                .map(|h| {
+                    let name = h.name.get(..40).unwrap_or(&h.name);
+                    let before = h.before.first().and_then(|v| v.as_deref());
+                    let after = h.after.first().and_then(|v| v.as_deref());
+                    match (before, after) {
+                        (Some(a), Some(b)) if name.len() + a.len() + b.len() <= 80 => {
+                            format!("{name} {a} → {b}, ")
+                        }
+                        (None, Some(v)) if name.len() + v.len() <= 80 => {
+                            format!("{name} added {v}, ")
+                        }
+                        (Some(v), None) if name.len() + v.len() <= 80 => {
+                            format!("{name} removed {v}, ")
+                        }
+                        _ => format!("{name} changed, "),
+                    }
+                });
+            let headline = if counts.added + counts.removed + counts.changed == 0
+                && diff.rebuilt.is_empty()
+                && diff.unversioned.added + diff.unversioned.removed == 0
+            {
+                "packages unchanged (configuration only)".to_owned()
+            } else if let Some(detail) = detail {
+                format!(
+                    "{detail}+{} −{} ~{}",
+                    counts.added, counts.removed, counts.changed
+                )
+            } else if let Some(name) = diff.rebuilt.first() {
+                format!(
+                    "{name} rebuilt, +{} −{} ~{}",
+                    counts.added, counts.removed, counts.changed
+                )
+            } else {
+                format!(
+                    "packages +{} −{} ~{}",
+                    counts.added, counts.removed, counts.changed
+                )
+            };
             if let Some(reason) = &mut self.reason {
-                reason.push_str("; ");
-                reason.push_str(&headline);
+                let position = reason.find(';').unwrap_or(reason.len());
+                reason.insert_str(position, &format!("; {headline}"));
             } else {
                 self.reason = Some(headline);
             }

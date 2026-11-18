@@ -141,14 +141,14 @@ fn realistic_closure_diff() {
             .iter()
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>(),
-        ["linux", "openssh", "openssl", "systemd"]
+        ["linux", "systemd", "openssh", "openssl"]
     );
     assert_eq!(
-        diff.changed[2].before,
+        diff.changed[3].before,
         [Some("3.0.16".into()), Some("3.4.1".into())]
     );
     assert_eq!(
-        diff.changed[2].after,
+        diff.changed[3].after,
         [Some("3.0.16".into()), Some("3.5.0".into())]
     );
     assert_eq!(
@@ -158,13 +158,16 @@ fn realistic_closure_diff() {
             .collect::<Vec<_>>(),
         [
             ("linux", &[HighlightKind::Kernel][..]),
-            ("openssh", &[HighlightKind::MajorVersion][..]),
             (
                 "systemd",
                 &[HighlightKind::Systemd, HighlightKind::MajorVersion][..]
-            )
+            ),
+            ("openssh", &[HighlightKind::MajorVersion][..]),
         ]
     );
+    assert_eq!(diff.unversioned.added, 17);
+    assert_eq!(diff.unversioned.removed, 3);
+    assert_eq!(diff.rebuilt, ["glibc"]);
     let mut reversed = after.clone();
     reversed.reverse();
     assert_eq!(diff_closures(&before, Some(&reversed)).unwrap(), Some(diff));
@@ -181,7 +184,8 @@ fn unknown_empty_unversioned_and_major_rules() {
     let added = diff_closures(&empty, Some(&[path("local-tools")]))
         .unwrap()
         .unwrap();
-    assert_eq!(added.added[0].after, [None]);
+    assert_eq!(added.added, []);
+    assert_eq!(added.unversioned.added, 1);
     assert_eq!(added.highlights, []);
     for (before, after, bump) in [
         (vec!["tool-9", "tool-10"], vec!["tool-10", "tool-11"], true),
@@ -255,8 +259,8 @@ fn caps_and_terminal_sanitising() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(safe.added[0].name, "tool");
-    assert_eq!(safe.added[0].after, [Some("1.2".into())]);
+    assert_eq!(safe.added, []);
+    assert_eq!(safe.invalid.pending, 1);
 }
 
 #[test]
@@ -328,4 +332,179 @@ fn unavailable_and_failed_previews_are_distinct_and_safe() {
     assert_eq!(failed.counts, DiffCounts::default());
     let long = [path(&format!("{}-1", "a".repeat(MAX_PACKAGE_TEXT)))];
     assert_eq!(diff_closures(&long, Some(&[])), Err(DiffError::NameTooLong));
+}
+
+#[test]
+fn review_highlights_keep_versions_past_alphabetical_cap() {
+    let mut before: Vec<_> = (0..198).map(|i| path(&format!("aaa{i}-1.0"))).collect();
+    let mut after: Vec<_> = (0..198).map(|i| path(&format!("aaa{i}-1.1"))).collect();
+    before.push(path("systemd-262"));
+    after.push(path("systemd-263"));
+    let diff = diff_closures(&before, Some(&after)).unwrap().unwrap();
+    let systemd = diff.changed.iter().find(|p| p.name == "systemd").unwrap();
+    assert_eq!(systemd.before, [Some("262".into())]);
+    assert_eq!(systemd.after, [Some("263".into())]);
+    let json = serde_json::to_value(&diff).unwrap();
+    assert_eq!(json["highlights"][0]["before"], serde_json::json!(["262"]));
+    assert_eq!(json["highlights"][0]["after"], serde_json::json!(["263"]));
+    assert_eq!(diff.changed.len(), MAX_PACKAGE_CHANGES);
+    assert!(diff.truncated.changed);
+}
+
+#[test]
+fn review_real_output_names_collapse() {
+    for (name, version, suffix) in [
+        ("linux", "6.18.59", "modules"),
+        ("glibc", "2.44-57", "getent"),
+        ("gcc", "16.2.0", "libgcc"),
+        ("foot", "1.26.0", "terminfo"),
+        ("ffmpeg", "8.1", "data"),
+        ("libxml2", "2.15.3", "py"),
+        ("nvidia-x11", "615.26", "lib32"),
+        ("util-linux", "2.42.4", "login"),
+        ("util-linux", "2.42.4", "mount"),
+        ("util-linux", "2.42.4", "swap"),
+        ("util-linux", "2.42.4", "lastlog"),
+        ("shadow", "4.19.0", "su"),
+        ("vim", "9.2.1164", "xxd"),
+        ("chromium", "157.0.0", "sandbox"),
+        ("python3", "3.14.8", "env"),
+        ("libressl", "4.2.0", "nc"),
+        ("nss-cacert", "3.123", "p11kit"),
+    ] {
+        let diff =
+            diff_closures::<String>(&[], Some(&[path(&format!("{name}-{version}-{suffix}"))]))
+                .unwrap()
+                .unwrap();
+        assert_eq!(diff.added[0].after, [Some(version.into())], "{suffix}");
+    }
+    let before = [path("tool-1.0"), path("tool-1.0-custom7")];
+    let diff = diff_closures(&before, Some(&[])).unwrap().unwrap();
+    assert_eq!(diff.removed[0].before, [Some("1.0".into())]);
+}
+
+#[test]
+fn review_unversioned_grouping_and_git_versions() {
+    let before = [
+        path("systemd"),
+        path("systemd-262"),
+        path("dbus-1"),
+        path("dbus-1.16.2"),
+        path("generic.desktop"),
+        path("bashrc"),
+        path("helix-tree-sitter-rust-abcdef0123456789abcdef0123456789abcdef0123"),
+    ];
+    let after = [
+        path("systemd"),
+        path("systemd-263"),
+        path("dbus-1"),
+        path("dbus-1.16.2"),
+        path("generic.json"),
+        path("bashrc"),
+        path("helix-tree-sitter-rust-fedcba9876543210fedcba9876543210fedcba98"),
+    ];
+    let diff = diff_closures(&before, Some(&after)).unwrap().unwrap();
+    assert_eq!(diff.counts.added, 0);
+    assert_eq!(diff.counts.removed, 0);
+    assert_eq!(diff.counts.changed, 2);
+    assert_eq!(
+        diff.changed
+            .iter()
+            .find(|p| p.name == "systemd")
+            .unwrap()
+            .before,
+        [Some("262".into())]
+    );
+    let json = serde_json::to_value(diff).unwrap();
+    assert_eq!(
+        json["unversioned"],
+        serde_json::json!({"added": 1, "removed": 1})
+    );
+    let dbus = diff_closures(&[path("dbus-1"), path("dbus-1.16.2")], Some(&[]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(dbus.removed[0].before, [Some("1.16.2".into())]);
+}
+
+#[test]
+fn review_unit_package_is_not_a_generated_unit() {
+    assert_eq!(
+        package_from_store_path(&path("unit-1.34.2")).unwrap().name,
+        "unit"
+    );
+    for name in ["unit-script-example-start", "unit-example.network"] {
+        assert_eq!(package_from_store_path(&path(name)), None);
+    }
+}
+
+#[test]
+fn review_critical_same_version_rebuilds() {
+    let before: Vec<_> = ["linux", "systemd", "glibc", "nix", "hello"]
+        .map(|n| path(&format!("{n}-1.0")))
+        .into();
+    let after: Vec<_> = before
+        .iter()
+        .map(|p| p.replacen("0123456789", "1123456789", 1))
+        .collect();
+    let diff = diff_closures(&before, Some(&after)).unwrap().unwrap();
+    assert_eq!(diff.counts, DiffCounts::default());
+    assert_eq!(
+        serde_json::to_value(&diff).unwrap()["rebuilt"],
+        serde_json::json!(["glibc", "linux", "nix", "systemd"])
+    );
+    let unchanged = diff_closures(&after, Some(&after)).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(unchanged).unwrap()["rebuilt"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn review_invalid_names_are_rejected_not_merged() {
+    let paths = [
+        path("ev\u{202e}il-1.0"),
+        path("evil-1.0"),
+        path("bad-1\\quote"),
+        path("bad-1\"quote"),
+        path("bad-1\u{1b}[0m"),
+    ];
+    let diff = diff_closures::<String>(&[], Some(&paths)).unwrap().unwrap();
+    assert_eq!(diff.counts.added, 1);
+    assert_eq!(diff.added[0].name, "evil");
+    assert_eq!(
+        serde_json::to_value(diff).unwrap()["invalid"],
+        serde_json::json!({"deployed": 0, "pending": 4})
+    );
+}
+
+#[test]
+fn review_preview_json_byte_budget() {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for i in 0..128 {
+        for v in 0..16 {
+            before.push(path(&format!("pkg{i}-1.{v}.{}", "a".repeat(225))));
+            after.push(path(&format!("pkg{i}-2.{v}.{}", "b".repeat(225))));
+        }
+    }
+    let diff = diff_closures(&before, Some(&after)).unwrap().unwrap();
+    let bytes = serde_json::to_vec(&diff).unwrap();
+    assert!(bytes.len() <= 256 * 1024, "{} bytes", bytes.len());
+    assert_eq!(diff.counts.changed, 128);
+    assert_eq!(
+        serde_json::to_value(diff).unwrap()["truncated"]["bytes"],
+        true
+    );
+}
+
+#[test]
+fn review_preview_records_toplevel_pair() {
+    let deployed = path("nixos-system-example-26.11.20261113.abcdef0");
+    let pending = path("nixos-system-example-26.11.20261116.fedcba9");
+    let diff = diff_closures(&[deployed.as_str()], Some(&[pending.as_str()]))
+        .unwrap()
+        .unwrap();
+    let json = serde_json::to_value(diff).unwrap();
+    assert_eq!(json["deployed"], deployed);
+    assert_eq!(json["pending"], pending);
 }
