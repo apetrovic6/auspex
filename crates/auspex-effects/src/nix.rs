@@ -237,6 +237,21 @@ impl FlakeRef {
         }
     }
 
+    /// The flake's directory on this machine, when it has one: the worktree of a git
+    /// reference, or the path of a `path:` reference. What `clan` is run from and given as
+    /// `--flake`, since it takes a directory, not a normalised `git+file://` URL.
+    pub(crate) fn local_dir(&self) -> Option<std::path::PathBuf> {
+        if let Some(dir) = &self.worktree {
+            return Some(dir.clone());
+        }
+        let rest = self.reference.strip_prefix("path:")?;
+        // `path:` references are built by `new` from `Url::path()`, which percent-encodes.
+        url::Url::parse(&format!("file://{rest}"))
+            .ok()?
+            .to_file_path()
+            .ok()
+    }
+
     pub(crate) fn worktree_dir(&self) -> Option<&Path> {
         self.worktree.as_deref()
     }

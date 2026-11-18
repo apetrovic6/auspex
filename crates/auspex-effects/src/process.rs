@@ -194,7 +194,7 @@ pub fn command(program: &OsStr) -> io::Result<Command> {
     resolve_in(program, std::env::var_os("PATH").as_deref()).map(Command::new)
 }
 
-fn resolve_in(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
+pub fn resolve_in(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
     let p = Path::new(program);
     if program.as_encoded_bytes().contains(&b'/') {
         if p.is_absolute() {

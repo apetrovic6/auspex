@@ -1,7 +1,8 @@
 # `auspex-effects`
 
 auspex's adapters: everything that touches the outside world. The ssh probe, the machine
-list (`nix eval`), the evaluation (`nix-eval-jobs`), the eval cache, Prometheus, the narinfo
+list (`nix eval`), the evaluation (`nix-eval-jobs`), the eval cache, which `clan` binary
+the fleet pins (`clan`: built from its lock, never taken from `PATH`) and running it, Prometheus, the narinfo
 "cached" badge, and DNS. This crate is the only one in auspex with tokio.
 
 **Admission rule:** a function belongs here when it *obtains* something: it runs a process,
