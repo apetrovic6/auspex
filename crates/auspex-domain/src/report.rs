@@ -21,6 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::diff::{DiffState, PackageDiff};
 use crate::eval::EvalOutcome;
 use crate::fleet::{
     Lint, Machine, MachineClass, ResolveError, ResolvedTarget, SharedIp, TargetSource,
@@ -170,6 +171,10 @@ pub struct MachineReport {
     pub current_system: Option<String>,
     /// The evaluated toplevel's store path, or `null` when not evaluated (yet, or at all).
     pub pending_system: Option<String>,
+    /// Package preview; null until gathered. See [`PackageDiff`] for states, caps and
+    /// truncation. `not_cached` means unknown until built or cached, not no changes.
+    #[serde(default)]
+    pub package_diff: Option<PackageDiff>,
     /// The deployed `system.configurationRevision`, or `null` when the machine does not set
     /// it or was not observed.
     pub deployed_revision: Option<String>,
@@ -192,6 +197,70 @@ pub struct MachineReport {
     pub lints: Vec<Lint>,
     /// Frozen in the config, so `U` skips it.
     pub frozen: bool,
+}
+
+impl MachineReport {
+    /// Attaches a pure preview; only computed update-pending rows gain a short headline.
+    ///
+    /// Status, badges and settlement never depend on the preview. Call this once for a
+    /// freshly built report; reason remains human text, not a machine-readable interface.
+    #[must_use]
+    pub fn with_package_diff(mut self, diff: PackageDiff) -> Self {
+        if self.status == Badge::UpdatePending && diff.state == DiffState::Computed {
+            let counts = diff.counts;
+            let detail = diff
+                .highlights
+                .iter()
+                .find(|h| h.name == "linux")
+                .or_else(|| diff.highlights.first())
+                .map(|h| {
+                    let name = h.name.get(..40).unwrap_or(&h.name);
+                    let before = h.before.first().and_then(|v| v.as_deref());
+                    let after = h.after.first().and_then(|v| v.as_deref());
+                    match (before, after) {
+                        (Some(a), Some(b)) if name.len() + a.len() + b.len() <= 80 => {
+                            format!("{name} {a} → {b}, ")
+                        }
+                        (None, Some(v)) if name.len() + v.len() <= 80 => {
+                            format!("{name} added {v}, ")
+                        }
+                        (Some(v), None) if name.len() + v.len() <= 80 => {
+                            format!("{name} removed {v}, ")
+                        }
+                        _ => format!("{name} changed, "),
+                    }
+                });
+            let headline = if counts.added + counts.removed + counts.changed == 0
+                && diff.rebuilt.is_empty()
+                && diff.unversioned.added + diff.unversioned.removed == 0
+            {
+                "packages unchanged (configuration only)".to_owned()
+            } else if let Some(detail) = detail {
+                format!(
+                    "{detail}+{} −{} ~{}",
+                    counts.added, counts.removed, counts.changed
+                )
+            } else if let Some(name) = diff.rebuilt.first() {
+                format!(
+                    "{name} rebuilt, +{} −{} ~{}",
+                    counts.added, counts.removed, counts.changed
+                )
+            } else {
+                format!(
+                    "packages +{} −{} ~{}",
+                    counts.added, counts.removed, counts.changed
+                )
+            };
+            if let Some(reason) = &mut self.reason {
+                let position = reason.find(';').unwrap_or(reason.len());
+                reason.insert_str(position, &format!("; {headline}"));
+            } else {
+                self.reason = Some(headline);
+            }
+        }
+        self.package_diff = Some(diff);
+        self
+    }
 }
 
 /// Builds one machine's entry.
@@ -260,6 +329,7 @@ pub fn machine_report(
             Some(EvalOutcome::Success(s)) => Some(s.out_path.to_string()),
             _ => None,
         },
+        package_diff: None,
         deployed_revision: observation.and_then(|o| o.configuration_revision.clone()),
         system_state: observation.and_then(|o| o.system_state.clone()),
         failed_units: observation.and_then(|o| o.failed_units.clone()),

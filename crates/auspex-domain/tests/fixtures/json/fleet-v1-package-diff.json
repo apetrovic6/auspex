@@ -1,0 +1,410 @@
+{
+  "version": 1,
+  "settled": false,
+  "errors": [],
+  "machines": [
+    {
+      "name": "broken",
+      "class": "nixos",
+      "tags": [],
+      "target": null,
+      "target_source": "inventory",
+      "target_error": "invalid host \"-oProxyCommand=sh\"",
+      "build_host": null,
+      "status": "unreachable",
+      "badges": [
+        "unreachable"
+      ],
+      "settled": false,
+      "reason": "invalid target: invalid host \"-oProxyCommand=sh\"",
+      "current_system": null,
+      "pending_system": null,
+      "package_diff": null,
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "cerberus",
+      "class": "nixos",
+      "tags": [
+        "server"
+      ],
+      "target": "root@192.168.1.2",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync",
+        "frozen"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/3123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus",
+      "pending_system": "/nix/store/3123456789abcdfghijklmnpqrsvwxyz-nixos-system-cerberus",
+      "package_diff": null,
+      "deployed_revision": null,
+      "system_state": "running",
+      "failed_units": [],
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [
+        {
+          "kind": "shared_ip",
+          "ip": "192.168.1.2",
+          "with": [
+            "mars"
+          ]
+        }
+      ],
+      "frozen": true
+    },
+    {
+      "name": "genetor",
+      "class": "darwin",
+      "tags": [
+        "workstation"
+      ],
+      "target": "admin@192.168.1.109",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "in_sync",
+      "badges": [
+        "in_sync"
+      ],
+      "settled": true,
+      "reason": null,
+      "current_system": "/nix/store/2123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05",
+      "pending_system": "/nix/store/2123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05",
+      "package_diff": null,
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": {
+          "value": 5000,
+          "source": "ssh"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 2048000,
+            "used_bytes": 1024000,
+            "available_bytes": 1024000
+          },
+          "source": "ssh"
+        },
+        "load": {
+          "value": {
+            "one": 1.5,
+            "five": 1.25,
+            "fifteen": 1.0
+          },
+          "source": "ssh"
+        },
+        "memory": null
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "luna",
+      "class": "nixos",
+      "tags": [
+        "k8s-server"
+      ],
+      "target": "root@192.168.1.12",
+      "target_source": "override",
+      "target_error": null,
+      "build_host": null,
+      "status": "eval_error",
+      "badges": [
+        "checking",
+        "eval_error"
+      ],
+      "settled": false,
+      "reason": "error: attribute 'k3sToken' missing",
+      "current_system": null,
+      "pending_system": null,
+      "package_diff": null,
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [],
+      "frozen": false
+    },
+    {
+      "name": "mars",
+      "class": "nixos",
+      "tags": [
+        "k8s-master"
+      ],
+      "target": "root@mars.ugalabugala.org",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": null,
+      "status": "unreachable",
+      "badges": [
+        "unreachable"
+      ],
+      "settled": false,
+      "reason": "ssh: connect to host mars.ugalabugala.org port 22: Connection timed out",
+      "current_system": null,
+      "pending_system": null,
+      "package_diff": null,
+      "deployed_revision": null,
+      "system_state": null,
+      "failed_units": null,
+      "health": {
+        "uptime_seconds": null,
+        "root_disk": null,
+        "load": null,
+        "memory": null
+      },
+      "lints": [
+        {
+          "kind": "hostname_target",
+          "host": "mars.ugalabugala.org"
+        },
+        {
+          "kind": "shared_ip",
+          "ip": "192.168.1.2",
+          "with": [
+            "cerberus"
+          ]
+        }
+      ],
+      "frozen": false
+    },
+    {
+      "name": "terra",
+      "class": "nixos",
+      "tags": [
+        "base",
+        "k8s-base"
+      ],
+      "target": "root@192.168.1.10",
+      "target_source": "inventory",
+      "target_error": null,
+      "build_host": "localhost",
+      "status": "update_pending",
+      "badges": [
+        "update_pending",
+        "failed_units"
+      ],
+      "settled": true,
+      "reason": "pending nixos-system-terra-b; linux 6.18.59 → 6.18.63, +1 −1 ~4; cache lookup failed; failed units: k3s.service",
+      "current_system": "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-a",
+      "pending_system": "/nix/store/1123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-b",
+      "package_diff": {
+        "state": "computed",
+        "reason": null,
+        "deployed": "/nix/store/f123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-26.11.20261113.d5cc683",
+        "pending": "/nix/store/h123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-26.11.20261116.abcdef0",
+        "added": [
+          {
+            "name": "ripgrep",
+            "before": [],
+            "after": [
+              "14.1.1"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          }
+        ],
+        "removed": [
+          {
+            "name": "nano",
+            "before": [
+              "8.3"
+            ],
+            "after": [],
+            "before_truncated": false,
+            "after_truncated": false
+          }
+        ],
+        "changed": [
+          {
+            "name": "linux",
+            "before": [
+              "6.18.59"
+            ],
+            "after": [
+              "6.18.63"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "systemd",
+            "before": [
+              "262"
+            ],
+            "after": [
+              "263"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "openssh",
+            "before": [
+              "9.9p2"
+            ],
+            "after": [
+              "10.0p1"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "openssl",
+            "before": [
+              "3.0.16",
+              "3.4.1"
+            ],
+            "after": [
+              "3.0.16",
+              "3.5.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          }
+        ],
+        "highlights": [
+          {
+            "name": "linux",
+            "kinds": [
+              "kernel"
+            ],
+            "before": [
+              "6.18.59"
+            ],
+            "after": [
+              "6.18.63"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "systemd",
+            "kinds": [
+              "systemd",
+              "major_version"
+            ],
+            "before": [
+              "262"
+            ],
+            "after": [
+              "263"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "openssh",
+            "kinds": [
+              "major_version"
+            ],
+            "before": [
+              "9.9p2"
+            ],
+            "after": [
+              "10.0p1"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          }
+        ],
+        "rebuilt": [
+          "glibc"
+        ],
+        "unversioned": {
+          "added": 17,
+          "removed": 3
+        },
+        "invalid": {
+          "deployed": 0,
+          "pending": 0
+        },
+        "counts": {
+          "added": 1,
+          "removed": 1,
+          "changed": 4
+        },
+        "truncated": {
+          "added": false,
+          "removed": false,
+          "changed": false,
+          "highlights": false,
+          "rebuilt": false,
+          "bytes": false
+        }
+      },
+      "deployed_revision": "c68e00a",
+      "system_state": "degraded",
+      "failed_units": [
+        "k3s.service"
+      ],
+      "health": {
+        "uptime_seconds": {
+          "value": 1010,
+          "source": "prometheus"
+        },
+        "root_disk": {
+          "value": {
+            "total_bytes": 1024000,
+            "used_bytes": 409600,
+            "available_bytes": 512000
+          },
+          "source": "ssh"
+        },
+        "load": {
+          "value": {
+            "one": 0.25,
+            "five": 0.5,
+            "fifteen": 0.75
+          },
+          "source": "prometheus"
+        },
+        "memory": {
+          "value": {
+            "total_bytes": 8589934592,
+            "available_bytes": 4294967296
+          },
+          "source": "prometheus"
+        }
+      },
+      "lints": [],
+      "frozen": false
+    }
+  ],
+  "shared_ips": [
+    {
+      "ip": "192.168.1.2",
+      "machines": [
+        "cerberus",
+        "mars"
+      ]
+    }
+  ]
+}
