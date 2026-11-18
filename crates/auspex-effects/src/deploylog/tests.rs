@@ -1149,6 +1149,16 @@ async fn child() {
             }
             std::process::exit(0);
         }
+        // Open, start an action and read it back, all in this one live process: what does it
+        // say about its own row?
+        "own" => {
+            let log = open_at(&path, HOST).await;
+            log.start(new_action(ActionKind::Deploy, "m"))
+                .await
+                .unwrap();
+            let row = log.recent("m", 1).await.unwrap().remove(0);
+            std::fs::write(dir.join("own-result"), format!("{:?}", row.result)).unwrap();
+        }
         other => panic!("unknown mode {other}"),
     }
 }
@@ -1498,14 +1508,16 @@ fn the_cut_never_splits_a_multibyte_character() {
 async fn queued_calls_share_one_deadline() {
     let d = dir();
     let path = db_in(d.path());
+    // A busy timeout much longer than the deadline: if it were not cut to what a call has
+    // left, the call holding the connection would wait it out and overrun its deadline.
     let log = ActionLog::open(params_with(
         path.clone(),
-        Duration::from_secs(1),
+        Duration::from_secs(2),
         Duration::from_millis(400),
     ))
     .await
     .unwrap();
-    let holder = hold_write_lock(&path, Duration::from_secs(3));
+    let holder = hold_write_lock(&path, Duration::from_secs(4));
 
     let began = Instant::now();
     let tasks: Vec<_> = (0..5)
@@ -1523,7 +1535,12 @@ async fn queued_calls_share_one_deadline() {
     for t in tasks {
         let (took, r) = t.await.unwrap();
         assert!(matches!(r, Err(Error::Timeout)), "{r:?}");
-        assert!(took < Duration::from_millis(1200), "one call took {took:?}");
+        // Every call, the one that held the connection included, within its own deadline
+        // plus a margin for scheduling.
+        assert!(
+            took < Duration::from_millis(400 + 450),
+            "one call took {took:?} with a deadline of 400 ms"
+        );
     }
     assert!(
         began.elapsed() < Duration::from_millis(1500),
@@ -1805,6 +1822,11 @@ async fn a_log_on_a_network_file_system_is_refused_before_anything_is_created() 
     assert!(
         !path.exists(),
         "the file was created on the refused file system"
+    );
+    // Nor the directory: an NFS home is not left with an empty `state/` behind.
+    assert!(
+        !path.parent().unwrap().exists(),
+        "the directory was created on the refused file system"
     );
     // A real, local directory is not refused: every other test opens one.
 }
@@ -2205,10 +2227,11 @@ async fn a_read_only_file_system_still_shows_the_history() {
     assert!(ActionLog::open(params(empty.clone(), HOST)).await.is_err());
 }
 
-/// SQLite cannot read a WAL database in a directory it cannot write (no `-shm`); the open
-/// then reads it as immutable, which is right where nothing writes.
+/// SQLite cannot read a WAL database in a directory it cannot write (no `-shm`). The open then
+/// fails and says why: no `immutable` fallback, which would show stale and torn history
+/// while another process writes the file (the re-review's reproduction).
 #[tokio::test]
-async fn a_database_in_a_directory_that_cannot_be_written_is_read_as_immutable() {
+async fn a_database_in_a_directory_that_cannot_be_written_shows_no_history_instead_of_a_torn_one() {
     let d = dir();
     let log = open_in(d.path()).await;
     let id = log
@@ -2223,17 +2246,74 @@ async fn a_database_in_a_directory_that_cannot_be_written_is_read_as_immutable()
     let state = path.parent().unwrap().to_owned();
     std::fs::set_permissions(&state, PermissionsExt::from_mode(0o500)).unwrap();
 
-    let conn = open_read_only(&path, Duration::from_secs(1));
+    let opened = open_read_only(&path, Duration::from_secs(1));
     std::fs::set_permissions(&state, PermissionsExt::from_mode(0o700)).unwrap();
-    let conn = conn.unwrap();
-    let n: i64 = conn
-        .query_row("SELECT count(*) FROM actions", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 1);
-    assert_eq!(
-        percent_encode("/a b/c%d/é".as_bytes()),
-        "/a%20b/c%25d/%C3%A9"
+    if rustix::process::geteuid().is_root() {
+        // Root writes into a 0500 directory: nothing here is read-only.
+        eprintln!("skipped: running as root");
+        return;
+    }
+    let e = opened.unwrap_err();
+    assert!(
+        matches!(&e, Error::Unusable(m) if m.contains("-shm") && m.contains("no history")),
+        "{e}"
     );
+}
+
+/// A read-only open of a newer schema is refused too (the review's survivor: the version check
+/// of the read-only path was never exercised, because the file there did not exist).
+#[tokio::test]
+async fn a_newer_schema_is_refused_read_only_too() {
+    let d = dir();
+    let path = db_in(d.path());
+    std::fs::create_dir(path.parent().unwrap()).unwrap();
+    std::fs::set_permissions(path.parent().unwrap(), PermissionsExt::from_mode(0o700)).unwrap();
+    raw(&path)
+        .execute_batch("CREATE TABLE actions (future TEXT); PRAGMA user_version = 2;")
+        .unwrap();
+    std::fs::set_permissions(&path, PermissionsExt::from_mode(0o600)).unwrap();
+    tests_hook::pretend(&path, tests_hook::Pretend::ReadOnly);
+    let e = ActionLog::open(params(path, HOST)).await.unwrap_err();
+    assert!(matches!(e, Error::NewerSchema { found: 2, .. }), "{e}");
+}
+
+/// A file that does not exist on a read-only file system cannot be created: say that.
+#[tokio::test]
+async fn a_missing_log_on_a_read_only_file_system_says_why() {
+    let d = dir();
+    let path = db_in(d.path());
+    tests_hook::pretend(&path, tests_hook::Pretend::ReadOnly);
+    let e = ActionLog::open(params(path, HOST)).await.unwrap_err();
+    assert!(
+        matches!(&e, Error::Unusable(m) if m.contains("read-only") && m.contains("cannot be created")),
+        "{e}"
+    );
+}
+
+/// A poisoned connection lock (a panic while it was held) does not turn into refusing every
+/// later call.
+#[tokio::test]
+async fn a_poisoned_connection_lock_is_recovered_from() {
+    let d = dir();
+    let log = open_in(d.path()).await;
+    let inner = Arc::clone(&log.inner);
+    let panicked = std::thread::spawn(move || {
+        let _guard = inner.conn.lock().unwrap();
+        panic!("a panic while the connection is locked");
+    })
+    .join();
+    assert!(panicked.is_err());
+    assert!(log.inner.conn.is_poisoned());
+    let id = log
+        .start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+    log.finish(id, outcome(ActionResult::Succeeded))
+        .await
+        .unwrap();
+    assert_eq!(log.recent("m", 5).await.unwrap().len(), 1);
+    // And closing it, which takes the connection out of a poisoned lock.
+    log.close().await;
 }
 
 /// A deadline of nothing is a deadline that has passed: the call fails even though the
@@ -2277,4 +2357,174 @@ fn a_path_that_does_not_exist_yet_is_resolved_through_what_does() {
     assert!(relative.is_absolute() && relative.starts_with(std::env::current_dir().unwrap()));
     // Where a `..` in the part that does not exist points cannot be said.
     assert!(resolve_through_existing(&link.join("a").join("..").join("b")).is_err());
+}
+
+// ----- Fix round 2 -----
+
+fn unshare_works(extra: &[&str]) -> bool {
+    Command::new("unshare")
+        .args(["-r", "-p", "-f"])
+        .args(extra)
+        .arg("true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// What a process says about its own live row, run as `unshare [options] <this binary>`.
+fn own_row_result(unshare: Option<&[&str]>) -> String {
+    let d = dir();
+    let work = d.path();
+    let exe = std::env::current_exe().unwrap();
+    let mut cmd = match unshare {
+        Some(options) => {
+            let mut c = Command::new("unshare");
+            c.args(options).arg(exe);
+            c
+        }
+        None => Command::new(exe),
+    };
+    cmd.args([
+        "--exact",
+        "deploylog::tests::child",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(MODE, "own")
+    .env(WORK, work)
+    .env(WHO, "0")
+    .stdin(Stdio::null())
+    .stdout(Stdio::null());
+    assert!(cmd.status().unwrap().success());
+    std::fs::read_to_string(work.join("own-result")).unwrap()
+}
+
+/// The re-review's R3: in a pid namespace that did not remount `/proc`, `getpid()` is 1 but
+/// `/proc/self` is the process's pid in the namespace `/proc` belongs to. The row used to be
+/// written under `getpid()` and judged by looking `/proc/1` up, which is somebody else: a
+/// process called its own live row interrupted.
+#[test]
+fn a_process_never_calls_its_own_live_row_interrupted() {
+    assert_eq!(own_row_result(None), "None", "outside any namespace");
+    if !unshare_works(&[]) {
+        eprintln!("skipped: no unprivileged user and pid namespaces here");
+        return;
+    }
+    // New pid namespace, /proc not remounted: `/proc` is the parent namespace's.
+    assert_eq!(own_row_result(Some(&["-r", "-p", "-f"])), "None");
+    // With its own /proc.
+    if unshare_works(&["--mount-proc"]) {
+        assert_eq!(
+            own_row_result(Some(&["-r", "-p", "-f", "--mount-proc"])),
+            "None"
+        );
+    }
+}
+
+#[test]
+fn the_pid_is_the_one_proc_knows() {
+    // Outside a namespace the two are the same; the pid recorded is what `/proc/self` says.
+    let from_proc: i64 = std::fs::read_link("/proc/self")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(pid_in_proc(), from_proc);
+    assert_eq!(pid_in_proc(), i64::from(std::process::id()));
+}
+
+// ----- R4: a file from before the nullable columns -----
+
+/// The version-1 schema exactly as `a07fe0e` created it, before `machine_id` and `pid_ns`.
+const SCHEMA_V1_A07FE0E: &str = include_str!("../../tests/fixtures/schema-v1-a07fe0e.sql");
+
+/// An action log as `a07fe0e` made it, with one finished row, in `dir`'s `state/`.
+fn make_old_log(dir: &Path) -> PathBuf {
+    let path = db_in(dir);
+    std::fs::create_dir(path.parent().unwrap()).unwrap();
+    std::fs::set_permissions(path.parent().unwrap(), PermissionsExt::from_mode(0o700)).unwrap();
+    {
+        let c = raw(&path);
+        c.execute_batch(SCHEMA_V1_A07FE0E).unwrap();
+        c.execute_batch(
+            "INSERT INTO actions (kind, machine, started_at, ended_at, result, exit_code, who, \
+             host, auspex_version, pid, pid_start) VALUES ('deploy', 'old', \
+             '2026-01-01T00:00:00.000Z', '2026-01-01T00:01:00.000Z', 'succeeded', 0, 'w', 'h', \
+             'v', 1, 'b/1'); PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    std::fs::set_permissions(&path, PermissionsExt::from_mode(0o600)).unwrap();
+    path
+}
+
+fn column_names(path: &Path) -> Vec<String> {
+    raw(path)
+        .prepare("SELECT name FROM pragma_table_info('actions') ORDER BY cid")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_version_one_file_without_the_new_columns_gets_them_on_open() {
+    let d = dir();
+    let path = make_old_log(d.path());
+    assert!(!column_names(&path).contains(&"machine_id".to_owned()));
+
+    let log = open_at(&path, HOST).await;
+    // Version 1 still, and the columns are those of a fresh file, in the same order.
+    let version: i64 = raw(&path)
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let fresh_dir = dir();
+    let fresh = open_in(fresh_dir.path()).await;
+    assert_eq!(column_names(&path), column_names(fresh.path()));
+    // The old row is still there (and, its writer unknown, left unjudged); new calls work.
+    let old = log.recent("old", 5).await.unwrap();
+    assert_eq!(old.len(), 1);
+    assert_eq!(old[0].result, Some(ActionResult::Succeeded));
+    let id = log
+        .start(new_action(ActionKind::Deploy, "new"))
+        .await
+        .unwrap();
+    log.finish(id, outcome(ActionResult::Succeeded))
+        .await
+        .unwrap();
+    assert_eq!(log.since(ts(0)).await.unwrap().len(), 2);
+    // A second open finds nothing to add.
+    log.close().await;
+    let again = open_at(&path, HOST).await;
+    assert_eq!(again.since(ts(0)).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn processes_that_open_an_old_file_together_add_each_column_once() {
+    for round in 0..10 {
+        let d = dir();
+        make_old_log(d.path());
+        let errors = run_hammers(d.path(), 6, 1);
+        assert!(errors.is_empty(), "round {round}: {errors:?}");
+        let log = open_in(d.path()).await;
+        assert_eq!(log.since(ts(0)).await.unwrap().len(), 7, "round {round}");
+        assert!(column_names(log.path()).contains(&"pid_ns".to_owned()));
+    }
+}
+
+#[tokio::test]
+async fn an_old_file_on_a_read_only_file_system_cannot_be_upgraded_and_says_so() {
+    let d = dir();
+    let path = make_old_log(d.path());
+    tests_hook::pretend(&path, tests_hook::Pretend::ReadOnly);
+    let e = ActionLog::open(params(path, HOST)).await.unwrap_err();
+    assert!(
+        matches!(&e, Error::Unusable(m) if m.contains("predates columns")),
+        "{e}"
+    );
 }

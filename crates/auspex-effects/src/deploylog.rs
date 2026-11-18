@@ -17,8 +17,23 @@
 //! call on a deploy's critical path (start the deploy, and write the row beside it, for
 //! example from a task of its own), and must never turn a log error into the action's result:
 //! a deploy that succeeded did succeed, whatever the log said. Every call can fail (a full
-//! disk, a locked file, a read-only file system, a deadline) and every one is bounded in time
-//! (see "Concurrency"), but a bound of seconds is still too long to hold a deploy for.
+//! disk, a locked file, a read-only file system, a deadline), and the **wait** before a write is
+//! bounded (see "Concurrency"), but a statement that has begun is not: a stalled disk stalls
+//! the call. That, and a bound of seconds being too long to hold a deploy for anyway, is why
+//! this rule is the real protection, not the deadline.
+//!
+//! What a caller does with an error: run every log call in a task of its own, never `select!`
+//! or time one out itself (a drop mid-statement leaves an orphan `start` row), and never feed
+//! a result into the action's outcome. Then:
+//!
+//! - `start` fails with `Timeout`, `Sqlite`, `ReadOnly` or `Worker`: no row was written. Show
+//!   "not logged"; keep no id. Retrying is safe.
+//! - `finish` fails with `Timeout` or `Sqlite`: the row stays unfinished and reads as running
+//!   until this process exits, then as interrupted. Retry; `NotRunning` on a retry means an
+//!   earlier attempt landed.
+//! - `Invalid` is a bug in the caller. `Corrupt` on a query: show the timeline as unavailable.
+//! - [`ActionLog::is_read_only`]: do not attempt writes, and hide the "logging" indicator.
+//! - `Unusable`, `NewerSchema`, `NotOurs` at open: run without a log, and show the reason once.
 //!
 //! The caller passes **summaries, never output**: `detail` is a short summary of the outcome,
 //! not clan's log. If it is longer than [`DETAIL_CAP`] bytes its **end** is kept (the cause of
@@ -40,10 +55,15 @@
 //!
 //! **Local file systems only.** SQLite's write-ahead log keeps an index in shared memory,
 //! which does not work across hosts: two machines writing one log over NFS can corrupt it.
-//! The open refuses a directory that `statfs` reports as NFS, SMB/CIFS, FUSE or 9p.
+//! **On Linux** the open refuses a directory that `statfs` reports as NFS, SMB/CIFS, FUSE or
+//! 9p (checked before anything is created; this includes local FUSE: bindfs, gocryptfs,
+//! ntfs-3g, virtiofs). Elsewhere (macOS) there is no such check: keep the log on a local disk.
 //!
-//! On a read-only file system the log opens **read-only**: the history stays readable
-//! ([`ActionLog::is_read_only`]) and `start` and `finish` fail with [`Error::ReadOnly`].
+//! On a read-only file system the log opens **read-only** when SQLite can read it: the history
+//! stays readable ([`ActionLog::is_read_only`]) and `start` and `finish` fail with
+//! [`Error::ReadOnly`]. SQLite reads a WAL database only with its `-shm` index, which it must
+//! be able to create or find; where it cannot (a directory it cannot write, with no `-shm`
+//! there), the open fails and says so, rather than show history that may be stale or torn.
 //!
 //! # Interrupted actions
 //!
@@ -73,22 +93,25 @@
 //! Dropping the last [`ActionLog`] closes the connection on the blocking pool too (call
 //! [`ActionLog::close`] to wait for it).
 //!
-//! **Each call has one total deadline** ([`OpenParams::call_timeout`], default 2 s), covering
-//! its wait for the connection (all clones share one, so calls queue), the busy timeout and
-//! the statement together: `N` calls at once wait at most that long in all, not `N` times the
-//! busy timeout. A call past its deadline fails with [`Error::Timeout`]; nothing is written
-//! by it. (There is no `CancellationToken`: the deadline is the bound, and there is no
-//! process to kill.)
+//! **Each call has one total deadline** ([`OpenParams::call_timeout`], default 2 s) on its
+//! **wait before the statement**: for the connection (all clones share one, so calls queue) and
+//! for another process's lock (the busy timeout is cut to what the call has left). `N` calls at
+//! once wait at most that long in all, not `N` times the busy timeout. A call that is still
+//! waiting at its deadline fails with [`Error::Timeout`] and has written nothing. **A statement
+//! that has begun runs to completion**: it is one short `INSERT` or `UPDATE`, it is not
+//! interrupted, and a stalled disk stalls the call for as long as it lasts (interrupting it
+//! could not promise that a `Timeout` wrote nothing). There is no `CancellationToken`: the
+//! deadline is the bound on waiting, and there is no process to kill.
 //!
 //! **Dropping a call's future** (a `select!`, a cancelled task) stops a call that has not
 //! begun its statement: it never starts, and writes nothing. A statement that has begun is
 //! one transaction and completes atomically; for [`ActionLog::start`] that leaves a row whose
 //! id the caller never saw, which reads as running until this process exits, and then as
-//! interrupted. That window is the length of one `INSERT`.
+//! interrupted. That window runs from the call's last check, just before its statement, to the
+//! end of the statement.
 
 use std::ffi::OsStr;
 use std::fmt;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -492,8 +515,9 @@ pub enum Error {
     Corrupt(String),
     /// SQLite said no.
     Sqlite(rusqlite::Error),
-    /// The call did not finish within [`OpenParams::call_timeout`] (waiting for the connection,
-    /// for another process's lock, or the statement). It wrote nothing.
+    /// The log was busy: the call was still waiting for the connection or for another process's
+    /// lock when its [`OpenParams::call_timeout`] ran out, or SQLite refused at once with busy.
+    /// It wrote nothing. (A statement that has begun is not cut short.)
     Timeout,
     /// The caller dropped the call before it began its statement. It wrote nothing.
     Cancelled,
@@ -526,9 +550,7 @@ impl fmt::Display for Error {
             ),
             Self::Corrupt(m) => write!(f, "the action log has an invalid row: {m}"),
             Self::Sqlite(e) => write!(f, "the action log: {e}"),
-            Self::Timeout => {
-                f.write_str("the action log did not answer in time; nothing was written")
-            }
+            Self::Timeout => f.write_str("the action log was busy; nothing was written"),
             Self::Cancelled => f.write_str("the action log call was dropped before it began"),
             Self::ReadOnly => f.write_str(
                 "the action log is on a read-only file system; it can be read, not written",
@@ -591,9 +613,9 @@ pub struct OpenParams {
     /// [`DEFAULT_BUSY_TIMEOUT`]. Within a call it is further limited by
     /// [`OpenParams::call_timeout`].
     pub busy_timeout: Duration,
-    /// The most one call may take in all: waiting for the connection, for the lock, and the
-    /// statement. Default [`DEFAULT_CALL_TIMEOUT`]. Past it the call fails with
-    /// [`Error::Timeout`].
+    /// The most one call may wait before its statement begins: for the connection and for
+    /// another process's lock. Default [`DEFAULT_CALL_TIMEOUT`]. Past it the call fails with
+    /// [`Error::Timeout`]. A statement that has begun is not cut short.
     pub call_timeout: Duration,
 }
 
@@ -790,8 +812,10 @@ impl ActionLog {
         self.blocking(move |i, call| i.since(time, call)).await
     }
 
-    /// Closes the connection, on the blocking pool, and waits for it. Dropping the last clone
-    /// closes it there too, without waiting. The close of the last connection to a database
+    /// Closes the connection, on the blocking pool, and waits for it **if this is the last
+    /// handle** (with other clones alive, or a dropped call's task still holding one, it returns
+    /// at once and the last one to go closes it). Dropping the last clone closes it there too,
+    /// without waiting. The close of the last connection to a database
     /// checkpoints and deletes the WAL: synchronous I/O that must not run on the runtime.
     pub async fn close(self) {
         if let Ok(mut inner) = Arc::try_unwrap(self.inner)
@@ -877,8 +901,11 @@ impl Inner {
         }
         // Before anything is created: a refusal must leave the fleet as it was.
         refuse_inside(dir, &fleet, &path)?;
+        // Likewise before the directory is made: an NFS home is not left with an empty
+        // `~/.local/state/auspex/` behind. A directory that exists is checked itself; one that
+        // does not, by the nearest ancestor that does, which is the file system it would be on.
+        refuse_network_fs(nearest_existing(dir), &path)?;
         prepare_dir(dir)?;
-        refuse_network_fs(dir, &path)?;
         let read_only = prepare_file(&path)?;
 
         let conn = if read_only {
@@ -902,7 +929,7 @@ impl Inner {
             conn: Mutex::new(Some(conn)),
             path,
             identity,
-            pid: i64::from(std::process::id()),
+            pid: pid_in_proc(),
             // `/proc/self`, not `/proc/<pid>`: in a pid namespace without its own /proc, our
             // pid names another process there.
             pid_start: process_stamp("self").map(|(_, stamp)| stamp),
@@ -1230,6 +1257,40 @@ fn init_schema(conn: &Connection, path: &Path) -> Result<()> {
             tx.commit()?;
         }
     }
+    add_missing_columns(conn)?;
+    Ok(())
+}
+
+/// Nullable columns added to version 1 after it first shipped, with their types. A file made by
+/// an earlier build lacks them; the open adds them (`ALTER TABLE ... ADD COLUMN`), which is
+/// the mechanism behind the README's rule that a new nullable column keeps version 1. A fresh
+/// file has them from `SCHEMA_V1` already. Constants only: they are spliced into SQL.
+const ADDED_COLUMNS: &[(&str, &str)] = &[("machine_id", "TEXT"), ("pid_ns", "TEXT")];
+
+/// The [`ADDED_COLUMNS`] this database does not have.
+fn missing_columns(conn: &Connection) -> Result<Vec<(&'static str, &'static str)>> {
+    let have: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('actions')")?
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(ADDED_COLUMNS
+        .iter()
+        .filter(|(name, _)| !have.iter().any(|h| h == name))
+        .copied()
+        .collect())
+}
+
+/// Adds the missing columns under the write lock, re-reading once it is held: two processes
+/// opening one old file both see a column missing, and only the first may add it.
+fn add_missing_columns(conn: &Connection) -> Result<()> {
+    if missing_columns(conn)?.is_empty() {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+    for (name, ty) in missing_columns(&tx)? {
+        tx.execute_batch(&format!("ALTER TABLE actions ADD COLUMN {name} {ty}"))?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1261,29 +1322,29 @@ fn object_count(conn: &Connection) -> Result<i64> {
 
 /// Opens the database for reading only (a read-only file system), checking its version.
 ///
-/// SQLite reads a WAL database read-only only if it can create or find the `-shm` file; on a
-/// read-only file system it cannot, so a failed first read is retried as `immutable`: no
-/// locking, no `-shm`, correct while nothing writes, which on a read-only file system nothing
-/// does.
+/// SQLite reads a WAL database read-only only with its `-shm` index, which it must create or
+/// find; where it cannot, the first read fails and so does the open, with a message that says
+/// why. Not `immutable`: that reads with no locks and no change detection, so while another
+/// process writes the same file (a read-only bind mount of a directory the TUI writes through
+/// a writable path: `EROFS` describes this mount, not the file) it shows stale rows and, once
+/// its cached pages mix with fresh ones, torn ones. No history is better than that.
 fn open_read_only(path: &Path, busy_timeout: Duration) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let plain = Connection::open_with_flags(path, flags)?;
-    plain.busy_timeout(busy_timeout)?;
-    let (conn, version, objects) =
-        if let (Ok(v), Ok(o)) = (user_version(&plain), object_count(&plain)) {
-            (plain, v, o)
-        } else {
-            drop(plain);
-            let uri = format!(
-                "file:{}?immutable=1",
-                percent_encode(path.as_os_str().as_bytes())
-            );
-            let conn = Connection::open_with_flags(uri, flags | OpenFlags::SQLITE_OPEN_URI)?;
-            let (v, o) = (user_version(&conn)?, object_count(&conn)?);
-            (conn, v, o)
-        };
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(busy_timeout)?;
+    let (version, objects) = match (user_version(&conn), object_count(&conn)) {
+        (Ok(v), Ok(o)) => (v, o),
+        (Err(e), _) | (_, Err(e)) => {
+            return Err(Error::Unusable(format!(
+                "cannot read the action log {} on a read-only file system: SQLite needs its \
+                 -shm index file, which it can neither find nor create there ({e}); showing \
+                 no history rather than history that may be stale",
+                path.display()
+            )));
+        }
+    };
     check_version(version, objects, path)?;
     if version == 0 {
         // Empty, and nothing can be created: there is no history to show.
@@ -1292,20 +1353,14 @@ fn open_read_only(path: &Path, busy_timeout: Duration) -> Result<Connection> {
             path.display()
         )));
     }
+    if !missing_columns(&conn)?.is_empty() {
+        return Err(Error::Unusable(format!(
+            "the action log {} predates columns this auspex needs, and its file system is \
+             read-only, so it cannot be upgraded",
+            path.display()
+        )));
+    }
     Ok(conn)
-}
-
-/// The bytes of a path as a URI path: everything but unreserved characters and `/` as `%XX`.
-fn percent_encode(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::new(), |mut out, &b| {
-        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'~') {
-            out.push(char::from(b));
-        } else {
-            let _ = write!(out, "%{b:02X}");
-        }
-        out
-    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1387,6 +1442,18 @@ const fn network_fs_name(f_type: i128) -> Option<&'static str> {
         0x0102_1997 => Some("9p"),
         _ => None,
     }
+}
+
+/// `p`, or the nearest ancestor of it that exists.
+fn nearest_existing(p: &Path) -> &Path {
+    let mut cur = p;
+    while !cur.exists() {
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => break,
+        }
+    }
+    cur
 }
 
 /// Refuses a directory on NFS, SMB/CIFS, FUSE or 9p: WAL's shared-memory index does not work
@@ -1497,7 +1564,13 @@ fn prepare_file(path: &Path) -> Result<bool> {
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
-            .map_err(open_error)?,
+            .map_err(|e| match e {
+                rustix::io::Errno::NOENT => Error::Unusable(format!(
+                    "the action log {shown} does not exist and its file system is read-only, so \
+                     it cannot be created"
+                )),
+                e => open_error(e),
+            })?,
             true,
         ),
         Err(e) => return Err(open_error(e)),
@@ -1601,6 +1674,17 @@ fn parse_stat(stat: &str) -> Option<(char, u64)> {
     let state = fields.next()?.chars().next()?;
     let started = fields.nth(18)?.parse().ok()?;
     Some((state, started))
+}
+
+/// The pid this process has in the `/proc` that is mounted (the number `/proc/self` resolves
+/// to), which is what `/proc/<pid>` lookups mean. It differs from `getpid()` in a pid namespace
+/// that did not remount `/proc` (`unshare -p` without `--mount-proc`): there `getpid()` is 1
+/// and `/proc/1` is somebody else. Falls back to `getpid()` without `/proc`.
+fn pid_in_proc() -> i64 {
+    std::fs::read_link("/proc/self")
+        .ok()
+        .and_then(|p| p.to_str().and_then(|s| s.parse().ok()))
+        .unwrap_or_else(|| i64::from(std::process::id()))
 }
 
 /// Whether the process that wrote a row can still be writing it. Only asked of a row whose

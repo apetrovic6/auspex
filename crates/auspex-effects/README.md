@@ -77,14 +77,22 @@ file is in WAL mode: read it with a read-only connection (`file:…/log.sqlite?m
 write to it, and never `VACUUM` or change its journal mode.
 
 **Local file systems only.** WAL keeps an index in shared memory, which does not work across
-hosts: two machines writing one log over NFS can corrupt it. auspex refuses a directory on NFS,
-SMB/CIFS, FUSE or 9p. Do not put the file on one, and do not share it between machines. On a
-read-only file system it opens read-only: history is shown, `start` and `finish` fail.
+hosts: two machines writing one log over NFS can corrupt it. **On Linux** auspex refuses a
+directory that `statfs` reports as NFS, SMB/CIFS, FUSE or 9p, before it creates anything. That
+includes *local* FUSE (bindfs, gocryptfs, ntfs-3g, virtiofs): put the state directory on a
+plain local file system (`XDG_STATE_HOME`). **On macOS there is no such check**: an SMB or NFS
+home is not detected, so keep the log on a local disk. Do not share the file between machines.
+On a read-only file system it opens read-only when SQLite can read it: history is shown,
+`start` and `finish` fail. SQLite reads a WAL database only with its `-shm` index, which it
+must find or create; where it cannot (a directory it cannot write, with no `-shm` in it), the
+open fails and says so, rather than show history that may be stale or torn.
 
 **Version.** `PRAGMA user_version` is the schema version, currently **1**. An empty file is
 created at 1. auspex refuses (and does not touch) a file with a higher version, and a file with
 tables but version 0. The rule for changes: a **new nullable column** is additive and keeps
-version 1 (a reader must name the columns it wants, never `SELECT *` by position); **anything
+version 1 (a reader must name the columns it wants, never `SELECT *` by position; auspex adds a
+column a file lacks with `ALTER TABLE ... ADD COLUMN` under the write lock when it opens it,
+and a read-only open of such a file is refused); **anything
 else** (renaming, removing or retyping a column, changing a value set, a new `NOT NULL`
 column) bumps the version, and ships with a migration that runs on open. Rows are never
 deleted by auspex. *Known gap:* the version is checked when a process opens the file, not on
@@ -110,7 +118,7 @@ before upgrading one.
 | `host` | text, not null | The host auspex ran on. |
 | `detail` | text | A short summary of the outcome, sanitised line by line (control characters removed, empty lines dropped), at most 4096 bytes. **If it was longer, its end was kept** and it starts with `…`: the cause of a failure is last. **Never clan's output**: the caller passes a summary, because output can hold whatever a machine prints. |
 | `auspex_version` | text, not null | The auspex that wrote the row, sanitised, at most 255 bytes. |
-| `pid`, `pid_start`, `machine_id`, `pid_ns` | integer, text, text, text | The writing process, for auspex's own interrupted-row check: its pid; `<boot id>/<start time>`; `/etc/machine-id` (the host name on macOS); the pid-namespace link (`pid:[<inode>]`). **Ignore them**: not part of the contract's meaning. |
+| `pid`, `pid_start`, `machine_id`, `pid_ns` | integer, text, text, text | The writing process, for auspex's own interrupted-row check: its pid (as `/proc` names it); `<boot id>/<start time>`; `/etc/machine-id` (the host name on macOS); the pid-namespace link (`pid:[<inode>]`). **Ignore them**: not part of the contract's meaning. |
 
 **An unfinished row.** `result IS NULL` means *running*, or *auspex died before it
 finished*. auspex's own queries tell the two apart (a row whose writing process is gone is
@@ -145,13 +153,17 @@ ORDER BY machine;
 
 **Concurrency and failure.** Two auspex processes (the TUI and a `--json` run) may write at
 once: WAL, a 5-second busy timeout, one short statement per transaction, all on tokio's
-blocking pool. Every call has **one total deadline, 2 seconds by default**, covering its wait
-for the shared connection, for the lock and the statement, so a burst of calls (one per machine
-for `U`) waits 2 seconds in all, not once per call. A call that misses it fails with `Timeout`
-and writes nothing. A call whose future is dropped before it begins its statement never
-begins it; one already in its statement completes atomically.
+blocking pool. Every call has **one total deadline, 2 seconds by default, on its wait before the
+statement**: for the shared connection and for another process's lock (the busy timeout is cut
+to what the call has left), so a burst of calls (one per machine for `U`) waits 2 seconds in
+all, not once per call. A call still waiting at its deadline fails with `Timeout` and has
+written nothing. **A statement that has begun runs to completion** (one short `INSERT` or
+`UPDATE`, not interrupted: interrupting it could not promise that a `Timeout` wrote nothing),
+so a stalled disk stalls the call. A call whose future is dropped before it begins its
+statement never begins it; one already in its statement completes atomically.
 
 **The log must never hold up or decide a deploy.** Callers do not await a log call on a deploy's
-critical path (start the deploy, and write the row beside it), and never turn a log error into
+critical path (start the deploy, and write the row beside it: this, not the deadline, is what
+keeps a stalled disk from holding a deploy), and never turn a log error into
 the action's result: a full disk, a locked file, a read-only file system or a timeout fail the
 log call, and the deploy that ran still succeeded or failed on its own.
