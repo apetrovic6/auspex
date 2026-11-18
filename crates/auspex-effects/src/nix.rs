@@ -237,6 +237,30 @@ impl FlakeRef {
         }
     }
 
+    /// The reference for a command that reads the flake's *metadata* (`nix flake metadata`,
+    /// `nix build --inputs-from`): [`Self::as_str`], plus `shallow=1` for a local git
+    /// reference.
+    ///
+    /// Without it nix refuses a shallow clone outright ("is a shallow Git repository, so
+    /// 'revCount' is not available"), because metadata always includes `revCount`. A fleet
+    /// checked out with `--depth` is an ordinary setup. Merged into an existing query rather
+    /// than appended blindly, and left alone when the operator already chose a `shallow`
+    /// value. Not used by evaluation: `nix eval` does not ask for `revCount` and works on a
+    /// shallow clone as it is.
+    #[must_use]
+    pub fn shallow_safe(&self) -> String {
+        if !self.reference.starts_with("git+file:") {
+            return self.reference.clone();
+        }
+        match self.reference.split_once('?') {
+            None => format!("{}?shallow=1", self.reference),
+            Some((_, query)) if query.split('&').any(|p| p.starts_with("shallow=")) => {
+                self.reference.clone()
+            }
+            Some(_) => format!("{}&shallow=1", self.reference),
+        }
+    }
+
     /// The flake's directory on this machine, when it has one: the worktree of a git
     /// reference, or the path of a `path:` reference. What `clan` is run from and given as
     /// `--flake`, since it takes a directory, not a normalised `git+file://` URL.
@@ -897,6 +921,22 @@ async fn drain<R: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_references_are_shallow_safe_only_for_local_git() {
+        let s = |r: &str| FlakeRef::new(r).unwrap().shallow_safe();
+        assert_eq!(s("git+file:///x"), "git+file:///x?shallow=1");
+        // Merged into the query the reference already has, not appended as a second one.
+        assert_eq!(s("git+file:///x?dir=a"), "git+file:///x?dir=a&shallow=1");
+        // The operator's own choice stays.
+        assert_eq!(
+            s("git+file:///x?shallow=0&dir=a"),
+            "git+file:///x?shallow=0&dir=a"
+        );
+        for other in ["path:/x", "github:o/r", "git+https://h/r"] {
+            assert_eq!(s(other), other);
+        }
+    }
 
     #[test]
     fn flake_refs() {

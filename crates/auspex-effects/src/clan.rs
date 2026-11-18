@@ -631,7 +631,7 @@ pub fn metadata_argv(flake: &FlakeRef) -> Vec<OsString> {
         "--no-write-lock-file",
         "--no-update-lock-file",
         "--",
-        flake.as_str(),
+        &flake.shallow_safe(),
     ]
     .map(OsString::from)
     .to_vec()
@@ -648,7 +648,7 @@ pub fn build_argv(flake: &FlakeRef, system: &str) -> Vec<OsString> {
         "--no-write-lock-file",
         "--no-update-lock-file",
         "--inputs-from",
-        flake.as_str(),
+        &flake.shallow_safe(),
         "--",
         &attr,
     ]

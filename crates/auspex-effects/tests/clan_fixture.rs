@@ -47,6 +47,9 @@ fn nix(args: &[&str]) {
     assert!(ok.status.success(), "nix {args:?}: {ok:?}");
 }
 
+/// A revision a tarball input claims (nix takes `rev` on a tarball URL as given).
+const TARBALL_REV: &str = "ae4bb5d7ae4bb5d7ae4bb5d7ae4bb5d7ae4bb5d7";
+
 struct Fixture {
     // Held for its Drop.
     _root: tempfile::TempDir,
@@ -61,6 +64,12 @@ struct Fixture {
 
 /// `None` (after saying why) when the fixture cannot be built here.
 fn fixture(core_has_package: bool) -> Option<Fixture> {
+    fixture_as(core_has_package, false)
+}
+
+/// With `tarball`, the fleet pins clan-core as a tarball with a `rev`, the shape of the real
+/// fleet's lock entry (`{type: tarball, rev, narHash}`), instead of a git input.
+fn fixture_as(core_has_package: bool, tarball: bool) -> Option<Fixture> {
     for tool in ["nix", "git"] {
         if find_on_path(tool).is_none() {
             eprintln!("SKIPPED: {tool} is not on PATH (as inside the ci-pure sandbox)");
@@ -81,12 +90,25 @@ fn fixture(core_has_package: bool) -> Option<Fixture> {
     git(&core, &["init", "-q"]);
     git(&core, &["add", "-A"]);
     git(&core, &["commit", "-q", "-m", "A"]);
+    let url = if tarball {
+        let archive = root.path().join("core.tar.gz");
+        git(
+            &core,
+            &[
+                "archive",
+                "--format=tar.gz",
+                "-o",
+                archive.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        format!("tarball+file://{}?rev={TARBALL_REV}", archive.display())
+    } else {
+        format!("git+file://{}", core.display())
+    };
     fs::write(
         fleet.join("flake.nix"),
-        format!(
-            "{{\n  inputs.clan-core.url = \"git+file://{}\";\n  outputs = _: {{}};\n}}\n",
-            core.display()
-        ),
+        format!("{{\n  inputs.clan-core.url = \"{url}\";\n  outputs = _: {{}};\n}}\n"),
     )
     .unwrap();
     lock(&fleet);
@@ -138,6 +160,23 @@ fn write_core(core: &Path, tag: &str, with_package: bool) {
 }
 
 impl Fixture {
+    async fn resolve_flake(
+        &self,
+        flake: &FlakeRef,
+        locator: &ClanLocator,
+        search: &Path,
+    ) -> Result<ClanBinary, ClanError> {
+        let mut p = ResolveParams::new();
+        p.nix = self.nix.as_os_str();
+        p.search_path = Some(search.as_os_str());
+        p.lock_timeout = Duration::from_secs(120);
+        p.build_timeout = Duration::from_secs(300);
+        locator
+            .resolve(&p, flake, &CancellationToken::new())
+            .await
+            .unwrap()
+    }
+
     fn flake(&self) -> FlakeRef {
         FlakeRef::new(self.fleet.to_str().unwrap()).unwrap()
     }
@@ -151,15 +190,7 @@ impl Fixture {
     }
 
     async fn resolve(&self, locator: &ClanLocator, search: &Path) -> Result<ClanBinary, ClanError> {
-        let mut p = ResolveParams::new();
-        p.nix = self.nix.as_os_str();
-        p.search_path = Some(search.as_os_str());
-        p.lock_timeout = Duration::from_secs(120);
-        p.build_timeout = Duration::from_secs(300);
-        locator
-            .resolve(&p, &self.flake(), &CancellationToken::new())
-            .await
-            .unwrap()
+        self.resolve_flake(&self.flake(), locator, search).await
     }
 }
 
@@ -365,4 +396,75 @@ async fn a_system_that_is_not_a_system_name_is_refused_before_anything_runs() {
         .unwrap_err();
     assert_eq!(e.step, ClanStep::Build);
     assert_eq!(f.calls("flake"), 0);
+}
+
+#[tokio::test]
+async fn a_shallow_clone_of_a_git_fleet_resolves() {
+    let Some(f) = fixture(true) else { return };
+    // The fleet as a git repository with two commits, cloned with --depth 1: nix refuses
+    // `nix flake metadata` on such a clone ("is a shallow Git repository, so 'revCount' is
+    // not available") unless the reference says `shallow=1`.
+    git(&f.fleet, &["init", "-q"]);
+    git(&f.fleet, &["add", "flake.nix", "flake.lock"]);
+    git(&f.fleet, &["commit", "-q", "-m", "one"]);
+    fs::write(f.fleet.join("notes"), "x").unwrap();
+    git(&f.fleet, &["add", "notes"]);
+    git(&f.fleet, &["commit", "-q", "-m", "two"]);
+    let shallow = f.empty.parent().unwrap().join("shallow");
+    git(
+        &f.empty,
+        &[
+            "clone",
+            "-q",
+            "--depth",
+            "1",
+            &format!("file://{}", f.fleet.display()),
+            shallow.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        shallow.join(".git/shallow").exists(),
+        "the clone is not shallow"
+    );
+    let flake = FlakeRef::new(shallow.to_str().unwrap()).unwrap();
+    assert!(
+        flake.as_str().starts_with("git+file://"),
+        "{}",
+        flake.as_str()
+    );
+    let rev = git(&f.core, &["rev-parse", "HEAD"]);
+    let got = f
+        .resolve_flake(&flake, &ClanLocator::new(), &f.empty)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got.revision.as_deref(), Some(rev.as_str()));
+    assert_eq!(output_of(&got.path), "fake clan A");
+}
+
+#[tokio::test]
+async fn a_tarball_clan_core_with_a_rev_is_pinned_and_built() {
+    let Some(f) = fixture_as(true, true) else {
+        return;
+    };
+    // The fixture is what it claims to be: the lock entry is a tarball that carries a rev.
+    let lock: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(f.fleet.join("flake.lock")).unwrap()).unwrap();
+    let locked = &lock["nodes"]["clan-core"]["locked"];
+    assert_eq!(locked["type"], "tarball", "{locked}");
+    assert_eq!(locked["rev"], TARBALL_REV, "{locked}");
+    assert!(locked["narHash"].is_string(), "{locked}");
+
+    let got = f
+        .resolve(&ClanLocator::new(), &f.empty)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(got.revision.as_deref(), Some(TARBALL_REV));
+    assert_eq!(
+        got.source,
+        ClanSource::FleetLock {
+            revision: TARBALL_REV.to_owned()
+        }
+    );
+    assert_eq!(got.source.to_string(), "fleet lock ae4bb5d");
+    assert_eq!(output_of(&got.path), "fake clan A");
 }
