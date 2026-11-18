@@ -237,6 +237,84 @@ fn json_contract_snapshot() {
     compare_snapshot(&snapshot_report(), "fleet-v1.json");
 }
 
+#[test]
+fn json_contract_snapshot_package_diff() {
+    let before: Vec<_> = include_str!("fixtures/closure-before.txt")
+        .lines()
+        .collect();
+    let after: Vec<_> = include_str!("fixtures/closure-after.txt").lines().collect();
+    let diff = auspex_domain::diff::diff_closures(&before, Some(&after))
+        .unwrap()
+        .unwrap();
+    let mut report = snapshot_report();
+    let terra = report
+        .machines
+        .iter_mut()
+        .find(|m| m.name == "terra")
+        .unwrap();
+    *terra = terra.clone().with_package_diff(diff);
+    compare_snapshot(&report, "fleet-v1-package-diff.json");
+    let parsed: FleetReport =
+        serde_json::from_value(serde_json::to_value(&report).unwrap()).unwrap();
+    assert_eq!(parsed, report);
+}
+
+#[test]
+fn package_diff_json_unknown() {
+    let diff = auspex_domain::diff::diff_closures::<&str>(&[], None).unwrap();
+    let pretty = serde_json::to_string_pretty(&diff).unwrap() + "\n";
+    assert_eq!(
+        pretty,
+        include_str!("fixtures/json/package-diff-v1-unknown.json")
+    );
+    assert_eq!(
+        serde_json::from_str::<Option<auspex_domain::diff::PackageDiff>>(&pretty).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn package_diff_report_headline_and_legacy() {
+    use auspex_domain::diff::{PackageDiff, diff_closures};
+    let base = snapshot_report()
+        .machines
+        .into_iter()
+        .find(|m| m.name == "terra")
+        .unwrap();
+    let diff = diff_closures::<&str>(&[], Some(&[])).unwrap().unwrap();
+    let attached = base.clone().with_package_diff(diff.clone());
+    assert_eq!(
+        attached.reason,
+        Some(format!(
+            "{}; packages +0 −0 ~0",
+            base.reason.as_deref().unwrap()
+        ))
+    );
+    assert_eq!(attached.status, base.status);
+    assert_eq!(attached.badges, base.badges);
+    assert_eq!(attached.settled, base.settled);
+    for unavailable in [
+        PackageDiff::not_cached(),
+        PackageDiff::failed("\u{1b}[31mcache failed"),
+    ] {
+        assert_eq!(
+            base.clone().with_package_diff(unavailable).reason,
+            base.reason
+        );
+    }
+    let mut in_sync = base.clone();
+    in_sync.status = Badge::InSync;
+    assert_eq!(
+        in_sync.clone().with_package_diff(diff).reason,
+        in_sync.reason
+    );
+    let mut json = serde_json::to_value(&base).unwrap();
+    assert!(json["package_diff"].is_null());
+    json.as_object_mut().unwrap().remove("package_diff");
+    let legacy: auspex_domain::report::MachineReport = serde_json::from_value(json).unwrap();
+    assert_eq!(legacy.package_diff, None);
+}
+
 /// A machine list that could not be read: no machines, one fleet error, not settled. It
 /// must not read as a healthy, empty fleet.
 fn failed_inventory_report() -> FleetReport {
@@ -397,6 +475,43 @@ fn fleet_report_sorts_machines() {
 
 /// Correctness 2, M65 to M68: every published enum spelling, including the ones the
 /// snapshot happens not to contain. The match makes a new variant a compile error here.
+#[test]
+#[expect(
+    clippy::items_after_statements,
+    reason = "each spelling table sits next to the loop that checks it"
+)]
+fn package_diff_enum_spellings_are_pinned() {
+    use auspex_domain::diff::{DiffState, HighlightKind};
+    fn diff_state(state: DiffState) -> &'static str {
+        match state {
+            DiffState::Computed => "computed",
+            DiffState::NotCached => "not_cached",
+            DiffState::Failed => "failed",
+        }
+    }
+    for state in [DiffState::Computed, DiffState::NotCached, DiffState::Failed] {
+        assert_eq!(serde_json::to_value(state).unwrap(), diff_state(state));
+    }
+    fn highlight(kind: HighlightKind) -> &'static str {
+        match kind {
+            HighlightKind::Kernel => "kernel",
+            HighlightKind::Systemd => "systemd",
+            HighlightKind::Glibc => "glibc",
+            HighlightKind::Nix => "nix",
+            HighlightKind::MajorVersion => "major_version",
+        }
+    }
+    for kind in [
+        HighlightKind::Kernel,
+        HighlightKind::Systemd,
+        HighlightKind::Glibc,
+        HighlightKind::Nix,
+        HighlightKind::MajorVersion,
+    ] {
+        assert_eq!(serde_json::to_value(kind).unwrap(), highlight(kind));
+    }
+}
+
 #[test]
 #[expect(
     clippy::items_after_statements,
