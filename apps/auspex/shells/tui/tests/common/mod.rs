@@ -68,12 +68,27 @@ pub fn type_keys(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
     }
 }
 
+thread_local! {
+    static CLOCK: (Instant, std::cell::Cell<Duration>) = (Instant::now(), std::cell::Cell::new(Duration::ZERO));
+}
+
+/// The test's own clock: it moves only when [`elapse`] says so, so "the question has been on
+/// screen for 0.3 s" is not a race with the machine's load. One per test thread.
+pub fn now() -> Instant {
+    CLOCK.with(|(base, offset)| *base + offset.get())
+}
+
+/// Lets `d` pass on the test's clock.
+pub fn elapse(d: Duration) {
+    CLOCK.with(|(_, offset)| offset.set(offset.get() + d));
+}
+
 /// One key, as the real loop sends it: through `Ui::key`, which discards a key that answers a
-/// question no frame has drawn yet.
+/// question that has not been on screen, whole, for `QUESTION_DWELL` (on [`now`]'s clock).
 pub fn press(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, key: Key) {
     let view = shell.view();
     // Long after any refresh started: a test that needs "just started" builds its Screen.
-    for e in ui.key(key, &view, Duration::from_secs(3600), keymap) {
+    for e in ui.key(key, &view, Duration::from_secs(3600), keymap, now()) {
         shell.send(e);
     }
 }
@@ -81,7 +96,7 @@ pub fn press(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, key: Key) {
 /// A paste, as the real loop sends it: through `Ui::paste`.
 pub fn paste(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, text: &str) {
     let view = shell.view();
-    for e in ui.paste(text, &view, Duration::from_secs(3600), keymap) {
+    for e in ui.paste(text, &view, Duration::from_secs(3600), keymap, now()) {
         shell.send(e);
     }
 }
@@ -99,13 +114,15 @@ pub fn frame(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap) {
     );
 }
 
-/// As [`type_keys`], with a frame drawn after each key: an operator who reads what is on the
-/// screen before pressing the next key, which is what a question asks of them.
+/// As [`type_keys`], with a frame drawn after each key and a second let pass: an operator who
+/// reads what is on the screen before pressing the next key, which is what a question asks of
+/// them.
 pub fn type_keys_seen(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
     frame(shell, ui, keymap);
     for c in keys.chars() {
         type_keys(shell, ui, keymap, &c.to_string());
         frame(shell, ui, keymap);
+        elapse(Duration::from_secs(1));
     }
 }
 
@@ -169,6 +186,7 @@ pub fn draw(
         flake: demo::FLAKE,
         log,
         output,
+        now: now(),
     };
     terminal.draw(|f| ui::draw(f, view, ui, &ctx)).unwrap();
     terminal.backend().buffer().clone()

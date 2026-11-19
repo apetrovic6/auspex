@@ -104,13 +104,15 @@ async fn until(shell: &Arc<Shell>, what: &str, ready: impl Fn(&ViewModel) -> boo
     }
 }
 
-/// alfrost, the first row and the first to evaluate, is ready to be updated.
+/// alfrost, the first row, is evaluated and the fleet has settled: a `y` while the evaluation
+/// is still streaming is refused, so an update is asked for only once it has finished.
 async fn ready(shell: &Arc<Shell>) {
-    until(shell, "alfrost to evaluate", |v| {
-        v.report
-            .machines
-            .first()
-            .is_some_and(|m| m.name == "alfrost" && m.pending_system.is_some())
+    until(shell, "alfrost to evaluate and the fleet to settle", |v| {
+        v.refresh.settled
+            && v.report
+                .machines
+                .first()
+                .is_some_and(|m| m.name == "alfrost" && m.pending_system.is_some())
     })
     .await;
 }

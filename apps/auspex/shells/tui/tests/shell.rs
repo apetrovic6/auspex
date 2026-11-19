@@ -195,6 +195,7 @@ fn connection_status(shell: &Shell, ui: &mut auspex_tui::ui::Ui) -> String {
         flake: "fake",
         log: &[],
         output: shell.output(),
+        now: std::time::Instant::now(),
     };
     terminal.draw(|frame| shell.draw(frame, ui, &ctx)).unwrap();
     (0..160)

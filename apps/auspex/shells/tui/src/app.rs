@@ -338,7 +338,7 @@ async fn tui(
             _ = frames.tick() => {
                 ui.frame = ui.frame.wrapping_add(1);
                 let log = shell.log.lines();
-                let ctx = Context { theme, keymap, flake, log: &log, output: shell.output() };
+                let ctx = Context { theme, keymap, flake, log: &log, output: shell.output(), now: std::time::Instant::now() };
                 if let Err(e) = terminal.draw(|f| shell.draw(f, &mut ui, &ctx)) {
                     failure = Some(format!("cannot draw: {e}"));
                     code = ExitCode::from(USAGE);
@@ -353,11 +353,11 @@ async fn tui(
                     }
                     // A paste is its own event (bracketed paste is on), never typed keys.
                     let events = if let crossterm::event::Event::Paste(text) = &event {
-                        ui.paste(text, &view, refresh.1.elapsed(), keymap)
+                        ui.paste(text, &view, refresh.1.elapsed(), keymap, std::time::Instant::now())
                     } else if let Some(key) =
                         event.as_key_press_event().and_then(|k| Key::from_event(&k))
                     {
-                        ui.key(key, &view, refresh.1.elapsed(), keymap)
+                        ui.key(key, &view, refresh.1.elapsed(), keymap, std::time::Instant::now())
                     } else {
                         continue;
                     };

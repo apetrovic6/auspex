@@ -506,6 +506,7 @@ async fn keys_before_the_frame_are_discarded_and_the_first_key_after_it_answers(
     type_keys(&shell, &mut ui, &km, "Ay");
     assert_eq!(shell.view().mode, Mode::Observe, "the y came too early");
     common::frame(&shell, &mut ui, &km);
+    common::elapse(auspex_tui::ui::QUESTION_DWELL);
     assert_eq!(shell.view().mode, Mode::Observe, "a frame answers nothing");
     type_keys(&shell, &mut ui, &km, "y");
     assert_eq!(shell.view().mode, Mode::Act);
@@ -529,6 +530,7 @@ async fn a_paste_deploys_nothing_and_answers_a_drawn_question_no() {
     assert!(shell.view().confirm.is_some(), "still waiting to be seen");
     // After it, a paste is a no, even of `y`.
     common::frame(&shell, &mut ui, &km);
+    common::elapse(auspex_tui::ui::QUESTION_DWELL);
     paste(&shell, &mut ui, &km, "y");
     assert_eq!(shell.view().mode, Mode::Observe);
     assert!(shell.view().confirm.is_none(), "answered no");
@@ -568,11 +570,13 @@ async fn each_question_seen_then_answered_deploys() {
     let km = Keymap::defaults();
     type_keys(&shell, &mut ui, &km, "A");
     common::frame(&shell, &mut ui, &km);
+    common::elapse(auspex_tui::ui::QUESTION_DWELL);
     type_keys(&shell, &mut ui, &km, "y/luna\nu");
     assert_eq!(shell.view().mode, Mode::Act);
     assert!(shell.view().action.is_none(), "the update is only asked");
     // The `y` typed with the `u` is not in the burst: it would be an answer before the frame.
     common::frame(&shell, &mut ui, &km);
+    common::elapse(auspex_tui::ui::QUESTION_DWELL);
     type_keys(&shell, &mut ui, &km, "y");
     let action = shell.view().action.expect("the update started");
     assert_eq!(action.machine, "luna");
@@ -587,6 +591,7 @@ async fn a_second_question_is_not_answered_by_the_first_ones_frame() {
     let km = Keymap::defaults();
     type_keys(&shell, &mut ui, &km, "A");
     common::frame(&shell, &mut ui, &km);
+    common::elapse(auspex_tui::ui::QUESTION_DWELL);
     // `y` answers act mode, `/luna\nu` asks the update, and the next `y` is typeahead.
     type_keys(&shell, &mut ui, &km, "y/luna\nuy");
     assert!(
@@ -597,4 +602,102 @@ async fn a_second_question_is_not_answered_by_the_first_ones_frame() {
         shell.view().confirm.map(|c| c.kind),
         Some(ConfirmKind::Update)
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// A question must be readable before it is answered (re-review findings 1 and 2)
+// ---------------------------------------------------------------------------------------
+
+/// A frame at 33 ms is not enough: a `y` typed 80 to 150 ms behind the `u` by habit used to be
+/// accepted. The question has to have been on screen for `QUESTION_DWELL`.
+#[tokio::test(start_paused = true)]
+async fn an_answer_right_behind_the_frame_is_discarded_until_the_dwell_has_passed() {
+    use std::time::Duration;
+
+    use auspex_tui::ui::QUESTION_DWELL;
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys(&shell, &mut ui, &km, "A");
+    common::frame(&shell, &mut ui, &km);
+    // The habitual `y`, one frame later.
+    common::elapse(Duration::from_millis(33));
+    type_keys(&shell, &mut ui, &km, "y");
+    assert_eq!(shell.view().mode, Mode::Observe, "33 ms is not reading");
+    common::elapse(QUESTION_DWELL - Duration::from_millis(34));
+    type_keys(&shell, &mut ui, &km, "y");
+    assert_eq!(shell.view().mode, Mode::Observe, "just short of the dwell");
+    assert!(
+        shell.view().confirm.is_some(),
+        "and the question is still open"
+    );
+    common::elapse(Duration::from_millis(1));
+    type_keys(&shell, &mut ui, &km, "y");
+    assert_eq!(shell.view().mode, Mode::Act, "the dwell has passed");
+}
+
+/// The same for the update's question, the one that deploys.
+#[tokio::test(start_paused = true)]
+async fn a_habitual_u_y_deploys_nothing_and_the_same_y_a_moment_later_does() {
+    use std::time::Duration;
+
+    use auspex_tui::ui::QUESTION_DWELL;
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys_seen(&shell, &mut ui, &km, "Ay/luna\n");
+    assert_eq!(shell.view().mode, Mode::Act);
+    type_keys(&shell, &mut ui, &km, "u");
+    common::frame(&shell, &mut ui, &km);
+    common::elapse(Duration::from_millis(100)); // a fast typist's gap
+    type_keys(&shell, &mut ui, &km, "y");
+    assert!(shell.view().action.is_none(), "nothing was deployed");
+    assert_eq!(
+        shell.view().confirm.map(|c| c.kind),
+        Some(ConfirmKind::Update),
+        "the question is still waiting to be read"
+    );
+    common::elapse(QUESTION_DWELL);
+    type_keys(&shell, &mut ui, &km, "y");
+    assert_eq!(shell.view().action.expect("started").machine, "luna");
+    until_action_ends(&shell).await;
+}
+
+/// A pane too small to show the whole question is not asking it: the box says so, the question
+/// does not count as drawn, and no `y` answers it. Once the pane is large enough, the dwell
+/// starts then.
+#[tokio::test(start_paused = true)]
+async fn a_question_that_did_not_fit_is_not_drawn_and_cannot_be_answered() {
+    use std::time::Duration;
+
+    use auspex_tui::ui::QUESTION_DWELL;
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys_seen(&shell, &mut ui, &km, "Ay/luna\nu");
+    // `type_keys_seen` ended with a frame at 120×40 and a second: the question is readable.
+    // Now the pane shrinks, as a resize does: the question is no longer drawn.
+    for (w, h) in [(20, 4), (80, 4), (30, 5), (80, 6), (27, 40)] {
+        let view = shell.view();
+        let frame = common::render_with(&view, &mut ui, &km, &[], shell.output(), w, h);
+        assert!(
+            ui.confirm_seen.is_none(),
+            "{w}x{h} shows no whole question:\n{frame}"
+        );
+        common::elapse(QUESTION_DWELL * 2);
+        type_keys(&shell, &mut ui, &km, "y");
+        assert!(shell.view().action.is_none(), "{w}x{h}: nothing deployed");
+        assert!(shell.view().confirm.is_some(), "{w}x{h}: still waiting");
+    }
+    // What the box says in a pane that holds the sentence.
+    let small = common::render_with(&shell.view(), &mut ui, &km, &[], shell.output(), 80, 6);
+    assert!(small.contains("terminal too small to ask"), "{small}");
+    // Large enough again: the dwell starts now, not from before the shrink.
+    common::frame(&shell, &mut ui, &km);
+    type_keys(&shell, &mut ui, &km, "y");
+    assert!(shell.view().action.is_none(), "not yet read");
+    common::elapse(QUESTION_DWELL);
+    type_keys(&shell, &mut ui, &km, "y");
+    assert_eq!(shell.view().action.expect("started").machine, "luna");
+    until_action_ends(&shell).await;
 }

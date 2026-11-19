@@ -9,7 +9,7 @@
 //! Widths are measured in terminal cells and everything is cut with an ellipsis, so a long
 //! or wide name never moves a column.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use auspex_core::{
     ActionResult, ActionStatus, ActionView, Event, Mode, Phase, PrometheusStatus, ViewModel,
@@ -64,26 +64,37 @@ pub struct Ui {
     pub approvals: usize,
     /// The last thing auspex could not do besides the action itself (the action log failed).
     pub warning: Option<String>,
-    /// The question the last frame drew (its `ConfirmView::serial`), or none. A question is
-    /// answered only after a frame has shown it: see [`Ui::key`].
-    pub confirm_drawn: Option<u64>,
+    /// The question the last frame drew whole (its `ConfirmView::serial`), and when a frame
+    /// first did. A question is answered only after it has been on screen for
+    /// [`QUESTION_DWELL`]: see [`Ui::key`].
+    pub confirm_seen: Option<(u64, Instant)>,
 }
+
+/// How long a question must have been on screen, whole, before a key may answer it.
+///
+/// A frame is drawn every 33 ms, so "a frame has drawn it" alone is passed by a `y` typed
+/// right behind the `u` by habit (80 to 150 ms between keys), and over a slow link a frame can
+/// still be in flight. The question names the machine and the system: it has to be readable
+/// first. A deliberate operator loses 0.3 s.
+pub const QUESTION_DWELL: Duration = Duration::from_millis(300);
 
 impl Ui {
     /// Handles one key against `view`: the events to send, in order.
     ///
-    /// While a question is open and no frame has drawn it yet, the key is discarded, not
-    /// answered. The question names the machine and the system; an answer typed before it
-    /// could be read (typeahead, `Ayuy` arriving in one burst) is not an answer to it. Every
-    /// question is a new one to draw, so `A` `y` `u` `y` needs a frame after `A` and after `u`.
+    /// While a question is open and has not been on screen, whole, for [`QUESTION_DWELL`], the
+    /// key is discarded, not answered. The question names the machine and the system; an answer
+    /// typed before it could be read (typeahead, `Ayuy` in one burst, a `y` typed right behind
+    /// the `u` by habit) is not an answer to it. Every question is a new one to draw and wait
+    /// for. `now` is when the key arrived.
     pub fn key(
         &mut self,
         key: Key,
         view: &ViewModel,
         since_refresh: Duration,
         keymap: &Keymap,
+        now: Instant,
     ) -> Vec<Event> {
-        if self.question_unseen(view) {
+        if self.question_unseen(view, now) {
             return Vec::new();
         }
         let query = view
@@ -98,7 +109,7 @@ impl Ui {
     /// Handles pasted text (bracketed paste, so it is not typed): never an answer to a
     /// question except no, and never a command.
     ///
-    /// With a question open, a paste is a no once the question has been drawn (and nothing
+    /// With a question open, a paste is a no once the question could be read (and nothing
     /// before). With a prompt open, the text goes into it as typed, without control characters
     /// (a pasted newline must not submit it). Otherwise it is ignored: pasted `uy` is not `u`
     /// and `y`.
@@ -108,9 +119,10 @@ impl Ui {
         view: &ViewModel,
         since_refresh: Duration,
         keymap: &Keymap,
+        now: Instant,
     ) -> Vec<Event> {
         if view.confirm.is_some() {
-            return if self.question_unseen(view) {
+            return if self.question_unseen(view, now) {
                 Vec::new()
             } else {
                 vec![Event::ConfirmAnswer(false)]
@@ -121,16 +133,21 @@ impl Ui {
         }
         let mut events = Vec::new();
         for c in text.chars().filter(|c| !c.is_control()) {
-            events.extend(self.key(Key::char(c), view, since_refresh, keymap));
+            events.extend(self.key(Key::char(c), view, since_refresh, keymap, now));
         }
         events
     }
 
-    /// A question is open that no frame has drawn.
-    fn question_unseen(&self, view: &ViewModel) -> bool {
+    /// A question is open that has not been on screen, whole, for [`QUESTION_DWELL`] at `now`.
+    fn question_unseen(&self, view: &ViewModel, now: Instant) -> bool {
         view.confirm
             .as_ref()
-            .is_some_and(|c| self.confirm_drawn != Some(c.serial))
+            .is_some_and(|c| match self.confirm_seen {
+                Some((serial, since)) if serial == c.serial => {
+                    now.saturating_duration_since(since) < QUESTION_DWELL
+                }
+                _ => true,
+            })
     }
 }
 
@@ -146,6 +163,8 @@ pub struct Context<'a> {
     pub log: &'a [String],
     /// The streamed output of updates and builds, for the Log tab.
     pub output: &'a Output,
+    /// When this frame is drawn: the time a question is first on screen is read from it.
+    pub now: Instant,
 }
 
 /// `s` cut to `width` cells, with `…` when cut, and padded with spaces to exactly `width`.
@@ -245,8 +264,16 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
     if view.help_open {
         draw_help(frame, main, ctx);
     }
-    draw_confirm(frame, main, view, ctx);
-    ui.confirm_drawn = view.confirm.as_ref().map(|c| c.serial);
+    // A question counts as drawn only if all of it fitted; one that did not (a small pane, a
+    // resize that shrank it) starts its dwell afresh when it does.
+    let whole = draw_confirm(frame, main, view, ctx);
+    ui.confirm_seen = match (&view.confirm, whole) {
+        (Some(c), true) => match ui.confirm_seen {
+            Some((serial, since)) if serial == c.serial => Some((serial, since)),
+            _ => Some((c.serial, ctx.now)),
+        },
+        _ => None,
+    };
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, theme: &Theme) {
@@ -1023,11 +1050,21 @@ fn draw_log(frame: &mut Frame, area: Rect, ui: &mut Ui, ctx: &Context<'_>) {
     frame.render_widget(Paragraph::new(shown), inner);
 }
 
+/// What the box says when the pane cannot show the question.
+const TOO_SMALL: &str = "terminal too small to ask: make it larger";
+
+/// The narrowest box the question is asked in. Narrower, it wraps into a column nobody reads.
+const MIN_CONFIRM_WIDTH: u16 = 28;
+
 /// The question waiting for y or N, in a box of its own: a one-line prompt would cut the very
 /// words that say what `y` does at 40 columns.
-fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'_>) {
+///
+/// Returns whether the whole question, and the line saying what `y` does, fitted. A pane too
+/// small to show it is not asking anything: the box then says so, the question is not counted
+/// as drawn, and no key can answer it.
+fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'_>) -> bool {
     let Some(confirm) = &view.confirm else {
-        return;
+        return false;
     };
     let theme = ctx.theme;
     let width = area.width.min(78);
@@ -1042,6 +1079,21 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
         theme.style(Role::Dim),
     )));
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let whole = width >= MIN_CONFIRM_WIDTH && height <= area.height;
+    let (width, height) = if whole {
+        (width, height)
+    } else {
+        // Not the question: a message, wrapped to what room there is.
+        let cells = usize::from(area.width.saturating_sub(2)).max(1);
+        lines = wrap(TOO_SMALL, cells)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, theme.style(Role::Warning))))
+            .collect();
+        (
+            area.width,
+            u16::try_from(lines.len() + 2).unwrap_or(u16::MAX),
+        )
+    };
     let rect = centred(area, width, height);
     frame.render_widget(Clear, rect);
     let block = Block::bordered()
@@ -1051,6 +1103,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines), inner);
+    whole
 }
 
 /// The package diff overlay (`d`): the selected machine's full list, scrollable.
