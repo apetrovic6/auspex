@@ -614,7 +614,6 @@ async fn a_second_question_is_not_answered_by_the_first_ones_frame() {
 async fn an_answer_right_behind_the_frame_is_discarded_until_the_dwell_has_passed() {
     use std::time::Duration;
 
-    use auspex_tui::ui::QUESTION_DWELL;
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = Keymap::defaults();
