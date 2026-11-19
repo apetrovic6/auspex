@@ -693,9 +693,11 @@ exit 99"#,
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    assert_eq!(stderr.matches("ssh agent approval").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("ssh: connecting to").count(), 1, "{stderr}");
     assert!(
-        stderr.contains("ssh: waiting for ssh agent approval for 2 hosts, one at a time"),
+        stderr.contains(
+            "ssh: connecting to 2 hosts (ssh agent approval may be needed; the agent shows prompts one at a time)"
+        ),
         "{stderr}"
     );
     assert_eq!(
@@ -707,7 +709,51 @@ exit 99"#,
     );
     assert!(
         start.elapsed() < Duration::from_secs(20),
-        "configured 5s approval not used (two hosts, one at a time: about 10 s; the default 60 s would be 120 s)"
+        "configured 5s approval not used (both hosts time out together at about 5 s; the default would be 60 s)"
+    );
+}
+
+/// Review F4: a first host that connects within the note's delay leaves nothing to report, and
+/// a host that needs the agent later in the scan still gets its note, once.
+#[test]
+fn headless_notes_a_later_approval_after_a_quick_first_connection() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let nix = nix_ok(&t, dir.path());
+    let eval = eval_ok(&t, dir.path());
+    // luna (192.0.2.11) connects at once, with no prompt. terra (192.0.2.10) takes a second to
+    // find that it has no master, and then waits for the agent.
+    let ssh = t.script(
+        dir.path(),
+        "ssh-later",
+        r#"for arg; do
+case "$arg" in
+  -O) case "$*" in *192.0.2.10*) @sleep@ 1;; esac
+    exit 1;;
+  true) case "$*" in *192.0.2.11*) exit 0;; esac
+    exec @sleep@ 15;;
+esac
+done
+exit 99"#,
+    );
+    let cfg = config(
+        dir.path(),
+        "[timeouts]\nssh_approval = 5\nprobe = 1\nsettle = 30\n",
+    );
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--plain", "--config"])
+        .arg(cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()));
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let out = run_within(&mut cmd, LIMIT);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert_eq!(stderr.matches("ssh: connecting to").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("ssh: connecting to 1 host (ssh agent approval may be needed)"),
+        "{stderr}"
     );
 }
 

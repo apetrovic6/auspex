@@ -116,13 +116,22 @@ still bounds the whole refresh; the loader warns when it is shorter than approva
 
 **Why approval prompts come one at a time.** An ssh agent that asks before it signs (Bitwarden,
 for one) shows its prompts one after another, and a prompt that is answered after ssh gave up
-is wasted. So auspex connects to cold hosts one at a time, in the order they are ready: the
-next host's `ssh_approval` window starts when the previous host's connection has ended
-(approved, refused, or failed), not when the scan started. Hosts whose master is already up
-are never queued, and a host that is down still fails at SSH's connect timeout and hands the
-turn on. The status bar and the headless note count every host waiting, queued or connecting.
-Because the turns are sequential, a fleet of N cold hosts can take up to N approvals, so
-`settle` has to cover as many as you expect to approve in one go, one by one.
+is wasted. auspex connects to every cold host at once, because most of a connection (the
+network, a down host's timeout) needs no agent, but it serialises the *approval window*: a
+host's `ssh_approval` window ends that long after the later of its own start and the moment the
+most recent connection in this run ended (approved, refused, failed, timed out or cancelled),
+and it is worked out again whenever another connection ends. So each answered prompt gives
+the hosts still waiting a fresh window, and nine prompts answered a few seconds apart all
+land within their windows. A host that is down fails at SSH's connect timeout, in parallel
+with the others, and costs nothing extra; a host that stalls without a prompt holds up nobody
+and only times out on its own window. Hosts whose master is already up are never involved.
+The status bar and the headless note count the hosts connecting, which may or may not be
+waiting for the agent. A fleet of N cold hosts needs `settle` to cover the N prompts, answered
+one by one. Two limits: the window is per auspex process (a TUI and a `--json` run do not see
+each other's connections, so their prompts can interleave at the agent), and auspex assumes that
+killing a waiting ssh (on refresh, quit or timeout) withdraws its request from the agent. If your
+agent keeps showing the prompt of a client that has gone, the next prompt can appear
+behind it.
 
 Masters remain reusable for ten idle minutes by default. Any process running as the
 operator can reuse that authenticated connection; the checked, operator-owned 0700

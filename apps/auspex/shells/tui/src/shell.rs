@@ -175,23 +175,43 @@ impl Shell {
         if waiting {
             self.approvals.fetch_add(1, Ordering::Relaxed);
             if !self.approval_noted.swap(true, Ordering::Relaxed) {
-                // One note for the whole round, naming how many hosts wait. Every host's
-                // phase is counted as it starts to wait, so the count is only the fleet's
-                // after a beat; and an approval that is over in that beat needs no note.
+                // One note for the whole round, naming how many hosts are connecting. Every
+                // host's phase is counted as it starts, so the count is only the fleet's
+                // after a beat; and a connection that is over in that beat needs no note.
                 let shell = Arc::clone(self);
                 self.tasks.spawn(async move {
-                    tokio::select! {
-                        () = shell.root.cancelled() => return,
-                        () = tokio::time::sleep(APPROVAL_NOTE_DELAY) => {}
-                    }
-                    match shell.approvals() {
-                        0 => shell.approval_noted.store(false, Ordering::Relaxed),
-                        1 => shell
-                            .log
-                            .line("ssh: waiting for ssh agent approval for 1 host"),
-                        n => shell.log.line(&format!(
-                            "ssh: waiting for ssh agent approval for {n} hosts, one at a time"
-                        )),
+                    loop {
+                        tokio::select! {
+                            () = shell.root.cancelled() => return,
+                            () = tokio::time::sleep(APPROVAL_NOTE_DELAY) => {}
+                        }
+                        match shell.approvals() {
+                            0 => {
+                                // Nothing to say, and the next round may need a note. A phase
+                                // that began between the count and this store saw the flag
+                                // still set and spawned no task, so look again: if one is
+                                // there and nobody else has taken the note, it is ours.
+                                shell.approval_noted.store(false, Ordering::Relaxed);
+                                if shell.approvals() == 0
+                                    || shell.approval_noted.swap(true, Ordering::Relaxed)
+                                {
+                                    return;
+                                }
+                            }
+                            1 => {
+                                shell.log.line(
+                                    "ssh: connecting to 1 host (ssh agent approval may be needed)",
+                                );
+                                return;
+                            }
+                            n => {
+                                shell.log.line(&format!(
+                                    "ssh: connecting to {n} hosts (ssh agent approval may be \
+                                     needed; the agent shows prompts one at a time)"
+                                ));
+                                return;
+                            }
+                        }
                     }
                 });
             }

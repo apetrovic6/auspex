@@ -24,12 +24,12 @@ use auspex_domain::fleet::{
     ConnectTimeout, MachineClass, PROBE_REMOTE_COMMAND, SshOptions, Target, ssh_args,
 };
 use auspex_domain::observe::{ProbeExit, ProbeOutcome, parse_probe, probe_script};
-use tokio::sync::Semaphore;
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::Cancelled;
-use crate::process::{End, Limits, OnExit, command, describe_status, run, spawn_error};
+use crate::process::{End, Limits, OnExit, Ran, command, describe_status, run, spawn_error};
 use crate::text::lossy;
 
 /// The default ssh program: `ssh`, looked up on `PATH`.
@@ -183,9 +183,10 @@ pub struct ProbeParams<'a> {
     pub connect_timeout: ConnectTimeout,
     /// How long an idle master remains available, in seconds.
     pub control_persist: u64,
-    /// The separate connect/authentication allowance, per connect phase and counted from the
-    /// moment the phase starts running, not from when it was queued behind another host's
-    /// (see `connect`: the agent shows its prompts one at a time).
+    /// The separate connect/authentication allowance, per connect phase: it ends this long after
+    /// the later of the phase's start and the moment the most recent phase in the control
+    /// directory ended, so a one-at-a-time agent gives each waiting phase a fresh window as
+    /// the earlier prompts are answered (see `ConnectWindow`).
     pub approval_deadline: Duration,
     /// Shell-side phase signal: true on entry, false on every exit, including drop.
     pub on_approval: Option<&'a (dyn Fn(bool) + Sync)>,
@@ -225,13 +226,20 @@ pub fn probe_argv(target: &Target, params: &ProbeParams<'_>) -> Result<Vec<Strin
     Ok(args)
 }
 
-struct ApprovalGuard<'a>(Option<&'a (dyn Fn(bool) + Sync)>);
+/// A running connect phase: counted while it runs, and on the way out (return, cancel or
+/// drop alike) it stops counting and tells the phases still waiting that one has ended
+/// ([`ConnectWindow`]).
+struct PhaseGuard<'a> {
+    signal: Option<&'a (dyn Fn(bool) + Sync)>,
+    window: Arc<ConnectWindow>,
+}
 
-impl Drop for ApprovalGuard<'_> {
+impl Drop for PhaseGuard<'_> {
     fn drop(&mut self) {
-        if let Some(signal) = self.0 {
+        if let Some(signal) = self.signal {
             signal(false);
         }
+        self.window.ended.send_replace(Some(Instant::now()));
     }
 }
 
@@ -242,6 +250,15 @@ impl Drop for ApprovalGuard<'_> {
 // not part of the key, because `%C` ignores them. The directory is, so that separately
 // prepared handles for the same directory still share a flight. Coordination is process-wide
 // for the same reason. Entries exist only while calls hold the flight.
+//
+// The key is built from the target as auspex has it, and does not read `~/.ssh/config`, which
+// ssh applies before it expands `%C`: a `Port`, `User` or `HostName` there changes the socket
+// without changing the key. Two spellings of one socket then make two flights, which is
+// harmless (the second finds the first's master, so no second prompt). One key for two sockets
+// is possible too: `Port 2222` in the config for `h`, with fleet targets `root@h` and
+// `root@h:22`. Then the second target's probe finds no master of its own and authenticates
+// by itself under `timeouts.probe`, which costs at most one extra prompt. Exact keying would
+// need `ssh -G` (one more process per cold host) and was not worth that.
 #[derive(PartialEq, Eq, Hash)]
 struct ControlKey {
     directory: String,
@@ -310,31 +327,78 @@ fn connection_flight(target: &Target, control_dir: &ControlDir) -> Arc<Connectio
     flight
 }
 
-/// The one connect phase allowed to run at a time, per control directory.
+/// When the last connect phase in a control directory ended, and who is told.
 ///
-/// A connect phase is the step that may need the agent's approval, and an agent such as
-/// Bitwarden shows its prompts one at a time. Started all at once, each phase's window
-/// (`approval_deadline`) ran from its own start, so later prompts appeared with their window
-/// nearly gone, were answered too late, and the answer was thrown away with the killed ssh.
-/// Behind this slot a phase starts when the previous one has finished, and its window starts
-/// then. tokio's semaphore queues its waiters first in, first out.
+/// **What is serialised is the approval window, not the phases.** A connect phase is the step
+/// that may need the agent's approval, and an agent such as Bitwarden shows its prompts one at
+/// a time. Every phase used to start at once with a window (`approval_deadline`) of its own
+/// from its own start, so later prompts appeared with their window nearly gone, were answered
+/// too late, and the answer was thrown away with the killed ssh. Now a phase's window ends
+/// `approval_deadline` after the later of its own start and the moment the most recent phase
+/// in the directory ended (approved, refused, failed, timed out or cancelled), and it is
+/// worked out again whenever another phase ends. Each finished approval therefore gives the
+/// ones still waiting a fresh window, which is what a one-at-a-time agent needs.
 ///
-/// Per control directory rather than one static: the agent is the shared resource, and
-/// auspex prepares one control directory per run, so in the program this is process-wide.
-/// Tests give every case a directory of its own, and a global slot would make their timing
-/// assertions depend on which other test happens to hold an "approval".
-static CONNECT_SLOTS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
+/// The phases themselves run concurrently. A first version held one slot through the whole
+/// phase, and that serialised work that needs no agent (the TCP connect, a down host's
+/// `ConnectTimeout`, a stalled authentication): down or stalled hosts delayed every cold host
+/// behind them, and in the same order on every refresh. Now a down host fails at
+/// `ConnectTimeout` in parallel, and a stalled host blocks nobody: it only times out on its
+/// own window. The agent keeps its own queue of prompts.
+///
+/// Nothing here makes a phase wait past `timeouts.settle`: the core's deadline cancels it.
+///
+/// Per control directory rather than one static: the agent is the shared resource, and auspex
+/// prepares one control directory per run, so in the program this is process-wide. Tests give
+/// every case a directory of its own, and a global one would make their timing assertions
+/// depend on which other test happens to have a phase ending. The window is per process: two
+/// auspex processes (a TUI and a `--json` run) do not see each other's phases.
+struct ConnectWindow {
+    ended: watch::Sender<Option<Instant>>,
+}
+
+static CONNECT_WINDOWS: LazyLock<Mutex<HashMap<String, Arc<ConnectWindow>>>> =
     LazyLock::new(Mutex::default);
 
-fn connect_slot(control_dir: &ControlDir) -> Arc<Semaphore> {
+fn connect_window(control_dir: &ControlDir) -> Arc<ConnectWindow> {
     // Never removed: bounded by the number of control directories, which is one.
     Arc::clone(
-        CONNECT_SLOTS
+        CONNECT_WINDOWS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(control_dir.as_str().to_owned())
-            .or_insert_with(|| Arc::new(Semaphore::new(1))),
+            .or_insert_with(|| {
+                Arc::new(ConnectWindow {
+                    ended: watch::channel(None).0,
+                })
+            }),
     )
+}
+
+/// Resolves, with `true`, when a connect phase that started at `start` has used up its window;
+/// with `false`, when `done` is cancelled first. Its deadline moves later each time another
+/// phase in the directory ends.
+async fn window_expired(
+    window: &ConnectWindow,
+    start: Instant,
+    approval_deadline: Duration,
+    done: &CancellationToken,
+) -> bool {
+    let mut ended = window.ended.subscribe();
+    loop {
+        let last_end = *ended.borrow_and_update();
+        let from = match last_end {
+            Some(at) if at > start => at,
+            _ => start,
+        };
+        tokio::select! {
+            biased;
+            () = done.cancelled() => return false,
+            // Another phase ended: work the deadline out again.
+            _ = ended.changed() => {}
+            () = tokio::time::sleep_until(from + approval_deadline) => return true,
+        }
+    }
 }
 
 fn approval_timeout() -> ProbeOutcome {
@@ -352,12 +416,12 @@ fn approval_timeout() -> ProbeOutcome {
 /// for the check, by `approval_deadline` for the connect phase, plus the kill), and so is the
 /// whole refresh, by `timeouts.settle`, which cancels. A timer on the wait cut off waiters
 /// whose holder went on to succeed. When the holder fails, each waiter runs a connect phase
-/// of its own (in the queue), because the failure may be the holder's own.
+/// of its own, because the failure may be the holder's own.
 ///
 /// # Errors
 ///
-/// [`Cancelled`] when `cancel` fired, whether waiting for the socket's turn, for the agent's,
-/// or while ssh ran; what ssh started has been killed and reaped, and the next caller finds
+/// [`Cancelled`] when `cancel` fired, whether waiting for the socket's turn or while ssh ran;
+/// what ssh started has been killed and reaped, and the next caller finds
 /// the flight [`ConnectionState::Pending`].
 pub(crate) async fn connect(
     target: &Target,
@@ -402,27 +466,18 @@ async fn connect_once(
                 }));
             }
         };
-        // The connect phase is the one that may need the agent, so it takes the control
-        // directory's turn ([`CONNECT_SLOTS`]). The check needs no approval and never waits,
-        // so a machine whose master is already up is not delayed by the queue. The phase
-        // counts as waiting from here, queued or running, and stops counting when the guard
-        // drops: on return, on cancel and on drop.
-        let (_approval, _turn) = if operation == SshOperation::Connect {
+        // The connect phase is the one that may need the agent: it counts as waiting while it
+        // runs, and its end moves the other phases' windows ([`ConnectWindow`]). The check
+        // needs no approval and is not counted.
+        let _phase = (operation == SshOperation::Connect).then(|| {
             if let Some(signal) = params.on_approval {
                 signal(true);
             }
-            let approval = ApprovalGuard(params.on_approval);
-            let turn = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(Cancelled),
-                turn = connect_slot(params.control_dir).acquire_owned() => {
-                    turn.expect("the connect slot is never closed")
-                }
-            };
-            (Some(approval), Some(turn))
-        } else {
-            (None, None)
-        };
+            PhaseGuard {
+                signal: params.on_approval,
+                window: connect_window(params.control_dir),
+            }
+        });
         let mut cmd = match command(params.ssh_program) {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -437,33 +492,25 @@ async fn connect_once(
         // `auto` recovers stale sockets and lets cross-process race losers run `true`
         // and exit. Only ssh's own ControlPersist path detaches a reusable master;
         // unlike -N -f, there is no socketless, unbounded background fallback.
-        // The window starts here: for the connect phase, when it holds the turn, not when it
-        // was queued.
-        let allowance = if operation == SshOperation::Check {
-            Duration::from_secs(params.connect_timeout.seconds())
-        } else {
-            params.approval_deadline
+        let limits = Limits {
+            stdout: STDOUT_CAP,
+            stderr: STDERR_CAP,
+            memory: None,
         };
-        // `LeaveGroup`, not `KillGroup`: with `ControlPersist` ssh forks the master, and a
-        // `ProxyJump` or `ProxyCommand` hop from `~/.ssh/config` (forked by this leader
-        // before authentication, so in its group) carries that master's transport after the
-        // leader has exited. Killing the group then would kill the hop, the master would
-        // lose its connection, and every refresh would prompt again for every machine
-        // behind a jump host. A cancel or a timeout still kills the group.
-        let ran = match run(
-            cmd,
-            None,
-            OnExit::LeaveGroup,
-            Limits {
-                stdout: STDOUT_CAP,
-                stderr: STDERR_CAP,
-                memory: None,
-            },
-            Instant::now() + allowance,
-            cancel,
-        )
-        .await
-        {
+        let ran = if operation == SshOperation::Check {
+            run(
+                cmd,
+                None,
+                OnExit::LeaveGroup,
+                limits,
+                Instant::now() + Duration::from_secs(params.connect_timeout.seconds()),
+                cancel,
+            )
+            .await
+        } else {
+            run_connect(cmd, limits, params, cancel).await
+        };
+        let ran = match ran {
             Ok(ran) => ran,
             Err(e) => {
                 return Ok(Some(ProbeOutcome::Unreachable {
@@ -489,6 +536,53 @@ async fn connect_once(
         }
     }
     Ok(None)
+}
+
+/// Runs the connect phase's ssh under its approval window ([`ConnectWindow`]).
+///
+/// [`run`] takes a fixed deadline, and this one moves: another phase ending gives this one a
+/// fresh window. So `run` gets a deadline it never reaches and a token of its own, and
+/// [`window_expired`] cancels that token when the window is used up. `run` then kills and
+/// reaps the group exactly as it does for a timeout, and the result is reported as one
+/// ([`End::TimedOut`]). The caller's own cancel stays a cancel.
+///
+/// `LeaveGroup`, not `KillGroup`: with `ControlPersist` ssh forks the master, and a
+/// `ProxyJump` or `ProxyCommand` hop from `~/.ssh/config` (forked by this leader before
+/// authentication, so in its group) carries that master's transport after the leader has
+/// exited. Killing the group then would kill the hop, the master would lose its connection,
+/// and every refresh would prompt again for every machine behind a jump host. A cancel or a
+/// timeout still kills the group.
+async fn run_connect(
+    cmd: tokio::process::Command,
+    limits: Limits,
+    params: &ProbeParams<'_>,
+    cancel: &CancellationToken,
+) -> io::Result<Ran> {
+    /// Past any phase: the real bound is the window.
+    const NEVER: Duration = Duration::from_secs(24 * 60 * 60);
+    let start = Instant::now();
+    let window = connect_window(params.control_dir);
+    let local = cancel.child_token();
+    let done = CancellationToken::new();
+    let (ran, expired) = tokio::join!(
+        async {
+            let ran = run(cmd, None, OnExit::LeaveGroup, limits, start + NEVER, &local).await;
+            done.cancel();
+            ran
+        },
+        async {
+            let expired = window_expired(&window, start, params.approval_deadline, &done).await;
+            if expired {
+                local.cancel();
+            }
+            expired
+        },
+    );
+    let mut ran = ran?;
+    if expired && matches!(ran.end, End::Cancelled) && !cancel.is_cancelled() {
+        ran.end = End::TimedOut;
+    }
+    Ok(ran)
 }
 
 /// Probes one machine. Serves the core's `Effect::Probe`.

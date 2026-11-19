@@ -1001,9 +1001,10 @@ async fn join_all<T>(
 /// first. A destination's master appears when its connection was approved, and is shared by
 /// every phase that names the destination.
 ///
-/// `@dir@/starts` gets one line per connection attempt (when ssh started, not when it was
-/// approved), `@dir@/approved` one per approval, `@dir@/overlap` a line if two connections
-/// were ever running at once.
+/// `@dir@/events` gets "start <dest>" when a connection attempt starts (not when it is
+/// approved) and "approved <dest>" when it is. `@dir@/overlap` gets a line if a second
+/// prompt ever showed while one was showing: the agent's own invariant, checked with a
+/// `running` marker made with `mkdir`, so the fake cannot quietly stop being one-at-a-time.
 fn serial_agent(t: &common::Tools, dir: &Path, delay: &str) -> std::path::PathBuf {
     t.script(
         dir,
@@ -1022,17 +1023,18 @@ esac
 case "$mode" in
   check) [ -f "@dir@/master-$dest" ]; exit $?;;
   connect)
-    echo "$dest" >> '@dir@/starts'
+    echo "start $dest" >> '@dir@/events'
     # The agent: one prompt at a time.
     n=0
     until mkdir '@dir@/agent' 2>/dev/null; do
       n=$((n + 1)); [ $n -gt 600 ] && exit 98
       @sleep@ 0.05
     done
-    echo "$dest" >> '@dir@/prompted'
+    mkdir '@dir@/running' 2>/dev/null || echo "$dest" >> '@dir@/overlap'
     @sleep@ {delay}
     : > "@dir@/master-$dest"
-    echo "$dest" >> '@dir@/approved'
+    echo "approved $dest" >> '@dir@/events'
+    rmdir '@dir@/running'
     rmdir '@dir@/agent'
     exit 0;;
 esac
@@ -1078,8 +1080,20 @@ async fn nine_hosts_behind_a_one_at_a_time_agent_all_connect_within_their_own_wi
         "{} of 9 failed: {failed:?}",
         failed.len()
     );
-    // One at a time: nine 2 s approvals back to back.
+    // One at a time at the agent: nine 2 s approvals back to back.
     assert!(elapsed >= Duration::from_secs(18), "{elapsed:?}");
+    assert!(
+        !dir.path().join("overlap").exists(),
+        "the fake agent showed two prompts at once"
+    );
+    // What is serialised is the window, not the phases: all nine connections were under way
+    // before the first approval.
+    let events = read_lines(&dir.path().join("events"));
+    let first_approval = events
+        .iter()
+        .position(|e| e.starts_with("approved"))
+        .unwrap();
+    assert_eq!(first_approval, 9, "{events:?}");
 }
 
 /// Blocks until `path` has `lines` lines (a fake's progress file), without holding up the
@@ -1116,7 +1130,8 @@ fn read_lines(path: &Path) -> Vec<String> {
 /// An ssh whose connect phase waits for a release file (`release-<destination>` or
 /// `release`), so a test decides when an approval happens. `starts` gets a line when a
 /// connect phase starts running. A destination containing `down` fails like an unreachable
-/// host after one second (its `ConnectTimeout`). A destination's master is the file
+/// host after one second (its `ConnectTimeout`), and one containing `stall` hangs without
+/// a prompt until its own `release-<destination>` file appears. A destination's master is the file
 /// `master-<destination>`, so a test can start with a warm one.
 fn gated_agent(t: &common::Tools, dir: &Path) -> std::path::PathBuf {
     t.script(
@@ -1141,6 +1156,15 @@ case "$mode" in
       *down*) @sleep@ 1
         echo "ssh: connect to host $dest port 22: Connection timed out" >&2
         exit 255;;
+      # Hangs in authentication without a prompt: only its own release file ends it.
+      *stall*)
+        n=0
+        while [ ! -f "@dir@/release-$dest" ]; do
+          n=$((n + 1)); [ $n -gt 1000 ] && exit 99
+          @sleep@ 0.02
+        done
+        : > "@dir@/master-$dest"
+        exit 0;;
     esac
     # Bounded, so a failed test leaves no process behind.
     n=0
@@ -1160,14 +1184,14 @@ printf '{}'"#,
 }
 
 #[tokio::test]
-async fn a_queued_phase_is_counted_and_cancelled_without_ever_starting() {
+async fn phases_run_together_are_counted_and_a_cancel_ends_only_its_own() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
     let program = gated_agent(&t, dir.path());
     let cd = control(dir.path());
-    // The note's count: phases waiting, queued and running alike.
+    // The note's count: connect phases running.
     let count = AtomicUsize::new(0);
     let signal = |waiting| {
         if waiting {
@@ -1195,9 +1219,8 @@ async fn a_queued_phase_is_counted_and_cancelled_without_ever_starting() {
                 .collect(),
         ),
         async {
-            // One phase runs; the other two are queued behind it. Which one runs depends
-            // on whose check finished first.
-            let running = wait_for_lines(&starts, 1).await.remove(0);
+            // All three phases run at once: none waits for another to be done.
+            wait_for_lines(&starts, 3).await;
             let t0 = Instant::now();
             while count.load(Ordering::SeqCst) != 3 {
                 assert!(
@@ -1206,42 +1229,29 @@ async fn a_queued_phase_is_counted_and_cancelled_without_ever_starting() {
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            // A refresh cancels a queued phase: it ends at once, and its host is never
-            // connected to.
-            let queued = names.iter().position(|n| *n != running).unwrap();
-            tokens[queued].cancel();
+            // A refresh cancels one of them: it ends at once and stops counting, and the
+            // others carry on.
+            tokens[1].cancel();
             let t0 = Instant::now();
             while count.load(Ordering::SeqCst) != 2 {
                 assert!(
                     t0.elapsed() < Duration::from_secs(2),
-                    "a cancelled queued phase still counts"
+                    "a cancelled phase still counts"
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            assert_eq!(
-                read_lines(&starts),
-                std::slice::from_ref(&running),
-                "a cancelled phase started"
-            );
             fs::write(dir.path().join("release"), "").unwrap();
-            fs::write(dir.path().join("cancelled"), names[queued]).unwrap();
         },
     );
-    let cancelled = fs::read_to_string(dir.path().join("cancelled")).unwrap();
-    for (name, result) in names.iter().zip(results) {
-        if *name == cancelled {
-            assert_eq!(result, Err(Cancelled), "{name}");
-        } else {
-            assert!(
-                matches!(result, Ok(ProbeOutcome::Observed(_))),
-                "{name}: {result:?}"
-            );
-        }
-    }
-    let started = read_lines(&starts);
-    assert_eq!(started.len(), 2, "{started:?}");
-    assert!(!started.contains(&cancelled), "{started:?}");
+    assert!(
+        matches!(results[0], Ok(ProbeOutcome::Observed(_))),
+        "{results:?}"
+    );
+    assert_eq!(results[1], Err(Cancelled));
+    assert!(
+        matches!(results[2], Ok(ProbeOutcome::Observed(_))),
+        "{results:?}"
+    );
     assert_eq!(count.load(Ordering::SeqCst), 0);
 }
 
@@ -1279,8 +1289,12 @@ async fn a_check_with_a_live_master_is_not_queued_behind_a_slow_approval() {
     assert_eq!(read_lines(&dir.path().join("starts")), ["root@slow"]);
 }
 
+// AUS-37 fix round 1 (review F1). The first version held one slot through the whole connect
+// phase, which serialised work that needs no agent: down and stalled hosts delayed every cold
+// host behind them, in the same order on every refresh.
+
 #[tokio::test]
-async fn a_down_host_frees_the_slot_when_its_connect_timeout_ends() {
+async fn a_cold_host_is_not_held_up_by_stalled_hosts() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
     let program = gated_agent(&t, dir.path());
@@ -1288,37 +1302,199 @@ async fn a_down_host_frees_the_slot_when_its_connect_timeout_ends() {
     let cd = control(dir.path());
     let mut params = ProbeParams::new(&cd);
     params.ssh_program = program.as_os_str();
-    // Far longer than the test: the slot must be freed by the failure, not by this.
-    params.approval_deadline = Duration::from_secs(60);
-    params.connect_timeout = ConnectTimeout::new(1).unwrap();
-    let down = Target::parse("root@down").unwrap();
-    let up = Target::parse("root@up").unwrap();
+    params.approval_deadline = Duration::from_secs(3);
+    // Two hosts that hang in authentication without ever prompting, then a cold host whose
+    // key needs no approval.
+    let targets: Vec<Target> = ["root@stall1", "root@stall2", "root@up"]
+        .iter()
+        .map(|s| Target::parse(s).unwrap())
+        .collect();
     let cancel = CancellationToken::new();
     let start = Instant::now();
-    let (down_result, up_result) =
-        tokio::join!(probe(&down, MachineClass::Nixos, &params, &cancel), async {
-            // The down host holds the slot first.
-            wait_for_lines(&dir.path().join("starts"), 1).await;
-            probe(&up, MachineClass::Nixos, &params, &cancel).await
-        },);
+    let results = join_all(
+        targets
+            .iter()
+            .map(|target| {
+                Box::pin(async {
+                    let result = probe(target, MachineClass::Nixos, &params, &cancel).await;
+                    (result, start.elapsed())
+                }) as std::pin::Pin<Box<_>>
+            })
+            .collect(),
+    )
+    .await;
+    let (up, waited) = &results[2];
+    assert!(matches!(up, Ok(ProbeOutcome::Observed(_))), "{up:?}");
     assert!(
-        start.elapsed() < Duration::from_secs(8),
-        "{:?}",
+        *waited < Duration::from_millis(1500),
+        "a cold host waited {waited:?} behind two stalled ones"
+    );
+    // The stalled hosts only time out on their own windows, in parallel.
+    for (result, at) in &results[..2] {
+        assert!(
+            matches!(result, Ok(ProbeOutcome::Unreachable { reason }) if reason.contains("timed out")),
+            "{result:?}"
+        );
+        assert!(
+            *at >= Duration::from_secs(3) && *at < Duration::from_millis(4500),
+            "{at:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cold_host_is_not_held_up_by_down_hosts() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = gated_agent(&t, dir.path());
+    fs::write(dir.path().join("release"), "").unwrap();
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    params.connect_timeout = ConnectTimeout::new(1).unwrap();
+    let names = [
+        "root@down1",
+        "root@down2",
+        "root@down3",
+        "root@down4",
+        "root@down5",
+        "root@up",
+    ];
+    let targets: Vec<Target> = names.iter().map(|s| Target::parse(s).unwrap()).collect();
+    let cancel = CancellationToken::new();
+    let start = Instant::now();
+    let results = join_all(
+        targets
+            .iter()
+            .map(|target| {
+                Box::pin(probe(target, MachineClass::Nixos, &params, &cancel))
+                    as std::pin::Pin<Box<_>>
+            })
+            .collect(),
+    )
+    .await;
+    // Five 1 s timeouts in parallel, not back to back.
+    assert!(
+        start.elapsed() < Duration::from_millis(2500),
+        "five down hosts took {:?}",
         start.elapsed()
     );
-    assert_eq!(
-        down_result,
-        Ok(ProbeOutcome::Unreachable {
-            reason: "ssh: connect to host root@down port 22: Connection timed out".to_owned()
-        })
+    assert!(
+        matches!(results[5], Ok(ProbeOutcome::Observed(_))),
+        "{results:?}"
+    );
+    for result in &results[..5] {
+        assert!(
+            matches!(result, Ok(ProbeOutcome::Unreachable { .. })),
+            "{result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stalled_host_alone_times_out_after_its_own_window() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = gated_agent(&t, dir.path());
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    params.approval_deadline = Duration::from_secs(2);
+    let start = Instant::now();
+    let result = probe(
+        &Target::parse("root@stall").unwrap(),
+        MachineClass::Nixos,
+        &params,
+        &CancellationToken::new(),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(&result, Ok(ProbeOutcome::Unreachable { reason }) if reason.contains("timed out")),
+        "{result:?}"
     );
     assert!(
-        matches!(up_result, Ok(ProbeOutcome::Observed(_))),
-        "{up_result:?}"
+        elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4),
+        "{elapsed:?}"
     );
-    assert_eq!(
-        read_lines(&dir.path().join("starts")),
-        ["root@down", "root@up"]
+}
+
+#[tokio::test]
+async fn an_ending_phase_gives_the_waiting_ones_a_fresh_window() {
+    // `slow` is approved after 2.5 s; `stall` is never approved. Its 3 s window is worked out
+    // again when `slow`'s phase ends, so it runs to about 2.5 + 3 s, not 3 s.
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = gated_agent(&t, dir.path());
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    params.approval_deadline = Duration::from_secs(3);
+    let slow = Target::parse("root@slow").unwrap();
+    let stall = Target::parse("root@stall").unwrap();
+    let cancel = CancellationToken::new();
+    let start = Instant::now();
+    let ((slow_result, stall_result, stalled_for), ()) = tokio::join!(
+        async {
+            let (a, b) = tokio::join!(probe(&slow, MachineClass::Nixos, &params, &cancel), async {
+                let r = probe(&stall, MachineClass::Nixos, &params, &cancel).await;
+                (r, start.elapsed())
+            },);
+            (a, b.0, b.1)
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            fs::write(dir.path().join("release-root@slow"), "").unwrap();
+        },
+    );
+    assert!(
+        matches!(slow_result, Ok(ProbeOutcome::Observed(_))),
+        "{slow_result:?}"
+    );
+    assert!(
+        matches!(&stall_result, Ok(ProbeOutcome::Unreachable { reason }) if reason.contains("timed out")),
+        "{stall_result:?}"
+    );
+    assert!(
+        stalled_for >= Duration::from_millis(5300) && stalled_for < Duration::from_secs(7),
+        "the window was not moved by the phase that ended: {stalled_for:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_phase_that_starts_long_after_an_earlier_one_ended_gets_its_full_window() {
+    // The window is `approval_deadline` after the *later* of the phase's start and the last
+    // end. An end that is older than the start must not shorten it.
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = gated_agent(&t, dir.path());
+    fs::write(dir.path().join("release-root@first"), "").unwrap();
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    params.approval_deadline = Duration::from_secs(2);
+    let cancel = CancellationToken::new();
+    let first = probe(
+        &Target::parse("root@first").unwrap(),
+        MachineClass::Nixos,
+        &params,
+        &cancel,
+    )
+    .await;
+    assert!(matches!(first, Ok(ProbeOutcome::Observed(_))), "{first:?}");
+    // Longer than a window: the first phase's end is now older than the next one's whole window.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let second_target = Target::parse("root@second").unwrap();
+    let (second, ()) = tokio::join!(
+        probe(&second_target, MachineClass::Nixos, &params, &cancel),
+        async {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            fs::write(dir.path().join("release-root@second"), "").unwrap();
+        },
+    );
+    assert!(
+        matches!(second, Ok(ProbeOutcome::Observed(_))),
+        "an approval 1 s into a 2 s window was cut off: {second:?}"
     );
 }
 
