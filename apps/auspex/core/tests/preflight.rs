@@ -18,7 +18,7 @@ use auspex_core::effects::{ActionRequest, EvalAnswer};
 use auspex_core::{Config, ConfirmKind, ConfirmView, Event, Mode, PreflightAnswer};
 use auspex_domain::preflight::{TreeState, Upstream};
 use crux_core::Request;
-use support::{Shell, clean_preflight, evaluated, inventory, observed, path};
+use support::{Shell, clean_preflight, evaluated, inventory, observed, path, sized};
 
 const GIB_KIB: u64 = 1 << 20;
 
@@ -123,7 +123,7 @@ fn tracking(ahead: u64) -> Upstream {
 
 fn closure(gib: u64) -> PreflightAnswer {
     PreflightAnswer {
-        closure_bytes: Ok(gib << 30),
+        closure: sized(gib << 30),
         ..clean_preflight()
     }
 }
@@ -384,7 +384,7 @@ fn unknown_disk_inputs_are_warnings() {
     let confirm = dialog(
         &mut s,
         PreflightAnswer {
-            closure_bytes: Err("closure size query timed out after 90s".to_owned()),
+            closure: Err("closure size query timed out after 90s".to_owned()),
             ..clean_preflight()
         },
     );
@@ -576,7 +576,7 @@ fn the_dialog_carries_refusals_and_warnings_together_with_no_way_to_proceed() {
     let confirm = dialog(
         &mut s,
         PreflightAnswer {
-            closure_bytes: Ok(4 << 30),
+            closure: sized(4 << 30),
             ..tree(2, tracking(1))
         },
     );
@@ -1210,4 +1210,153 @@ fn backspace_clears_the_mismatch_line() {
     assert!(s.view().confirm.unwrap().typed.unwrap().mismatch);
     s.send(Event::ConfirmBackspace);
     assert!(!s.view().confirm.unwrap().typed.unwrap().mismatch);
+}
+
+// ---------------------------------------------------------------------------------------
+// Finding 4: the disk check counts what the machine does not have yet
+// ---------------------------------------------------------------------------------------
+
+fn store_path(c: char, name: &str) -> auspex_domain::observe::StorePath {
+    auspex_domain::observe::StorePath::new(path(c, name)).unwrap()
+}
+
+/// luna runs `now` and evaluates to `next`; its store has `free_gib` free. With the package
+/// preview on, its own closure (`now`, zlib, a huge library) and the pending one (`next`, zlib,
+/// a small tool) come back from the preview; without it, only the checks' own answer is there.
+fn luna_with_a_preview(preview: bool, free_gib: u64) -> Shell {
+    let config = Config {
+        flake: "/fleet".to_owned(),
+        allow_act: true,
+        local_system: "x86_64-linux".to_owned(),
+        preflight_timeout_seconds: 90,
+        binary_cache: preview,
+        diff: preview.then_some(auspex_core::DiffConfig {
+            timeout_seconds: 90,
+        }),
+        ..Config::default()
+    };
+    let now = path('0', "nixos-system-now");
+    let mut s = Shell::new();
+    s.start_with(config, FLEET);
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        let out = if m == "luna" {
+            path('1', "nixos-system-next")
+        } else {
+            new(m)
+        };
+        s.eval_item(&mut eval, m, evaluated(m, &out));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    for m in ["luna", "sol", "terra"] {
+        let extra = format!(
+            "store_disk_kb={} {} {}\n",
+            1000 * GIB_KIB,
+            (1000 - free_gib) * GIB_KIB,
+            free_gib * GIB_KIB
+        );
+        s.probe(m, observed(&now, &extra));
+    }
+    if preview {
+        let mut cache = s.take_cache("luna");
+        s.resolve(&mut cache, auspex_domain::status::NarCache::Cached);
+        let mut deployed = s.take_deployed("luna");
+        s.resolve(
+            &mut deployed,
+            Ok(auspex_domain::closure::ClosurePaths {
+                paths: vec![
+                    store_path('0', "nixos-system-now"),
+                    store_path('c', "zlib-1.3.1"),
+                    store_path('g', "huge-library-1.0"),
+                ],
+                dropped: 0,
+            }),
+        );
+    }
+    s.send(Event::ToggleAct);
+    s.send(Event::ConfirmAnswer(true));
+    s
+}
+
+/// What the checks sized: the system, zlib and the huge library (both of which luna has), and
+/// a small new tool.
+fn sized_closure() -> PreflightAnswer {
+    PreflightAnswer {
+        closure: Ok(vec![
+            (store_path('1', "nixos-system-next"), 100 << 20),
+            (store_path('c', "zlib-1.3.1"), 1 << 30),
+            (store_path('g', "huge-library-1.0"), 5 << 30),
+            (store_path('f', "small-tool-1.0"), 50 << 20),
+        ]),
+        ..clean_preflight()
+    }
+}
+
+#[test]
+fn with_the_machines_own_closure_known_only_the_paths_it_lacks_are_counted() {
+    // 6.15 GiB closure in all, 150 MiB of it new; the store has 3 GiB free.
+    let mut s = luna_with_a_preview(true, 3);
+    let confirm = dialog(&mut s, sized_closure());
+    assert_eq!(confirm.kind, ConfirmKind::Update, "{:?}", confirm.refusals);
+    assert_eq!(confirm.refusals, Vec::<String>::new());
+    let _ = proceeds(&mut s);
+}
+
+#[test]
+fn without_it_the_whole_closure_is_counted_and_the_dialog_says_so() {
+    let mut s = luna_with_a_preview(false, 3);
+    let confirm = dialog(&mut s, sized_closure());
+    assert_eq!(confirm.kind, ConfirmKind::Refused);
+    assert!(
+        confirm.refusals[0].contains("the whole closure's 6.1 GiB")
+            && confirm.refusals[0]
+                .contains("which of its paths the machine has already is not known"),
+        "{:?}",
+        confirm.refusals
+    );
+}
+
+#[test]
+fn the_refusal_names_the_paths_it_counted_when_what_is_new_is_still_too_big() {
+    // The machine has the huge library, but the new part (150 MiB) does not fit in 1 GiB free
+    // once the 1 GiB margin is added.
+    let mut s = luna_with_a_preview(true, 1);
+    let confirm = dialog(&mut s, sized_closure());
+    assert_eq!(confirm.kind, ConfirmKind::Refused);
+    assert!(
+        confirm.refusals[0]
+            .contains("the 150.0 MiB of the 2 of the closure's 4 paths it does not have yet"),
+        "{:?}",
+        confirm.refusals
+    );
+}
+
+#[test]
+fn a_refresh_forgets_the_machines_closure_until_the_preview_fetches_it_again() {
+    let mut s = luna_with_a_preview(true, 3);
+    s.send(Event::ConfirmAnswer(false));
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        let out = if m == "luna" {
+            path('1', "nixos-system-next")
+        } else {
+            new(m)
+        };
+        s.eval_item(&mut eval, m, evaluated(m, &out));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    for m in ["luna", "sol", "terra"] {
+        s.probe(m, probe_with_store(m, Some(3)));
+    }
+    // No preview answer yet: the whole closure again, and so a refusal at 3 GiB.
+    let confirm = dialog(&mut s, sized_closure());
+    assert_eq!(confirm.kind, ConfirmKind::Refused);
+    assert!(
+        confirm.refusals[0].contains("the whole closure's"),
+        "{:?}",
+        confirm.refusals
+    );
 }

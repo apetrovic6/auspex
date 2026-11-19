@@ -74,13 +74,15 @@ cancels the look.
 | Check | Refuses | Warns |
 |---|---|---|
 | **The fleet repository** (`git status` in the fleet directory, read-only: no hooks, no filters, no index rewrite) | never | uncommitted changes to tracked files (untracked files do not count: nix ignores them); `HEAD` ahead of its upstream; no upstream (or a deleted one, or a detached `HEAD`); the check could not run |
-| **Free disk on the target's `/nix/store`** (the probe's `df -Pk /nix/store`, not `/`: with impermanence `/` is a tmpfs) | free is less than the pending closure's size plus 1 GiB | the free space or the closure's size is not known (the size is the sum of NAR sizes from `nix path-info --recursive --size`, against the local store first and then the binary cache) |
-| **Duplicate address** (the shared-IP lint) | the machine's target resolves to an address another machine's does too (the dialog names which), **or its address is not known** (the rule fails closed: a hostname that did not resolve cannot be told apart from another machine) | other machines' addresses are not known |
+| **Free disk on the target's `/nix/store`** (the probe's `df -Pk /nix/store`, not `/`: with impermanence `/` is a tmpfs) | free is less than what the update adds plus 1 GiB. What it adds is the NAR size of the pending closure's paths that are **not** in the machine's own closure (the package preview fetches that one), or, when the machine's closure is not known, the whole pending closure; the dialog says which was counted. Sizes come from `nix path-info --recursive --size`, against the local store first and then the binary cache. **Refused too while the machine's probe is still out** (a refresh clears the probes): "not here yet" is not "not known" | the free space or the closure's size is not known (the probe answered without the field, or the size could not be had) |
+| **Duplicate address** (the shared-IP lint) | the machine's target resolves to an address another machine's does too (the dialog names which), **or its address is not known** (the rule fails closed: a hostname that did not resolve cannot be told apart from another machine), **or address resolution is still out** (after a refresh, until it answers no collision can be ruled out) | other machines' addresses are not known because their resolution finished and failed |
 
 A check that fails to *run* is a warning, not a refusal, except the duplicate-address rule.
-The free space is the probe's, from the last scan, and the closure size is the whole closure
-(a deploy copies less, since the target already has most of it): the check errs towards
-refusing, by design.
+The free space is the probe's, from the last scan. The estimate is still an overestimate (the
+store holds older generations, and paths are shared between them), which is the safe direction.
+`u` itself is refused ("still probing luna", "still resolving addresses") while either is out, and
+the same rules decide again at `y`: a typed name that became required, or a warning that was not in
+the dialog, asks again instead of deploying.
 
 The question is `update luna to 0a1b2c3d nixos-system-luna-…? y/N` for a machine that is not **public**.
 For a machine marked public (`machines.<m>.public = true`, see Configuration) it is `type luna,

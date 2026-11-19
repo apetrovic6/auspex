@@ -314,8 +314,10 @@ pub struct PreflightAnswer {
     /// The fleet repository's state, or one line on why it could not be read (not a local
     /// directory, not a git repository, git failed or timed out).
     pub tree: Result<TreeState, String>,
-    /// The pending closure's NAR size in bytes, or one line on why it is not known.
-    pub closure_bytes: Result<u64, String>,
+    /// Every path of the pending closure with its NAR size, or one line on why that is not
+    /// known. The core leaves out the paths the machine already has (when it knows its closure)
+    /// and sums the rest.
+    pub closure: Result<Vec<(StorePath, u64)>, String>,
 }
 
 impl Operation for PreflightRequest {

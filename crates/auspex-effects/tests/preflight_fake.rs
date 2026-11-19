@@ -545,7 +545,14 @@ async fn a_path_valid_locally_is_sized_locally_and_the_cache_is_not_asked() {
     )
     .await
     .unwrap();
-    assert_eq!(answer, Ok(6000));
+    assert_eq!(
+        answer,
+        Ok(vec![
+            (StorePath::new(A).unwrap(), 1000),
+            (StorePath::new(B).unwrap(), 2000),
+            (StorePath::new(SYSTEM).unwrap(), 3000)
+        ])
+    );
     assert_eq!(
         fs::read_to_string(dir.path().join("nix-argv")).unwrap(),
         format!("path-info\n--recursive\n--size\n--\n{SYSTEM}\n")
@@ -578,7 +585,13 @@ async fn otherwise_the_cache_is_asked_read_only_with_exactly_this_argv() {
     )
     .await
     .unwrap();
-    assert_eq!(answer, Ok(42));
+    assert_eq!(
+        answer,
+        Ok(vec![
+            (StorePath::new(A).unwrap(), 40),
+            (StorePath::new(SYSTEM).unwrap(), 2)
+        ])
+    );
     assert_eq!(
         fs::read_to_string(dir.path().join("nix-argv")).unwrap(),
         format!(

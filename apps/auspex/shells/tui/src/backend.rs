@@ -637,10 +637,10 @@ impl Real {
             };
             preflight::closure_size(&op.store_path, &params, cancel).await
         };
-        let (tree, closure_bytes) = tokio::join!(tree, size);
+        let (tree, closure) = tokio::join!(tree, size);
         Ok(PreflightAnswer {
             tree: tree?,
-            closure_bytes: closure_bytes?,
+            closure: closure?,
         })
     }
 

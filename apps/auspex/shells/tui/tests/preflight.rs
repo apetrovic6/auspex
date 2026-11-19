@@ -38,7 +38,7 @@ fn dirty_and_unpushed() -> PreflightAnswer {
                 behind: 0,
             },
         }),
-        closure_bytes: Ok(2_469_606_195),
+        closure: Ok(vec![(StorePath::new(GLIBC).unwrap(), 2_469_606_195)]),
     }
 }
 
@@ -281,7 +281,10 @@ async fn the_real_backend_answers_both_checks_from_git_and_nix_and_runs_exactly_
                     behind: 0,
                 },
             }),
-            closure_bytes: Ok(3000),
+            closure: Ok(vec![
+                (StorePath::new(GLIBC).unwrap(), 1000),
+                (StorePath::new(SYSTEM).unwrap(), 2000)
+            ]),
         }
     );
     // git: one status, in the fleet directory.
@@ -327,7 +330,10 @@ async fn a_failing_check_is_one_line_in_its_own_half_of_the_answer_and_never_the
         .unwrap();
     let why = answer.tree.unwrap_err();
     assert!(why.contains("not a git repository"), "{why}");
-    assert_eq!(answer.closure_bytes, Ok(5));
+    assert_eq!(
+        answer.closure,
+        Ok(vec![(StorePath::new(SYSTEM).unwrap(), 5)])
+    );
     let argv = fs::read_to_string(dir.path().join("nix-argv")).unwrap();
     assert!(
         argv.contains("--store\nhttps://cache.example/\n--\n"),
@@ -348,7 +354,7 @@ async fn a_failing_check_is_one_line_in_its_own_half_of_the_answer_and_never_the
     assert!(!dir.path().join("git-argv").exists());
     assert!(
         answer
-            .closure_bytes
+            .closure
             .unwrap_err()
             .contains("no binary cache is configured")
     );

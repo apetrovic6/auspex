@@ -29,7 +29,10 @@
 //! already calls it, so the day it says something else nothing else changes. It is not an
 //! approximation: a guess from package names would be a rule that looks like it works.
 
+use std::collections::BTreeSet;
+
 use crate::fleet::SharedIp;
+use crate::observe::StorePath;
 use crate::text::sanitize_line;
 
 /// Free space an update must leave on the target's `/nix/store` beyond the closure: 1 GiB.
@@ -155,16 +158,17 @@ fn parse_branch_line(line: &str) -> Upstream {
 
 /// Reads `nix path-info --recursive --size` output: one `<store path> <NAR size>` per line.
 ///
-/// Returns the total in bytes. Strict: a line that is not a store path and a number makes the
-/// whole answer an error, because a sum that silently left a path out is an *underestimate*,
-/// and a size check that errs low lets a full disk through.
+/// Returns every path with its size, so the caller can leave out the ones a machine already
+/// has ([`estimate`]). Strict: a line that is not a store path and a number makes the whole
+/// answer an error, because a sum that silently left a path out is an *underestimate*, and a
+/// size check that errs low lets a full disk through.
 ///
 /// # Errors
 ///
-/// One line: no paths at all, an unreadable line, or a sum that overflows.
-pub fn parse_closure_sizes(text: &str) -> Result<u64, String> {
+/// One line: no paths at all, an unreadable line, or a total that overflows 64 bits.
+pub fn parse_closure_sizes(text: &str) -> Result<Vec<(StorePath, u64)>, String> {
     let mut total: u64 = 0;
-    let mut paths = 0_usize;
+    let mut paths = Vec::new();
     for line in text.lines() {
         let line = line.trim_end_matches('\r');
         if line.trim().is_empty() {
@@ -177,12 +181,12 @@ pub fn parse_closure_sizes(text: &str) -> Result<u64, String> {
                 sanitize_line(line)
             ));
         };
-        if !path.starts_with("/nix/store/") {
+        let Ok(path) = StorePath::new(path) else {
             return Err(format!(
                 "a line of the size listing does not start with a store path: {:?}",
                 sanitize_line(line)
             ));
-        }
+        };
         let size: u64 = size.parse().map_err(|_| {
             format!(
                 "a line of the size listing has no size: {:?}",
@@ -192,12 +196,90 @@ pub fn parse_closure_sizes(text: &str) -> Result<u64, String> {
         total = total
             .checked_add(size)
             .ok_or_else(|| "the closure's size does not fit in 64 bits".to_owned())?;
-        paths += 1;
+        paths.push((path, size));
     }
-    if paths == 0 {
+    if paths.is_empty() {
         return Err("the size listing has no store paths".to_owned());
     }
-    Ok(total)
+    Ok(paths)
+}
+
+/// What an update is estimated to add to the target's store, and how that was worked out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Need {
+    /// The bytes the update is expected to add (before the margin).
+    pub bytes: u64,
+    /// What they were counted from.
+    pub basis: Basis,
+}
+
+/// What a [`Need`] was counted from. The dialog says which, because the two differ by a lot and
+/// a refusal is only as good as its estimate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Basis {
+    /// The whole pending closure: which of its paths the machine already has is not known (the
+    /// machine's closure was not fetched, or does not match what its probe saw).
+    WholeClosure,
+    /// Only the paths of the pending closure that are not in the machine's closure.
+    NotOnMachine {
+        /// How many paths the machine does not have.
+        new_paths: usize,
+        /// How many paths the pending closure has.
+        total_paths: usize,
+        /// The whole closure's size, for comparison.
+        whole_bytes: u64,
+    },
+}
+
+/// The estimate of what the pending closure `sizes` adds to a machine: with the machine's own
+/// closure (`deployed`, which the package preview already fetches) only the paths it does not
+/// have; without it, the whole closure.
+///
+/// Still an overestimate (the store holds older generations too, and paths are shared
+/// between them), which is the safe direction. The margin is added by the rule, not here.
+#[must_use]
+pub fn estimate(sizes: &[(StorePath, u64)], deployed: Option<&BTreeSet<StorePath>>) -> Need {
+    let whole = sizes.iter().fold(0_u64, |a, (_, n)| a.saturating_add(*n));
+    let Some(deployed) = deployed else {
+        return Need {
+            bytes: whole,
+            basis: Basis::WholeClosure,
+        };
+    };
+    let fresh: Vec<&(StorePath, u64)> = sizes
+        .iter()
+        .filter(|(p, _)| !deployed.contains(p))
+        .collect();
+    Need {
+        bytes: fresh.iter().fold(0_u64, |a, (_, n)| a.saturating_add(*n)),
+        basis: Basis::NotOnMachine {
+            new_paths: fresh.len(),
+            total_paths: sizes.len(),
+            whole_bytes: whole,
+        },
+    }
+}
+
+impl Basis {
+    /// For the dialog: what the estimate counts.
+    fn describe(self, bytes: u64) -> String {
+        match self {
+            Self::WholeClosure => format!(
+                "the whole closure's {}; which of its paths the machine has already is not known",
+                format_bytes(bytes)
+            ),
+            Self::NotOnMachine {
+                new_paths,
+                total_paths,
+                whole_bytes,
+            } => format!(
+                "the {} of the {new_paths} of the closure's {total_paths} paths it does not have \
+                 yet, of {} in all",
+                format_bytes(bytes),
+                format_bytes(whole_bytes)
+            ),
+        }
+    }
 }
 
 /// `n` bytes for a person: `3.2 GiB`, `512 MiB`, `0 B`.
@@ -266,8 +348,8 @@ pub struct Facts<'a> {
     pub machine: &'a str,
     /// The fleet repository's state, or why it could not be read.
     pub tree: Result<&'a TreeState, &'a str>,
-    /// The pending closure's NAR size in bytes, or why it is not known.
-    pub closure_bytes: Result<u64, &'a str>,
+    /// What the pending closure is estimated to add to the target's store, or why it is not known.
+    pub closure: Result<Need, &'a str>,
     /// Free bytes on the target's `/nix/store` filesystem as the last probe saw them, or
     /// `None` when the probe did not report it.
     pub free_bytes: Option<u64>,
@@ -357,8 +439,8 @@ fn disk_check(facts: &Facts<'_>, out: &mut Preflight) {
         ));
         return;
     }
-    let closure = match facts.closure_bytes {
-        Ok(c) => c,
+    let need = match facts.closure {
+        Ok(n) => n,
         Err(why) => {
             out.warnings.push(format!(
                 "the size of the pending closure is not known, so {machine}'s free disk is not \
@@ -371,19 +453,18 @@ fn disk_check(facts: &Facts<'_>, out: &mut Preflight) {
     let Some(free) = facts.free_bytes else {
         out.warnings.push(format!(
             "free space on {machine}'s /nix/store is not known (its last probe did not report \
-             it), so it is not checked against the closure's {}",
-            format_bytes(closure)
+             it), so it is not checked against the {} the update is expected to add",
+            format_bytes(need.bytes)
         ));
         return;
     };
-    let needed = closure.saturating_add(FREE_MARGIN_BYTES);
+    let needed = need.bytes.saturating_add(FREE_MARGIN_BYTES);
     if free < needed {
         out.refusals.push(format!(
-            "{machine}'s /nix/store has {} free, and this update needs {} (the closure's {} \
-             plus {} to spare)",
+            "{machine}'s /nix/store has {} free, and this update needs {} ({}, plus {} to spare)",
             format_bytes(free),
             format_bytes(needed),
-            format_bytes(closure),
+            need.basis.describe(need.bytes),
             format_bytes(FREE_MARGIN_BYTES)
         ));
     }
@@ -470,7 +551,10 @@ mod tests {
         Facts {
             machine: "luna",
             tree: Ok(tree),
-            closure_bytes: closure,
+            closure: closure.map(|bytes| Need {
+                bytes,
+                basis: Basis::WholeClosure,
+            }),
             free_bytes: free,
             probing: false,
             addresses: NO_ADDRESS_TROUBLE,
@@ -740,14 +824,18 @@ mod tests {
     }
 
     #[test]
-    fn closure_sizes_are_summed_strictly() {
+    fn closure_sizes_are_read_strictly() {
         let a = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-a";
         let b = "/nix/store/1123456789abcdfghijklmnpqrsvwxyz-b";
+        let sized = |p: &str, n: u64| (StorePath::new(p).unwrap(), n);
         assert_eq!(
             parse_closure_sizes(&format!("{a}\t100\n{b}\t2048\n\n")),
-            Ok(2148)
+            Ok(vec![sized(a, 100), sized(b, 2048)])
         );
-        assert_eq!(parse_closure_sizes(&format!("{a}   7\r\n")), Ok(7));
+        assert_eq!(
+            parse_closure_sizes(&format!("{a}   7\r\n")),
+            Ok(vec![sized(a, 7)])
+        );
         for bad in [
             "",
             "\n",
@@ -761,6 +849,71 @@ mod tests {
         ] {
             assert!(parse_closure_sizes(bad).is_err(), "{bad:?}");
         }
+    }
+
+    fn p(c: char) -> StorePath {
+        StorePath::new(format!("/nix/store/{c}123456789abcdfghijklmnpqrsvwxyz-{c}")).unwrap()
+    }
+
+    #[test]
+    fn the_estimate_counts_only_what_the_machine_does_not_have() {
+        let sizes = [(p('a'), 4 * GIB), (p('b'), 100), (p('c'), 50)];
+        // The machine has the big path already: only b and c are new.
+        let deployed: BTreeSet<StorePath> = [p('a'), p('z')].into_iter().collect();
+        let need = estimate(&sizes, Some(&deployed));
+        assert_eq!(need.bytes, 150);
+        assert_eq!(
+            need.basis,
+            Basis::NotOnMachine {
+                new_paths: 2,
+                total_paths: 3,
+                whole_bytes: 4 * GIB + 150
+            }
+        );
+        // Without the machine's closure: all of it.
+        let need = estimate(&sizes, None);
+        assert_eq!(need.bytes, 4 * GIB + 150);
+        assert_eq!(need.basis, Basis::WholeClosure);
+        // A machine that has all of it needs nothing.
+        let all: BTreeSet<StorePath> = sizes.iter().map(|(p, _)| p.clone()).collect();
+        assert_eq!(estimate(&sizes, Some(&all)).bytes, 0);
+        // Sums never overflow.
+        let huge = [(p('a'), u64::MAX), (p('b'), u64::MAX)];
+        assert_eq!(estimate(&huge, None).bytes, u64::MAX);
+    }
+
+    #[test]
+    fn a_refusal_says_which_estimate_it_used() {
+        let t = tree(0, tracking(0));
+        let mut f = facts(&t, Ok(0), Some(GIB / 2));
+        let whole = estimate(&[(p('a'), 4 * GIB)], None);
+        f.closure = Ok(whole);
+        let why = preflight(&f).refusals.remove(0);
+        assert!(
+            why.contains("the whole closure's 4.0 GiB") && why.contains("not known"),
+            "{why}"
+        );
+        let deployed: BTreeSet<StorePath> = std::iter::once(p('z')).collect();
+        let part = estimate(&[(p('a'), 4 * GIB), (p('b'), 1)], Some(&deployed));
+        f.closure = Ok(part);
+        let why = preflight(&f).refusals.remove(0);
+        assert!(
+            why.contains("the 4.0 GiB of the 2 of the closure's 2 paths it does not have yet"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn a_closure_mostly_on_the_machine_no_longer_refuses() {
+        // 6 GiB closure, 5 GiB free: refused as a whole, fine when only 100 MiB is new.
+        let t = tree(0, tracking(0));
+        let sizes = [(p('a'), 6 * GIB - (100 << 20)), (p('b'), 100 << 20)];
+        let mut f = facts(&t, Ok(0), Some(5 * GIB));
+        f.closure = Ok(estimate(&sizes, None));
+        assert_eq!(preflight(&f).refusals.len(), 1);
+        let deployed: BTreeSet<StorePath> = std::iter::once(p('a')).collect();
+        f.closure = Ok(estimate(&sizes, Some(&deployed)));
+        assert_eq!(preflight(&f).refusals, Vec::<String>::new());
     }
 
     #[test]

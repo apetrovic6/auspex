@@ -98,7 +98,7 @@ async fn size_with(
     deadline: Instant,
     timeout: Duration,
     cancel: &CancellationToken,
-) -> Result<Result<u64, String>, Cancelled> {
+) -> Result<Result<Vec<(StorePath, u64)>, String>, Cancelled> {
     let mut cmd = match command(nix) {
         Ok(c) => c,
         Err(e) => return Ok(Err(spawn_error(&format!("cannot run {what}"), nix, &e))),
@@ -121,7 +121,8 @@ async fn size_with(
     }
 }
 
-/// The NAR size, in bytes, of the closure of `path`, the pending toplevel.
+/// The NAR size of every path of the closure of `path`, the pending toplevel (the caller sums
+/// them, or leaves out the ones a machine has already: [`auspex_domain::preflight::estimate`]).
 ///
 /// 1. `nix path-info --recursive --size -- <path>` against the local store. It succeeds only
 ///    when the path is valid here, writes nothing, and a failure of any kind falls through.
@@ -137,7 +138,7 @@ pub async fn closure_size(
     path: &StorePath,
     params: &PendingParams<'_>,
     cancel: &CancellationToken,
-) -> Result<Result<u64, String>, Cancelled> {
+) -> Result<Result<Vec<(StorePath, u64)>, String>, Cancelled> {
     const WHAT: &str = "closure size query";
     let deadline = Instant::now() + params.timeout;
     let local = match size_with(

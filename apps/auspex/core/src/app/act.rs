@@ -46,7 +46,7 @@
 use auspex_domain::eval::EvalOutcome;
 use auspex_domain::fleet::{is_plain_name, shared_ips};
 use auspex_domain::observe::{ProbeOutcome, StorePath};
-use auspex_domain::preflight::{Addresses, Facts, Preflight, preflight};
+use auspex_domain::preflight::{Addresses, Facts, Preflight, estimate, preflight};
 use auspex_domain::status::NarCache;
 use crux_core::Command;
 use crux_core::render::render;
@@ -470,6 +470,13 @@ fn review(model: &Model, machine: &str, answer: &PreflightAnswer) -> Preflight {
             _ => None,
         })
         .map(|d| d.available_bytes);
+    // What the machine already has, when the package preview fetched its closure: the update adds
+    // only the rest.
+    let deployed = model
+        .rows
+        .iter()
+        .find(|r| r.machine.name == machine)
+        .and_then(|r| r.deployed_paths.as_ref());
     let known = |name: &str| model.addresses.get(name).is_some_and(|a| !a.is_empty());
     let shared = shared_ips(&model.addresses);
     let others_unknown = model
@@ -486,10 +493,10 @@ fn review(model: &Model, machine: &str, answer: &PreflightAnswer) -> Preflight {
     preflight(&Facts {
         machine,
         tree: answer.tree.as_ref().map_err(String::as_str),
-        closure_bytes: answer
-            .closure_bytes
+        closure: answer
+            .closure
             .as_ref()
-            .map(|b| *b)
+            .map(|sizes| estimate(sizes, deployed))
             .map_err(String::as_str),
         free_bytes,
         probing: probing(model, machine),
@@ -895,6 +902,7 @@ pub(super) fn refresh_machine(model: &mut Model, name: &str) -> Vec<Command<Effe
     row.probe = None;
     row.cache = NarCache::NotApplicable;
     row.diff = super::DiffSlot::Idle;
+    row.deployed_paths = None;
     if !fleet_eval_out {
         row.eval = None;
     }

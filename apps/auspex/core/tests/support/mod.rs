@@ -415,6 +415,14 @@ pub fn clean_preflight() -> auspex_core::PreflightAnswer {
                 behind: 0,
             },
         }),
-        closure_bytes: Ok(2 << 30),
+        closure: sized(2 << 30),
     }
+}
+
+/// A pending closure of one path of `bytes`: what the checks size.
+pub fn sized(bytes: u64) -> Result<Vec<(StorePath, u64)>, String> {
+    Ok(vec![(
+        StorePath::new(path('s', "closure-payload")).unwrap(),
+        bytes,
+    )])
 }

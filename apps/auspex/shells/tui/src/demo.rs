@@ -587,7 +587,6 @@ impl Demo {
         cancel: &CancellationToken,
     ) -> Result<PreflightAnswer, Cancelled> {
         after(250, cancel).await?;
-        let _ = op;
         Ok(self
             .preflight_answer
             .clone()
@@ -600,8 +599,13 @@ impl Demo {
                         behind: 0,
                     },
                 }),
-                // 2.3 GiB.
-                closure_bytes: Ok(2_469_606_195),
+                // The pending closure of the preview, 32 MiB a path: with the machine's own
+                // closure known the estimate counts only the paths it does not have.
+                closure: Ok(closure(&op.machine, true)
+                    .paths
+                    .into_iter()
+                    .map(|p| (p, 32 << 20))
+                    .collect()),
             }))
     }
 }

@@ -347,6 +347,9 @@ struct Row {
     eval: Option<EvalOutcome>,
     cache: NarCache,
     diff: DiffSlot,
+    /// The machine's own closure (what the package preview fetched), kept when it is consistent
+    /// with what the probe saw: the disk check counts only the pending paths not in it.
+    deployed_paths: Option<BTreeSet<StorePath>>,
 }
 
 impl Row {
@@ -831,6 +834,7 @@ fn inventory_answered(model: &mut Model, answer: InventoryAnswer) -> Command<Eff
                 eval: None,
                 cache: NarCache::NotApplicable,
                 diff: DiffSlot::Idle,
+                deployed_paths: None,
             }
         })
         .collect();
@@ -1209,6 +1213,10 @@ fn closure_answered(
             return Command::all(commands);
         }
     };
+    // The machine's own closure, for the disk check: only if it is the closure of the system
+    // the probe saw (a machine that changed system in between is not the one that was asked).
+    let own =
+        (side == Side::Deployed).then(|| paths.paths.iter().cloned().collect::<BTreeSet<_>>());
     match side {
         Side::Deployed => *deployed = Some(paths),
         Side::Pending => *pending = Some(paths),
@@ -1223,6 +1231,13 @@ fn closure_answered(
             pending,
         );
         row.diff = DiffSlot::Done(diff);
+    }
+    if let Some(own) = own {
+        let consistent = matches!(
+            &row.probe,
+            Some(ProbeOutcome::Observed(o)) if o.current_system.as_ref().is_some_and(|c| own.contains(c))
+        );
+        row.deployed_paths = consistent.then_some(own);
     }
     render()
 }
