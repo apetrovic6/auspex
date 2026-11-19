@@ -300,7 +300,7 @@ fn approval_timeout() -> ProbeOutcome {
     }
 }
 
-async fn connect(
+pub(crate) async fn connect(
     target: &Target,
     params: &ProbeParams<'_>,
     cancel: &CancellationToken,

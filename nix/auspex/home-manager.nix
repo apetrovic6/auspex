@@ -63,6 +63,10 @@ in {
           probe = timeout "Probe script timeout in seconds, after authentication.";
           eval = timeout "Per-machine evaluation timeout in seconds.";
           settle = timeout "Headless fleet settling timeout in seconds.";
+          diff = timeout "Package preview timeout in seconds (default 120): how long one machine's two closure queries may take. Not cut short by the settle timeout; the preview is failed when it passes, and the scan is not.";
+        };
+        diff = section {
+          enabled = optional types.bool "Whether a machine with an update pending gets a package preview (default true). When false no closure is queried and package_diff stays null.";
         };
         eval = section {
           workers = optional types.ints.positive "Number of nix-eval-jobs workers.";

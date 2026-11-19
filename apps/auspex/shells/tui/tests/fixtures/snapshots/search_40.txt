@@ -12,7 +12,7 @@
 │›✗    mars            unreachable     │
 │ ✓    mechanicus-for… in sync         │
 │ ✓    phobos          in sync         │
-│ ↑    sol             update pending  │
+│ ↑◆   sol             update pending  │
 │ ✓    terra           in sync         │
 │ ✓    titan           in sync         │
 │ ✗    triton          unreachable     │

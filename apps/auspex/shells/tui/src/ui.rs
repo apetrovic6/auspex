@@ -22,6 +22,7 @@ use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 use crate::input::{Input, Prompt};
 use crate::keymap::{Action, Keymap};
+use crate::packages::{self, Kind};
 use crate::theme::{Role, Theme};
 
 /// At this width or more, list and detail sit side by side.
@@ -148,9 +149,9 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
             Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .areas(main);
         draw_list(frame, list, view, ui, theme);
-        draw_detail(frame, detail, view, theme);
+        draw_detail(frame, detail, view, ctx);
     } else if ui.input.detail_open {
-        draw_detail(frame, main, view, theme);
+        draw_detail(frame, main, view, ctx);
     } else {
         draw_list(frame, main, view, ui, theme);
     }
@@ -160,6 +161,9 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
 
     if ui.input.log_open {
         draw_log(frame, main, ctx);
+    }
+    if ui.input.diff_open {
+        draw_diff(frame, main, view, ui, ctx);
     }
     if view.help_open {
         draw_help(frame, main, ctx);
@@ -301,10 +305,18 @@ const fn health_source(s: HealthSource) -> &'static str {
     clippy::too_many_lines,
     reason = "one entry per line of the panel, in the panel's order"
 )]
-pub fn detail_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
+pub fn detail_lines(
+    m: &MachineReport,
+    cache_configured: bool,
+    diff_key: Option<&str>,
+    value_cells: usize,
+) -> Vec<(&'static str, String)> {
     let mut out = vec![
         ("status", m.status.label().to_owned()),
-        ("reason", m.reason.clone().unwrap_or_else(|| "—".to_owned())),
+        (
+            "reason",
+            packages::panel_reason(m).unwrap_or_else(|| "—".to_owned()),
+        ),
         (
             "host",
             format!(
@@ -314,6 +326,11 @@ pub fn detail_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
             ),
         ),
     ];
+    // One row for the preview, right after the reason: health comes before the full block below,
+    // which a short panel cuts, so this is what says a preview exists.
+    if let Some(row) = packages::summary_row(m, diff_key, value_cells) {
+        out.insert(2, row);
+    }
     if let Some(e) = &m.target_error {
         out.push(("refused", e.clone()));
     }
@@ -429,12 +446,16 @@ pub fn detail_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
             },
         ),
     ));
+    // The package preview comes last, capped at a few lines: failed units and the systemd
+    // state matter most just before an update, and the full list is on `d`.
+    out.extend(packages::panel_rows(m, cache_configured, value_cells));
     out
 }
 
 const LABEL_CELLS: usize = 9;
 
-fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, theme: &Theme) {
+fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'_>) {
+    let theme = ctx.theme;
     let m = view.selected.and_then(|i| view.report.machines.get(i));
     let title = m.map_or_else(|| " detail ".to_owned(), |m| format!(" {} ", m.name));
     let block = Block::bordered()
@@ -464,7 +485,8 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, theme: &Theme) {
     }
     lines.push(Line::from(badges));
     let room = usize::from(inner.height);
-    for (label, value) in detail_lines(m) {
+    let diff_key = ctx.keymap.keys_for(Action::Diff).into_iter().next();
+    for (label, value) in detail_lines(m, view.binary_cache, diff_key.as_deref(), value_cells) {
         if lines.len() >= room {
             break; // nothing below the panel is drawn, so nothing below it is wrapped
         }
@@ -604,6 +626,13 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         refresh.to_owned(),
         format!("{} pending", view.refresh.pending_machines),
     ];
+    // What the previews are doing: they are not "pending machines" (the status and badges are
+    // final), but a settled-looking bar over a still-filling panel would say nothing.
+    match view.refresh.diffs_pending {
+        0 => {}
+        1 => parts.push("1 diff collecting".to_owned()),
+        n => parts.push(format!("{n} diffs collecting")),
+    }
     if ui.approvals != 0 {
         let noun = if ui.approvals == 1 { "host" } else { "hosts" };
         parts.push(format!("ssh: connecting {} {noun}", ui.approvals));
@@ -759,6 +788,83 @@ fn draw_log(frame: &mut Frame, area: Rect, ctx: &Context<'_>) {
         .iter()
         .skip(lines.len().saturating_sub(height))
         .map(|l| Line::from(Span::styled(cut(l, width), theme.style(Role::Text))))
+        .collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// The package diff overlay (`d`): the selected machine's full list, scrollable.
+///
+/// `ui.input.diff_scroll` is clamped here, to the last page of the list, and written back:
+/// the keys only add to it (`G` sets it to the maximum), so the drawing is what knows how
+/// long the list is.
+fn draw_diff(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>) {
+    let theme = ctx.theme;
+    let machine = view.selected.and_then(|i| view.report.machines.get(i));
+    let rect = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    frame.render_widget(Clear, rect);
+    let lines = machine.map_or_else(
+        || vec![(Kind::Note, "no machine selected".to_owned())],
+        |m| packages::full_lines(m, view.binary_cache),
+    );
+    let inner_height = usize::from(rect.height.saturating_sub(2));
+    let last_start = lines.len().saturating_sub(inner_height.max(1));
+    ui.input.diff_scroll = ui.input.diff_scroll.min(last_start);
+    let start = ui.input.diff_scroll;
+    let position = if lines.len() > inner_height {
+        format!(
+            " {}–{}/{} ",
+            start + 1,
+            (start + inner_height).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        String::new()
+    };
+    let close = ctx
+        .keymap
+        .keys_for(Action::Quit)
+        .into_iter()
+        .find(|k| k == "q")
+        .map_or_else(
+            || ctx.keymap.keys_for(Action::Diff).join(" "),
+            |_| "q".to_owned(),
+        );
+    let title = format!(
+        " package diff: {} ",
+        machine.map_or("—", |m| m.name.as_str())
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            cut(&title, usize::from(rect.width.saturating_sub(4))),
+            theme.style(Role::Title),
+        ))
+        .title_bottom(Span::styled(
+            format!("{position}{close}/esc close "),
+            theme.style(Role::Dim),
+        ))
+        .border_style(theme.style(Role::Dim))
+        .style(theme.base());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let width = usize::from(inner.width);
+    let shown: Vec<Line> = lines
+        .iter()
+        .skip(start)
+        .take(inner_height)
+        .map(|(kind, text)| match kind {
+            Kind::Heading => Line::from(Span::styled(cut(text, width), theme.style(Role::Title))),
+            Kind::Item => Line::from(Span::styled(
+                format!("  {}", cut(text, width.saturating_sub(2))),
+                theme.style(Role::Text),
+            )),
+            Kind::Note => Line::from(Span::styled(cut(text, width), theme.style(Role::Dim))),
+        })
         .collect();
     frame.render_widget(Paragraph::new(shown), inner);
 }

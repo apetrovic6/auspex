@@ -52,13 +52,15 @@ pub enum Action {
     Detail,
     /// The log: the adapters' notes and the config's warnings.
     Log,
+    /// The selected machine's package diff, in full (changed, added, removed).
+    Diff,
     /// Quit.
     Quit,
 }
 
 impl Action {
     /// Every action, in the order the help overlay lists them.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Down,
         Self::Up,
         Self::HalfPageDown,
@@ -70,6 +72,7 @@ impl Action {
         Self::SearchPrevious,
         Self::Detail,
         Self::Log,
+        Self::Diff,
         Self::Refresh,
         Self::Command,
         Self::Help,
@@ -94,6 +97,7 @@ impl Action {
             Self::Command => "command",
             Self::Detail => "detail",
             Self::Log => "log",
+            Self::Diff => "diff",
             Self::Quit => "quit",
         }
     }
@@ -116,6 +120,7 @@ impl Action {
             Self::Command => "command (:q, :refresh)",
             Self::Detail => "machine detail (narrow)",
             Self::Log => "log",
+            Self::Diff => "package diff (q closes)",
             Self::Quit => "quit",
         }
     }
@@ -138,6 +143,7 @@ impl Action {
             Self::Command => &[":"],
             Self::Detail => &["enter", "tab"],
             Self::Log => &["L"],
+            Self::Diff => &["d"],
             Self::Quit => &["q", "esc", "ctrl-c"],
         }
     }

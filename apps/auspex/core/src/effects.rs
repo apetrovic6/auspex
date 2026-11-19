@@ -14,11 +14,19 @@
 //! emits [`Effect::Cancel`] for every request still outstanding when a refresh starts or the
 //! user quits, and when the global deadline passes. The shell kills whatever is running for
 //! that id and drops the `Request`. An answer it resolves anyway is ignored by the core.
+//!
+//! The one exception to "the global deadline cancels everything" is the package preview's two
+//! closure queries ([`DeployedClosureRequest`], [`PendingClosureRequest`]): they start only
+//! after a machine's probe, evaluation and cache lookup are in, so `timeouts.settle` may
+//! already be nearly spent, and the preview must not make the scan "timed out". They carry
+//! their own deadline, `timeouts.diff`, which the shell enforces, and the fleet settles when
+//! they have answered.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::IpAddr;
 
+use auspex_domain::closure::ClosurePaths;
 use auspex_domain::eval::EvalOutcome;
 use auspex_domain::fleet::{Machine, MachineClass, Target};
 use auspex_domain::observe::{ProbeOutcome, PromSample, StorePath};
@@ -200,6 +208,62 @@ impl Operation for CacheRequest {
     type Output = NarCache;
 }
 
+/// Query what `target` runs: its `/run/current-system` closure.
+///
+/// The adapter authenticates like a probe (the same ssh control master, the same approval
+/// phase when none is up), runs `nix-store --query --requisites /run/current-system` there
+/// and hands the output to [`auspex_domain::closure::parse_closure`]. Only asked for a
+/// machine whose probe observed a system and whose pending toplevel is known, differs and is
+/// cached: there is nothing to compare otherwise.
+///
+/// `timeout_seconds` is `timeouts.diff`: the adapter's budget for the query, and the shell's
+/// bound on the whole request, approval phase included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeployedClosureRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The refresh it belongs to.
+    pub generation: Generation,
+    /// The machine, for logging.
+    pub machine: String,
+    /// The resolved, already-validated target the probe used.
+    pub target: Target,
+    /// `timeouts.diff`.
+    pub timeout_seconds: u64,
+}
+
+/// The closure's store paths, or one line on why it could not be had. A failure here makes
+/// the machine's preview `failed`; it never changes the machine's status.
+pub type ClosureAnswer = Result<ClosurePaths, String>;
+
+impl Operation for DeployedClosureRequest {
+    type Output = ClosureAnswer;
+}
+
+/// Query what `store_path`, the pending toplevel, would run: its closure.
+///
+/// The adapter uses the local store when the path is valid there (`nix-store --query
+/// --requisites`), otherwise the binary cache (`nix path-info --recursive --store <cache>`),
+/// and writes nothing to the local store either way. Only asked when the core's cache lookup
+/// said [`NarCache::Cached`]: without that the preview is `not_cached` and no query runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingClosureRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The refresh it belongs to.
+    pub generation: Generation,
+    /// The machine, for logging.
+    pub machine: String,
+    /// The pending toplevel.
+    pub store_path: StorePath,
+    /// `timeouts.diff`.
+    pub timeout_seconds: u64,
+}
+
+impl Operation for PendingClosureRequest {
+    type Output = ClosureAnswer;
+}
+
 /// Resolve hostname targets to addresses, for the shared-IP lint. Targets that are already
 /// IP literals are not sent: the core knows their address.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +318,10 @@ pub enum Effect {
     CacheLookup(CacheRequest),
     /// [`ResolveRequest`].
     ResolveAddresses(ResolveRequest),
+    /// [`DeployedClosureRequest`].
+    DeployedClosure(DeployedClosureRequest),
+    /// [`PendingClosureRequest`].
+    PendingClosure(PendingClosureRequest),
     /// [`CancelRequest`].
     Cancel(CancelRequest),
 }

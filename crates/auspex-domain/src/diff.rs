@@ -146,7 +146,9 @@ pub enum DiffState {
 pub struct PackageDiff {
     pub state: DiffState,
     pub reason: Option<String>,
-    /// Unique system toplevel in each closure; null if absent or ambiguous.
+    /// System toplevel in each closure: the unique one (null if absent or ambiguous) from
+    /// `diff_closures`; the core then records the toplevel it checked (the probe's system and
+    /// the evaluation's out path), which a closure holding other toplevels still contains.
     pub deployed: Option<String>,
     pub pending: Option<String>,
     pub added: Vec<PackageChange>,

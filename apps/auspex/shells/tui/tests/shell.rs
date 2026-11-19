@@ -301,3 +301,151 @@ async fn approval_count_tracks_real_connection_inner() {
     assert_eq!(final_count, 0);
     assert!(!final_status.contains("ssh: connecting"), "{final_status}");
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_global_deadline_does_not_cut_a_preview_short() {
+    // sol's two closure queries are requested at 690 ms (the list takes 150 ms, the probe 420,
+    // the cache lookup 120) and the first answers (with a
+    // failure) 300 ms later, at 990 ms; the deadline is 800 ms, so it passes with both in flight.
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_millis(800),
+    );
+    let start = Instant::now();
+    shell.send(Event::Start(demo::config()));
+    settle(&shell).await;
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_millis(990),
+        "settled when sol's preview failed, not at the 800 ms deadline"
+    );
+    let view = shell.view();
+    // luna's probe (4 s) was cut by the deadline, which is what timed the scan out; the
+    // preview did not.
+    assert!(view.refresh.timed_out);
+    assert_eq!(row(&view, "luna").status, Badge::Unreachable);
+    let sol = row(&view, "sol");
+    assert_eq!(
+        sol.status,
+        Badge::UpdatePending,
+        "the preview changed nothing else"
+    );
+    let diff = sol.package_diff.as_ref().unwrap();
+    assert_eq!(diff.state, auspex_domain::diff::DiffState::Failed);
+    assert!(sol.settled);
+    // The failed side cancelled the other, and nothing is left running.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(shell.in_flight(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refresh_during_a_preview_cancels_it_and_the_next_scan_makes_its_own() {
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    shell.send(Event::Start(demo::config()));
+    // 700 ms: sol's closure queries are in flight.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(shell.view().refresh.diffs_pending > 0);
+    shell.send(Event::Refresh);
+    assert_eq!(shell.view().refresh.diffs_pending, 0, "the rows are gone");
+    settle(&shell).await;
+    let view = shell.view();
+    assert_eq!(
+        row(&view, "luna").package_diff.as_ref().unwrap().state,
+        auspex_domain::diff::DiffState::Computed
+    );
+    assert_eq!(
+        row(&view, "sol").package_diff.as_ref().unwrap().state,
+        auspex_domain::diff::DiffState::Failed
+    );
+    assert_eq!(view.refresh.diffs_pending, 0);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(
+        shell.in_flight(),
+        0,
+        "no token of the cancelled queries is left"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_shell_arms_the_cores_backstop_at_settle_plus_diff() {
+    // sol's preview would fail by itself at 990 ms; the deadline is 800 ms and the backstop
+    // 50 ms after it, so the core fails the preview first, at 850 ms, with its own reason.
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_millis(800),
+    );
+    shell.set_preview_grace(Duration::from_millis(50));
+    let start = Instant::now();
+    shell.send(Event::Start(demo::config()));
+    settle(&shell).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(850));
+    let view = shell.view();
+    let sol = row(&view, "sol");
+    assert_eq!(
+        sol.package_diff.as_ref().unwrap().reason.as_deref(),
+        Some(auspex_core::PREVIEW_TIMED_OUT)
+    );
+    assert_eq!(sol.status, Badge::UpdatePending);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(shell.in_flight(), 0, "the cancelled queries left no token");
+
+    // Without the backstop the same run settles when the preview answers itself.
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_millis(800),
+    );
+    let start = Instant::now();
+    shell.send(Event::Start(demo::config()));
+    settle(&shell).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(990));
+}
+
+#[tokio::test(start_paused = true)]
+async fn previews_have_a_permit_pool_of_their_own() {
+    use auspex_tui::shell::MAX_PREVIEW_QUERIES;
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    shell.send(Event::Start(demo::config()));
+    // 800 ms: sol's two queries run (and luna's probe, a per-machine call, is out).
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(shell.running_previews() > 0);
+    assert!(shell.running_previews() <= MAX_PREVIEW_QUERIES);
+    assert!(
+        shell.running_per_machine() <= 2,
+        "previews take nothing from the shared pool: {}",
+        shell.running_per_machine()
+    );
+}
+
+/// Re-review N5: the backstop's timer is cancelled with everything else, so a quit during its
+/// grace window does not wait out `REAP_GRACE` for a sleeping task.
+#[tokio::test(start_paused = true)]
+async fn quitting_during_the_backstop_window_does_not_wait_for_the_timer() {
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_millis(800),
+    );
+    shell.set_preview_grace(Duration::from_secs(3600));
+    shell.send(Event::Start(demo::config()));
+    // Past the global deadline, inside the grace window; sol's preview has failed by itself.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let before = Instant::now();
+    shell.send(Event::Quit);
+    shell.shutdown().await;
+    assert!(
+        before.elapsed() < auspex_tui::shell::REAP_GRACE,
+        "shutdown returned at once, not after the reap grace: {:?}",
+        before.elapsed()
+    );
+}

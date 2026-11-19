@@ -10,10 +10,12 @@
 use std::collections::BTreeMap;
 
 use auspex_core::effects::{
-    CacheRequest, EvalAnswer, EvalRequest, InventoryRequest, ProbeRequest, PrometheusRequest,
-    ResolveRequest,
+    CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest, InventoryRequest,
+    PendingClosureRequest, ProbeRequest, PrometheusRequest, ResolveRequest,
 };
-use auspex_core::{Auspex, Config, Core, Effect, Event, PrometheusConfig, RequestId, ViewModel};
+use auspex_core::{
+    Auspex, Config, Core, DiffConfig, Effect, Event, PrometheusConfig, RequestId, ViewModel,
+};
 use auspex_domain::eval::{EvalFailure, EvalOutcome, EvalSuccess};
 use auspex_domain::fleet::{Machine, parse_inventory};
 use auspex_domain::observe::{ProbeExit, ProbeOutcome, PromSample, StorePath, parse_probe};
@@ -111,6 +113,17 @@ pub fn full_config() -> Config {
             max_age_seconds: 60,
         }),
         binary_cache: true,
+        diff: None,
+    }
+}
+
+/// [`full_config`] with the package preview on, `timeouts.diff` being 90 s.
+pub fn diff_config() -> Config {
+    Config {
+        diff: Some(DiffConfig {
+            timeout_seconds: 90,
+        }),
+        ..full_config()
     }
 }
 
@@ -131,6 +144,8 @@ pub struct Shell {
     pub prometheus: Vec<Request<PrometheusRequest>>,
     pub caches: Vec<Request<CacheRequest>>,
     pub resolves: Vec<Request<ResolveRequest>>,
+    pub deployed: Vec<Request<DeployedClosureRequest>>,
+    pub pending_closures: Vec<Request<PendingClosureRequest>>,
     /// Every cancel the core has emitted, in order.
     pub cancels: Vec<RequestId>,
     /// Every request id the core has issued, in order.
@@ -153,6 +168,8 @@ impl Shell {
             prometheus: Vec::new(),
             caches: Vec::new(),
             resolves: Vec::new(),
+            deployed: Vec::new(),
+            pending_closures: Vec::new(),
             cancels: Vec::new(),
             issued: Vec::new(),
         }
@@ -196,6 +213,14 @@ impl Shell {
                     self.issued.push(r.operation.id);
                     self.resolves.push(r);
                 }
+                Effect::DeployedClosure(r) => {
+                    self.issued.push(r.operation.id);
+                    self.deployed.push(r);
+                }
+                Effect::PendingClosure(r) => {
+                    self.issued.push(r.operation.id);
+                    self.pending_closures.push(r);
+                }
                 Effect::Cancel(r) => self.cancels.push(r.operation.id),
             }
         }
@@ -220,6 +245,8 @@ impl Shell {
         self.prometheus.retain(|r| live(&r.operation.id));
         self.caches.retain(|r| live(&r.operation.id));
         self.resolves.retain(|r| live(&r.operation.id));
+        self.deployed.retain(|r| live(&r.operation.id));
+        self.pending_closures.retain(|r| live(&r.operation.id));
     }
 
     /// The number of requests of every kind not yet taken by the test.
@@ -230,6 +257,8 @@ impl Shell {
             + self.prometheus.len()
             + self.caches.len()
             + self.resolves.len()
+            + self.deployed.len()
+            + self.pending_closures.len()
     }
 
     /// Start, and answer the machine list with `json`.
@@ -274,6 +303,24 @@ impl Shell {
             .position(|r| r.operation.machine == machine)
             .unwrap_or_else(|| panic!("no cache request for {machine}"));
         self.caches.remove(i)
+    }
+
+    pub fn take_deployed(&mut self, machine: &str) -> Request<DeployedClosureRequest> {
+        let i = self
+            .deployed
+            .iter()
+            .position(|r| r.operation.machine == machine)
+            .unwrap_or_else(|| panic!("no deployed-closure request for {machine}"));
+        self.deployed.remove(i)
+    }
+
+    pub fn take_pending(&mut self, machine: &str) -> Request<PendingClosureRequest> {
+        let i = self
+            .pending_closures
+            .iter()
+            .position(|r| r.operation.machine == machine)
+            .unwrap_or_else(|| panic!("no pending-closure request for {machine}"));
+        self.pending_closures.remove(i)
     }
 
     /// Answers `machine`'s probe.

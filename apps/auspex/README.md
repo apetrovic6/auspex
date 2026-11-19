@@ -96,6 +96,10 @@ ssh_connect = 5      # TCP connection timeout; 1..60 seconds
 ssh_approval = 60    # authentication/agent approval; 5..600 seconds
 probe = 10          # script execution, after authentication
 settle = 120        # global refresh deadline, including approval
+diff = 120          # one machine's package preview; 1..86400 seconds (see below)
+
+[diff]
+enabled = true      # false: never query a closure; package_diff stays null
 ```
 
 The config file's `flake` and `CLAN_DIR` take a leading `~/` (your `$HOME`; `~user/` is refused);
@@ -118,6 +122,50 @@ These SSH connections stay open for up to `ssh.control_persist` idle seconds **a
 auspex quits**. Lower the value to shorten that window, or close a known master explicitly:
 `ssh -S "$XDG_RUNTIME_DIR/auspex/<socket-hash>" -O exit -- user@host` (use its actual
 socket path and destination).
+
+## Package preview
+
+For a machine whose update is pending, auspex shows **what** would change, nvd-style: the
+packages added, removed and changed between what it runs and what the fleet evaluates to,
+with the kernel, systemd, glibc and nix called out and major-version bumps counted. The
+detail panel shows the headline, the critical changes with their versions, a count of the
+other major-version changes, then the counts of added, removed, changed, rebuilt and
+unversioned packages; `d` opens the full, scrollable list (`j`/`k`, `Ctrl-d`/`Ctrl-u`, `gg`/`G`;
+`q` or `Esc` closes it). `--plain` ends a pending machine's line with the headline; `--json`
+carries the whole preview as `package_diff` (see `auspex_domain::report`).
+
+Two lists of store paths are compared, and both queries write nothing to the store:
+
+- **What the machine runs:** `nix-store --query --requisites /run/current-system`, over the
+  same ssh control master the probe opened: no new approval prompt while the master is up, and
+  through the same approval phase when it is not. It works on nix-darwin too. Its output is
+  capped at 4 MiB; a line that is not a store path is dropped and counted.
+- **What the update would run:** only when the binary cache already has the pending
+  toplevel (the `cached` badge). If the path is valid in the local store, `nix-store --query
+  --requisites` locally; otherwise `nix path-info --recursive --store <cache> <path>`, which
+  writes nothing to the local store (nix keeps its own narinfo cache under `~/.cache/nix`; the
+  query passes `--option narinfo-cache-negative-ttl 0` so a path that is missing right now is
+  not remembered as missing for an hour). A pending toplevel that the cache says it does not
+  have is reported as `not_cached`, with no network call (so is every update-pending machine
+  when no cache is configured, and the panel says which); a cache lookup that failed is a
+  `failed` preview, because nobody checked. A preview is built from what exists, never from a
+  build. Each closure's own system must be the one the scan saw (the probe's
+  `current_system`, the evaluation's out path), or the preview is `failed` ("the machine
+  changed system while it was being queried").
+
+A query that fails or runs out of `timeouts.diff` makes that machine's preview `failed`, with
+the reason; it never changes the machine's status or fails the scan. A refresh cancels
+queries still running. `timeouts.settle` does not cut a preview short: the queries start late
+in a refresh, so headless mode waits for them, at most `timeouts.diff` after they were
+requested. Both are backed by a deadline in the core itself, `timeouts.settle` plus
+`timeouts.diff` after the refresh started, at which a preview still out is cancelled and
+`failed` ("timed out"): headless mode therefore waits at most `settle + diff` (240 s by
+default), and never depends on an adapter answering. Previews have their own small pool of
+query slots (8 queries at once, each of the two queries of a machine taking a slot of its own),
+separate from the 32 shared by probes and cache lookups, so a slow preview cannot hold up
+another machine's `cached` badge. `timeouts.diff` starts when a query gets its slot; a preview
+that never got one before `settle + diff` is `failed` ("no preview slot became free"). Set
+`diff.enabled = false` to switch the feature off.
 
 Stamp deployed machines with the **fleet's** revision, not auspex's:
 

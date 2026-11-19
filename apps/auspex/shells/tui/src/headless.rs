@@ -9,10 +9,11 @@ use std::fmt::Write as _;
 
 use auspex_core::ViewModel;
 use auspex_domain::fleet::TargetSource;
-use auspex_domain::report::{FleetErrorKind, FleetReport};
+use auspex_domain::report::{FleetErrorKind, FleetReport, MachineReport};
 use ratatui::style::Color;
 use unicode_width::UnicodeWidthStr as _;
 
+use crate::packages;
 use crate::theme::badge_colour;
 use crate::ui::{BADGE_CELLS, badge_glyphs, fit};
 
@@ -74,6 +75,18 @@ const fn sgr(c: Color) -> &'static str {
     }
 }
 
+/// The reason column: the machine's `reason`, which already ends in the package headline
+/// for a computed preview, plus a few words for the two states that have none, so a scripted
+/// reader of `--plain` is told why a pending update has no preview.
+fn reason(m: &MachineReport, cache_configured: bool) -> String {
+    let base = m.reason.as_deref().unwrap_or("-");
+    match packages::plain_note(m, cache_configured) {
+        Some(note) if m.reason.is_some() => format!("{base}; {note}"),
+        Some(note) => note,
+        None => base.to_owned(),
+    }
+}
+
 /// `--plain`.
 #[must_use]
 pub fn plain(view: &ViewModel, colour: bool, settle_seconds: u64) -> String {
@@ -118,7 +131,7 @@ pub fn plain(view: &ViewModel, colour: bool, settle_seconds: u64) -> String {
             fit(m.status.label(), status_w),
             fit(&target, target_w),
             fit(source(m.target_source), source_w),
-            m.reason.as_deref().unwrap_or("-"),
+            reason(m, view.binary_cache),
         );
         out.push_str(line.trim_end());
         out.push('\n');

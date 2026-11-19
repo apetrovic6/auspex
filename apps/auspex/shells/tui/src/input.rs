@@ -6,7 +6,7 @@
 //! directly.
 //!
 //! Esc's precedence, first that applies: a prompt is cancelled; the help overlay closes; the
-//! log closes; the narrow layout's detail view closes; a half-typed count or sequence is
+//! package diff closes; the log closes; the narrow layout's detail view closes; a half-typed count or sequence is
 //! dropped. Only then is Esc an ordinary key (by default, quit).
 
 use std::time::Duration;
@@ -57,6 +57,11 @@ pub struct Input {
     pub detail_open: bool,
     /// The log overlay.
     pub log_open: bool,
+    /// The package diff overlay (`d`): the selected machine's full list of changes.
+    pub diff_open: bool,
+    /// Its first visible line. Only ever set by keys; the drawing clamps it to the list (and
+    /// writes the clamped value back), so `G` can say "the end" without knowing how long it is.
+    pub diff_scroll: usize,
     /// A one-line message for the prompt row (an unknown command), until the next key.
     pub message: Option<String>,
 }
@@ -110,6 +115,10 @@ impl Input {
             if screen.help_open {
                 return vec![Event::CloseHelp];
             }
+            if self.diff_open {
+                self.diff_open = false;
+                return Vec::new();
+            }
             if self.log_open {
                 self.log_open = false;
                 return Vec::new();
@@ -148,6 +157,12 @@ impl Input {
             Lookup::Action(a) => a,
         };
         let count = self.count.take();
+        // Over the diff overlay a plain quit key (`q`, Esc by default) closes it; a quit key
+        // that is a control chord (`ctrl-c` by default) still quits, as it does from help. It
+        // is the keymap's own Quit binding either way, so a rebound or unbound chord follows.
+        if self.diff_open && action == Action::Quit && key.ctrl {
+            return vec![Event::Quit];
+        }
         if screen.help_open && !matches!(action, Action::Help | Action::Quit) {
             // The overlay covers the list; keys that move it would act unseen.
             return Vec::new();
@@ -164,6 +179,9 @@ impl Input {
     ) -> Vec<Event> {
         let n = count.unwrap_or(1);
         let half = screen.page.max(1);
+        if self.diff_open {
+            return self.diff_action(action, n, half);
+        }
         match action {
             Action::Down => vec![Event::MoveDown(n)],
             Action::Up => vec![Event::MoveUp(n)],
@@ -204,8 +222,46 @@ impl Input {
                 self.log_open = !self.log_open;
                 Vec::new()
             }
+            Action::Diff => {
+                self.diff_open = true;
+                self.diff_scroll = 0;
+                Vec::new()
+            }
             Action::Quit => vec![Event::Quit],
         }
+    }
+
+    /// What an action does while the package diff is open: scroll it, or close it. Nothing
+    /// else, because the overlay covers the list (a key that moved the selection or started
+    /// a refresh would act unseen), and `q`, whatever it is bound to, closes the overlay
+    /// rather than quitting auspex from under it.
+    fn diff_action(&mut self, action: Action, n: usize, half: usize) -> Vec<Event> {
+        match action {
+            Action::Quit | Action::Diff => self.diff_open = false,
+            Action::Down => self.diff_scroll = self.diff_scroll.saturating_add(n),
+            Action::Up => self.diff_scroll = self.diff_scroll.saturating_sub(n),
+            Action::HalfPageDown => {
+                self.diff_scroll = self
+                    .diff_scroll
+                    .saturating_add(n.saturating_mul(half / 2).max(1));
+            }
+            Action::HalfPageUp => {
+                self.diff_scroll = self
+                    .diff_scroll
+                    .saturating_sub(n.saturating_mul(half / 2).max(1));
+            }
+            Action::Top => self.diff_scroll = 0,
+            Action::Bottom => self.diff_scroll = usize::MAX,
+            Action::Search
+            | Action::SearchNext
+            | Action::SearchPrevious
+            | Action::Refresh
+            | Action::Help
+            | Action::Command
+            | Action::Detail
+            | Action::Log => {}
+        }
+        Vec::new()
     }
 
     fn prompt_key(&mut self, prompt: Prompt, key: Key, screen: Screen) -> Vec<Event> {

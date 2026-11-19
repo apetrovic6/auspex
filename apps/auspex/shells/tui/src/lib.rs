@@ -8,6 +8,7 @@
 //! - [`shell`]: the effect mapping, cancellation and the global deadline; [`backend`] the
 //!   adapters behind it, or [`demo`]'s script.
 //! - [`keymap`] and [`input`]: keys to core events; [`ui`] and [`theme`]: drawing.
+//! - [`packages`]: the package preview as text, for the detail panel and the `d` view.
 //! - [`headless`]: `--plain` and `--json`.
 //! - [`app`]: putting it together, signals included.
 //!
@@ -22,6 +23,7 @@ pub mod headless;
 pub mod input;
 pub mod keymap;
 pub mod log;
+pub mod packages;
 pub mod shell;
 pub mod theme;
 pub mod ui;

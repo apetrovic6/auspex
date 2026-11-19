@@ -28,6 +28,10 @@ pub struct ViewModel {
     pub refresh: RefreshView,
     /// Whether the Prometheus fallback is in effect, for the status bar.
     pub prometheus: PrometheusStatus,
+    /// Whether a binary cache is configured (`cache.url`), so a shell can say which of the two
+    /// reasons a preview is `not_cached`: the cache does not have the pending closure, or there
+    /// is no cache to ask.
+    pub binary_cache: bool,
     /// The selected row, or `None` when there are no rows.
     pub selected: Option<usize>,
     /// The search, when a query is set.
@@ -50,6 +54,9 @@ pub struct RefreshView {
     pub phase: Phase,
     /// Machines still showing a spinner (checking or evaluating).
     pub pending_machines: usize,
+    /// Machines whose package preview is still being collected (their closure queries are
+    /// out). Not part of `pending_machines`: the status and badges are final already.
+    pub diffs_pending: usize,
     /// `Model::fleet_settled`: headless mode prints the report once this is `true`.
     pub settled: bool,
     /// The global deadline passed with something still outstanding, which was then marked as

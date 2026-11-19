@@ -149,8 +149,9 @@ pub struct MachineReport {
     pub badges: Vec<Badge>,
     /// `true` when this machine's probe, evaluation and applicable auxiliary answers are
     /// final: its probe is back (or its target was refused), its evaluation is back, its
-    /// ncps lookup is not pending or no update is pending, and neither its Prometheus nor
-    /// its Alertmanager answer is outstanding. Computed from facts, never from badges:
+    /// ncps lookup is not pending or no update is pending, its package preview is not still
+    /// being collected, and neither its Prometheus nor its Alertmanager answer is
+    /// outstanding. Computed from facts, never from badges:
     /// an unreachable machine whose evaluation is still running is not settled, nor is
     /// one with an update pending whose cache lookup has not answered. This does not cover
     /// shared-IP resolution, which may still change `lints`; only [`FleetReport::settled`]
@@ -199,6 +200,62 @@ pub struct MachineReport {
     pub frozen: bool,
 }
 
+fn headline_of(diff: &PackageDiff) -> String {
+    let counts = diff.counts;
+    let detail = diff
+        .highlights
+        .iter()
+        .find(|h| h.name == "linux")
+        .or_else(|| diff.highlights.first())
+        .map(|h| {
+            let name = h.name.get(..40).unwrap_or(&h.name);
+            let before = h.before.first().and_then(|v| v.as_deref());
+            let after = h.after.first().and_then(|v| v.as_deref());
+            match (before, after) {
+                (Some(a), Some(b)) if name.len() + a.len() + b.len() <= 80 => {
+                    format!("{name} {a} → {b}, ")
+                }
+                (None, Some(v)) if name.len() + v.len() <= 80 => {
+                    format!("{name} added {v}, ")
+                }
+                (Some(v), None) if name.len() + v.len() <= 80 => {
+                    format!("{name} removed {v}, ")
+                }
+                _ => format!("{name} changed, "),
+            }
+        });
+    if counts.added + counts.removed + counts.changed == 0
+        && diff.rebuilt.is_empty()
+        && diff.unversioned.added + diff.unversioned.removed == 0
+    {
+        "packages unchanged (configuration only)".to_owned()
+    } else if let Some(detail) = detail {
+        format!(
+            "{detail}+{} −{} ~{}",
+            counts.added, counts.removed, counts.changed
+        )
+    } else if let Some(name) = diff.rebuilt.first() {
+        format!(
+            "{name} rebuilt, +{} −{} ~{}",
+            counts.added, counts.removed, counts.changed
+        )
+    } else {
+        format!(
+            "packages +{} −{} ~{}",
+            counts.added, counts.removed, counts.changed
+        )
+    }
+}
+
+/// The one-line headline of a computed preview, or `None` for any other state.
+///
+/// What [`MachineReport::with_package_diff`] appends to `reason`, so a shell can show it on
+/// its own line without parsing human text out of `reason`.
+#[must_use]
+pub fn diff_headline(diff: &PackageDiff) -> Option<String> {
+    (diff.state == DiffState::Computed).then(|| headline_of(diff))
+}
+
 impl MachineReport {
     /// Attaches a pure preview; only computed update-pending rows gain a short headline.
     ///
@@ -206,51 +263,9 @@ impl MachineReport {
     /// freshly built report; reason remains human text, not a machine-readable interface.
     #[must_use]
     pub fn with_package_diff(mut self, diff: PackageDiff) -> Self {
-        if self.status == Badge::UpdatePending && diff.state == DiffState::Computed {
-            let counts = diff.counts;
-            let detail = diff
-                .highlights
-                .iter()
-                .find(|h| h.name == "linux")
-                .or_else(|| diff.highlights.first())
-                .map(|h| {
-                    let name = h.name.get(..40).unwrap_or(&h.name);
-                    let before = h.before.first().and_then(|v| v.as_deref());
-                    let after = h.after.first().and_then(|v| v.as_deref());
-                    match (before, after) {
-                        (Some(a), Some(b)) if name.len() + a.len() + b.len() <= 80 => {
-                            format!("{name} {a} → {b}, ")
-                        }
-                        (None, Some(v)) if name.len() + v.len() <= 80 => {
-                            format!("{name} added {v}, ")
-                        }
-                        (Some(v), None) if name.len() + v.len() <= 80 => {
-                            format!("{name} removed {v}, ")
-                        }
-                        _ => format!("{name} changed, "),
-                    }
-                });
-            let headline = if counts.added + counts.removed + counts.changed == 0
-                && diff.rebuilt.is_empty()
-                && diff.unversioned.added + diff.unversioned.removed == 0
-            {
-                "packages unchanged (configuration only)".to_owned()
-            } else if let Some(detail) = detail {
-                format!(
-                    "{detail}+{} −{} ~{}",
-                    counts.added, counts.removed, counts.changed
-                )
-            } else if let Some(name) = diff.rebuilt.first() {
-                format!(
-                    "{name} rebuilt, +{} −{} ~{}",
-                    counts.added, counts.removed, counts.changed
-                )
-            } else {
-                format!(
-                    "packages +{} −{} ~{}",
-                    counts.added, counts.removed, counts.changed
-                )
-            };
+        if self.status == Badge::UpdatePending
+            && let Some(headline) = diff_headline(&diff)
+        {
             if let Some(reason) = &mut self.reason {
                 let position = reason.find(';').unwrap_or(reason.len());
                 reason.insert_str(position, &format!("; {headline}"));

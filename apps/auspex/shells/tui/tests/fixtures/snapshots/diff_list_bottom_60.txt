@@ -1,0 +1,12 @@
+┌ machines (18) ───────────────────────────────────────────┐
+│┌ package diff: luna ────────────────────────────────────┐│
+││removed (2)                                             ││
+││  htop  3.3.0                                           ││
+││  nano  8.3                                             ││
+││rebuilt (1)                                             ││
+││  nix  same version, new build                          ││
+││1 unreadable path (1 deployed, 0 pending)               ││
+│└ 17–22/22 q/esc close ──────────────────────────────────┘│
+└──────────────────────────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ settled │ 0 pending │ prom: ok              ? help

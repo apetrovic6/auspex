@@ -189,7 +189,38 @@
       "reason": "pending nixos-system-cypramundi-25.11.20261101.6a2f1c0",
       "current_system": "/nix/store/i4payi4paxh3paxh3n9wh3n9wg2m9wg2-nixos-system-cypramundi-25.11.20261019.b81e2d4",
       "pending_system": "/nix/store/8jx7iv6hs4gr3dq2cn1bmzaly8kx7iw6-nixos-system-cypramundi-25.11.20261101.6a2f1c0",
-      "package_diff": null,
+      "package_diff": {
+        "state": "not_cached",
+        "reason": null,
+        "deployed": null,
+        "pending": null,
+        "added": [],
+        "removed": [],
+        "changed": [],
+        "highlights": [],
+        "rebuilt": [],
+        "unversioned": {
+          "added": 0,
+          "removed": 0
+        },
+        "invalid": {
+          "deployed": 0,
+          "pending": 0
+        },
+        "counts": {
+          "added": 0,
+          "removed": 0,
+          "changed": 0
+        },
+        "truncated": {
+          "added": false,
+          "removed": false,
+          "changed": false,
+          "highlights": false,
+          "rebuilt": false,
+          "bytes": false
+        }
+      },
       "deployed_revision": "6a2f1c0e9d",
       "system_state": "running",
       "failed_units": [],
@@ -542,10 +573,287 @@
         "cached"
       ],
       "settled": true,
-      "reason": "pending nixos-system-luna-25.11.20261101.6a2f1c0",
+      "reason": "pending nixos-system-luna-25.11.20261101.6a2f1c0; linux 6.12.38 → 6.12.41, +3 −2 ~10",
       "current_system": "/nix/store/0357acgiknqsxz2469bdhjmprwy0358a-nixos-system-luna-25.11.20261019.b81e2d4",
       "pending_system": "/nix/store/g1j4m7qavdyh1k4n7rawdzh2k5n8rbwf-nixos-system-luna-25.11.20261101.6a2f1c0",
-      "package_diff": null,
+      "package_diff": {
+        "state": "computed",
+        "reason": null,
+        "deployed": "/nix/store/0357acgiknqsxz2469bdhjmprwy0358a-nixos-system-luna-25.11.20261019.b81e2d4",
+        "pending": "/nix/store/g1j4m7qavdyh1k4n7rawdzh2k5n8rbwf-nixos-system-luna-25.11.20261101.6a2f1c0",
+        "added": [
+          {
+            "name": "fd",
+            "before": [],
+            "after": [
+              "10.2.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "ripgrep",
+            "before": [],
+            "after": [
+              "14.1.1"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "tailscale",
+            "before": [],
+            "after": [
+              "1.80.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          }
+        ],
+        "removed": [
+          {
+            "name": "htop",
+            "before": [
+              "3.3.0"
+            ],
+            "after": [],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "nano",
+            "before": [
+              "8.3"
+            ],
+            "after": [],
+            "before_truncated": false,
+            "after_truncated": false
+          }
+        ],
+        "changed": [
+          {
+            "name": "glibc",
+            "before": [
+              "2.40-66"
+            ],
+            "after": [
+              "2.40-77"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "linux",
+            "before": [
+              "6.12.38"
+            ],
+            "after": [
+              "6.12.41"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "systemd",
+            "before": [
+              "256.10"
+            ],
+            "after": [
+              "257.2"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "firefox",
+            "before": [
+              "133.0"
+            ],
+            "after": [
+              "134.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "nodejs",
+            "before": [
+              "20.18.1"
+            ],
+            "after": [
+              "22.12.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "postgresql",
+            "before": [
+              "16.6"
+            ],
+            "after": [
+              "17.2"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "curl",
+            "before": [
+              "8.11.1"
+            ],
+            "after": [
+              "8.12.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "openssh",
+            "before": [
+              "9.9p1"
+            ],
+            "after": [
+              "9.9p2"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "openssl",
+            "before": [
+              "3.4.1"
+            ],
+            "after": [
+              "3.4.2"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "python3",
+            "before": [
+              "3.12.8"
+            ],
+            "after": [
+              "3.13.1"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          }
+        ],
+        "highlights": [
+          {
+            "name": "glibc",
+            "kinds": [
+              "glibc"
+            ],
+            "before": [
+              "2.40-66"
+            ],
+            "after": [
+              "2.40-77"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "linux",
+            "kinds": [
+              "kernel"
+            ],
+            "before": [
+              "6.12.38"
+            ],
+            "after": [
+              "6.12.41"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "systemd",
+            "kinds": [
+              "systemd",
+              "major_version"
+            ],
+            "before": [
+              "256.10"
+            ],
+            "after": [
+              "257.2"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "firefox",
+            "kinds": [
+              "major_version"
+            ],
+            "before": [
+              "133.0"
+            ],
+            "after": [
+              "134.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "nodejs",
+            "kinds": [
+              "major_version"
+            ],
+            "before": [
+              "20.18.1"
+            ],
+            "after": [
+              "22.12.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "postgresql",
+            "kinds": [
+              "major_version"
+            ],
+            "before": [
+              "16.6"
+            ],
+            "after": [
+              "17.2"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          }
+        ],
+        "rebuilt": [
+          "nix"
+        ],
+        "unversioned": {
+          "added": 1,
+          "removed": 1
+        },
+        "invalid": {
+          "deployed": 1,
+          "pending": 0
+        },
+        "counts": {
+          "added": 3,
+          "removed": 2,
+          "changed": 10
+        },
+        "truncated": {
+          "added": false,
+          "removed": false,
+          "changed": false,
+          "highlights": false,
+          "rebuilt": false,
+          "bytes": false
+        }
+      },
       "deployed_revision": "6a2f1c0e9d",
       "system_state": "running",
       "failed_units": [],
@@ -735,13 +1043,45 @@
       "build_host": "localhost",
       "status": "update_pending",
       "badges": [
-        "update_pending"
+        "update_pending",
+        "cached"
       ],
       "settled": true,
       "reason": "pending nixos-system-sol-25.11.20261101.6a2f1c0",
       "current_system": "/nix/store/8kx7jw7iv6hs5gs4fr3dq2dp1cn0bm0a-nixos-system-sol-25.11.20261019.b81e2d4",
       "pending_system": "/nix/store/mc4vj91qg6ymc3vj90qg6xmc3sj90pg6-nixos-system-sol-25.11.20261101.6a2f1c0",
-      "package_diff": null,
+      "package_diff": {
+        "state": "failed",
+        "reason": "deployed closure query timed out after 120s",
+        "deployed": null,
+        "pending": null,
+        "added": [],
+        "removed": [],
+        "changed": [],
+        "highlights": [],
+        "rebuilt": [],
+        "unversioned": {
+          "added": 0,
+          "removed": 0
+        },
+        "invalid": {
+          "deployed": 0,
+          "pending": 0
+        },
+        "counts": {
+          "added": 0,
+          "removed": 0,
+          "changed": 0
+        },
+        "truncated": {
+          "added": false,
+          "removed": false,
+          "changed": false,
+          "highlights": false,
+          "rebuilt": false,
+          "bytes": false
+        }
+      },
       "deployed_revision": "6a2f1c0e9d",
       "system_state": "running",
       "failed_units": [],

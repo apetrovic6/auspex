@@ -9,6 +9,10 @@ ssh_approval = 60
 probe = 10
 eval = 300
 settle = 120
+diff = 120
+
+[diff]
+enabled = false
 
 [eval]
 workers = 4

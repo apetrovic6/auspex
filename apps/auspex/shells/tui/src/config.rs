@@ -28,6 +28,8 @@ pub struct Settings {
     pub ssh: SshSettings,
     /// `[eval]`.
     pub eval: EvalSettings,
+    /// `[diff]`.
+    pub diff: DiffSettings,
     /// `[prometheus]`, or `None` when there is no `url` (then health comes from ssh).
     pub prometheus: Option<PrometheusSettings>,
     /// `[cache] url`: the binary cache for the "cached" badge, or `None` for no badge.
@@ -39,6 +41,21 @@ pub struct Settings {
     pub keymap: BTreeMap<String, Vec<String>>,
     /// `[theme] file`, with a leading `~/` expanded, or `None` for the terminal's ANSI 16.
     pub theme_file: Option<PathBuf>,
+}
+
+/// `[diff]`: the package preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffSettings {
+    /// `diff.enabled`: whether a machine whose update is pending gets a package preview (its
+    /// two closures queried and compared). Off, no closure is ever queried and `package_diff`
+    /// stays `null`.
+    pub enabled: bool,
+}
+
+impl Default for DiffSettings {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// SSH connection reuse settings.
@@ -69,6 +86,10 @@ pub struct Timeouts {
     pub eval: u64,
     /// The global deadline for one refresh: past it everything pending is timed out.
     pub settle: u64,
+    /// One machine's package preview, from the moment its two closure queries are requested.
+    /// Past it the preview is `failed`; the scan is not. Not bounded by `settle`: the queries
+    /// start late in a refresh, so the fleet settles at most this long after the last one.
+    pub diff: u64,
 }
 
 impl Default for Timeouts {
@@ -79,6 +100,7 @@ impl Default for Timeouts {
             probe: 10,
             eval: 300,
             settle: 120,
+            diff: 120,
         }
     }
 }
@@ -249,6 +271,7 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                         "probe" => s.timeouts.probe = w.timeout(v, &name)?,
                         "eval" => s.timeouts.eval = w.timeout(v, &name)?,
                         "settle" => s.timeouts.settle = w.timeout(v, &name)?,
+                        "diff" => s.timeouts.diff = w.timeout(v, &name)?,
                         _ => w.unknown(&name),
                     }
                 }
@@ -279,6 +302,15 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                     match k.as_str() {
                         "workers" => s.eval.workers = w.positive(v, &name)?,
                         "max_memory_mb" => s.eval.max_memory_mb = w.positive(v, &name)?,
+                        _ => w.unknown(&name),
+                    }
+                }
+            }
+            "diff" => {
+                for (k, v) in w.table(value, "diff")? {
+                    let name = format!("diff.{k}");
+                    match k.as_str() {
+                        "enabled" => s.diff.enabled = w.boolean(v, &name)?,
                         _ => w.unknown(&name),
                     }
                 }
@@ -444,6 +476,14 @@ impl Walk {
         v.as_str()
             .map(str::to_owned)
             .ok_or_else(|| wrong(key, "a string", v))
+    }
+
+    #[expect(
+        clippy::unused_self,
+        reason = "kept beside `unknown` so every key reads alike"
+    )]
+    fn boolean(&self, v: &Value, key: &str) -> Result<bool, String> {
+        v.as_bool().ok_or_else(|| wrong(key, "true or false", v))
     }
 
     fn bounded(&self, v: &Value, key: &str, min: u64, max: u64) -> Result<u64, String> {

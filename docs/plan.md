@@ -81,7 +81,10 @@ concrete reason. The first known one: the phase-2 `clan-probe` binary would shar
 
 `--plain` and `--json` run the same core and effects without a terminal, until the fleet has
 settled, then print the final view model. "Settled" means every machine has a status or an
-error, or the global timeout has passed (`fleet_settled()` in the core). That gives one code
+error, or the global timeout has passed (`fleet_settled()` in the core). The one exception
+is the package preview (step 5): its closure queries are not cut by the global timeout but by
+their own, `timeouts.diff`, with a backstop in the core at `timeouts.settle + timeouts.diff`,
+so headless mode waits at most that long. That gives one code
 path, so the JSON always matches what the TUI shows. The JSON is a documented, versioned
 contract, because the weekly digest and coding agents read it.
 
