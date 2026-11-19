@@ -354,15 +354,16 @@ async fn deleted_and_emptied_files_differ() {
 }
 
 /// Review mutations R03 and R28: the worktree cap is a total. Two sparse tracked files of
-/// 130 MiB each are 260 MiB, over the 256 MiB cap, though each alone is under it.
+/// 600 MiB each are 1200 MiB, over the 1 GiB cap, though each alone is under it. Sparse, so
+/// nothing is written to disk.
 #[tokio::test]
 async fn the_worktree_cap_is_a_total() {
     let Some(r) = repo() else { return };
-    sparse(&r.path().join("a.bin"), 130 << 20);
-    sparse(&r.path().join("b.bin"), 130 << 20);
+    sparse(&r.path().join("a.bin"), 600 << 20);
+    sparse(&r.path().join("b.bin"), 600 << 20);
     git(r.path(), &["add", "a.bin", "b.bin"]);
     let e = key(r.path()).await.unwrap_err();
-    assert!(e.contains("larger than"), "{e}");
+    assert!(e.contains("larger than 1024 MiB"), "{e}");
 }
 
 /// Review finding F6: the index listing is capped at 64 MiB, exactly. A git whose
