@@ -28,7 +28,9 @@ use auspex_tui::demo::{self, Demo};
 use auspex_tui::log::Log;
 use auspex_tui::output::Stream;
 use auspex_tui::shell::Shell;
-use common::{Tools, alive, cleanup, still_alive_after_wait, tempdir, tools, wait_for_pids};
+use common::{
+    Tools, alive, cleanup, pid_exists, still_alive_after_wait, tempdir, tools, wait_for_pids,
+};
 
 /// What a test sets up: scripts and the log in `dir`, the fleet in `fleet`.
 struct World {
@@ -49,6 +51,11 @@ fn identity() -> Identity {
 /// A shell over the scripted fleet whose actions run `clan` and `nix` (fake programs), logging
 /// to a database of its own.
 fn world(t: &Tools, clan_body: &str, nix_body: &str) -> World {
+    world_with(t, clan_body, nix_body, true)
+}
+
+/// [`world`], with no action log configured when `logged` is false (no usable state directory).
+fn world_with(t: &Tools, clan_body: &str, nix_body: &str, logged: bool) -> World {
     let dir = tempdir();
     let fleet = tempdir();
     let clan = t.script(dir.path(), "clan", clan_body);
@@ -60,11 +67,13 @@ fn world(t: &Tools, clan_body: &str, nix_body: &str) -> World {
     });
     let shell = Shell::new(backend, Log::memory(), Duration::from_secs(120));
     let db = dir.path().join("state").join("log.sqlite");
-    shell.set_action_log(OpenParams::new(
-        db.clone(),
-        identity(),
-        fleet.path().to_path_buf(),
-    ));
+    if logged {
+        shell.set_action_log(OpenParams::new(
+            db.clone(),
+            identity(),
+            fleet.path().to_path_buf(),
+        ));
+    }
     shell.send(Event::Start(auspex_core::Config {
         flake: fleet.path().to_str().unwrap().to_owned(),
         ..demo::config()
@@ -184,7 +193,7 @@ async fn an_update_runs_the_exact_argv_streams_and_is_logged_succeeded() {
     let w = world(
         &t,
         &format!(
-            "{RECORD}echo 'building'\necho 'a warning' >&2\necho \"cwd=$PWD\"\necho 'activating'\nexit 0"
+            "{RECORD}echo 'building'\necho 'a warning' >&2\necho \"cwd=$PWD\"\necho 'activating'\necho 'token=hunter2-from-an-activation-script'\nexit 0"
         ),
         "exit 99",
     );
@@ -196,8 +205,8 @@ async fn an_update_runs_the_exact_argv_streams_and_is_logged_succeeded() {
     assert_eq!(end.exit_code, Some(0));
     assert_eq!(
         end.summary,
-        ["activating"],
-        "a success's summary is its last line"
+        ["exit 0, 5 lines"],
+        "a success's summary is fixed text, not a line of what the script printed"
     );
 
     let fleet = fs::canonicalize(w.fleet.path()).unwrap();
@@ -247,7 +256,15 @@ async fn an_update_runs_the_exact_argv_streams_and_is_logged_succeeded() {
     assert_eq!(row.exit_code, Some(0));
     assert_eq!(row.who, "tester");
     assert!(row.ended_at.is_some());
-    assert_eq!(row.detail.as_deref(), Some("activating"));
+    assert_eq!(
+        row.detail.as_deref(),
+        Some("exit 0, 5 lines"),
+        "the action log holds a summary, never a line of the output"
+    );
+    assert!(
+        !format!("{row:?}").contains("hunter2"),
+        "nothing the script printed is in the row: {row:?}"
+    );
 }
 
 #[tokio::test]
@@ -417,10 +434,7 @@ async fn a_build_runs_nix_build_streams_and_is_logged_as_a_build() {
     w.shell.send(Event::BuildSelected);
     let end = ended(&w.shell).await;
     assert_eq!(end.result, ActionResult::Succeeded);
-    assert_eq!(
-        end.summary,
-        ["/nix/store/0123456789abcdfghijklmnpqrsvwxyz-built"]
-    );
+    assert_eq!(end.summary, ["exit 0, 1 line"]);
     let argv = recorded(w.dir.path());
     assert_eq!(
         &argv[..4],
@@ -518,6 +532,13 @@ async fn quitting_during_an_update_asks_then_stops_it_before_exit_and_logs_cance
 
     w.shell.send(Event::ConfirmAnswer(true));
     until(&w.shell, "quit", |v| v.quit).await;
+    // The leader itself is reaped, not a zombie, by the time `quit` is true: no polling here,
+    // `still_alive_after_wait` below is for the reparented grandchild, which init reaps.
+    assert!(
+        !pid_exists(pids[1]),
+        "the leader {} is still in the process table when quit became true",
+        pids[1]
+    );
     // `quit` is true only once the process group is killed and reaped: nothing is left.
     let left = still_alive_after_wait(&pids);
     assert!(left.is_empty(), "orphans at the moment of exit: {left:?}");
@@ -546,6 +567,11 @@ async fn a_termination_signal_does_the_same_without_a_question() {
     tokio::time::timeout(Duration::from_secs(20), w.shell.terminate())
         .await
         .expect("terminate returns once everything is reaped");
+    assert!(
+        !pid_exists(pids[1]),
+        "the leader {} is still in the process table after terminate returned",
+        pids[1]
+    );
     let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     assert!(left.is_empty(), "orphans after SIGTERM's path: {left:?}");
@@ -570,7 +596,36 @@ async fn a_second_quit_forces_and_the_shutdown_still_reaps() {
     w.shell.send(Event::Quit); // the second: forces, whether or not it has been reaped yet
     assert!(w.shell.view().quit);
     w.shell.terminate().await;
+    assert!(
+        !pid_exists(pids[1]),
+        "the leader {} is still in the process table after the forced quit's shutdown",
+        pids[1]
+    );
     let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     assert!(left.is_empty(), "{left:?}");
+}
+
+/// With no action log (no usable state directory) nothing but the action's own task is left to
+/// wait for, so the exit's wait for the reaping must not depend on the log task.
+#[tokio::test]
+async fn a_termination_signal_waits_for_the_reaping_with_no_action_log() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let w = world_with(&t, SLOW_CLAN, "exit 99", false);
+    let pids = running_update(&w).await;
+
+    tokio::time::timeout(Duration::from_secs(20), w.shell.terminate())
+        .await
+        .expect("terminate returns once everything is reaped");
+    // At the instant terminate returns, which is when main exits: no polling.
+    assert!(
+        !pid_exists(pids[1]),
+        "the leader {} is still in the process table: terminate did not wait for the reaping",
+        pids[1]
+    );
+    let left = still_alive_after_wait(&pids);
+    cleanup(&pids);
+    assert!(left.is_empty(), "orphans after the signal's path: {left:?}");
+    assert!(w.shell.view().quit);
+    assert!(!w.db.exists(), "no log was configured, none was written");
 }

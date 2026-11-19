@@ -18,7 +18,7 @@ use auspex_effects::act::{UPDATE_HEAD, build, build_argv, update, update_args, u
 use auspex_effects::clan::{ClanLine, RunEnd, RunParams, Stream};
 use auspex_effects::nix::FlakeRef;
 use auspex_effects::{CancellationToken, Cancelled};
-use common::{Tools, cleanup, still_alive_after_wait, tempdir, tools, wait_for_pids};
+use common::{Tools, cleanup, pid_exists, still_alive_after_wait, tempdir, tools, wait_for_pids};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 const LOCAL: &str = "x86_64-linux";
@@ -330,6 +330,13 @@ async fn cancelling_an_update_kills_the_whole_group_and_reaps_it() {
         .expect("returns once cancelled")
         .unwrap();
     assert_eq!(answer.unwrap_err(), Cancelled);
+    // The leader (`$$`, the second pid) is reaped, not a zombie, when the answer comes: no
+    // polling. The first pid is the reparented grandchild, which init reaps in its own time.
+    assert!(
+        !pid_exists(pids[1]),
+        "the leader {} is still in the process table when the cancel was answered",
+        pids[1]
+    );
     let left = still_alive_after_wait(&pids);
     cleanup(&left);
     assert!(left.is_empty(), "left behind: {left:?}");
@@ -501,6 +508,13 @@ async fn cancelling_a_build_kills_the_whole_group_and_reaps_it() {
         .expect("returns once cancelled")
         .unwrap();
     assert_eq!(answer.unwrap_err(), Cancelled);
+    // The leader (`$$`, the second pid) is reaped, not a zombie, when the answer comes: no
+    // polling. The first pid is the reparented grandchild, which init reaps in its own time.
+    assert!(
+        !pid_exists(pids[1]),
+        "the leader {} is still in the process table when the cancel was answered",
+        pids[1]
+    );
     let left = still_alive_after_wait(&pids);
     cleanup(&left);
     assert!(left.is_empty(), "left behind: {left:?}");

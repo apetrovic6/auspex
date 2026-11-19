@@ -754,8 +754,15 @@ fn action_end(
             ActionEnd {
                 result,
                 exit_code,
+                // Fixed text, not a line of output: an activation script prints whatever it
+                // prints, and the action log holds summaries, never output. The Log tab has the
+                // lines.
                 summary: if ok {
-                    output.tail(Stream::Stdout, 1)
+                    let n = output.printed_lines();
+                    vec![format!(
+                        "exit 0, {n} {}",
+                        if n == 1 { "line" } else { "lines" }
+                    )]
                 } else {
                     summary()
                 },

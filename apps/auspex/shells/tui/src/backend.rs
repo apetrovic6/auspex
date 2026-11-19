@@ -298,7 +298,8 @@ pub struct Real {
     flake_source: FlakeSource,
     /// Which `clan` each fleet pins, found once and kept for the run.
     clan: ClanLocator,
-    /// An explicit path to `clan` (`AUSPEX_CLAN`, for the tests' fake): wins over resolution.
+    /// An explicit path to `clan`, set only by [`Self::for_actions`] (the tests' fake): wins over
+    /// resolution. A real run always resolves the fleet's pinned `clan` from its lock.
     clan_path: Option<PathBuf>,
 }
 
@@ -348,9 +349,10 @@ impl Real {
             cache_dir: cache::default_dir(),
             flake_source,
             clan: ClanLocator::new(),
-            clan_path: std::env::var_os("AUSPEX_CLAN")
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from),
+            // Never from the environment: an inherited variable (a profile, a wrapper, a
+            // leftover from debugging) would change which binary deploys. Only the tests'
+            // constructor, `for_actions`, sets it.
+            clan_path: None,
         }
     }
 
@@ -694,6 +696,24 @@ async fn pump<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `u` runs the fleet's pinned `clan`, found from its lock. An environment variable that
+    /// named another binary would silently replace it in the release build, so none is read:
+    /// the only way to name one is the tests' constructor.
+    #[test]
+    fn no_environment_variable_names_the_clan_that_deploys() {
+        let name = concat!("AUSPEX", "_CLAN");
+        let mut read = 0;
+        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "rs") {
+                read += 1;
+                let text = std::fs::read_to_string(&path).unwrap();
+                assert!(!text.contains(name), "{} mentions {name}", path.display());
+            }
+        }
+        assert!(read > 5, "the sources were found");
+    }
 
     #[test]
     fn unnamed_instances_are_asked_as_name_9100_and_answered_by_name() {

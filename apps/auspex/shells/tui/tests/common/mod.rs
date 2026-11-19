@@ -356,6 +356,17 @@ pub fn alive(pid: i32) -> bool {
         .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
 }
 
+/// Whether `pid` exists at all, zombies included: a child that has exited but was never
+/// reaped still exists. What "the leader was reaped" is checked with: `alive` counts a zombie
+/// as gone.
+pub fn pid_exists(pid: i32) -> bool {
+    if Path::new("/proc/self/stat").exists() {
+        return Path::new(&format!("/proc/{pid}")).exists();
+    }
+    rustix::process::Pid::from_raw(pid)
+        .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+}
+
 /// Kills pids this test spawned that are still alive, so a failing assertion leaves
 /// nothing behind.
 pub fn cleanup(pids: &[i32]) {

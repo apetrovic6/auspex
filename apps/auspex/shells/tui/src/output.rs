@@ -175,6 +175,22 @@ impl Output {
         })
     }
 
+    /// How many lines the current action printed on standard output and error, counting those
+    /// already dropped from the front.
+    #[must_use]
+    pub fn printed_lines(&self) -> u64 {
+        self.with(|inner| {
+            inner.current.as_ref().map_or(0, |run| {
+                let kept = run
+                    .lines
+                    .iter()
+                    .filter(|l| l.stream != Stream::Note)
+                    .count();
+                run.dropped + kept as u64
+            })
+        })
+    }
+
     /// The last `n` lines of the current action that came from `stream`, oldest first.
     #[must_use]
     pub fn tail(&self, stream: Stream, n: usize) -> Vec<String> {

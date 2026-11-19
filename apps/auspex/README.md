@@ -68,7 +68,7 @@ ssh says so, and what to change (`nixos-rebuild` strips `SSH_AUTH_SOCK`; an agen
 makes the server give up). After an update the machine is probed and evaluated again.
 
 Every `u` and `b` is a row in `$XDG_STATE_HOME/auspex/log.sqlite` (start, end, result, exit code
-and a short summary, never the output; see the schema in `crates/auspex-effects`). If the log
+and a short summary, never the output: the last error lines of a failure, the fixed text `exit 0, N lines` for a success; see the schema in `crates/auspex-effects`). If the log
 cannot be written the status bar says so; the action is not affected.
 
 **Quitting during an action** asks `an update of luna is running; quit and stop it? (an activation already under way on the machine may complete) y/N`. `y` (or a
