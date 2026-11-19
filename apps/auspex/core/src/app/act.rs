@@ -321,7 +321,10 @@ pub(super) fn request(model: &mut Model, kind: ActionKind) -> Command<Effect, Ev
     };
     match check(model, kind, &machine) {
         Err(why) => model.notice(why),
-        Ok(checked) if kind == ActionKind::Update => start_checks(model, machine, checked),
+        Ok(checked) if kind == ActionKind::Update => match not_yet(model, &machine) {
+            Some(why) => model.notice(why),
+            None => start_checks(model, machine, checked),
+        },
         Ok(_) => launch(model, kind, machine),
     }
 }
@@ -425,6 +428,33 @@ fn start_checks(model: &mut Model, machine: String, shown: Shown) -> Command<Eff
     Command::all(commands)
 }
 
+/// `machine`'s probe is out in this refresh: what it would say is not "unknown", it is not here
+/// yet (a refresh clears every probe and asks for them again).
+fn probing(model: &Model, machine: &str) -> bool {
+    model
+        .outstanding
+        .values()
+        .any(|p| matches!(p, Pending::Probe(n) if n == machine))
+}
+
+/// Address resolution is out in this refresh: until it answers, no collision can be ruled out.
+fn resolving(model: &Model) -> bool {
+    model
+        .outstanding
+        .values()
+        .any(|p| matches!(p, Pending::Resolve(_)))
+}
+
+/// Why an update of `machine` cannot be asked about yet, when what the checks need from the
+/// core is still on its way. Refused at `u` rather than shown as a warning: "not known yet"
+/// must not read as "not known".
+fn not_yet(model: &Model, machine: &str) -> Option<String> {
+    if probing(model, machine) {
+        return Some(format!("still probing {machine}; try again in a moment"));
+    }
+    resolving(model).then(|| "still resolving addresses; try again in a moment".to_owned())
+}
+
 /// What the checks decide for `machine` now: the shell's `answer` and what the core holds.
 ///
 /// Called when the answer comes in (what the dialog shows) and again when the operator
@@ -462,10 +492,12 @@ fn review(model: &Model, machine: &str, answer: &PreflightAnswer) -> Preflight {
             .map(|b| *b)
             .map_err(String::as_str),
         free_bytes,
+        probing: probing(model, machine),
         addresses: Addresses {
             own_known: known(machine),
             shared: &shared,
             others_unknown,
+            resolving: resolving(model),
         },
         public,
     })
@@ -567,12 +599,15 @@ fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effec
 /// may have moved while the dialog was open: act mode turned off, an action started, the list
 /// refreshed, an address changed. Everything is decided again, with the checks' answer the
 /// dialog was showing.
-fn confirm_update(
-    model: &mut Model,
-    machine: String,
-    path: &str,
-    answer: &PreflightAnswer,
-) -> Command<Effect, Event> {
+fn confirm_update(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
+    let Asked {
+        machine,
+        to,
+        path,
+        answer,
+        review: shown,
+        typed_given,
+    } = asked;
     if !model.act {
         return model.notice(ACT_MODE_OFF);
     }
@@ -598,14 +633,52 @@ fn confirm_update(
         model.view.notice = Some(note);
         return command;
     }
-    let now = review(model, &machine, answer);
+    let now = review(model, &machine, &answer);
     if !now.refusals.is_empty() {
         return model.notice(format!(
             "not updating {machine}: {}",
             now.refusals.join("; ")
         ));
     }
+    // Every rule is decided again, not only the refusals: what the operator confirmed is the
+    // dialog they saw. If the rules now say something else, they are asked again about that.
+    // The typed name may have become required (a reconfigured `public`, or the AUS-22 hook
+    // reading the pending system), and a check may have turned up something new to read.
+    let again = if now.typed_confirmation && !typed_given {
+        Some(format!(
+            "{machine} now has to be confirmed by typing its name"
+        ))
+    } else if now.warnings != shown.warnings {
+        Some("what the checks found changed; asking again".to_owned())
+    } else {
+        None
+    };
+    if let Some(note) = again {
+        let typed = (now.refusals.is_empty() && now.typed_confirmation).then(Typed::default);
+        model.ask(Confirm::Update {
+            machine,
+            to,
+            path,
+            answer,
+            review: now,
+            typed,
+        });
+        return model.notice(note);
+    }
     launch(model, ActionKind::Update, machine)
+}
+
+/// What the dialog the operator confirmed was about.
+struct Asked {
+    machine: String,
+    to: String,
+    path: String,
+    answer: PreflightAnswer,
+    /// What the checks decided when the dialog was drawn.
+    review: Preflight,
+    /// The operator typed the machine's name (so the typed confirmation, if required now, is
+    /// satisfied).
+    typed_given: bool,
 }
 
 /// `y` or anything else, to the open question.
@@ -638,10 +711,22 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
         }
         Confirm::Update {
             machine,
+            to,
             path,
             answer,
+            review,
             ..
-        } => confirm_update(model, machine, &path, &answer),
+        } => confirm_update(
+            model,
+            Asked {
+                machine,
+                to,
+                path,
+                answer,
+                review,
+                typed_given: false,
+            },
+        ),
         Confirm::Quit => stop_and_quit(model),
     }
 }
@@ -679,10 +764,11 @@ pub(super) fn typed_submit(model: &mut Model) -> Command<Effect, Event> {
     model.view.notice = None;
     let Some(Confirm::Update {
         machine,
+        to,
         path,
         answer,
+        review,
         typed: Some(typed),
-        ..
     }) = &mut model.confirm
     else {
         return Command::done();
@@ -691,9 +777,16 @@ pub(super) fn typed_submit(model: &mut Model) -> Command<Effect, Event> {
         typed.mismatch = true;
         return render();
     }
-    let (machine, path, answer) = (machine.clone(), path.clone(), answer.clone());
+    let asked = Asked {
+        machine: machine.clone(),
+        to: to.clone(),
+        path: path.clone(),
+        answer: answer.clone(),
+        review: review.clone(),
+        typed_given: true,
+    };
     model.confirm = None;
-    confirm_update(model, machine, &path, &answer)
+    confirm_update(model, asked)
 }
 
 /// The operator's request to quit (`q`, Esc, Ctrl-C, `:q`).

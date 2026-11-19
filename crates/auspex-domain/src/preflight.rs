@@ -254,6 +254,9 @@ pub struct Addresses<'a> {
     /// How many *other* machines have no known address, so a collision with them cannot be
     /// ruled out.
     pub others_unknown: usize,
+    /// Address resolution is still out for this refresh. "Not known yet" is not "resolution
+    /// failed": until it answers, no collision can be ruled out, so the rule refuses.
+    pub resolving: bool,
 }
 
 /// Everything the rules need, gathered by the core.
@@ -268,6 +271,10 @@ pub struct Facts<'a> {
     /// Free bytes on the target's `/nix/store` filesystem as the last probe saw them, or
     /// `None` when the probe did not report it.
     pub free_bytes: Option<u64>,
+    /// The machine's probe is still out for this refresh, so its free space is not "unknown"
+    /// but not here yet. The disk rule refuses until it answers: a refresh clears the probes,
+    /// and without this a refusal for disk would turn into a warning for a few seconds.
+    pub probing: bool,
     /// The duplicate-address rule's inputs.
     pub addresses: Addresses<'a>,
     /// `machines.<m>.public`.
@@ -344,6 +351,12 @@ fn tree_check(facts: &Facts<'_>, out: &mut Preflight) {
 
 fn disk_check(facts: &Facts<'_>, out: &mut Preflight) {
     let machine = facts.machine;
+    if facts.probing {
+        out.refusals.push(format!(
+            "still probing {machine}, so its free disk is not known yet: try again in a moment"
+        ));
+        return;
+    }
     let closure = match facts.closure_bytes {
         Ok(c) => c,
         Err(why) => {
@@ -379,6 +392,13 @@ fn disk_check(facts: &Facts<'_>, out: &mut Preflight) {
 fn address_check(facts: &Facts<'_>, out: &mut Preflight) {
     let machine = facts.machine;
     let a = facts.addresses;
+    if a.resolving {
+        out.refusals.push(format!(
+            "still resolving addresses, so whether {machine}'s address is shared with another \
+             machine cannot be told yet: try again in a moment"
+        ));
+        return;
+    }
     if !a.own_known {
         out.refusals.push(format!(
             "{machine} has no known address (its target is missing, or a hostname that has not \
@@ -439,6 +459,7 @@ mod tests {
         own_known: true,
         shared: &[],
         others_unknown: 0,
+        resolving: false,
     };
 
     fn facts<'a>(
@@ -451,6 +472,7 @@ mod tests {
             tree: Ok(tree),
             closure_bytes: closure,
             free_bytes: free,
+            probing: false,
             addresses: NO_ADDRESS_TROUBLE,
             public: false,
         }
@@ -640,6 +662,45 @@ mod tests {
         let two = [shared("10.0.0.1", &["luna", "sol"])];
         f.addresses.shared = &two;
         assert!(preflight(&f).refusals[0].contains("sol also resolves to"));
+    }
+
+    #[test]
+    fn pending_is_not_unknown_a_probe_still_out_refuses_the_disk_rule() {
+        let t = tree(0, tracking(0));
+        let mut f = facts(&t, Ok(GIB), None);
+        f.probing = true;
+        let p = preflight(&f);
+        assert_eq!(p.refusals.len(), 1, "{:?}", p.refusals);
+        assert!(
+            p.refusals[0].contains("still probing luna"),
+            "{:?}",
+            p.refusals
+        );
+        // Unknown because the probe answered without it stays a warning.
+        f.probing = false;
+        let p = preflight(&f);
+        assert_eq!(p.refusals, Vec::<String>::new());
+        assert!(p.warnings[0].contains("not known"), "{:?}", p.warnings);
+    }
+
+    #[test]
+    fn resolution_still_out_refuses_the_address_rule_and_resolution_failed_does_not() {
+        let t = tree(0, tracking(0));
+        let mut f = facts(&t, Ok(GIB), Some(10 * GIB));
+        f.addresses.resolving = true;
+        let p = preflight(&f);
+        assert_eq!(p.refusals.len(), 1, "{:?}", p.refusals);
+        assert!(
+            p.refusals[0].contains("still resolving"),
+            "{:?}",
+            p.refusals
+        );
+        // Finished, and another machine's name failed: a warning, as decided.
+        f.addresses.resolving = false;
+        f.addresses.others_unknown = 1;
+        let p = preflight(&f);
+        assert_eq!(p.refusals, Vec::<String>::new());
+        assert_eq!(p.warnings.len(), 1);
     }
 
     #[test]

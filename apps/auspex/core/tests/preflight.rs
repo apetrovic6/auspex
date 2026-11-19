@@ -478,15 +478,15 @@ fn a_hostname_that_resolves_to_another_machines_address_is_refused() {
     s.send(Event::ToggleAct);
     s.send(Event::ConfirmAnswer(true));
 
-    // Resolution has not answered: luna's address is not known, and that is a refusal.
-    let confirm = dialog(&mut s, clean_preflight());
-    assert_eq!(confirm.kind, ConfirmKind::Refused, "the rule fails closed");
+    // Resolution has not answered: that is not "unknown", it is not here yet, and `u` is
+    // refused (nothing is asked, nothing runs).
+    s.send(Event::UpdateSelected);
     assert!(
-        confirm.refusals[0].contains("luna has no known address"),
-        "{:?}",
-        confirm.refusals
+        notice(&s).contains("still resolving addresses"),
+        "{}",
+        notice(&s)
     );
-    s.send(Event::ConfirmAnswer(false));
+    assert!(s.preflights.is_empty() && s.view().confirm.is_none());
 
     // The wildcard record answers with sol's address.
     let mut resolve = s.resolves.remove(0);
@@ -553,6 +553,9 @@ fn another_machines_unresolved_hostname_is_a_warning_not_a_refusal() {
       "terra": {"deploy": {"targetHost": "root@192.168.1.10"}}
     }"#;
     let mut s = ready(config(), json, Some(100));
+    // Resolution finished and sol's name did not resolve: a warning for luna.
+    let mut resolve = s.resolves.remove(0);
+    s.resolve(&mut resolve, std::collections::BTreeMap::new());
     let confirm = dialog(&mut s, clean_preflight());
     assert_eq!(confirm.kind, ConfirmKind::Update);
     assert_eq!(confirm.refusals, Vec::<String>::new());
@@ -951,4 +954,260 @@ fn a_refused_dialog_after_a_changed_system_is_asked_again_before_y_counts() {
     let again = s.view().confirm.expect("asked again");
     assert_eq!(again.kind, ConfirmKind::Checking);
     assert_ne!(again.serial, confirm.serial);
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1: pending is not unknown, and every rule is decided again at `y`
+// ---------------------------------------------------------------------------------------
+
+/// The reviewer's R1. luna's store has 2 GiB free and the closure is 4 GiB: refused. Then a
+/// refresh whose evaluation is back (an eval-cache hit) and whose probes are not: `u` and `y`
+/// must not deploy.
+#[test]
+fn r1_a_disk_refusal_survives_a_refresh_whose_probes_are_still_out() {
+    let mut s = ready(config(), FLEET, Some(2));
+    let confirm = dialog(&mut s, closure(4));
+    assert_eq!(confirm.kind, ConfirmKind::Refused, "precondition");
+    s.send(Event::ConfirmAnswer(false));
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    // `u` is refused at once: luna is being probed.
+    s.send(Event::UpdateSelected);
+    assert!(notice(&s).contains("still probing luna"), "{}", notice(&s));
+    assert!(s.preflights.is_empty() && s.view().confirm.is_none());
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+}
+
+/// Unknown because the probe answered without the field stays a warning (the decision of the
+/// first round); pending is what is refused.
+#[test]
+fn a_probe_that_answered_without_the_field_is_still_only_a_warning() {
+    let mut s = ready(config(), FLEET, None);
+    let confirm = dialog(&mut s, closure(4));
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    assert!(
+        confirm.warnings[0].contains("not known"),
+        "{:?}",
+        confirm.warnings
+    );
+}
+
+#[test]
+fn u_right_after_start_up_before_the_first_probe_is_refused() {
+    let mut s = Shell::new();
+    s.send(Event::Start(config()));
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    s.send(Event::ToggleAct);
+    s.send(Event::ConfirmAnswer(true));
+    s.send(Event::UpdateSelected);
+    assert!(notice(&s).contains("still probing luna"), "{}", notice(&s));
+    assert!(s.preflights.is_empty());
+    // The moment the probe is in, `u` is asked.
+    s.probe("luna", probe_with_store("luna", Some(100)));
+    s.send(Event::UpdateSelected);
+    assert_eq!(s.view().confirm.expect("asked").kind, ConfirmKind::Checking);
+}
+
+/// The dialog is open (a clear one), then a refresh: until the probe is back the `y` is
+/// refused, whatever the dialog said, and it is refused for the right reason.
+#[test]
+fn y_after_a_refresh_whose_probe_is_still_out_is_refused() {
+    let mut s = ready(config(), FLEET, Some(100));
+    let confirm = dialog(&mut s, closure(4));
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    assert!(notice(&s).contains("still probing luna"), "{}", notice(&s));
+}
+
+const SOL_BY_NAME: &str = r#"{
+  "luna":  {"deploy": {"targetHost": "root@192.168.1.11"}},
+  "sol":   {"deploy": {"targetHost": "root@sol.lab.example"}},
+  "terra": {"deploy": {"targetHost": "root@192.168.1.10"}}
+}"#;
+
+/// The reviewer's R2. luna is an IP literal, sol's hostname resolves to luna's address: refused
+/// once resolved. After a refresh, before resolution answers, `u` and `y` must not deploy.
+#[test]
+fn r2_a_shared_address_refusal_survives_a_refresh_whose_resolution_is_still_out() {
+    let luna: IpAddr = "192.168.1.11".parse().unwrap();
+    let mut s = ready(config(), SOL_BY_NAME, Some(100));
+    let mut resolve = s.resolves.remove(0);
+    s.resolve(
+        &mut resolve,
+        std::iter::once(("sol".to_owned(), vec![luna])).collect(),
+    );
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Refused, "precondition");
+    s.send(Event::ConfirmAnswer(false));
+    rescan(&mut s, SOL_BY_NAME, 100); // resolution is asked again and not answered
+    assert_eq!(s.resolves.len(), 1);
+    s.send(Event::UpdateSelected);
+    assert!(
+        notice(&s).contains("still resolving addresses"),
+        "{}",
+        notice(&s)
+    );
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+}
+
+/// A dialog open, a refresh, resolution still out: `y` is refused.
+#[test]
+fn y_after_a_refresh_whose_resolution_is_still_out_is_refused() {
+    let mut s = ready(config(), SOL_BY_NAME, Some(100));
+    let mut resolve = s.resolves.remove(0);
+    s.resolve(
+        &mut resolve,
+        std::iter::once(("sol".to_owned(), vec!["192.168.1.12".parse().unwrap()])).collect(),
+    );
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update, "precondition");
+    rescan(&mut s, SOL_BY_NAME, 100);
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    assert!(
+        notice(&s).contains("still resolving addresses"),
+        "{}",
+        notice(&s)
+    );
+}
+
+/// The reviewer's R3. A y/N dialog is open; the config then marks luna public (`Start` again,
+/// which the core's contract allows). `y` must not deploy: it asks again, as a typed one.
+#[test]
+fn r3_a_machine_made_public_while_its_question_is_open_is_asked_again_as_typed() {
+    let mut s = ready(config(), FLEET, Some(100));
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    s.send(Event::Start(public(&["luna"])));
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    for m in ["luna", "sol", "terra"] {
+        s.probe(m, probe_with_store(m, Some(100)));
+    }
+    // `Start` replaced the configuration, act mode stays (the model keeps it).
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    let again = s.view().confirm.expect("asked again");
+    assert_eq!(again.kind, ConfirmKind::UpdateTyped);
+    assert_ne!(again.serial, confirm.serial, "a new question, to be drawn");
+    assert!(notice(&s).contains("typing its name"), "{}", notice(&s));
+    type_text(&mut s, "luna");
+    s.send(Event::ConfirmSubmit);
+    assert_eq!(s.take_action().operation.machine, "luna");
+}
+
+/// A typed confirmation that was given stays given: the name typed is enough, and nothing asks
+/// a third time.
+#[test]
+fn the_typed_name_satisfies_a_typed_requirement_that_is_still_in_force() {
+    let mut s = ready(public(&["luna"]), FLEET, Some(100));
+    dialog(&mut s, clean_preflight());
+    type_text(&mut s, "luna");
+    s.send(Event::ConfirmSubmit);
+    assert_eq!(s.take_action().operation.machine, "luna");
+}
+
+/// "Every rule at `y`": a warning that was not in the dialog is a new dialog, not a deploy.
+#[test]
+fn a_warning_that_appeared_while_the_dialog_was_open_asks_again() {
+    let mut s = ready(config(), FLEET, Some(100));
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    assert_eq!(confirm.warnings, Vec::<String>::new());
+    // The probe of the next scan did not report /nix/store: free space becomes unknown.
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    for m in ["luna", "sol", "terra"] {
+        s.probe(m, probe_with_store(m, None));
+    }
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    let again = s.view().confirm.expect("asked again");
+    assert_eq!(again.kind, ConfirmKind::Update);
+    assert_eq!(again.warnings.len(), 1, "{:?}", again.warnings);
+    assert_ne!(again.serial, confirm.serial);
+    assert!(notice(&s).contains("changed"), "{}", notice(&s));
+    // A yes to the dialog as now drawn deploys.
+    let _ = proceeds(&mut s);
+}
+
+/// A machine whose target was refused (an option-looking target) has no address to collide with
+/// and never will, so it is not "another machine with no known address" (the reviewer's M7).
+/// (A machine with no `targetHost` at all is not this case: its own name is its hostname.)
+#[test]
+fn a_machine_with_no_target_is_not_counted_as_unknown() {
+    let json = r#"{
+      "luna":  {"deploy": {"targetHost": "root@192.168.1.11"}},
+      "sol":   {"deploy": {"targetHost": "-oProxyCommand=evil"}},
+      "terra": {"deploy": {"targetHost": "root@192.168.1.10"}}
+    }"#;
+    let mut s = Shell::new();
+    s.start_with(config(), json);
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    // sol's target was refused, so it is not probed.
+    for m in ["luna", "terra"] {
+        s.probe(m, probe_with_store(m, None));
+    }
+    s.send(Event::ToggleAct);
+    s.send(Event::ConfirmAnswer(true));
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    // One warning: luna's own free space is unknown (the probes reported none). Not a second one
+    // about sol.
+    assert_eq!(confirm.warnings.len(), 1, "{:?}", confirm.warnings);
+    assert!(
+        !confirm.warnings[0].contains("other machines"),
+        "{:?}",
+        confirm.warnings
+    );
+}
+
+/// Backspace clears "that is not luna" (the reviewer's M4).
+#[test]
+fn backspace_clears_the_mismatch_line() {
+    let mut s = ready(public(&["luna"]), FLEET, Some(100));
+    dialog(&mut s, clean_preflight());
+    type_text(&mut s, "lun");
+    s.send(Event::ConfirmSubmit);
+    assert!(s.view().confirm.unwrap().typed.unwrap().mismatch);
+    s.send(Event::ConfirmBackspace);
+    assert!(!s.view().confirm.unwrap().typed.unwrap().mismatch);
 }

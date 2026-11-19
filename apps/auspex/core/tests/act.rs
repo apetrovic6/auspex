@@ -332,7 +332,8 @@ fn the_question_shows_the_hash_prefix_so_two_systems_of_one_name_differ() {
     );
 }
 
-/// luna's tree is evaluated again, to `to`, while a question about it is open.
+/// luna's tree is evaluated again, to `to`, and every machine probed again, while a question
+/// about it is open.
 fn luna_evaluates_to(s: &mut Shell, to: &str) {
     s.send(Event::Refresh);
     let mut list = s.take_inventory();
@@ -343,6 +344,11 @@ fn luna_evaluates_to(s: &mut Shell, to: &str) {
         s.eval_item(&mut eval, m, evaluated(m, &out));
     }
     s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    // The probes too: a refresh clears them, and an update is not asked about (or confirmed)
+    // while its machine's probe is still out.
+    for m in ["luna", "sol", "terra"] {
+        s.probe(m, observed(&old(m), ""));
+    }
 }
 
 #[test]
