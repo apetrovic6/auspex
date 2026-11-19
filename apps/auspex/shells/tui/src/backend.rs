@@ -356,6 +356,16 @@ impl Real {
         }
     }
 
+    /// How the fleet's pinned `clan` is found for `u`: with the locator's own `nix` (from
+    /// `PATH`), not this backend's, which `AUSPEX_NIX` or the tests' constructor may have set. The locator
+    /// runs that program to build the clan that then deploys, so an inherited override (a profile,
+    /// a wrapper, a leftover) must not be able to choose it.
+    fn resolve_params(&self) -> ResolveParams<'_> {
+        let mut resolve = ResolveParams::new();
+        resolve.config_path = self.clan_path.as_deref();
+        resolve
+    }
+
     /// Adapters that can run actions and nothing else: for the shell's own tests, which run
     /// the real `u` and `b` against fake `clan` and `nix` programs over a scripted fleet
     /// ([`crate::demo::Demo::real_actions`]). No control directory is created and no other
@@ -609,9 +619,7 @@ impl Real {
                     return Ok(Err(format!("refused: {r}")));
                 }
                 sink(Stream::Note, "resolving the fleet's pinned clan…");
-                let mut resolve = ResolveParams::new();
-                resolve.nix = &self.nix;
-                resolve.config_path = self.clan_path.as_deref();
+                let resolve = self.resolve_params();
                 let binary = match self.clan.resolve(&resolve, &flake, cancel).await? {
                     Ok(b) => b,
                     Err(e) => return Ok(Err(e.to_string())),
@@ -700,18 +708,35 @@ mod tests {
     /// `u` runs the fleet's pinned `clan`, found from its lock. An environment variable that
     /// named another binary would silently replace it in the release build, so none is read:
     /// the only way to name one is the tests' constructor.
+    /// `AUSPEX_NIX` (and the tests' `nix`) is for evaluation and `b`; it must not be the program
+    /// that builds the clan `u` deploys with.
+    #[test]
+    fn the_nix_that_resolves_clan_is_not_the_overridable_one() {
+        let real = Real::for_actions(OsString::from("/overridden/nix"), None);
+        let params = real.resolve_params();
+        assert_eq!(params.nix, std::ffi::OsStr::new(nix::DEFAULT_NIX));
+    }
+
     #[test]
     fn no_environment_variable_names_the_clan_that_deploys() {
-        let name = concat!("AUSPEX", "_CLAN");
-        let mut read = 0;
-        for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/src")).unwrap() {
-            let path = entry.unwrap().path();
-            if path.extension().is_some_and(|e| e == "rs") {
-                read += 1;
-                let text = std::fs::read_to_string(&path).unwrap();
-                assert!(!text.contains(name), "{} mentions {name}", path.display());
+        fn walk(dir: &std::path::Path, name: &str, read: &mut usize) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, name, read);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    *read += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(!text.contains(name), "{} mentions {name}", path.display());
+                }
             }
         }
+        let mut read = 0;
+        walk(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            concat!("AUSPEX", "_CLAN"),
+            &mut read,
+        );
         assert!(read > 5, "the sources were found");
     }
 
