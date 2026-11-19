@@ -624,7 +624,7 @@ async fn an_answer_right_behind_the_frame_is_discarded_until_the_dwell_has_passe
     common::elapse(Duration::from_millis(33));
     type_keys(&shell, &mut ui, &km, "y");
     assert_eq!(shell.view().mode, Mode::Observe, "33 ms is not reading");
-    common::elapse(QUESTION_DWELL - Duration::from_millis(34));
+    common::elapse(Duration::from_millis(266));
     type_keys(&shell, &mut ui, &km, "y");
     assert_eq!(shell.view().mode, Mode::Observe, "just short of the dwell");
     assert!(
@@ -668,8 +668,6 @@ async fn a_habitual_u_y_deploys_nothing_and_the_same_y_a_moment_later_does() {
 /// starts then.
 #[tokio::test(start_paused = true)]
 async fn a_question_that_did_not_fit_is_not_drawn_and_cannot_be_answered() {
-    use std::time::Duration;
-
     use auspex_tui::ui::QUESTION_DWELL;
     let shell = settled_demo().await;
     let mut ui = Ui::default();
