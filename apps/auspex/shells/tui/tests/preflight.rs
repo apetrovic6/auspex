@@ -99,6 +99,7 @@ async fn refusals_come_first_then_warnings_then_the_question_and_nothing_proceed
         "a key before the frame is not an answer"
     );
     common::frame(&shell, &mut ui, &km);
+    common::elapse(auspex_tui::ui::QUESTION_DWELL);
     let confirm = shell.view().confirm.expect("a dialog");
     assert_eq!(confirm.kind, ConfirmKind::Refused);
     assert_eq!(confirm.refusals.len(), 1, "{:?}", confirm.refusals);
@@ -130,6 +131,8 @@ async fn refusals_come_first_then_warnings_then_the_question_and_nothing_proceed
     expect_file("snapshots", "preflight_refused_40.txt", &narrow);
 
     // `y` closes it and nothing runs.
+    // It has been on screen for the dwell: `y` closes it.
+    type_keys(&shell, &mut ui, &km, "y");
     type_keys(&shell, &mut ui, &km, "y");
     assert!(shell.view().confirm.is_none());
     assert!(shell.view().action.is_none());

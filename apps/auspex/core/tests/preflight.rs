@@ -1360,3 +1360,38 @@ fn a_refresh_forgets_the_machines_closure_until_the_preview_fetches_it_again() {
         confirm.refusals
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// PR #24 round 2: a yes while a refresh is running is refused, on these dialogs too
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_yes_while_a_refresh_is_running_is_refused_on_the_checks_dialog_too() {
+    let mut s = ready(config(), FLEET, Some(100));
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    s.send(Event::Refresh);
+    let _list = s.take_inventory();
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    assert_eq!(
+        notice(&s),
+        "a refresh is running; ask again when it has finished"
+    );
+    assert!(s.view().confirm.is_none(), "the question is over");
+}
+
+#[test]
+fn a_typed_name_while_a_refresh_is_running_is_refused_too() {
+    let mut s = ready(public(&["luna"]), FLEET, Some(100));
+    dialog(&mut s, clean_preflight());
+    type_text(&mut s, "luna");
+    s.send(Event::Refresh);
+    let _list = s.take_inventory();
+    s.send(Event::ConfirmSubmit);
+    nothing_runs(&s);
+    assert_eq!(
+        notice(&s),
+        "a refresh is running; ask again when it has finished"
+    );
+}

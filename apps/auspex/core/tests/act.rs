@@ -745,6 +745,7 @@ fn a_yes_while_a_refresh_is_running_is_refused_and_asks_to_ask_again() {
     let mut s = settled(config());
     act_on(&mut s);
     s.send(Event::UpdateSelected);
+    answer_checks(&mut s, clean_preflight());
     // The tree is read again: the old evaluation stays on the row until the new one arrives,
     // so the path still matches, but auspex itself knows it is out of date.
     s.send(Event::Refresh);
@@ -764,6 +765,10 @@ fn a_yes_while_a_refresh_is_running_is_refused_and_asks_to_ask_again() {
         s.eval_item(&mut eval, m, evaluated(m, &new(m)));
     }
     s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    // ... and probed again: an update is not asked about while its probe is out.
+    for m in ["luna", "sol", "terra"] {
+        s.probe(m, observed(&old(m), ""));
+    }
     assert_eq!(update(&mut s).operation.machine, "luna");
 }
 
@@ -778,6 +783,7 @@ fn a_yes_while_the_evaluation_is_still_streaming_is_refused_though_the_machine_h
     s.probe("luna", observed(&old("luna"), ""));
     act_on(&mut s);
     s.send(Event::UpdateSelected);
+    answer_checks(&mut s, clean_preflight());
     assert!(s.view().confirm.is_some(), "the question is asked");
     s.send(Event::ConfirmAnswer(true));
     assert!(

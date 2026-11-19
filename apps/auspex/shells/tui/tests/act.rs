@@ -668,10 +668,24 @@ async fn a_habitual_u_y_deploys_nothing_and_the_same_y_a_moment_later_does() {
     common::elapse(Duration::from_millis(100)); // a fast typist's gap
     type_keys(&shell, &mut ui, &km, "y");
     assert!(shell.view().action.is_none(), "nothing was deployed");
+    // What `u` asked first is the checks ("checking luna…"): the habitual `y` did not cancel
+    // them, it was not on screen long enough to count.
+    assert_eq!(
+        shell.view().confirm.map(|c| c.kind),
+        Some(ConfirmKind::Checking),
+        "the question is still waiting to be read"
+    );
+    // The checks answer and open the dialog, a question of its own, which a `y` right behind
+    // its frame does not answer either.
+    common::until_checked(&shell).await;
+    common::frame(&shell, &mut ui, &km);
+    common::elapse(Duration::from_millis(100));
+    type_keys(&shell, &mut ui, &km, "y");
+    assert!(shell.view().action.is_none(), "nothing was deployed");
     assert_eq!(
         shell.view().confirm.map(|c| c.kind),
         Some(ConfirmKind::Update),
-        "the question is still waiting to be read"
+        "the dialog is still waiting to be read"
     );
     common::elapse(QUESTION_DWELL);
     type_keys(&shell, &mut ui, &km, "y");
@@ -689,7 +703,8 @@ async fn a_question_that_did_not_fit_is_not_drawn_and_cannot_be_answered() {
     let mut ui = Ui::default();
     let km = Keymap::defaults();
     type_keys_seen(&shell, &mut ui, &km, "Ay/luna\nu");
-    // `type_keys_seen` ended with a frame at 120×40 and a second: the question is readable.
+    common::until_asked(&shell, &mut ui, &km).await;
+    // `until_asked` ended with a frame at 120×40 and the dwell: the dialog is readable.
     // Now the pane shrinks, as a resize does: the question is no longer drawn.
     for (w, h) in [(20, 4), (80, 4), (30, 5), (80, 6), (27, 40)] {
         let view = shell.view();
