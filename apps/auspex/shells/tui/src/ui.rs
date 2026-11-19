@@ -12,8 +12,8 @@
 use std::time::{Duration, Instant};
 
 use auspex_core::{
-    ActionResult, ActionStatus, ActionView, ConfirmKind, Event, Mode, Phase, PrometheusStatus,
-    ViewModel,
+    ActionResult, ActionStatus, ActionView, ConfirmKind, ConfirmView, Event, Mode, Phase,
+    PrometheusStatus, ViewModel,
 };
 use auspex_domain::fleet::{Lint, TargetSource};
 use auspex_domain::observe::{HealthSource, StorePath};
@@ -1057,6 +1057,116 @@ const TOO_SMALL: &str = "terminal too small to ask: make it larger";
 /// The narrowest box the question is asked in. Narrower, it wraps into a column nobody reads.
 const MIN_CONFIRM_WIDTH: u16 = 28;
 
+/// What the operator must always see in the question box: the question, the typed name (and a
+/// mismatch) and what to press. The line saying what `y` does is the one a clipped box used to
+/// lose first.
+fn confirm_tail(confirm: &ConfirmView, cells: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let mut tail: Vec<Line> = wrap(&confirm.question, cells)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, theme.style(Role::Warning))))
+        .collect();
+    if let Some(typed) = &confirm.typed {
+        tail.push(Line::default());
+        tail.push(Line::from(vec![
+            Span::styled("> ", theme.style(Role::Dim)),
+            Span::styled(typed.text.clone(), theme.style(Role::Text)),
+            Span::styled("▏", theme.style(Role::Dim)),
+        ]));
+        if typed.mismatch {
+            tail.push(Line::from(Span::styled(
+                format!("that is not {}", typed.expected),
+                theme.style(Role::Error),
+            )));
+        }
+    }
+    tail.push(Line::default());
+    let hint = match confirm.kind {
+        ConfirmKind::Refused => "any key closes",
+        ConfirmKind::Checking => "any key cancels",
+        ConfirmKind::UpdateTyped => "Enter confirms the exact name; Esc cancels",
+        _ => "y confirms; any other key cancels",
+    };
+    tail.extend(
+        wrap(hint, cells)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, theme.style(Role::Dim)))),
+    );
+    tail
+}
+
+/// What the checks found, refusals first, in at most `room` lines.
+///
+/// Each sentence starts with its kind in words, so the colour is not the only thing that says
+/// which is which (a monochrome terminal, a colour-blind operator), and continuation lines are
+/// indented under it. What does not fit is replaced by a line saying how many are not shown;
+/// refusals come first, so they are the last to go.
+fn confirm_found(
+    confirm: &ConfirmView,
+    cells: usize,
+    room: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let sentence = |label: &str, role: Role, item: &String| -> Vec<Line<'static>> {
+        wrap(&format!("{label}: {item}"), cells)
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let l = if i == 0 { l } else { format!("  {l}") };
+                Line::from(Span::styled(l, theme.style(role)))
+            })
+            .collect()
+    };
+    let found: Vec<Vec<Line>> = confirm
+        .refusals
+        .iter()
+        .map(|r| sentence("refused", Role::Error, r))
+        .chain(
+            confirm
+                .warnings
+                .iter()
+                .map(|w| sentence("warning", Role::Warning, w)),
+        )
+        .collect();
+    let mut shown = 0;
+    let mut used = 0;
+    for item in &found {
+        if used + item.len() > room {
+            break;
+        }
+        used += item.len();
+        shown += 1;
+    }
+    // A "…and N more" line has to fit too: give up the last shown item for it if need be.
+    let mut more = found.len() - shown;
+    if more > 0 {
+        while shown > 0 && used + 1 > room {
+            shown -= 1;
+            used -= found[shown].len();
+            more += 1;
+        }
+    }
+    let mut lines: Vec<Line> = found[..shown].iter().flatten().cloned().collect();
+    if more > 0 && used < room {
+        let hidden_refusals = confirm.refusals.len().saturating_sub(shown);
+        let (what, role) = if hidden_refusals > 0 {
+            (
+                format!("…and {more} more, {hidden_refusals} refused: enlarge"),
+                Role::Error,
+            )
+        } else {
+            (
+                format!(
+                    "…and {more} more warning{}",
+                    if more == 1 { "" } else { "s" }
+                ),
+                Role::Warning,
+            )
+        };
+        lines.push(Line::from(Span::styled(what, theme.style(role))));
+    }
+    lines
+}
+
 /// The question waiting for an answer, in a box of its own: a one-line prompt would cut the very
 /// words that say what `y` does at 40 columns.
 ///
@@ -1066,7 +1176,9 @@ const MIN_CONFIRM_WIDTH: u16 = 28;
 ///
 /// Returns whether the whole question, and the line saying what `y` does, fitted. A pane too
 /// small to show it is not asking anything: the box then says so, the question is not counted
-/// as drawn, and no key can answer it.
+/// as drawn, and no key can answer it. When the question fits but what the checks found does
+/// not, the question, the typed name and the hint stay and the findings are cut: refusals
+/// first, with a line saying how many are not shown.
 fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'_>) -> bool {
     let Some(confirm) = &view.confirm else {
         return false;
@@ -1074,73 +1186,27 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
     let theme = ctx.theme;
     let width = area.width.min(78);
     let text_cells = usize::from(width.saturating_sub(4)).max(1);
-    let mut lines: Vec<Line> = Vec::new();
-    // Sentences from the checks start with their kind in words, so the colour is not the only
-    // thing that says which is which (a monochrome terminal, a colour-blind operator).
-    let mut section = |label: &str, role: Role, items: &[String]| {
-        for item in items {
-            for (i, l) in wrap(&format!("{label}: {item}"), text_cells)
-                .into_iter()
-                .enumerate()
-            {
-                // Continuation lines are indented under the sentence.
-                let l = if i == 0 { l } else { format!("  {l}") };
-                lines.push(Line::from(Span::styled(l, theme.style(role))));
-            }
+    let tail = confirm_tail(confirm, text_cells, theme);
+    let whole = width >= MIN_CONFIRM_WIDTH && tail.len() + 2 <= usize::from(area.height);
+    let lines: Vec<Line> = if whole {
+        // What is left of the pane (less the blank between the two parts) goes to the findings.
+        let room = (usize::from(area.height) - 2 - tail.len()).saturating_sub(1);
+        let mut lines = confirm_found(confirm, text_cells, room, theme);
+        if !lines.is_empty() {
+            lines.push(Line::default());
         }
-    };
-    section("refused", Role::Error, &confirm.refusals);
-    section("warning", Role::Warning, &confirm.warnings);
-    if !lines.is_empty() {
-        lines.push(Line::default());
-    }
-    lines.extend(
-        wrap(&confirm.question, text_cells)
-            .into_iter()
-            .map(|l| Line::from(Span::styled(l, theme.style(Role::Warning)))),
-    );
-    if let Some(typed) = &confirm.typed {
-        lines.push(Line::default());
-        lines.push(Line::from(vec![
-            Span::styled("> ", theme.style(Role::Dim)),
-            Span::styled(typed.text.clone(), theme.style(Role::Text)),
-            Span::styled("▏", theme.style(Role::Dim)),
-        ]));
-        if typed.mismatch {
-            lines.push(Line::from(Span::styled(
-                format!("that is not {}", typed.expected),
-                theme.style(Role::Error),
-            )));
-        }
-    }
-    lines.push(Line::default());
-    let hint = match confirm.kind {
-        ConfirmKind::Refused => "any key closes",
-        ConfirmKind::Checking => "any key cancels",
-        ConfirmKind::UpdateTyped => "Enter confirms the exact name; Esc cancels",
-        _ => "y confirms; any other key cancels",
-    };
-    lines.extend(
-        wrap(hint, text_cells)
-            .into_iter()
-            .map(|l| Line::from(Span::styled(l, theme.style(Role::Dim)))),
-    );
-    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let whole = width >= MIN_CONFIRM_WIDTH && height <= area.height;
-    let (width, height) = if whole {
-        (width, height)
+        lines.extend(tail);
+        lines
     } else {
         // Not the question: a message, wrapped to what room there is.
         let cells = usize::from(area.width.saturating_sub(2)).max(1);
-        lines = wrap(TOO_SMALL, cells)
+        wrap(TOO_SMALL, cells)
             .into_iter()
             .map(|l| Line::from(Span::styled(l, theme.style(Role::Warning))))
-            .collect();
-        (
-            area.width,
-            u16::try_from(lines.len() + 2).unwrap_or(u16::MAX),
-        )
+            .collect()
     };
+    let width = if whole { width } else { area.width };
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let rect = centred(area, width, height);
     frame.render_widget(Clear, rect);
     let block = Block::bordered()

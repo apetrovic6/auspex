@@ -639,3 +639,77 @@ async fn a_termination_signal_waits_for_the_reaping_with_no_action_log() {
     assert!(w.shell.view().quit);
     assert!(!w.db.exists(), "no log was configured, none was written");
 }
+
+// ---------------------------------------------------------------------------------------
+// The checks before an update, cancelled (PR #26 review 8, M14)
+// ---------------------------------------------------------------------------------------
+
+/// A shell whose checks before an update run for real, with a fake `git` and a fake `nix`
+/// that each start a `sleep` and wait for it, recording their pids.
+fn world_checking(t: &Tools) -> World {
+    let dir = tempdir();
+    let fleet = tempdir();
+    let slow = "@sleep@ 60 &\necho $! >> '@dir@/pids'\necho $$ >> '@dir@/pids'\nwait";
+    // git is asked twice (the config listing, then the status): only the status hangs.
+    let git = t.script(
+        dir.path(),
+        "git",
+        &format!("case \" $* \" in *\" config \"*) exit 0;; esac\n{slow}"),
+    );
+    let nix = t.script(dir.path(), "nix", slow);
+    let clan = t.script(dir.path(), "clan", "exit 99");
+    let real = Real::for_actions(nix.into_os_string(), Some(clan))
+        .with_git_and_cache(git.into_os_string(), None);
+    let backend = Backend::Demo(Demo {
+        real_actions: Some(Box::new(real)),
+        real_preflight: true,
+        ..Demo::default()
+    });
+    let shell = Shell::new(backend, Log::memory(), Duration::from_secs(120));
+    shell.send(Event::Start(auspex_core::Config {
+        flake: fleet.path().to_str().unwrap().to_owned(),
+        ..demo::config()
+    }));
+    World {
+        db: dir.path().join("state").join("log.sqlite"),
+        dir,
+        fleet,
+        shell,
+    }
+}
+
+#[tokio::test]
+async fn cancelling_the_checks_kills_and_reaps_the_shells_git_and_nix() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let w = world_checking(&t);
+    ready(&w.shell).await;
+    act_on(&w.shell);
+    w.shell.send(Event::UpdateSelected);
+    assert_eq!(
+        w.shell.view().confirm.expect("checking").kind,
+        ConfirmKind::Checking
+    );
+    // git's status and nix's size query are both running (a shell and its sleep each).
+    let pids = tokio::task::spawn_blocking({
+        let p = w.dir.path().join("pids");
+        move || wait_for_pids(&p, 4)
+    })
+    .await
+    .unwrap();
+    assert!(pids.iter().all(|p| alive(*p)));
+    // Any key cancels the checks: the processes are gone, long before `timeouts.diff`.
+    w.shell.send(Event::ConfirmAnswer(false));
+    // The wait blocks, so it runs off the runtime: the shell's own tasks do the killing.
+    let left = tokio::task::spawn_blocking({
+        let pids = pids.clone();
+        move || still_alive_after_wait(&pids)
+    })
+    .await
+    .unwrap();
+    assert!(left.is_empty(), "left running after the cancel: {left:?}");
+    assert!(w.shell.view().confirm.is_none());
+    assert!(w.shell.view().action.is_none());
+    cleanup(&pids);
+    w.shell.shutdown().await;
+    let _ = (&w.fleet, &w.db);
+}

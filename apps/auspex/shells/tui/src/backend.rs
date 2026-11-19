@@ -611,7 +611,13 @@ impl Real {
         closure::pending(&op.store_path, &params, cancel).await
     }
 
-    async fn preflight(
+    /// `Effect::Preflight` with the real adapters: `git` and `nix`, both bounded by
+    /// `op.timeout_seconds` (at least a second).
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired: both processes have been killed and reaped.
+    pub async fn preflight(
         &self,
         op: &PreflightRequest,
         cancel: &CancellationToken,

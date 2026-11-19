@@ -14,7 +14,9 @@ use std::fs;
 use std::time::Duration;
 
 use auspex_core::effects::{PreflightRequest, RequestId};
-use auspex_core::{ActionStatus, ConfirmKind, Mode, PreflightAnswer};
+use auspex_core::{
+    ActionStatus, ConfirmKind, ConfirmView, Mode, PreflightAnswer, TypedView, ViewModel,
+};
 use auspex_domain::observe::StorePath;
 use auspex_domain::preflight::{TreeState, Upstream};
 use auspex_effects::CancellationToken;
@@ -23,8 +25,8 @@ use auspex_tui::demo::{Demo, PUBLIC_MACHINE};
 use auspex_tui::keymap::{Key, Keymap};
 use auspex_tui::ui::Ui;
 use common::{
-    Tools, expect_file, press, render, settled_demo, settled_demo_with, tempdir, tools, type_keys,
-    type_keys_seen, until_asked, until_checked,
+    Tools, expect_file, press, render, render_with, settled_demo, settled_demo_with, tempdir,
+    tools, type_keys, type_keys_seen, until_asked, until_checked,
 };
 use crossterm::event::KeyCode;
 
@@ -413,4 +415,172 @@ async fn a_paste_answers_the_checks_dialogs_no_and_never_yes() {
     common::paste(&shell, &mut ui, &km, "y");
     assert!(shell.view().action.is_none());
     assert!(shell.view().confirm.is_none());
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1 (review 7): a box that does not fit keeps the question, the input and the hint
+// ---------------------------------------------------------------------------------------
+
+/// The demo's settled view with its open question replaced by `confirm`: what the drawing does
+/// with a dialog of any size, without building the fleet that would produce it.
+fn view_asking(
+    shell: &std::sync::Arc<auspex_tui::shell::Shell>,
+    confirm: ConfirmView,
+) -> ViewModel {
+    let mut view = shell.view();
+    view.confirm = Some(confirm);
+    view
+}
+
+fn sentences(what: &str, n: usize) -> Vec<String> {
+    (1..=n)
+        .map(|i| format!("{what} number {i} says something that is long enough to wrap onto lines"))
+        .collect()
+}
+
+fn question(kind: ConfirmKind, typed: bool) -> ConfirmView {
+    ConfirmView {
+        kind,
+        question: if typed {
+            "update cypramundi to g1j4m7qa nixos-system-cypramundi-25.11? it is marked public: \
+             type cypramundi, then Enter. Esc cancels"
+                .to_owned()
+        } else {
+            "update luna to g1j4m7qa nixos-system-luna-25.11? y/N".to_owned()
+        },
+        serial: 1,
+        refusals: Vec::new(),
+        warnings: Vec::new(),
+        typed: typed.then(|| TypedView {
+            expected: "cypramundi".to_owned(),
+            text: "cypra".to_owned(),
+            mismatch: true,
+        }),
+    }
+}
+
+async fn drawn(view: &ViewModel, w: u16, h: u16) -> (String, bool) {
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    let frame = render_with(view, &mut ui, &km, &[], shell.output(), w, h);
+    (frame, ui.confirm_seen.is_some())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_typed_dialog_that_does_not_fit_keeps_the_input_line_and_the_hint() {
+    // The reviewer's case (a public machine, three warnings) in a pane too short for them all.
+    let shell = settled_demo().await;
+    let mut confirm = question(ConfirmKind::UpdateTyped, true);
+    confirm.warnings = sentences("warning", 3);
+    let (frame, whole) = drawn(&view_asking(&shell, confirm), 40, 20).await;
+    assert!(
+        whole,
+        "the question fitted, so it counts as drawn:\n{frame}"
+    );
+    assert!(
+        frame.contains("> cypra"),
+        "the typed name is shown:\n{frame}"
+    );
+    assert!(frame.contains("that is not cypramundi"), "{frame}");
+    assert!(frame.contains("Enter confirms"), "the hint:\n{frame}");
+    assert!(frame.contains("type cypramundi"), "the question:\n{frame}");
+    assert!(
+        frame.contains("…and ") && frame.contains(" more warning"),
+        "what is not shown is counted:\n{frame}"
+    );
+    expect_file("snapshots", "preflight_clipped_typed_40.txt", &frame);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_y_n_dialog_with_many_warnings_keeps_its_y_n_line() {
+    let shell = settled_demo().await;
+    let mut confirm = question(ConfirmKind::Update, false);
+    confirm.warnings = sentences("warning", 4);
+    let (frame, whole) = drawn(&view_asking(&shell, confirm), 40, 16).await;
+    assert!(whole);
+    assert!(frame.contains("y/N"), "the question's own y/N:\n{frame}");
+    assert!(frame.contains("y confirms"), "{frame}");
+    assert!(frame.contains("…and "), "{frame}");
+    expect_file("snapshots", "preflight_clipped_yn_40.txt", &frame);
+}
+
+#[tokio::test(start_paused = true)]
+async fn refusals_are_kept_and_warnings_give_way() {
+    let shell = settled_demo().await;
+    let mut confirm = question(ConfirmKind::Refused, false);
+    confirm.question = "luna will not be updated.".to_owned();
+    confirm.refusals = sentences("refusal", 2);
+    confirm.warnings = sentences("warning", 3);
+    let (frame, whole) = drawn(&view_asking(&shell, confirm), 40, 17).await;
+    assert!(whole);
+    assert!(frame.contains("refused: refusal number 1"), "{frame}");
+    assert!(frame.contains("refused: refusal number 2"), "{frame}");
+    assert!(frame.contains("any key closes"), "{frame}");
+    assert!(frame.contains("…and 3 more warnings"), "{frame}");
+    assert!(
+        !frame.contains("warning number 1"),
+        "no room for a warning at all:\n{frame}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn when_even_the_refusals_do_not_fit_the_line_says_so_and_asks_for_a_larger_terminal() {
+    let shell = settled_demo().await;
+    let mut confirm = question(ConfirmKind::Refused, false);
+    confirm.question = "luna will not be updated.".to_owned();
+    confirm.refusals = sentences("refusal", 5);
+    let (frame, whole) = drawn(&view_asking(&shell, confirm), 40, 16).await;
+    assert!(whole);
+    assert!(
+        frame.contains("refused: refusal number 1"),
+        "at least the first refusal is shown:\n{frame}"
+    );
+    assert!(frame.contains("refused: enlarge"), "{frame}");
+    assert!(frame.contains("any key closes"), "{frame}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dialog_whose_own_question_does_not_fit_is_still_too_small_to_ask() {
+    let shell = settled_demo().await;
+    let mut confirm = question(ConfirmKind::UpdateTyped, true);
+    confirm.warnings = sentences("warning", 3);
+    let (frame, whole) = drawn(&view_asking(&shell, confirm), 40, 8).await;
+    assert!(!whole, "nothing can be answered here:\n{frame}");
+    assert!(frame.contains("terminal too small to ask"), "{frame}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dialog_that_fits_is_drawn_unchanged() {
+    let shell = settled_demo().await;
+    let mut confirm = question(ConfirmKind::Update, false);
+    confirm.warnings = sentences("warning", 2);
+    let (frame, whole) = drawn(&view_asking(&shell, confirm), 120, 40).await;
+    assert!(whole);
+    assert!(frame.contains("warning number 1") && frame.contains("warning number 2"));
+    assert!(!frame.contains("…and "), "{frame}");
+}
+
+/// `timeout_seconds: 0` is one second, never "no time at all" (the reviewer's M10: the loader
+/// rejects 0, but the shell must not rely on that).
+#[tokio::test]
+async fn a_timeout_of_zero_is_one_second_not_none() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let b = backend(
+        &t,
+        dir.path(),
+        "printf '## main\\0'",
+        &format!("printf '%s\\t%s\\n' '{SYSTEM}' 7"),
+        None,
+    );
+    let mut op = request(fleet.path().to_str().unwrap());
+    op.timeout_seconds = 0;
+    let answer = b.preflight(&op, &CancellationToken::new()).await.unwrap();
+    assert_eq!(
+        answer.closure,
+        Ok(vec![(StorePath::new(SYSTEM).unwrap(), 7)])
+    );
+    assert!(answer.tree.is_ok(), "{:?}", answer.tree);
 }

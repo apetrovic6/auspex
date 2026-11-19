@@ -1,0 +1,20 @@
+┌ confirm ─────────────────────────────┐
+│warning: warning number 1 says        │
+│  something that is long enough to    │
+│  wrap onto lines                     │
+│…and 2 more warnings                  │
+│                                      │
+│update cypramundi to g1j4m7qa         │
+│nixos-system-cypramundi-25.11? it is  │
+│marked public: type cypramundi, then  │
+│Enter. Esc cancels                    │
+│                                      │
+│> cypra▏                              │
+│that is not cypramundi                │
+│                                      │
+│Enter confirms the exact name; Esc    │
+│cancels                               │
+└──────────────────────────────────────┘
+└──────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ settled │ 0 pending │ prom: ok

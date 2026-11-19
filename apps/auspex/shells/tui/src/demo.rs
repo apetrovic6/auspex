@@ -435,6 +435,10 @@ pub struct Demo {
     /// What the checks before an update find in the shell. `None`: a clean, pushed tree and a
     /// closure of 2.3 GiB. The shell's own tests set it to make each check warn or refuse.
     pub preflight_answer: Option<PreflightAnswer>,
+    /// Run the checks before an update for real, with `real_actions`' adapters (a fake `git` and
+    /// a fake `nix`), instead of answering them from `preflight_answer`. For the shell's own
+    /// tests of what cancelling them does to the processes.
+    pub real_preflight: bool,
 }
 
 impl Demo {
@@ -586,6 +590,11 @@ impl Demo {
         op: &auspex_core::effects::PreflightRequest,
         cancel: &CancellationToken,
     ) -> Result<PreflightAnswer, Cancelled> {
+        if self.real_preflight
+            && let Some(real) = &self.real_actions
+        {
+            return real.preflight(op, cancel).await;
+        }
         after(250, cancel).await?;
         Ok(self
             .preflight_answer
