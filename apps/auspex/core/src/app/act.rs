@@ -46,6 +46,9 @@ use crate::view::{ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode};
 /// The notice of an action key pressed in observe mode.
 pub const ACT_MODE_OFF: &str = "act mode is off (A)";
 
+/// The notice of a `y` while the machine's evaluation is being refreshed.
+pub const REFRESH_RUNNING: &str = "a refresh is running; ask again when it has finished";
+
 /// A question waiting for y or N.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Confirm {
@@ -96,6 +99,14 @@ impl Model {
         let id = RequestId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Whether the list, the fleet's evaluation or `machine`'s own evaluation is out.
+    fn refresh_running(&self, machine: &str) -> bool {
+        self.outstanding.values().any(|p| {
+            matches!(p, Pending::Inventory | Pending::Eval)
+                || matches!(p, Pending::EvalOne(n) if n == machine)
+        })
     }
 
     /// Opens `confirm` as a new question: a shell must draw it before it may be answered.
@@ -341,6 +352,12 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
             }
             if model.action_active() {
                 return model.notice("another action is already running");
+            }
+            // The tree is being read again (the list, the fleet's evaluation or this machine's
+            // own): what would be deployed is not settled, and the evaluation the question
+            // showed may be the one being replaced. The operator asks again once it is.
+            if model.refresh_running(&machine) {
+                return model.notice(REFRESH_RUNNING);
             }
             match check(model, ActionKind::Update, &machine) {
                 Ok(now) if now.path == path => launch(model, ActionKind::Update, machine),

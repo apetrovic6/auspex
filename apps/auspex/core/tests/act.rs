@@ -238,6 +238,10 @@ fn update_refuses_a_machine_the_inventory_no_longer_has() {
             r#"{"sol": {"deploy": {"targetHost": "root@192.168.1.12"}}}"#,
         )),
     );
+    // The refresh has finished (a yes during it is refused for that reason, below).
+    let mut eval = s.take_eval();
+    s.eval_item(&mut eval, "sol", evaluated("sol", &new("sol")));
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
     s.send(Event::ConfirmAnswer(true));
     assert!(
         s.actions.is_empty(),
@@ -507,13 +511,17 @@ fn a_failed_update_refreshes_the_machine_too() {
 
 #[test]
 fn the_evaluation_is_not_asked_twice_while_the_fleets_is_still_out() {
-    let mut s = Shell::new();
-    s.start_with(config(), THREE);
+    // The update runs while the list is read again (an update is refused once the evaluation is
+    // out, so the refresh starts after it was confirmed: the action outlives it).
+    let mut s = settled(config());
+    act_on(&mut s);
+    let mut req = update(&mut s);
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(THREE)));
     let mut eval = s.take_eval();
     s.eval_item(&mut eval, "luna", evaluated("luna", &new("luna")));
     s.probe("luna", observed(&old("luna"), ""));
-    act_on(&mut s);
-    let mut req = update(&mut s);
     s.resolve(&mut req, end(ActionResult::Succeeded, Some(0)));
     assert!(
         s.probes.iter().any(|p| p.operation.machine == "luna"),
@@ -667,4 +675,63 @@ fn quitting_during_a_build_asks_too() {
         s.view().confirm.unwrap().question,
         "a build of luna is running; quit and stop it? y/N"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// A yes while the machine is being evaluated again (re-review finding 4)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_yes_while_a_refresh_is_running_is_refused_and_asks_to_ask_again() {
+    let mut s = settled(config());
+    act_on(&mut s);
+    s.send(Event::UpdateSelected);
+    // The tree is read again: the old evaluation stays on the row until the new one arrives,
+    // so the path still matches, but auspex itself knows it is out of date.
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.send(Event::ConfirmAnswer(true));
+    assert!(s.actions.is_empty(), "nothing runs while a refresh runs");
+    assert_eq!(
+        notice(&s),
+        "a refresh is running; ask again when it has finished"
+    );
+    assert!(s.view().confirm.is_none(), "the question is over");
+
+    // When it has finished, the same path deploys.
+    s.resolve(&mut list, Ok(inventory(THREE)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    assert_eq!(update(&mut s).operation.machine, "luna");
+}
+
+#[test]
+fn a_yes_while_the_evaluation_is_still_streaming_is_refused_though_the_machine_has_one() {
+    // The fleet is being evaluated: luna's result has arrived (so `u` may ask), the stream has
+    // not finished (so the tree is still being read).
+    let mut s = Shell::new();
+    s.start_with(config(), THREE);
+    let mut eval = s.take_eval();
+    s.eval_item(&mut eval, "luna", evaluated("luna", &new("luna")));
+    s.probe("luna", observed(&old("luna"), ""));
+    act_on(&mut s);
+    s.send(Event::UpdateSelected);
+    assert!(s.view().confirm.is_some(), "the question is asked");
+    s.send(Event::ConfirmAnswer(true));
+    assert!(
+        s.actions.is_empty(),
+        "nothing runs while the evaluation runs"
+    );
+    assert_eq!(
+        notice(&s),
+        "a refresh is running; ask again when it has finished"
+    );
+    // Finished: the same question deploys.
+    s.eval_item(&mut eval, "sol", evaluated("sol", &new("sol")));
+    s.eval_item(&mut eval, "terra", evaluated("terra", &new("terra")));
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    assert_eq!(update(&mut s).operation.machine, "luna");
 }
