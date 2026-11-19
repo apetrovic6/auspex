@@ -33,9 +33,8 @@ pub enum Kind {
 
 /// The sentence for a `not_cached` preview.
 ///
-/// It says which of its two causes applies: the cache
-/// was asked and does not have the pending closure, or there is no cache to ask
-/// (`cache_configured` is `ViewModel::binary_cache`).
+/// It says which of its two causes applies: the cache was asked and does not have the pending
+/// closure, or there is no cache to ask (`cache_configured` is `ViewModel::binary_cache`).
 #[must_use]
 pub const fn not_cached_text(cache_configured: bool) -> &'static str {
     if cache_configured {
@@ -164,8 +163,67 @@ pub fn plain_note(m: &MachineReport, cache_configured: bool) -> Option<String> {
     }
 }
 
-/// The most lines the detail panel gives the package preview. The rest is on `d`.
+/// The most rows the detail panel gives the block of package preview lines. The rest is on
+/// `d`.
 pub const PANEL_LINES: usize = 4;
+
+/// [`panel_lines`] as at most [`PANEL_LINES`] *rendered* rows of `cells` cells each.
+///
+/// Each value is wrapped to the width it will be drawn at, and what does not fit in the
+/// budget is cut, the last row ending in `…`: the cap counts rows on screen, not entries.
+#[must_use]
+pub fn panel_rows(
+    m: &MachineReport,
+    cache_configured: bool,
+    cells: usize,
+) -> Vec<(&'static str, String)> {
+    let mut rows: Vec<(&'static str, String)> = Vec::new();
+    let mut cut_off = false;
+    for (label, value) in panel_lines(m, cache_configured) {
+        for (i, piece) in crate::ui::wrap(&value, cells).into_iter().enumerate() {
+            if rows.len() == PANEL_LINES {
+                cut_off = true;
+                break;
+            }
+            rows.push((if i == 0 { label } else { "" }, piece));
+        }
+    }
+    if cut_off && let Some((_, last)) = rows.last_mut() {
+        let mut shown: String = last.chars().take(cells.saturating_sub(1)).collect();
+        shown.push('…');
+        *last = shown;
+    }
+    rows
+}
+
+/// One row for the detail panel, near its top, saying that a preview exists and how to open it.
+///
+/// `+3 −2 ~10 packages (d)`, `not cached (d)`, `failed (d)`, `checking…`; nothing for a machine
+/// that is not update pending or has no preview coming. `key` is the key bound to the `d` view,
+/// or `None` when it is unbound. The value is cut to `cells` with the key hint kept, so a
+/// preview is always visible however short the panel is.
+#[must_use]
+pub fn summary_row(
+    m: &MachineReport,
+    key: Option<&str>,
+    cells: usize,
+) -> Option<(&'static str, String)> {
+    if m.status != Badge::UpdatePending {
+        return None;
+    }
+    let base = match m.package_diff.as_ref().map(|d| (d.state, d.counts)) {
+        None if m.settled => return None,
+        None => return Some(("diff", "checking…".to_owned())),
+        Some((DiffState::Computed, c)) => {
+            format!("+{} −{} ~{} packages", c.added, c.removed, c.changed)
+        }
+        Some((DiffState::NotCached, _)) => "not cached".to_owned(),
+        Some((DiffState::Failed, _)) => "failed".to_owned(),
+    };
+    let hint = key.map_or_else(String::new, |k| format!(" ({k})"));
+    let room = cells.saturating_sub(hint.chars().count());
+    Some(("diff", format!("{}{hint}", crate::ui::cut(&base, room))))
+}
 
 /// The `reason` line for the detail panel, without the package headline.
 ///
@@ -192,7 +250,8 @@ pub fn panel_reason(m: &MachineReport) -> Option<String> {
 
 /// The detail panel's lines for the package preview.
 ///
-/// `(label, value)`, at most [`PANEL_LINES`], or nothing for a machine that is not update pending or has no preview to
+/// `(label, value)`, at most [`PANEL_LINES`] entries (see [`panel_rows`] for the cap in rendered
+/// rows), or nothing for a machine that is not update pending or has no preview to
 /// show (and is settled, so none is coming).
 ///
 /// Computed: the headline (once; see [`panel_reason`]), the critical highlights with
@@ -237,23 +296,25 @@ pub fn panel_lines(m: &MachineReport, cache_configured: bool) -> Vec<(&'static s
     if !critical.is_empty() {
         out.push(("critical", critical.join(", ")));
     }
-    if major > 0 {
-        out.push((
-            "major",
-            format!(
-                "{}{major} other major-version change{}",
-                if diff.truncated.highlights {
-                    "at least "
-                } else {
-                    ""
-                },
-                if major == 1 { "" } else { "s" }
-            ),
-        ));
-    }
+    // The major-version count shares the counts row: the block is a few rows, and the full
+    // list is on `d`.
     let c = diff.counts;
-    let mut counts = format!(
-        "+{} added  −{} removed  ~{} changed  {} rebuilt",
+    let mut counts = String::new();
+    if major > 0 {
+        let _ = write!(
+            counts,
+            "{}{major} other major-version change{}; ",
+            if diff.truncated.highlights {
+                "at least "
+            } else {
+                ""
+            },
+            if major == 1 { "" } else { "s" }
+        );
+    }
+    let _ = write!(
+        counts,
+        "+{} −{} ~{}  {} rebuilt",
         c.added,
         c.removed,
         c.changed,
@@ -270,7 +331,6 @@ pub fn panel_lines(m: &MachineReport, cache_configured: bool) -> Vec<(&'static s
         let _ = write!(counts, "; {note}");
     }
     out.push(("counts", counts));
-    debug_assert!(out.len() <= PANEL_LINES);
     out
 }
 
@@ -503,10 +563,36 @@ mod tests {
         });
         let lines = panel_lines(&m, true);
         assert!(lines.len() <= PANEL_LINES, "{lines:?}");
+        // Counted in rendered rows, at any width.
+        for cells in [12, 30, 62, 200] {
+            let rows = panel_rows(&m, true, cells);
+            assert!(rows.len() <= PANEL_LINES, "{cells}: {rows:?}");
+            assert!(
+                rows.iter().all(|(_, v)| v.chars().count() <= cells),
+                "{rows:?}"
+            );
+        }
+        let narrow = panel_rows(&m, true, 20);
+        assert_eq!(narrow.len(), PANEL_LINES);
+        assert!(narrow.last().unwrap().1.ends_with('…'), "{narrow:?}");
+        assert!(
+            !panel_rows(&m, true, 200)
+                .iter()
+                .any(|(_, v)| v.ends_with('…'))
+        );
+        let (label, value) = summary_row(&m, Some("d"), 40).unwrap();
+        assert_eq!(label, "diff");
+        assert!(
+            value.ends_with(" (d)") && value.starts_with("+0 −0 ~1"),
+            "{value}"
+        );
+        // However narrow, the hint stays.
+        assert!(summary_row(&m, Some("d"), 9).unwrap().1.ends_with(" (d)"));
+        assert_eq!(summary_row(&m, None, 40).unwrap().1, "+0 −0 ~1 packages");
         let text: Vec<String> = lines.iter().map(|(l, v)| format!("{l} {v}")).collect();
         assert!(
             text.iter()
-                .any(|l| l == "major at least 1 other major-version change"),
+                .any(|l| l.starts_with("counts at least 1 other major-version change; +")),
             "{text:?}"
         );
         assert!(

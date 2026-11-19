@@ -52,8 +52,7 @@ async fn a_computed_diff_at_120_columns() {
     assert!(at("critical  linux") < at("systemd 256.10 → 257.2"));
     assert!(at("systemd 256.10") < at("glibc"));
     assert!(at("glibc") < at("nix rebuilt"));
-    assert!(at("nix rebuilt") < at("3 other major-version changes"));
-    assert!(at("other major-version changes") < at("+3 added  −2 removed  ~10 changed"));
+    assert!(at("nix rebuilt") < at("3 other major-version changes; +3 −2 ~10"));
     // The headline once: the reason line no longer carries it.
     assert_eq!(
         frame.matches("linux 6.12.38 → 6.12.41, +3").count(),
@@ -237,14 +236,28 @@ async fn failed_units_and_systemd_stay_visible_on_a_24_row_panel() {
     for (width, file) in [
         (120, "diff_computed_120x24.txt"),
         (100, "diff_computed_100x24.txt"),
+        (40, "diff_computed_40x24.txt"),
     ] {
         let mut ui = Ui::default();
-        type_keys(&shell, &mut ui, &km, "/luna\n");
+        // The narrow layout shows the detail only after Enter.
+        let keys = if width < 100 { "/luna\n\n" } else { "/luna\n" };
+        type_keys(&shell, &mut ui, &km, keys);
         let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), width, 24);
-        for needle in ["systemd   running", "failed    none"] {
-            assert!(frame.contains(needle), "{width}: {needle}\n{frame}");
+        // Re-review N4: however short the panel, one row says a preview exists and how to open it.
+        assert!(frame.contains("+3 −2 ~10 packages (d)"), "{width}\n{frame}");
+        if width >= 100 {
+            for needle in ["systemd   running", "failed    none"] {
+                assert!(frame.contains(needle), "{width}: {needle}\n{frame}");
+            }
         }
         expect_file("snapshots", file, &frame);
+    }
+    // The other two states, at 100x24 where the block below health is cut off entirely.
+    for (name, says) in [("cypramundi", "not cached (d)"), ("sol", "failed (d)")] {
+        let mut ui = Ui::default();
+        type_keys(&shell, &mut ui, &km, &format!("/{name}\n"));
+        let frame = render(&shell.view(), &mut ui, &km, &[], 100, 24);
+        assert!(frame.contains(says), "{name}\n{frame}");
     }
 }
 
@@ -287,4 +300,70 @@ async fn the_status_bar_counts_previews_that_are_still_collecting() {
     }
     let frame = render(&shell.view(), &mut ui, &km, &[], 120, 24);
     assert!(!frame.contains("collecting"), "{frame}");
+}
+
+/// Re-review N3: with no `[cache]` the TUI and `--plain` say there is no cache to ask, not
+/// that the cache lacks the path.
+#[tokio::test(start_paused = true)]
+async fn without_a_cache_the_wording_says_so_in_the_panel_the_list_and_plain() {
+    use auspex_tui::backend::Backend;
+    use auspex_tui::demo::{self, Demo};
+    use auspex_tui::log::Log;
+    use auspex_tui::shell::Shell;
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        std::time::Duration::from_secs(120),
+    );
+    let mut config = demo::config();
+    config.binary_cache = false;
+    shell.send(auspex_core::Event::Start(config));
+    while !shell.view().refresh.settled {
+        shell.changed().await;
+    }
+    let view = shell.view();
+    assert!(!view.binary_cache);
+    let (mut ui, km) = (Ui::default(), Keymap::defaults());
+    type_keys(&shell, &mut ui, &km, "/luna\n");
+    let panel = render(&shell.view(), &mut ui, &km, &[], 120, 40);
+    assert!(panel.contains("no binary cache is configured"), "{panel}");
+    assert!(!panel.contains("binary cache does not have"), "{panel}");
+    type_keys(&shell, &mut ui, &km, "d");
+    let list = render(&shell.view(), &mut ui, &km, &[], 160, 30);
+    assert!(list.contains("no binary cache is configured"), "{list}");
+    let plain = auspex_tui::headless::plain(&view, false, 120);
+    assert!(
+        plain.contains("packages: no binary cache configured, no preview"),
+        "{plain}"
+    );
+    assert!(!plain.contains("not in the binary cache"), "{plain}");
+}
+
+/// Re-review N6: the overlay lets the keymap's own Quit chord through, so a rebound or
+/// unbound `ctrl-c` is followed, not a hard-coded one.
+#[tokio::test(start_paused = true)]
+async fn the_overlay_follows_the_keymaps_quit_chord() {
+    use auspex_tui::keymap::Key;
+    let ctrl = |c| Key {
+        code: crossterm::event::KeyCode::Char(c),
+        ctrl: true,
+    };
+    let mut warnings = Vec::new();
+    let km = Keymap::with_overrides(
+        &std::collections::BTreeMap::from([(
+            "quit".to_owned(),
+            vec!["q".to_owned(), "ctrl-x".to_owned()],
+        )]),
+        &mut warnings,
+    )
+    .unwrap();
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    type_keys(&shell, &mut ui, &km, "/luna\nd");
+    // ctrl-c is no longer a quit key: it does nothing, and the overlay stays.
+    common::press(&shell, &mut ui, &km, ctrl('c'));
+    assert!(!shell.view().quit && ui.input.diff_open);
+    // The rebound chord quits.
+    common::press(&shell, &mut ui, &km, ctrl('x'));
+    assert!(shell.view().quit);
 }

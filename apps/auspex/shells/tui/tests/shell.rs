@@ -426,3 +426,26 @@ async fn previews_have_a_permit_pool_of_their_own() {
         shell.running_per_machine()
     );
 }
+
+/// Re-review N5: the backstop's timer is cancelled with everything else, so a quit during its
+/// grace window does not wait out `REAP_GRACE` for a sleeping task.
+#[tokio::test(start_paused = true)]
+async fn quitting_during_the_backstop_window_does_not_wait_for_the_timer() {
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_millis(800),
+    );
+    shell.set_preview_grace(Duration::from_secs(3600));
+    shell.send(Event::Start(demo::config()));
+    // Past the global deadline, inside the grace window; sol's preview has failed by itself.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let before = Instant::now();
+    shell.send(Event::Quit);
+    shell.shutdown().await;
+    assert!(
+        before.elapsed() < auspex_tui::shell::REAP_GRACE,
+        "shutdown returned at once, not after the reap grace: {:?}",
+        before.elapsed()
+    );
+}

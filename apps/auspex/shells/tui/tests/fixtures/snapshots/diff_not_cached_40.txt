@@ -4,6 +4,7 @@
 │reason    pending                     │
 │          nixos-system-cypramundi-25.1│
 │          1.20261101.6a2f1c0          │
+│diff      not cached (d)              │
 │host      root@198.51.100.4:2222      │
 │          (config override)           │
 │class     nixos  tags: base, server   │
@@ -26,8 +27,7 @@
 │diff      not cached: the binary cache│
 │          does not have the pending   │
 │          closure, so there is no     │
-│          preview until it is built   │
-│          and pushed                  │
+│          preview until it is built…  │
 │                                      │
 │                                      │
 │                                      │

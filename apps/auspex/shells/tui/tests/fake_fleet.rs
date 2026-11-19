@@ -1012,8 +1012,7 @@ esac"#
         "ssh",
         &format!(
             r#"for a; do [ "$a" = '-O' ] && exit 0; done
-for a; do dest=$a; done
-dest=$(printf '%s' "$@" | @cat@ >/dev/null; for a; do case "$prev" in --) printf '%s' "$a";; esac; prev=$a; done)
+for a; do case "$prev" in --) dest=$a;; esac; prev=$a; done
 n=${{dest##*.}}
 m=$(printf 'm%02d' $((n - 10)))
 script=$(@cat@)
@@ -1037,6 +1036,18 @@ esac"#,
 
 #[test]
 fn many_previews_never_starve_a_late_machines_cache_lookup() {
+    crowd(4, 40);
+}
+
+/// Re-review N2: previews queued for a slot do not spend their `timeouts.diff`. Each query
+/// takes 5 s and `diff` is 8 s, so a budget that counted the wait would cut every wave after
+/// the first; the clock starts when a query holds its slot, so all 18 machines compute.
+#[test]
+fn previews_waiting_for_a_slot_do_not_spend_their_timeout() {
+    crowd(30, 8);
+}
+
+fn crowd(settle: u64, diff: u64) {
     let Some(t) = tools(&["cat", "sleep"]) else {
         return;
     };
@@ -1050,7 +1061,7 @@ fn many_previews_never_starve_a_late_machines_cache_lookup() {
     let cache = cache_that_has_everything();
     let cfg = config(
         dir.path(),
-        &format!("[cache]\nurl = \"{cache}\"\n[timeouts]\nsettle = 4\ndiff = 40\n"),
+        &format!("[cache]\nurl = \"{cache}\"\n[timeouts]\nsettle = {settle}\ndiff = {diff}\n"),
     );
     let mut cmd = auspex(dir.path());
     cmd.args(["--json", "--config"])
@@ -1087,17 +1098,13 @@ fn many_previews_never_starve_a_late_machines_cache_lookup() {
         "the late machine keeps its cached badge: {late:?}"
     );
     for m in &report.machines {
-        let state = m.package_diff.as_ref().map(|d| d.state);
-        assert!(
-            matches!(
-                state,
-                Some(
-                    auspex_domain::diff::DiffState::Computed
-                        | auspex_domain::diff::DiffState::Failed
-                )
-            ),
-            "{}: {state:?}",
-            m.name
+        let diff = m.package_diff.as_ref().unwrap();
+        assert_eq!(
+            diff.state,
+            auspex_domain::diff::DiffState::Computed,
+            "{}: {:?}",
+            m.name,
+            diff.reason
         );
     }
 }

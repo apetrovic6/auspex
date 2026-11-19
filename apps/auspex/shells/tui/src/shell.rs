@@ -21,7 +21,7 @@
 //!
 //! The package preview's two closure queries are the exception: the core leaves them
 //! running past that deadline, and the shell bounds each by `timeouts.diff` instead
-//! ([`within`]): waiting for a permit, ssh's approval phase and the query itself all count,
+//! ([`within`]): ssh's approval phase and the query itself count, not the wait for a slot,
 //! and when it passes the adapter kills and reaps what it started and the request is answered
 //! as a failure, which the core turns into a `failed` preview.
 
@@ -52,7 +52,9 @@ use crate::log::Log;
 /// the evaluation, Prometheus, DNS) are not limited: they must not queue behind hung probes.
 pub const MAX_CONCURRENT: usize = 32;
 
-/// How many package-preview queries may run at once: 8, both queries of 4 machines.
+/// How many package-preview queries may run at once: 8.
+///
+/// Each query (deployed or pending) takes one slot of its own; nothing pairs a machine's two.
 ///
 /// A pool of their own, never the one above. A preview holds its permits for up to
 /// `timeouts.diff`, and the global deadline deliberately leaves it running, so sharing would let
@@ -271,12 +273,18 @@ impl Shell {
                 let token = self.open(op.id);
                 let shell = Arc::clone(self);
                 self.one_shot(op.id, request, async move {
+                    // The wait for a slot is bounded by the core's backstop, not by
+                    // `timeouts.diff`, which starts once the query holds one.
+                    let _permit = shell.preview_gate(&token).await?;
+                    shell.send(Event::PreviewStarted {
+                        generation: op.generation,
+                        id: op.id,
+                    });
                     let timeout = Duration::from_secs(op.timeout_seconds);
                     within(&token, timeout, "deployed closure query", |token| {
                         let shell = Arc::clone(&shell);
                         let op = op.clone();
                         async move {
-                            let _permit = shell.preview_gate(&token).await?;
                             shell
                                 .backend
                                 .deployed_closure(&op, &token, &|waiting| shell.approval(waiting))
@@ -291,14 +299,16 @@ impl Shell {
                 let token = self.open(op.id);
                 let shell = Arc::clone(self);
                 self.one_shot(op.id, request, async move {
+                    let _permit = shell.preview_gate(&token).await?;
+                    shell.send(Event::PreviewStarted {
+                        generation: op.generation,
+                        id: op.id,
+                    });
                     let timeout = Duration::from_secs(op.timeout_seconds);
                     within(&token, timeout, "pending closure query", |token| {
                         let shell = Arc::clone(&shell);
                         let op = op.clone();
-                        async move {
-                            let _permit = shell.preview_gate(&token).await?;
-                            shell.backend.pending_closure(&op, &token).await
-                        }
+                        async move { shell.backend.pending_closure(&op, &token).await }
                     })
                     .await
                 });
@@ -463,8 +473,9 @@ impl Shell {
 
 /// Runs `work` under `timeout`, answering with a failure when it passes.
 ///
-/// `timeouts.diff` bounds the whole of one preview query: waiting for a permit, ssh's
-/// approval phase and the query itself, not only the query's own deadline. `work` gets a
+/// `timeouts.diff` bounds one preview query once it holds a slot: ssh's approval phase and
+/// the query itself, not only the query's own deadline. (The wait for a slot is not counted:
+/// the core's backstop at `settle + diff` bounds it.) `work` gets a
 /// child of `token`; on the timeout that child is cancelled, which makes the adapter kill and
 /// reap its process group and return `Cancelled`, and that is then answered as the timeout it
 /// was. A cancellation from the core (a refresh, a quit) cancels `token` itself, and stays a

@@ -161,8 +161,10 @@ requested. Both are backed by a deadline in the core itself, `timeouts.settle` p
 `timeouts.diff` after the refresh started, at which a preview still out is cancelled and
 `failed` ("timed out"): headless mode therefore waits at most `settle + diff` (240 s by
 default), and never depends on an adapter answering. Previews have their own small pool of
-query slots (8, both queries of four machines at a time), separate from the 32 shared by probes
-and cache lookups, so a slow preview cannot hold up another machine's `cached` badge. Set
+query slots (8 queries at once, each of the two queries of a machine taking a slot of its own),
+separate from the 32 shared by probes and cache lookups, so a slow preview cannot hold up
+another machine's `cached` badge. `timeouts.diff` starts when a query gets its slot; a preview
+that never got one before `settle + diff` is `failed` ("no preview slot became free"). Set
 `diff.enabled = false` to switch the feature off.
 
 Stamp deployed machines with the **fleet's** revision, not auspex's:

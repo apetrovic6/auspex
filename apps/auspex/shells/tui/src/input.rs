@@ -111,17 +111,6 @@ impl Input {
             return self.prompt_key(prompt, key, screen);
         }
         let esc = key == Key::plain(KeyCode::Esc);
-        // Ctrl-C quits from the diff overlay, as it does from the help overlay: `q` and Esc
-        // close it, but the chord that means "get me out" must not be swallowed by it.
-        if self.diff_open
-            && key
-                == (Key {
-                    code: KeyCode::Char('c'),
-                    ctrl: true,
-                })
-        {
-            return vec![Event::Quit];
-        }
         if esc {
             if screen.help_open {
                 return vec![Event::CloseHelp];
@@ -168,6 +157,12 @@ impl Input {
             Lookup::Action(a) => a,
         };
         let count = self.count.take();
+        // Over the diff overlay a plain quit key (`q`, Esc by default) closes it; a quit key
+        // that is a control chord (`ctrl-c` by default) still quits, as it does from help. It
+        // is the keymap's own Quit binding either way, so a rebound or unbound chord follows.
+        if self.diff_open && action == Action::Quit && key.ctrl {
+            return vec![Event::Quit];
+        }
         if screen.help_open && !matches!(action, Action::Help | Action::Quit) {
             // The overlay covers the list; keys that move it would act unseen.
             return Vec::new();

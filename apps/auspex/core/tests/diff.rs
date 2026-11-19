@@ -484,6 +484,13 @@ fn the_cores_own_backstop_fails_every_outstanding_preview_without_the_shell() {
     assert_eq!(shell.view(), before);
 
     // The backstop: nothing answered, and the fleet settles anyway.
+    // Every query had its slot and nothing answered.
+    for id in &ids {
+        shell.send(Event::PreviewStarted {
+            generation,
+            id: *id,
+        });
+    }
     shell.send(Event::PreviewDeadlinePassed { generation });
     for id in ids {
         assert!(
@@ -506,7 +513,6 @@ fn the_cores_own_backstop_fails_every_outstanding_preview_without_the_shell() {
         assert_eq!(row.status, Badge::UpdatePending);
         assert!(row.settled);
     }
-    // A late answer after the backstop is dropped.
     assert_eq!(shell.view().report.errors, []);
 }
 
@@ -570,13 +576,10 @@ fn a_closure_of_another_system_than_the_scan_saw_is_failed_not_shown() {
     assert_eq!(diff.state, DiffState::Failed);
     assert_eq!(diff.reason.as_deref(), Some(auspex_core::SYSTEM_CHANGED));
 
-    // No system toplevel in the deployed closure at all.
+    // No system toplevel in the deployed closure at all: it does not hold the probe's.
     let bare = closure(&[('c', "zlib-1.3.1")], 0);
     let diff = preview_of(bare, new());
-    assert_eq!(
-        diff.reason.as_deref(),
-        Some(auspex_core::NO_DEPLOYED_SYSTEM)
-    );
+    assert_eq!(diff.reason.as_deref(), Some(auspex_core::SYSTEM_CHANGED));
 
     // The pending side is not the evaluated toplevel.
     let other = closure(&[('8', "nixos-system-elsewhere"), ('c', "zlib-1.3.1")], 0);
@@ -589,4 +592,133 @@ fn a_closure_of_another_system_than_the_scan_saw_is_failed_not_shown() {
 
     // And the matching pair is a computed diff, which is what the other tests use.
     assert_eq!(preview_of(old(), new()).state, DiffState::Computed);
+}
+
+/// Re-review N1: a host closure routinely holds other system toplevels (a declarative
+/// container, a microvm, a specialisation). The check is membership of the system the scan
+/// saw, not uniqueness of the toplevel, so these computed before and must still.
+#[test]
+fn a_closure_with_a_second_system_toplevel_is_computed() {
+    let with_container = |system: (char, &str), container: (char, &str)| {
+        closure(
+            &[
+                system,
+                container,
+                ('a', "linux-6.12.38"),
+                ('b', "htop-3.3.0"),
+                ('c', "zlib-1.3.1"),
+            ],
+            0,
+        )
+    };
+    let deployed = with_container(
+        ('0', "nixos-system-now"),
+        ('7', "nixos-system-webcontainer-25.05"),
+    );
+    let pending = closure(
+        &[
+            ('1', "nixos-system-next"),
+            ('6', "nixos-system-webcontainer-25.11"),
+            ('d', "linux-6.12.41"),
+            ('c', "zlib-1.3.1"),
+        ],
+        0,
+    );
+    let diff = preview_of(deployed.clone(), pending.clone());
+    assert_eq!(diff.state, DiffState::Computed, "{diff:?}");
+    // The toplevels that were checked are the scan's, not "ambiguous" nulls.
+    assert_eq!(
+        diff.deployed.as_deref(),
+        Some(path('0', "nixos-system-now").as_str())
+    );
+    assert_eq!(
+        diff.pending.as_deref(),
+        Some(path('1', "nixos-system-next").as_str())
+    );
+    assert_eq!(diff.counts.changed, 1);
+
+    // The container on one side only, and the probe's system still absent: a real mismatch.
+    let switched = with_container(
+        ('9', "nixos-system-switched"),
+        ('7', "nixos-system-webcontainer-25.05"),
+    );
+    assert_eq!(
+        preview_of(switched, pending).reason.as_deref(),
+        Some(auspex_core::SYSTEM_CHANGED)
+    );
+    let elsewhere = closure(
+        &[
+            ('8', "nixos-system-elsewhere"),
+            ('6', "nixos-system-webcontainer-25.11"),
+        ],
+        0,
+    );
+    assert_eq!(
+        preview_of(deployed, elsewhere).reason.as_deref(),
+        Some(auspex_core::PENDING_SYSTEM_MISMATCH)
+    );
+}
+
+/// Re-review N2: a preview that never got a query slot says so, not "timed out".
+#[test]
+fn the_backstop_says_no_slot_for_a_preview_that_never_started() {
+    let mut shell = scanned(diff_config());
+    answer_cache(&mut shell, "luna", NarCache::Cached);
+    answer_cache(&mut shell, "sol", NarCache::Cached);
+    let generation = shell.view().refresh.generation;
+    // luna's deployed query got a slot; sol's two are still queued.
+    let luna_deployed = shell
+        .deployed
+        .iter()
+        .find(|r| r.operation.machine == "luna")
+        .unwrap()
+        .operation
+        .id;
+    // A stale or unknown start changes nothing.
+    shell.send(Event::PreviewStarted {
+        generation: auspex_core::Generation(generation.0 + 1),
+        id: luna_deployed,
+    });
+    shell.send(Event::PreviewStarted {
+        generation,
+        id: luna_deployed,
+    });
+    shell.send(Event::PreviewDeadlinePassed { generation });
+    assert_eq!(
+        shell.row("luna").package_diff.unwrap().reason.as_deref(),
+        Some(auspex_core::PREVIEW_TIMED_OUT)
+    );
+    assert_eq!(
+        shell.row("sol").package_diff.unwrap().reason.as_deref(),
+        Some(auspex_core::PREVIEW_NO_SLOT)
+    );
+}
+
+/// Re-review N5: a refresh cancels the backstop's work: the old generation's backstop does
+/// nothing to the new generation's previews.
+#[test]
+fn an_old_generations_backstop_leaves_the_new_generations_previews_alone() {
+    let mut shell = scanned(diff_config());
+    answer_cache(&mut shell, "luna", NarCache::Cached);
+    let old_generation = shell.view().refresh.generation;
+    shell.send(Event::Refresh);
+    shell.drop_cancelled();
+    // The new refresh lists its machines and gets as far as a preview.
+    let mut list = shell.take_inventory();
+    shell.resolve(&mut list, Ok(inventory(THREE)));
+    let before = shell.view();
+    shell.send(Event::PreviewDeadlinePassed {
+        generation: old_generation,
+    });
+    assert_eq!(shell.view(), before);
+    assert!(shell.cancels.len() >= 2, "only the refresh's own cancels");
+    let cancels = shell.cancels.len();
+    shell.send(Event::PreviewDeadlinePassed {
+        generation: old_generation,
+    });
+    assert_eq!(
+        shell.cancels.len(),
+        cancels,
+        "and the stale backstop cancels nothing"
+    );
 }

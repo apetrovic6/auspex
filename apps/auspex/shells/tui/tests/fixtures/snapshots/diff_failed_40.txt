@@ -4,6 +4,7 @@
 │reason    pending                     │
 │          nixos-system-sol-25.11.20261│
 │          101.6a2f1c0                 │
+│diff      failed (d)                  │
 │host      root@192.168.1.12 (inventory│
 │          deploy.targetHost)          │
 │build     localhost                   │
@@ -26,7 +27,6 @@
 │          (prometheus)                │
 │diff      failed: deployed closure    │
 │          query timed out after 120s  │
-│                                      │
 │                                      │
 │                                      │
 │                                      │

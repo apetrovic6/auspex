@@ -74,6 +74,9 @@ pub const PROMETHEUS_TIMED_OUT: &str = "no answer before the global deadline";
 /// The reason of a `failed` preview whose cache lookup failed.
 pub const CACHE_LOOKUP_FAILED: &str =
     "the cache lookup failed, so the pending packages are unknown";
+/// The reason of a preview that never got a query slot before the backstop deadline.
+pub const PREVIEW_NO_SLOT: &str =
+    "no preview slot became free before timeouts.settle + timeouts.diff passed";
 /// The reason a package preview still out at the backstop deadline is `failed` with.
 pub const PREVIEW_TIMED_OUT: &str =
     "timed out: the package preview did not finish before timeouts.settle + timeouts.diff";
@@ -112,6 +115,15 @@ pub enum Event {
     PreviewDeadlinePassed {
         /// The refresh the deadline was started for.
         generation: Generation,
+    },
+    /// The shell's preview query `id` now holds a preview slot, so its `timeouts.diff` clock
+    /// has started. A query that never gets here before [`Event::PreviewDeadlinePassed`] is
+    /// failed as having had no slot, not as having timed out. Ignored when stale.
+    PreviewStarted {
+        /// The request's generation.
+        generation: Generation,
+        /// The request.
+        id: RequestId,
     },
 
     // --- answers (built by the core) ---------------------------------------------------
@@ -338,6 +350,9 @@ pub struct Model {
     fleet_errors: Vec<FleetError>,
     /// The deadline passed for this generation.
     deadline_passed: bool,
+    /// Closure requests whose query holds a preview slot (the shell said so with
+    /// [`Event::PreviewStarted`]): the rest are still waiting for one.
+    started: BTreeSet<RequestId>,
     /// ... with something still outstanding.
     timed_out: bool,
     view: ViewState,
@@ -505,6 +520,7 @@ impl App for Auspex {
             Event::Refresh => Command::done(),
             Event::DeadlinePassed { generation } => deadline(model, generation),
             Event::PreviewDeadlinePassed { generation } => preview_deadline(model, generation),
+            Event::PreviewStarted { generation, id } => preview_started(model, generation, id),
             Event::InventoryAnswered {
                 generation,
                 id,
@@ -688,6 +704,7 @@ fn refresh(model: &mut Model) -> Command<Effect, Event> {
     model.addresses.clear();
     model.fleet_errors.clear();
     model.deadline_passed = false;
+    model.started.clear();
     model.timed_out = false;
     model.prometheus = if model
         .config
@@ -1109,7 +1126,13 @@ fn closure_answered(
     }
     if let (Some(deployed), Some(pending)) = (deployed.as_ref(), pending.as_ref()) {
         let diff = compare(deployed, pending);
-        let diff = verified(row, diff);
+        let diff = verified(
+            row.probe.as_ref(),
+            row.eval.as_ref(),
+            diff,
+            deployed,
+            pending,
+        );
         row.diff = DiffSlot::Done(diff);
     }
     render()
@@ -1117,40 +1140,51 @@ fn closure_answered(
 
 /// Why a closure's system is not the one the scan saw.
 pub const SYSTEM_CHANGED: &str = "the machine changed system while it was being queried";
-/// [`SYSTEM_CHANGED`] for a closure query that found no system toplevel at all.
-pub const NO_DEPLOYED_SYSTEM: &str =
-    "the deployed closure holds no system to compare with the one the probe saw";
 /// The pending side's equivalent: the cache's closure is not the evaluated toplevel's.
 pub const PENDING_SYSTEM_MISMATCH: &str =
     "the pending closure is not the system the evaluation produced";
 
 /// A computed preview is only a preview of *this* update if its two closures are the ones the
-/// scan saw: the deployed closure's toplevel must be the probe's `current_system` and the
-/// pending one the evaluation's out path. A deploy or switch between the probe and the query
-/// (seconds apart, an operator deploying with auspex open) would otherwise show the diff of a
-/// different system, unremarked, such as "packages unchanged" on a pending row. A mismatch
-/// makes the preview `failed`.
-fn verified(row: &Row, diff: PackageDiff) -> PackageDiff {
+/// scan saw: the deployed closure must contain the probe's `current_system` and the pending
+/// one the evaluation's out path.
+///
+/// Membership, not uniqueness of "the" system toplevel: a host closure routinely holds other
+/// toplevels (a declarative container, a microvm, a specialisation), which the domain calls
+/// ambiguous and leaves out of `deployed`/`pending`. Each closure is the closure *of* the
+/// queried path, so it contains that path; a deploy or switch between the probe and the query
+/// (seconds apart, an operator deploying with auspex open) breaks that, and would otherwise
+/// show the diff of a different system, such as "packages unchanged" on a pending row. A
+/// mismatch makes the preview `failed`. On success `deployed` and `pending` record the
+/// toplevels that were checked.
+fn verified(
+    probe: Option<&ProbeOutcome>,
+    eval: Option<&EvalOutcome>,
+    mut diff: PackageDiff,
+    deployed: &ClosurePaths,
+    pending: &ClosurePaths,
+) -> PackageDiff {
     if diff.state != DiffState::Computed {
         return diff;
     }
-    let probed = match &row.probe {
-        Some(ProbeOutcome::Observed(o)) => o.current_system.as_ref().map(StorePath::as_str),
+    let probed = match probe {
+        Some(ProbeOutcome::Observed(o)) => o.current_system.as_ref(),
         _ => None,
     };
-    let evaluated = match &row.eval {
-        Some(EvalOutcome::Success(s)) => Some(s.out_path.as_str()),
+    let evaluated = match eval {
+        Some(EvalOutcome::Success(s)) => Some(&s.out_path),
         _ => None,
     };
-    if diff.deployed.is_none() {
-        return PackageDiff::failed(NO_DEPLOYED_SYSTEM);
-    }
-    if diff.deployed.as_deref() != probed {
+    let holds = |closure: &ClosurePaths, system: Option<&StorePath>| {
+        system.is_some_and(|s| closure.paths.contains(s))
+    };
+    if !holds(deployed, probed) {
         return PackageDiff::failed(SYSTEM_CHANGED);
     }
-    if diff.pending.as_deref() != evaluated {
+    if !holds(pending, evaluated) {
         return PackageDiff::failed(PENDING_SYSTEM_MISMATCH);
     }
+    diff.deployed = probed.map(ToString::to_string);
+    diff.pending = evaluated.map(ToString::to_string);
     diff
 }
 
@@ -1180,6 +1214,18 @@ fn eval_error(machine: &str, reason: &str) -> EvalOutcome {
     })
 }
 
+/// A preview query holds a slot ([`Event::PreviewStarted`]); a stale or cancelled one is ignored.
+fn preview_started(
+    model: &mut Model,
+    generation: Generation,
+    id: RequestId,
+) -> Command<Effect, Event> {
+    if generation == model.generation && model.outstanding.contains_key(&id) {
+        model.started.insert(id);
+    }
+    Command::done()
+}
+
 /// The previews' backstop deadline ([`Event::PreviewDeadlinePassed`]): whatever previews are
 /// still out are cancelled and failed. Nothing else changes: the scan's own deadline is
 /// [`deadline`]'s, and a preview never touches `timed_out`.
@@ -1187,10 +1233,25 @@ fn preview_deadline(model: &mut Model, generation: Generation) -> Command<Effect
     if generation != model.generation || model.inventory == Inventory::NotStarted {
         return Command::done();
     }
+    // Before the cancels forget the requests: which machines never got a slot at all.
+    let ran: BTreeSet<String> = model
+        .outstanding
+        .iter()
+        .filter(|(id, _)| model.started.contains(id))
+        .filter_map(|(_, p)| match p {
+            Pending::Deployed(name) | Pending::Update(name) => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
     let mut commands = model.cancel_where(Pending::is_closure);
     for row in &mut model.rows {
         if matches!(row.diff, DiffSlot::Collecting { .. }) {
-            row.diff = DiffSlot::Done(PackageDiff::failed(PREVIEW_TIMED_OUT));
+            let reason = if ran.contains(&row.machine.name) {
+                PREVIEW_TIMED_OUT
+            } else {
+                PREVIEW_NO_SLOT
+            };
+            row.diff = DiffSlot::Done(PackageDiff::failed(reason));
         }
     }
     commands.push(render());
@@ -1288,6 +1349,7 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::Refresh
         | Event::DeadlinePassed { .. }
         | Event::PreviewDeadlinePassed { .. }
+        | Event::PreviewStarted { .. }
         | Event::InventoryAnswered { .. }
         | Event::ProbeAnswered { .. }
         | Event::EvalAnswered { .. }

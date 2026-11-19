@@ -149,9 +149,9 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
             Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)])
                 .areas(main);
         draw_list(frame, list, view, ui, theme);
-        draw_detail(frame, detail, view, theme);
+        draw_detail(frame, detail, view, ctx);
     } else if ui.input.detail_open {
-        draw_detail(frame, main, view, theme);
+        draw_detail(frame, main, view, ctx);
     } else {
         draw_list(frame, main, view, ui, theme);
     }
@@ -305,7 +305,12 @@ const fn health_source(s: HealthSource) -> &'static str {
     clippy::too_many_lines,
     reason = "one entry per line of the panel, in the panel's order"
 )]
-pub fn detail_lines(m: &MachineReport, cache_configured: bool) -> Vec<(&'static str, String)> {
+pub fn detail_lines(
+    m: &MachineReport,
+    cache_configured: bool,
+    diff_key: Option<&str>,
+    value_cells: usize,
+) -> Vec<(&'static str, String)> {
     let mut out = vec![
         ("status", m.status.label().to_owned()),
         (
@@ -321,6 +326,11 @@ pub fn detail_lines(m: &MachineReport, cache_configured: bool) -> Vec<(&'static 
             ),
         ),
     ];
+    // One row for the preview, right after the reason: health comes before the full block below,
+    // which a short panel cuts, so this is what says a preview exists.
+    if let Some(row) = packages::summary_row(m, diff_key, value_cells) {
+        out.insert(2, row);
+    }
     if let Some(e) = &m.target_error {
         out.push(("refused", e.clone()));
     }
@@ -438,13 +448,14 @@ pub fn detail_lines(m: &MachineReport, cache_configured: bool) -> Vec<(&'static 
     ));
     // The package preview comes last, capped at a few lines: failed units and the systemd
     // state matter most just before an update, and the full list is on `d`.
-    out.extend(packages::panel_lines(m, cache_configured));
+    out.extend(packages::panel_rows(m, cache_configured, value_cells));
     out
 }
 
 const LABEL_CELLS: usize = 9;
 
-fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, theme: &Theme) {
+fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'_>) {
+    let theme = ctx.theme;
     let m = view.selected.and_then(|i| view.report.machines.get(i));
     let title = m.map_or_else(|| " detail ".to_owned(), |m| format!(" {} ", m.name));
     let block = Block::bordered()
@@ -474,7 +485,8 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, theme: &Theme) {
     }
     lines.push(Line::from(badges));
     let room = usize::from(inner.height);
-    for (label, value) in detail_lines(m, view.binary_cache) {
+    let diff_key = ctx.keymap.keys_for(Action::Diff).into_iter().next();
+    for (label, value) in detail_lines(m, view.binary_cache, diff_key.as_deref(), value_cells) {
         if lines.len() >= room {
             break; // nothing below the panel is drawn, so nothing below it is wrapped
         }
