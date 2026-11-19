@@ -420,6 +420,10 @@ pub fn clean_preflight() -> auspex_core::PreflightAnswer {
 }
 
 /// A pending closure of one path of `bytes`: what the checks size.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "fills the Result field of PreflightAnswer"
+)]
 pub fn sized(bytes: u64) -> Result<Vec<(StorePath, u64)>, String> {
     Ok(vec![(
         StorePath::new(path('s', "closure-payload")).unwrap(),

@@ -17,7 +17,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use auspex_domain::observe::StorePath;
-use auspex_domain::preflight::{STATUS_ARGS, TreeState, Upstream};
+use auspex_domain::preflight::{TreeState, Upstream, status_args};
 use auspex_effects::cache::GitParams;
 use auspex_effects::closure::PendingParams;
 use auspex_effects::nix::FlakeRef;
@@ -41,19 +41,27 @@ fn store_path() -> StorePath {
 // git status
 // ---------------------------------------------------------------------------------------
 
-/// A fake git: records its argv, its working directory and two environment variables, then
-/// runs `body`.
-fn fake_git(t: &Tools, dir: &Path, body: &str) -> PathBuf {
+/// A fake git: records every call's argv (each followed by a `--` line), its working directory
+/// and two environment variables; answers the config listing with `listing` (a `printf` format)
+/// and runs `body` for anything else (the status).
+fn fake_git_listing(t: &Tools, dir: &Path, listing: &str, body: &str) -> PathBuf {
     t.script(
         dir,
         "git",
         &format!(
-            "printf '%s\\n' \"$@\" > '@dir@/git-argv'\n\
+            "printf '%s\\n' \"$@\" >> '@dir@/git-argv'\n\
+             printf -- '--\\n' >> '@dir@/git-argv'\n\
              pwd > '@dir@/git-cwd'\n\
              printf '%s|%s\\n' \"$GIT_OPTIONAL_LOCKS\" \"${{GIT_DIR-unset}}\" > '@dir@/git-env'\n\
+             case \" $* \" in *\" config \"*) printf '{listing}'; exit 0;; esac\n\
              {body}"
         ),
     )
+}
+
+/// [`fake_git_listing`] for a repository that defines no filter drivers.
+fn fake_git(t: &Tools, dir: &Path, body: &str) -> PathBuf {
+    fake_git_listing(t, dir, "core.bare\\0", body)
 }
 
 fn git_params(program: &Path, timeout: Duration) -> GitParams<'_> {
@@ -72,14 +80,15 @@ fn tracking(ahead: u64, behind: u64) -> Upstream {
 }
 
 #[tokio::test]
-async fn the_tree_check_runs_exactly_one_read_only_hardened_git_status_in_the_fleet_directory() {
+async fn the_tree_check_lists_the_config_then_runs_one_read_only_hardened_git_status() {
     let Some(t) = tools(&["cat"]) else { return };
     let dir = tempdir();
     let repo = dir.path().join("fleet");
     fs::create_dir(&repo).unwrap();
-    let program = fake_git(
+    let program = fake_git_listing(
         &t,
         dir.path(),
+        "core.bare\\0filter.evil.clean\\0filter.my.driver.process\\0",
         "printf '## main...origin/main [ahead 2]\\0 M flake.nix\\0M  a.nix\\0'",
     );
     let answer = tree_state(
@@ -96,16 +105,26 @@ async fn the_tree_check_runs_exactly_one_read_only_hardened_git_status_in_the_fl
             upstream: tracking(2, 0),
         })
     );
-    // The cache module's hardening first, then the check's own arguments: one command.
+    // Two commands, both with the cache module's hardening first: the read-only listing of
+    // config keys, then the status with every filter driver the listing named blanked.
     let argv = fs::read_to_string(dir.path().join("git-argv")).unwrap();
-    let mut want = vec!["-c", "core.fsmonitor=false"];
-    want.extend(STATUS_ARGS);
-    assert_eq!(argv, format!("{}\n", want.join("\n")));
     assert_eq!(
         argv,
-        "-c\ncore.fsmonitor=false\n--no-optional-locks\n-c\ncore.hooksPath=/dev/null\n\
-         --attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904\nstatus\n--porcelain=v1\n-b\n-z\n\
-         --untracked-files=no\n--ignore-submodules=all\n--no-renames\n"
+        "-c\ncore.fsmonitor=false\nconfig\n--list\n--name-only\n-z\n--\n\
+         -c\ncore.fsmonitor=false\n--no-optional-locks\n-c\ncore.hooksPath=/dev/null\n\
+         -c\ncore.attributesFile=/dev/null\n\
+         -c\nfilter.evil.clean=\n-c\nfilter.evil.smudge=\n-c\nfilter.evil.process=\n\
+         -c\nfilter.my.driver.clean=\n-c\nfilter.my.driver.smudge=\n\
+         -c\nfilter.my.driver.process=\n\
+         status\n--porcelain=v1\n-b\n-z\n--untracked-files=no\n--ignore-submodules=all\n\
+         --no-renames\n--\n"
+    );
+    // The same, from the domain's own function.
+    let mut want = vec!["-c".to_owned(), "core.fsmonitor=false".to_owned()];
+    want.extend(status_args(&["evil".to_owned(), "my.driver".to_owned()]));
+    assert!(
+        argv.contains(&format!("{}\n--\n", want.join("\n"))),
+        "{argv}"
     );
     // In the fleet's directory, with locks off.
     let cwd = fs::read_to_string(dir.path().join("git-cwd")).unwrap();
@@ -735,4 +754,244 @@ async fn a_slow_nix_is_a_timeout_and_a_cancelled_one_is_killed_and_reaped() {
         still_alive_after_wait(&canceller.await.unwrap()),
         Vec::<i32>::new()
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1 (review 5, 6): every way an attribute can name a filter, and SHA-256
+// ---------------------------------------------------------------------------------------
+
+/// One way a repository can make `git status` run a filter, set up in a fresh repository whose
+/// `host.nix` is committed. `filter_cmd` is the command line a filter driver would run (it
+/// touches a marker file and then copies stdin to stdout, so a clean filter would also work).
+struct Route {
+    name: &'static str,
+    /// Configures the route in `repo`, for a driver (named `driver`) that runs `filter_cmd`.
+    /// `kind` is which of the driver's commands to set (`clean`, `process`, `smudge`).
+    setup: fn(repo: &Path, driver: &str, kind: &str, filter_cmd: &str),
+    driver: &'static str,
+    kind: &'static str,
+}
+
+fn set_driver(repo: &Path, driver: &str, kind: &str, cmd: &str) {
+    real_git(repo, &["config", &format!("filter.{driver}.{kind}"), cmd]);
+}
+
+fn attributes_in_info(repo: &Path, driver: &str) {
+    fs::create_dir_all(repo.join(".git/info")).unwrap();
+    fs::write(
+        repo.join(".git/info/attributes"),
+        format!("* filter={driver}\n"),
+    )
+    .unwrap();
+}
+
+const ROUTES: &[Route] = &[
+    Route {
+        name: "a tracked .gitattributes",
+        setup: |r, d, k, c| {
+            fs::write(r.join(".gitattributes"), format!("* filter={d}\n")).unwrap();
+            real_git(r, &["add", ".gitattributes"]);
+            real_git(r, &["commit", "-q", "-m", "attributes"]);
+            set_driver(r, d, k, c);
+        },
+        driver: "evil",
+        kind: "clean",
+    },
+    Route {
+        name: ".git/info/attributes",
+        setup: |r, d, k, c| {
+            attributes_in_info(r, d);
+            set_driver(r, d, k, c);
+        },
+        driver: "evil",
+        kind: "clean",
+    },
+    Route {
+        name: "core.attributesFile",
+        setup: |r, d, k, c| {
+            let file = r.join("..").join("attrs-elsewhere");
+            fs::write(&file, format!("* filter={d}\n")).unwrap();
+            real_git(
+                r,
+                &["config", "core.attributesFile", file.to_str().unwrap()],
+            );
+            set_driver(r, d, k, c);
+        },
+        driver: "evil",
+        kind: "clean",
+    },
+    Route {
+        name: "a driver defined by an included config file",
+        setup: |r, d, k, c| {
+            attributes_in_info(r, d);
+            fs::write(
+                r.join(".git/extra.cfg"),
+                format!("[filter \"{d}\"]\n\t{k} = {c}\n"),
+            )
+            .unwrap();
+            real_git(r, &["config", "include.path", "extra.cfg"]);
+        },
+        driver: "evil",
+        kind: "clean",
+    },
+    Route {
+        name: "a long-running process filter",
+        setup: |r, d, k, c| {
+            attributes_in_info(r, d);
+            set_driver(r, d, k, c);
+        },
+        driver: "evil",
+        kind: "process",
+    },
+    Route {
+        name: "a driver whose name has a dot",
+        setup: |r, d, k, c| {
+            attributes_in_info(r, d);
+            set_driver(r, d, k, c);
+        },
+        driver: "my.driver",
+        kind: "clean",
+    },
+    Route {
+        name: "a smudge filter",
+        setup: |r, d, k, c| {
+            attributes_in_info(r, d);
+            set_driver(r, d, k, c);
+        },
+        driver: "evil",
+        kind: "smudge",
+    },
+];
+
+#[tokio::test]
+async fn no_filter_runs_whichever_way_the_repository_names_it() {
+    let Some(t) = with_real_git() else { return };
+    for route in ROUTES {
+        let dir = tempdir();
+        let r = dir.path().join("repo");
+        fs::create_dir(&r).unwrap();
+        real_git(&r, &["init", "-q", "-b", "main"]);
+        fs::write(r.join("host.nix"), "1\n").unwrap();
+        real_git(&r, &["add", "host.nix"]);
+        real_git(&r, &["commit", "-q", "-m", "one"]);
+        let ran = dir.path().join("FILTER-RAN");
+        let cmd = format!(
+            "{} '{}'; {}",
+            t.get("touch").display(),
+            ran.display(),
+            t.get("cat").display()
+        );
+        (route.setup)(&r, route.driver, route.kind, &cmd);
+        // Sanity: without the check's blanking, this very repository does run the filter
+        // (otherwise the test below would pass for a repository that never would have).
+        std::thread::sleep(Duration::from_millis(1100));
+        let now = fs::read(r.join("host.nix")).unwrap();
+        fs::write(r.join("host.nix"), now).unwrap();
+        if route.kind == "clean" {
+            real_git(&r, &["status", "--porcelain"]);
+            assert!(
+                ran.exists(),
+                "{}: an ordinary `git status` did not run the filter, so this route proves nothing",
+                route.name
+            );
+            fs::remove_file(&ran).unwrap();
+            fs::write(r.join("host.nix"), "1\n").unwrap();
+            std::thread::sleep(Duration::from_millis(1100));
+            let now = fs::read(r.join("host.nix")).unwrap();
+            fs::write(r.join("host.nix"), now).unwrap();
+        }
+
+        let answer = real_tree(&r)
+            .await
+            .unwrap_or_else(|why| panic!("{}: {why}", route.name));
+        assert_eq!(answer.changed_files, 0, "{}: same content", route.name);
+        assert!(
+            !ran.exists(),
+            "{}: the status check ran the repository's filter",
+            route.name
+        );
+        // And a real change is still seen.
+        fs::write(r.join("host.nix"), "2\n").unwrap();
+        let answer = real_tree(&r).await.unwrap();
+        assert_eq!(answer.changed_files, 1, "{}", route.name);
+        assert!(!ran.exists(), "{}: ran on a changed file", route.name);
+    }
+}
+
+#[tokio::test]
+async fn a_sha256_repository_is_checked_like_any_other() {
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let remote = tempdir();
+    let r = dir.path();
+    let init = Command::new("git")
+        .current_dir(r)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["init", "-q", "-b", "main", "--object-format=sha256"])
+        .output()
+        .unwrap();
+    if !init.status.success() {
+        assert!(!in_nix_build(), "git cannot make a SHA-256 repository");
+        eprintln!("SKIPPED: this git has no SHA-256 repositories");
+        return;
+    }
+    real_git(
+        remote.path(),
+        &[
+            "init",
+            "-q",
+            "--bare",
+            "-b",
+            "main",
+            "--object-format=sha256",
+        ],
+    );
+    fs::write(r.join("host.nix"), "1\n").unwrap();
+    real_git(r, &["add", "host.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    real_git(
+        r,
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+    );
+    real_git(r, &["push", "-q", "-u", "origin", "main"]);
+    assert_eq!(
+        real_tree(r).await,
+        Ok(TreeState {
+            changed_files: 0,
+            upstream: tracking(0, 0)
+        })
+    );
+    fs::write(r.join("host.nix"), "2\n").unwrap();
+    real_git(r, &["commit", "-q", "-a", "-m", "two"]);
+    fs::write(r.join("host.nix"), "3\n").unwrap();
+    assert_eq!(
+        real_tree(r).await,
+        Ok(TreeState {
+            changed_files: 1,
+            upstream: tracking(1, 0)
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_filter_driver_that_cannot_be_blanked_makes_the_check_not_run() {
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    real_git(r, &["init", "-q", "-b", "main"]);
+    fs::write(r.join("host.nix"), "1\n").unwrap();
+    real_git(r, &["add", "host.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    // `-c key=value` splits at the first `=`, so a driver named `a=b` cannot be turned off.
+    fs::write(
+        r.join(".git/config"),
+        format!(
+            "{}\n[filter \"a=b\"]\n\tclean = cat\n",
+            fs::read_to_string(r.join(".git/config")).unwrap()
+        ),
+    )
+    .unwrap();
+    let why = real_tree(r).await.unwrap_err();
+    assert!(why.contains("cannot be turned off"), "{why}");
 }

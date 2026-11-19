@@ -73,35 +73,107 @@ pub enum Upstream {
     },
 }
 
-/// The arguments of the one `git` command the tree check runs, after the program.
+/// The arguments (after the program) of the read-only listing of every config key.
+///
+/// The tree check reads the filter driver names from it: `--name-only` so no value is printed,
+/// `-z` so a name with an odd character cannot be split into two records and slip past
+/// [`parse_filter_names`].
+pub const LIST_CONFIG_ARGS: [&str; 4] = ["config", "--list", "--name-only", "-z"];
+
+/// The filter drivers the repository's configuration defines, sorted and unique.
+///
+/// Every `<name>` of a key `filter.<name>.clean`, `.smudge` or `.process`, read from the output
+/// of `git config --list --name-only -z` ([`LIST_CONFIG_ARGS`]).
+///
+/// A *filter driver* is a command git runs on file contents; `git status` runs the `clean` (or
+/// `process`) one of a driver an attribute names on every file whose stat changed, to see
+/// whether it really did.
+///
+/// # Errors
+///
+/// One line when a driver cannot be blanked (see [`status_args`]): its name has a character a
+/// `-c key=value` argument cannot carry (`=`, or a control character). Failing is the safe
+/// answer: the check then says it could not run, and no filter was left to run.
+pub fn parse_filter_names(text: &str) -> Result<Vec<String>, String> {
+    let mut names = BTreeSet::new();
+    for key in text.split('\0') {
+        let Some(rest) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some(name) = [".clean", ".smudge", ".process"]
+            .iter()
+            .find_map(|suffix| rest.strip_suffix(suffix))
+        else {
+            continue;
+        };
+        if name.is_empty() || name.contains('=') || name.chars().any(char::is_control) {
+            return Err(format!(
+                "a filter driver of this repository ({:?}) has a name that cannot be turned off",
+                sanitize_line(name)
+            ));
+        }
+        names.insert(name.to_owned());
+    }
+    Ok(names.into_iter().collect())
+}
+
+/// The arguments of the one `git status` the tree check runs, after the program, with every
+/// filter driver in `filters` ([`parse_filter_names`]) turned off.
 ///
 /// - `--no-optional-locks`: `status` would refresh and rewrite the index otherwise. A
 ///   read-only check must not write to the operator's repository.
-/// - `-c core.hooksPath=/dev/null`, `-c core.fsmonitor=false`: no hook command is run.
-///   `fsmonitor` is the one `status` actually consults (it is a command from the repository's
-///   config); `hooksPath` is belt and braces, since `status` runs no hook.
-/// - `--attr-source <the empty tree>`: attributes are read from nothing instead of from the
-///   tracked `.gitattributes`, so a `filter=` attribute in a commit that was pulled in cannot
-///   name a clean filter for `status` to run on a file whose stat changed. (`.git/info/attributes`
-///   and the filter definitions themselves live in the repository's own metadata, which git
-///   cannot be told to ignore; that is the operator's own and is not defended against.)
+/// - `-c core.hooksPath=/dev/null` and the runner's `-c core.fsmonitor=false`: no hook command
+///   is run. `fsmonitor` is the one `status` actually consults (it is a command from the
+///   repository's config); `hooksPath` is belt and braces, since `status` runs no hook.
+/// - **No filter can run.** `status` runs a clean filter on a file whose stat changed, and a
+///   filter is a command named by config and chosen by an *attribute*, which can come from
+///   three places: a tracked `.gitattributes`, `.git/info/attributes`, or a file named by
+///   `core.attributesFile`. `-c core.attributesFile=/dev/null` closes the third; **blanking the
+///   drivers closes all three at once**, because what an attribute names is a driver, and a
+///   driver with no `clean`, `smudge` and `process` command is not run (measured: the file is
+///   then compared as it is). So the drivers the repository defines are listed first (read-only:
+///   `git config --list --name-only`, which runs nothing) and each is emptied here. A driver
+///   defined by an included file or by `--global` config is listed too. (An earlier version
+///   read attributes from the empty tree instead, with `--attr-source`; that does not stop
+///   `.git/info/attributes` or the config route, needs git 2.40, and names SHA-1\'s empty tree,
+///   so a SHA-256 repository could never be checked.)
 /// - `--porcelain=v1 -b -z`: stable, machine-readable, NUL-separated, with the branch line
 ///   first. One command answers both "dirty" and "ahead".
 /// - `--untracked-files=no`, `--ignore-submodules=all`, `--no-renames`: only tracked files of
 ///   this repository, one record per file.
-pub const STATUS_ARGS: [&str; 11] = [
-    "--no-optional-locks",
-    "-c",
-    "core.hooksPath=/dev/null",
-    "--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904",
-    "status",
-    "--porcelain=v1",
-    "-b",
-    "-z",
-    "--untracked-files=no",
-    "--ignore-submodules=all",
-    "--no-renames",
-];
+#[must_use]
+pub fn status_args(filters: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--no-optional-locks",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "core.attributesFile=/dev/null",
+    ]
+    .iter()
+    .map(|a| (*a).to_owned())
+    .collect();
+    for name in filters {
+        for what in ["clean", "smudge", "process"] {
+            args.push("-c".to_owned());
+            args.push(format!("filter.{name}.{what}="));
+        }
+    }
+    args.extend(
+        [
+            "status",
+            "--porcelain=v1",
+            "-b",
+            "-z",
+            "--untracked-files=no",
+            "--ignore-submodules=all",
+            "--no-renames",
+        ]
+        .iter()
+        .map(|a| (*a).to_owned()),
+    );
+    args
+}
 
 /// Reads `git status --porcelain=v1 -b -z` output.
 ///
@@ -231,9 +303,10 @@ pub enum Basis {
     },
 }
 
-/// The estimate of what the pending closure `sizes` adds to a machine: with the machine's own
-/// closure (`deployed`, which the package preview already fetches) only the paths it does not
-/// have; without it, the whole closure.
+/// The estimate of what the pending closure `sizes` adds to a machine.
+///
+/// With the machine's own closure (`deployed`, which the package preview already fetches) it
+/// counts only the paths the machine does not have; without it, the whole closure.
 ///
 /// Still an overestimate (the store holds older generations too, and paths are shared
 /// between them), which is the safe direction. The margin is added by the rule, not here.
@@ -914,6 +987,72 @@ mod tests {
         let deployed: BTreeSet<StorePath> = std::iter::once(p('a')).collect();
         f.closure = Ok(estimate(&sizes, Some(&deployed)));
         assert_eq!(preflight(&f).refusals, Vec::<String>::new());
+    }
+
+    #[test]
+    fn filter_drivers_are_listed_from_the_config_keys() {
+        let keys = "core.bare\0filter.lfs.clean\0filter.lfs.smudge\0filter.lfs.required\0\
+                    filter.my.driver.process\0filter.evil.clean\0user.name\0filter.x.y\0";
+        assert_eq!(
+            parse_filter_names(keys),
+            Ok(vec![
+                "evil".to_owned(),
+                "lfs".to_owned(),
+                "my.driver".to_owned()
+            ])
+        );
+        assert_eq!(parse_filter_names(""), Ok(Vec::new()));
+        // A name `-c key=value` cannot carry: the check cannot run, and says so.
+        for bad in [
+            "filter.a=b.clean\0",
+            "filter.a\u{1b}b.clean\0",
+            "filter..clean\0",
+        ] {
+            assert!(parse_filter_names(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn status_runs_with_every_listed_filter_blanked_and_nothing_else_changed() {
+        assert_eq!(
+            status_args(&[]),
+            [
+                "--no-optional-locks",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.attributesFile=/dev/null",
+                "status",
+                "--porcelain=v1",
+                "-b",
+                "-z",
+                "--untracked-files=no",
+                "--ignore-submodules=all",
+                "--no-renames",
+            ]
+        );
+        let args = status_args(&["a".to_owned(), "b.c".to_owned()]);
+        let want = [
+            "-c",
+            "filter.a.clean=",
+            "-c",
+            "filter.a.smudge=",
+            "-c",
+            "filter.a.process=",
+            "-c",
+            "filter.b.c.clean=",
+            "-c",
+            "filter.b.c.smudge=",
+            "-c",
+            "filter.b.c.process=",
+        ];
+        let at = args.iter().position(|a| a == "filter.a.clean=").unwrap() - 1;
+        assert_eq!(args[at..at + 12], want);
+        // The status command comes after every override, or they would not apply to it.
+        let status = args.iter().position(|a| a == "status").unwrap();
+        assert!(args.iter().rposition(|a| a.starts_with("filter.")).unwrap() < status);
+        // No attr-source: it names SHA-1's empty tree, which a SHA-256 repository rejects.
+        assert!(!args.iter().any(|a| a.contains("attr-source")));
     }
 
     #[test]

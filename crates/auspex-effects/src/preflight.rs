@@ -5,13 +5,13 @@
 //! (its own session, no terminal, stdin on `/dev/null`, capped output, killed and reaped on
 //! cancellation or timeout).
 //!
-//! - [`tree_state`]: one `git status` ([`auspex_domain::preflight::STATUS_ARGS`]) in the fleet
+//! - [`tree_state`]: one `git status` ([`auspex_domain::preflight::status_args`]) in the fleet
 //!   directory, run exactly as the cache key's git commands are ([`crate::cache`]: the same
 //!   address-space limit, `core.fsmonitor=false`, `GIT_OPTIONAL_LOCKS=0`, and the variables
 //!   that would point git at another repository removed), plus the hardening that command
 //!   needs because, unlike those, it can read file contents. A fleet that is not a local
 //!   directory, or not a git repository, is an answer ("cannot be checked"), not a failure.
-//! - [`closure_size`]: the sum of the NAR sizes of the pending toplevel's closure, from
+//! - [`closure_size`]: the NAR size of every path of the pending toplevel's closure, from
 //!   `nix path-info --recursive --size`: against the local store first (valid there when this
 //!   machine built it), then against the binary cache. The package preview's pending-closure
 //!   query asks the same two places in the same order ([`crate::closure::pending`]); this one
@@ -25,7 +25,10 @@ use std::path::Path;
 use std::time::Duration;
 
 use auspex_domain::observe::StorePath;
-use auspex_domain::preflight::{STATUS_ARGS, TreeState, parse_closure_sizes, parse_tree_status};
+use auspex_domain::preflight::{
+    LIST_CONFIG_ARGS, TreeState, parse_closure_sizes, parse_filter_names, parse_tree_status,
+    status_args,
+};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -40,6 +43,10 @@ use crate::process::{End, OnExit, command, run, spawn_error};
 /// "could not be done", not a count from a prefix.
 const STATUS_CAP: usize = 4 * 1024 * 1024;
 
+/// The most config-key listing kept: 1 MiB. Past it the check is "could not be done", not a
+/// list of filters with some missing.
+const CONFIG_CAP: usize = 1024 * 1024;
+
 /// The fleet repository's state, read from `dir`.
 ///
 /// # Errors
@@ -51,7 +58,20 @@ pub async fn tree_state(
     dir: &Path,
     cancel: &CancellationToken,
 ) -> Result<Result<TreeState, String>, Cancelled> {
-    let out = match git(params, dir, &STATUS_ARGS, STATUS_CAP, cancel).await? {
+    // First, which filter drivers the repository defines (a read-only listing of config keys,
+    // which runs nothing): `status` then runs with each of them emptied, so no filter an
+    // attribute names can run on a file it has to read.
+    let listing = match git(params, dir, &LIST_CONFIG_ARGS, CONFIG_CAP, cancel).await? {
+        Ok(out) => out,
+        Err(why) => return Ok(Err(why)),
+    };
+    let filters = match parse_filter_names(&String::from_utf8_lossy(&listing)) {
+        Ok(f) => f,
+        Err(why) => return Ok(Err(why)),
+    };
+    let args = status_args(&filters);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = match git(params, dir, &args, STATUS_CAP, cancel).await? {
         Ok(out) => out,
         Err(why) => return Ok(Err(why)),
     };
