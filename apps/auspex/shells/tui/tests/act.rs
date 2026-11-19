@@ -9,12 +9,14 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use auspex_core::{ActionStatus, Event, Mode};
+use auspex_core::{ActionStatus, ConfirmKind, Event, Mode};
 use auspex_tui::keymap::Keymap;
 use auspex_tui::output::{KEEP_LINES, Output, Stream};
 use auspex_tui::theme::{Role, Theme};
 use auspex_tui::ui::Ui;
-use common::{draw, expect_file, render, render_with, settled_demo, type_keys};
+use common::{
+    draw, expect_file, paste, render, render_with, settled_demo, type_keys, type_keys_seen,
+};
 
 /// Waits (time is paused, so this is instant) until the action is over.
 async fn until_action_ends(shell: &std::sync::Arc<auspex_tui::shell::Shell>) {
@@ -46,7 +48,7 @@ async fn in_observe_mode_u_says_act_mode_is_off_and_nothing_else_happens() {
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = Keymap::defaults();
-    type_keys(&shell, &mut ui, &km, "u");
+    type_keys_seen(&shell, &mut ui, &km, "u");
     assert_eq!(ui.input.message.as_deref(), Some("act mode is off (A)"));
     let view = shell.view();
     assert!(view.confirm.is_none(), "no question");
@@ -61,10 +63,10 @@ async fn the_observe_message_names_the_key_the_operator_bound() {
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = remapped("X");
-    type_keys(&shell, &mut ui, &km, "u");
+    type_keys_seen(&shell, &mut ui, &km, "u");
     assert_eq!(ui.input.message.as_deref(), Some("act mode is off (X)"));
     // And the remapped key is the one that asks.
-    type_keys(&shell, &mut ui, &km, "X");
+    type_keys_seen(&shell, &mut ui, &km, "X");
     assert!(shell.view().confirm.is_some());
 }
 
@@ -73,22 +75,22 @@ async fn the_keys_do_nothing_but_answer_while_a_question_is_open() {
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = Keymap::defaults();
-    type_keys(&shell, &mut ui, &km, "A");
+    type_keys_seen(&shell, &mut ui, &km, "A");
     assert!(shell.view().confirm.is_some());
     let selected = shell.view().selected;
     // `j` moves nothing and answers no; it is not a yes.
-    type_keys(&shell, &mut ui, &km, "j");
+    type_keys_seen(&shell, &mut ui, &km, "j");
     assert_eq!(shell.view().selected, selected, "the list did not move");
     assert!(shell.view().confirm.is_none());
     assert_eq!(shell.view().mode, Mode::Observe, "any key but y is a no");
 
-    type_keys(&shell, &mut ui, &km, "A");
-    type_keys(&shell, &mut ui, &km, "\x1b");
+    type_keys_seen(&shell, &mut ui, &km, "A");
+    type_keys_seen(&shell, &mut ui, &km, "\x1b");
     assert_eq!(shell.view().mode, Mode::Observe, "Esc is a no");
-    type_keys(&shell, &mut ui, &km, "A");
-    type_keys(&shell, &mut ui, &km, "y");
+    type_keys_seen(&shell, &mut ui, &km, "A");
+    type_keys_seen(&shell, &mut ui, &km, "y");
     assert_eq!(shell.view().mode, Mode::Act);
-    type_keys(&shell, &mut ui, &km, "A");
+    type_keys_seen(&shell, &mut ui, &km, "A");
     assert_eq!(shell.view().mode, Mode::Observe, "A turns it off at once");
 }
 
@@ -101,7 +103,7 @@ async fn act_mode_in_the_status_bar_at_120_columns() {
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = Keymap::defaults();
-    type_keys(&shell, &mut ui, &km, "Ay/luna\n");
+    type_keys_seen(&shell, &mut ui, &km, "Ay/luna\n");
     assert_eq!(shell.view().mode, Mode::Act);
     let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 30);
     let status = frame.lines().last().unwrap();
@@ -114,7 +116,7 @@ async fn the_act_word_is_in_the_warning_colour() {
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = Keymap::defaults();
-    type_keys(&shell, &mut ui, &km, "Ay");
+    type_keys_seen(&shell, &mut ui, &km, "Ay");
     let out = Output::default();
     let buf = draw(&shell.view(), &mut ui, &km, &[], &out, 120, 30);
     let theme = Theme::Ansi;
@@ -126,7 +128,7 @@ async fn the_act_word_is_in_the_warning_colour() {
         assert_eq!(cell.fg, warning.fg.unwrap(), "{c}");
     }
     // In observe mode the same cells are the ordinary title colour.
-    type_keys(&shell, &mut ui, &km, "A");
+    type_keys_seen(&shell, &mut ui, &km, "A");
     let buf = draw(&shell.view(), &mut ui, &km, &[], &out, 120, 30);
     assert_eq!(buf[(0, status_y)].symbol(), "O");
     assert_ne!(buf[(0, status_y)].fg, warning.fg.unwrap());
@@ -138,16 +140,16 @@ async fn the_confirmations_at_40_and_120_columns() {
     let mut ui = Ui::default();
     let km = Keymap::defaults();
 
-    type_keys(&shell, &mut ui, &km, "A");
+    type_keys_seen(&shell, &mut ui, &km, "A");
     let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 30);
     assert!(frame.contains("turn on act mode?"), "{frame}");
     expect_file("snapshots", "confirm_act_120.txt", &frame);
-    type_keys(&shell, &mut ui, &km, "y");
+    type_keys_seen(&shell, &mut ui, &km, "y");
 
-    type_keys(&shell, &mut ui, &km, "/luna\nu");
+    type_keys_seen(&shell, &mut ui, &km, "/luna\nu");
     let q = shell.view().confirm.unwrap().question;
     assert!(
-        q.starts_with("update luna to nixos-system-luna-") && q.ends_with("? y/N"),
+        q.starts_with("update luna to g1j4m7qa nixos-system-luna-") && q.ends_with("? y/N"),
         "{q}"
     );
     let wide = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 30);
@@ -172,7 +174,7 @@ async fn an_update_streams_into_the_log_tab_and_the_status_bar_says_how_it_ended
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = Keymap::defaults();
-    type_keys(&shell, &mut ui, &km, "Ay/luna\nuy");
+    type_keys_seen(&shell, &mut ui, &km, "Ay/luna\nuy");
     // Running: the bar names it.
     let running = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 30);
     assert!(
@@ -207,7 +209,7 @@ async fn an_update_streams_into_the_log_tab_and_the_status_bar_says_how_it_ended
         ActionStatus::Ended(_)
     ));
 
-    type_keys(&shell, &mut ui, &km, "L");
+    type_keys_seen(&shell, &mut ui, &km, "L");
     let wide = render_with(
         &shell.view(),
         &mut ui,
@@ -236,7 +238,7 @@ async fn an_update_streams_into_the_log_tab_and_the_status_bar_says_how_it_ended
     expect_file("snapshots", "log_tab_40.txt", &narrow);
 
     // Tab: the adapters' notes instead. Esc closes the tab.
-    type_keys(&shell, &mut ui, &km, "\t");
+    type_keys_seen(&shell, &mut ui, &km, "\t");
     let notes = render_with(
         &shell.view(),
         &mut ui,
@@ -247,7 +249,7 @@ async fn an_update_streams_into_the_log_tab_and_the_status_bar_says_how_it_ended
         30,
     );
     assert!(notes.contains("log: notes"), "{notes}");
-    type_keys(&shell, &mut ui, &km, "\x1b");
+    type_keys_seen(&shell, &mut ui, &km, "\x1b");
     assert!(!ui.input.log_open);
 }
 
@@ -257,7 +259,7 @@ async fn a_failed_update_says_where_it_failed_at_ssh_and_the_fix() {
     let mut ui = Ui::default();
     let km = Keymap::defaults();
     // mars is the demo's dead host: its scripted update fails with ssh's own line.
-    type_keys(&shell, &mut ui, &km, "Ay/mars\nuy");
+    type_keys_seen(&shell, &mut ui, &km, "Ay/mars\nuy");
     until_action_ends(&shell).await;
     let view = shell.view();
     let ActionStatus::Ended(end) = &view.action.as_ref().unwrap().status else {
@@ -280,7 +282,7 @@ async fn b_refuses_the_darwin_host_and_builds_the_rest_in_observe_mode() {
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = Keymap::defaults();
-    type_keys(&shell, &mut ui, &km, "/genetor\nb");
+    type_keys_seen(&shell, &mut ui, &km, "/genetor\nb");
     let view = shell.view();
     assert!(view.action.is_none());
     assert!(
@@ -291,7 +293,7 @@ async fn b_refuses_the_darwin_host_and_builds_the_rest_in_observe_mode() {
         "{:?}",
         view.notice
     );
-    type_keys(&shell, &mut ui, &km, "/luna\nb");
+    type_keys_seen(&shell, &mut ui, &km, "/luna\nb");
     assert!(
         shell.view().action.is_some(),
         "luna builds, without act mode"
@@ -462,4 +464,137 @@ async fn only_the_terminal_ui_may_enter_act_mode() {
     shell.send(Event::ConfirmAnswer(true));
     assert_eq!(shell.view().mode, Mode::Observe);
     assert!(shell.view().confirm.is_none());
+}
+
+// ---------------------------------------------------------------------------------------
+// A question is answered only after it has been drawn (review finding 2)
+// ---------------------------------------------------------------------------------------
+
+/// Typeahead: `Ayuy` arriving in one burst, with no frame drawn between the keys, answers
+/// nothing and deploys nothing. Neither question was ever on screen.
+#[tokio::test(start_paused = true)]
+async fn a_burst_of_keys_cannot_turn_on_act_mode_and_update() {
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys(&shell, &mut ui, &km, "/luna\n");
+    type_keys(&shell, &mut ui, &km, "Ayuy");
+    let view = shell.view();
+    assert!(view.action.is_none(), "nothing was deployed");
+    assert_eq!(view.mode, Mode::Observe, "act mode was not answered into");
+    assert_eq!(
+        view.confirm.map(|c| c.kind),
+        Some(ConfirmKind::Act),
+        "the first question is still waiting to be seen"
+    );
+    // Longer bursts, and the same burst with the question's own key repeated.
+    for burst in ["Ayuyu", "Ayyyyuyyy", "Ay/luna\nuy"] {
+        type_keys(&shell, &mut ui, &km, burst);
+        assert!(shell.view().action.is_none(), "{burst:?}");
+        assert_eq!(shell.view().mode, Mode::Observe, "{burst:?}");
+    }
+    assert!(shell.log.lines().iter().all(|l| !l.contains("update luna")));
+}
+
+/// The keys before the first frame are discarded, not queued: after the frame that shows the
+/// question, the operator's own `y` is the answer, and only it.
+#[tokio::test(start_paused = true)]
+async fn keys_before_the_frame_are_discarded_and_the_first_key_after_it_answers() {
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys(&shell, &mut ui, &km, "Ay");
+    assert_eq!(shell.view().mode, Mode::Observe, "the y came too early");
+    common::frame(&shell, &mut ui, &km);
+    assert_eq!(shell.view().mode, Mode::Observe, "a frame answers nothing");
+    type_keys(&shell, &mut ui, &km, "y");
+    assert_eq!(shell.view().mode, Mode::Act);
+}
+
+/// A paste is no, never yes and never commands: bracketed paste is on, so the terminal says
+/// "this was pasted" and it does not arrive as keystrokes.
+#[tokio::test(start_paused = true)]
+async fn a_paste_deploys_nothing_and_answers_a_drawn_question_no() {
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    // With no question open, pasted text is not typed: pasted `Ayuy` starts nothing.
+    paste(&shell, &mut ui, &km, "Ayuy");
+    assert!(shell.view().confirm.is_none());
+    assert_eq!(shell.view().mode, Mode::Observe);
+    // Before the question is drawn, a paste is discarded like any key.
+    type_keys(&shell, &mut ui, &km, "A");
+    paste(&shell, &mut ui, &km, "y");
+    assert_eq!(shell.view().mode, Mode::Observe);
+    assert!(shell.view().confirm.is_some(), "still waiting to be seen");
+    // After it, a paste is a no, even of `y`.
+    common::frame(&shell, &mut ui, &km);
+    paste(&shell, &mut ui, &km, "y");
+    assert_eq!(shell.view().mode, Mode::Observe);
+    assert!(shell.view().confirm.is_none(), "answered no");
+
+    // The same for an update's question.
+    type_keys_seen(&shell, &mut ui, &km, "Ay/luna\nu");
+    assert_eq!(shell.view().mode, Mode::Act);
+    assert_eq!(
+        shell.view().confirm.map(|c| c.kind),
+        Some(ConfirmKind::Update)
+    );
+    paste(&shell, &mut ui, &km, "y\ny");
+    assert!(shell.view().action.is_none(), "nothing was deployed");
+    assert!(shell.view().confirm.is_none());
+}
+
+/// A pasted search is still a search: the text goes into an open prompt as typed (without a
+/// newline, which would submit it).
+#[tokio::test(start_paused = true)]
+async fn a_paste_into_the_search_prompt_is_typed_without_its_newline() {
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys(&shell, &mut ui, &km, "/");
+    paste(&shell, &mut ui, &km, "lu\nna");
+    assert_eq!(
+        shell.view().search.as_ref().map(|s| s.query.as_str()),
+        Some("luna")
+    );
+}
+
+/// The sequence the brief names: `A`, a frame, `y`, `u`, a frame, `y` deploys.
+#[tokio::test(start_paused = true)]
+async fn each_question_seen_then_answered_deploys() {
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys(&shell, &mut ui, &km, "A");
+    common::frame(&shell, &mut ui, &km);
+    type_keys(&shell, &mut ui, &km, "y/luna\nu");
+    assert_eq!(shell.view().mode, Mode::Act);
+    assert!(shell.view().action.is_none(), "the update is only asked");
+    // The `y` typed with the `u` is not in the burst: it would be an answer before the frame.
+    common::frame(&shell, &mut ui, &km);
+    type_keys(&shell, &mut ui, &km, "y");
+    let action = shell.view().action.expect("the update started");
+    assert_eq!(action.machine, "luna");
+    until_action_ends(&shell).await;
+}
+
+/// Answering one question does not show the next one: a new question needs its own frame.
+#[tokio::test(start_paused = true)]
+async fn a_second_question_is_not_answered_by_the_first_ones_frame() {
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys(&shell, &mut ui, &km, "A");
+    common::frame(&shell, &mut ui, &km);
+    // `y` answers act mode, `/luna\nu` asks the update, and the next `y` is typeahead.
+    type_keys(&shell, &mut ui, &km, "y/luna\nuy");
+    assert!(
+        shell.view().action.is_none(),
+        "the update's question was never drawn"
+    );
+    assert_eq!(
+        shell.view().confirm.map(|c| c.kind),
+        Some(ConfirmKind::Update)
+    );
 }

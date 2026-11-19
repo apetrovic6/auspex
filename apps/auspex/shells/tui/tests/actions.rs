@@ -508,7 +508,7 @@ async fn quitting_during_an_update_asks_then_stops_it_before_exit_and_logs_cance
     let view = w.shell.view();
     assert_eq!(
         view.confirm.unwrap().question,
-        "an update of alfrost is running; quit and stop it? y/N"
+        "an update of alfrost is running; quit and stop it? (an activation already under way on the machine may complete) y/N"
     );
     assert!(!view.quit);
     assert!(

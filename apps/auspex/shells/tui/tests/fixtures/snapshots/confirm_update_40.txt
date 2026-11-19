@@ -6,7 +6,7 @@
 │ ?    deimos          not installed   │
 │ ✓    europa          in sync         │
 ┌ confirm ─────────────────────────────┐
-│update luna to                        │
+│update luna to g1j4m7qa               │
 │nixos-system-luna-25.11.20261101.6a2  │
 │f1c0? y/N                             │
 │                                      │

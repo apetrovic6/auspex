@@ -329,7 +329,9 @@ Acceptance:
   after, and refuse if any node is already NotReady.
 - **Freezing:** `f` freezes a machine so `U` skips it; freezes persist in the config.
 - **Before any update:**
-  - warn if the fleet tree is dirty or unpushed;
+  - warn if the fleet tree is dirty or unpushed, or **changed since it was evaluated** (clan
+    deploys the tree as it is at `y`; today only a changed pending store path is caught, by commit
+    and dirty state or a re-evaluation of that one machine before running would catch the rest);
   - check free disk on the target against the new closure size;
   - apply the typed-confirmation rule;
   - apply the duplicate-IP refusal.

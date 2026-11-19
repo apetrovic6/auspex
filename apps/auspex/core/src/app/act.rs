@@ -51,8 +51,13 @@ pub const ACT_MODE_OFF: &str = "act mode is off (A)";
 pub(super) enum Confirm {
     /// Turn act mode on.
     Act,
-    /// Update `machine` to the system named `to`.
-    Update { machine: String, to: String },
+    /// Update `machine` to the pending system `to` (what the question shows: hash prefix and
+    /// name), whose store path was `path` when it was asked.
+    Update {
+        machine: String,
+        to: String,
+        path: String,
+    },
     /// Quit while an action runs.
     Quit,
 }
@@ -93,6 +98,12 @@ impl Model {
         id
     }
 
+    /// Opens `confirm` as a new question: a shell must draw it before it may be answered.
+    fn ask(&mut self, confirm: Confirm) {
+        self.confirm_serial += 1;
+        self.confirm = Some(confirm);
+    }
+
     fn notice(&mut self, text: impl Into<String>) -> Command<Effect, Event> {
         self.view.notice = Some(text.into());
         render()
@@ -118,6 +129,7 @@ pub(super) fn views(model: &Model) -> (Mode, Option<ActionView>, Option<ConfirmV
             Confirm::Quit => ConfirmKind::Quit,
         },
         question: question(model, c),
+        serial: model.confirm_serial,
     });
     (mode, action, confirm)
 }
@@ -125,7 +137,7 @@ pub(super) fn views(model: &Model) -> (Mode, Option<ActionView>, Option<ConfirmV
 fn question(model: &Model, confirm: &Confirm) -> String {
     match confirm {
         Confirm::Act => "turn on act mode? updates will be possible. y/N".to_owned(),
-        Confirm::Update { machine, to } => format!("update {machine} to {to}? y/N"),
+        Confirm::Update { machine, to, .. } => format!("update {machine} to {to}? y/N"),
         Confirm::Quit => {
             let what = model.action.as_ref().map_or_else(
                 || "an action".to_owned(),
@@ -138,7 +150,15 @@ fn question(model: &Model, confirm: &Confirm) -> String {
                     format!("{article} {} of {}", a.kind.label(), a.machine)
                 },
             );
-            format!("{what} is running; quit and stop it? y/N")
+            // Only an update has a remote side: killing clan's group ends the local ssh, but an
+            // activation already running on the machine can finish without it.
+            let remote = match model.action.as_ref() {
+                Some(a) if a.kind == ActionKind::Update => {
+                    " (an activation already under way on the machine may complete)"
+                }
+                _ => "",
+            };
+            format!("{what} is running; quit and stop it?{remote} y/N")
         }
     }
 }
@@ -154,7 +174,7 @@ pub(super) fn toggle_act(model: &mut Model) -> Command<Effect, Event> {
         model.confirm = None;
         return render();
     }
-    model.confirm = Some(Confirm::Act);
+    model.ask(Confirm::Act);
     render()
 }
 
@@ -179,8 +199,12 @@ pub(super) fn request(model: &mut Model, kind: ActionKind) -> Command<Effect, Ev
     };
     match check(model, kind, &machine) {
         Err(why) => model.notice(why),
-        Ok(to) if kind == ActionKind::Update => {
-            model.confirm = Some(Confirm::Update { machine, to });
+        Ok(Shown { shown, path }) if kind == ActionKind::Update => {
+            model.ask(Confirm::Update {
+                machine,
+                to: shown,
+                path,
+            });
             render()
         }
         Ok(_) => launch(model, kind, machine),
@@ -196,9 +220,19 @@ fn article(kind: ActionKind) -> String {
     format!("{a} {}", kind.label())
 }
 
+/// The system a machine's evaluation produced: what an update would deploy.
+struct Shown {
+    /// As the question shows it, as the detail panel does: the hash's first 8 characters and
+    /// the name (the name alone does not identify a system: two configurations on one nixpkgs
+    /// share it).
+    shown: String,
+    /// The whole store path, to tell at `y` whether it is still the one that was asked about.
+    path: String,
+}
+
 /// Everything that must hold before an action on `machine` may be asked for. On success, the
-/// name of the system the machine's evaluation produced (what an update would deploy).
-fn check(model: &Model, kind: ActionKind, machine: &str) -> Result<String, String> {
+/// pending system the machine's evaluation produced.
+fn check(model: &Model, kind: ActionKind, machine: &str) -> Result<Shown, String> {
     if !is_plain_name(machine) {
         return Err(format!(
             "{machine:?} is not a plain machine name; not touching it"
@@ -237,7 +271,10 @@ fn check(model: &Model, kind: ActionKind, machine: &str) -> Result<String, Strin
             }
         }
     }
-    Ok(eval.out_path.name().to_owned())
+    Ok(Shown {
+        shown: format!("{} {}", &eval.out_path.hash()[..8], eval.out_path.name()),
+        path: eval.out_path.as_str().to_owned(),
+    })
 }
 
 /// Issues the request. Called only after [`check`] and, for an update, the operator's `y`.
@@ -296,7 +333,7 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
             model.act = model.config.as_ref().is_some_and(|c| c.allow_act);
             render()
         }
-        Confirm::Update { machine, .. } => {
+        Confirm::Update { machine, path, .. } => {
             // The world may have moved while the question was open: act mode turned off, an
             // action started, the list refreshed. Everything is checked again.
             if !model.act {
@@ -306,7 +343,20 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
                 return model.notice("another action is already running");
             }
             match check(model, ActionKind::Update, &machine) {
-                Ok(_) => launch(model, ActionKind::Update, machine),
+                Ok(now) if now.path == path => launch(model, ActionKind::Update, machine),
+                // The pending system is not the one the operator was shown (a refresh
+                // evaluated the tree again): what they said yes to is not what would be
+                // deployed, so ask again about the new one.
+                Ok(now) => {
+                    let note = format!("the pending system of {machine} changed; asking again");
+                    model.ask(Confirm::Update {
+                        machine,
+                        to: now.shown,
+                        path: now.path,
+                    });
+                    model.view.notice = Some(note);
+                    render()
+                }
                 Err(why) => model.notice(why),
             }
         }
@@ -320,7 +370,7 @@ pub(super) fn quit(model: &mut Model) -> Command<Effect, Event> {
     match model.action.as_ref().map(|a| &a.phase) {
         Some(Phase::Running) => {
             if model.confirm != Some(Confirm::Quit) {
-                model.confirm = Some(Confirm::Quit);
+                model.ask(Confirm::Quit);
             }
             render()
         }

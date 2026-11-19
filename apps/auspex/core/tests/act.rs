@@ -156,7 +156,7 @@ fn update_asks_naming_the_machine_and_its_pending_system_and_waits_for_yes() {
     assert_eq!(confirm.kind, ConfirmKind::Update);
     assert_eq!(
         confirm.question,
-        "update luna to nixos-system-luna-new? y/N"
+        "update luna to b1234567 nixos-system-luna-new? y/N"
     );
     assert!(s.actions.is_empty(), "no request before the answer");
     s.send(Event::ConfirmAnswer(false));
@@ -282,6 +282,77 @@ fn turning_act_mode_off_withdraws_a_waiting_update() {
     s.send(Event::ConfirmAnswer(true));
     assert!(s.actions.is_empty());
     assert_eq!(s.view().mode, Mode::Observe);
+}
+
+#[test]
+fn the_question_shows_the_hash_prefix_so_two_systems_of_one_name_differ() {
+    let mut s = settled(config());
+    act_on(&mut s);
+    s.send(Event::UpdateSelected);
+    let question = s.view().confirm.expect("a question").question;
+    assert_eq!(
+        question,
+        "update luna to b1234567 nixos-system-luna-new? y/N"
+    );
+}
+
+/// luna's tree is evaluated again, to `to`, while a question about it is open.
+fn luna_evaluates_to(s: &mut Shell, to: &str) {
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(THREE)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        let out = if m == "luna" { to.to_owned() } else { new(m) };
+        s.eval_item(&mut eval, m, evaluated(m, &out));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+}
+
+#[test]
+fn a_yes_to_a_system_that_is_no_longer_the_pending_one_asks_again_and_deploys_nothing() {
+    let mut s = settled(config());
+    act_on(&mut s);
+    s.send(Event::UpdateSelected);
+    let asked = s.view().confirm.expect("a question");
+    // Same name, another hash: what `clan` would deploy now is not what was shown.
+    luna_evaluates_to(&mut s, &path('c', "nixos-system-luna-new"));
+    s.send(Event::ConfirmAnswer(true));
+    assert!(s.actions.is_empty(), "nothing runs on a stale yes");
+    let again = s.view().confirm.expect("asked again");
+    assert_eq!(
+        again.question,
+        "update luna to c1234567 nixos-system-luna-new? y/N"
+    );
+    assert_ne!(
+        again.serial, asked.serial,
+        "a new question, to be drawn anew"
+    );
+    assert!(notice(&s).contains("changed"), "{}", notice(&s));
+    // A yes to the new question deploys.
+    s.send(Event::ConfirmAnswer(true));
+    assert_eq!(s.take_action().operation.machine, "luna");
+}
+
+#[test]
+fn a_yes_to_the_system_still_pending_after_a_refresh_deploys() {
+    let mut s = settled(config());
+    act_on(&mut s);
+    s.send(Event::UpdateSelected);
+    luna_evaluates_to(&mut s, &new("luna"));
+    s.send(Event::ConfirmAnswer(true));
+    assert_eq!(s.take_action().operation.machine, "luna");
+}
+
+#[test]
+fn every_question_has_its_own_serial() {
+    let mut s = settled(config());
+    s.send(Event::ToggleAct);
+    let first = s.view().confirm.expect("a question").serial;
+    s.send(Event::ConfirmAnswer(true));
+    s.send(Event::UpdateSelected);
+    let second = s.view().confirm.expect("a question").serial;
+    assert_ne!(first, second);
 }
 
 #[test]
@@ -503,7 +574,7 @@ fn quitting_during_an_update_asks_and_n_keeps_it_running() {
     assert_eq!(confirm.kind, ConfirmKind::Quit);
     assert_eq!(
         confirm.question,
-        "an update of luna is running; quit and stop it? y/N"
+        "an update of luna is running; quit and stop it? (an activation already under way on the machine may complete) y/N"
     );
     assert!(!s.view().quit);
     assert!(

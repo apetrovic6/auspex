@@ -9,11 +9,11 @@
 │ ✓    genetor              in sync                  ││lints     none                                                  │
 │ ✓    io                   in sync                  ││current   0357acgi nixos-system-luna-25.11.20261019.b81e2d4     │
 │›↑◆   luna                 update pending           ││pending   g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0     │
-│ ✗    mars             ┌ confirm ─────────────────────────────────────────────────────────────┐                       │
-│ ✓    mechanicus-forge-│update luna to nixos-system-luna-25.11.20261101.6a2f1c0? y/N          │                       │
-│ ✓    phobos           │                                                                      │                       │
-│ ↑◆   sol              │y confirms; any other key cancels                                     │                       │
-│ ✓    terra            └──────────────────────────────────────────────────────────────────────┘.3 GiB free            │
+│ ✗    mars         ┌ confirm ─────────────────────────────────────────────────────────────────────┐                   │
+│ ✓    mechanicus-fo│update luna to g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0? y/N         │                   │
+│ ✓    phobos       │                                                                              │                   │
+│ ↑◆   sol          │y confirms; any other key cancels                                             │                   │
+│ ✓    terra        └──────────────────────────────────────────────────────────────────────────────┘iB free            │
 │ ✓    titan                in sync                  ││          (prometheus)                                          │
 │ ✗    triton               unreachable              ││load      0.40 0.35 0.30 (prometheus)                           │
 │ !    vulcan               eval error               ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │

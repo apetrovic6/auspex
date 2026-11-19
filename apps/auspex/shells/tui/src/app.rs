@@ -33,7 +33,6 @@ use crate::cli::{Args, Mode};
 use crate::config::{self, FlakeSource, Settings};
 use crate::demo::{self, Demo};
 use crate::headless;
-use crate::input::Screen;
 use crate::keymap::{Key, Keymap};
 use crate::log::{Log, say};
 use crate::shell::Shell;
@@ -324,6 +323,7 @@ async fn tui(
             return ExitCode::from(USAGE);
         }
     };
+    enter_bracketed_paste();
     shell.send(Event::Start(config));
     let mut ui = Ui::default();
     let mut events = EventStream::new();
@@ -347,16 +347,21 @@ async fn tui(
             }
             event = events.next() => match event {
                 Some(Ok(event)) => {
-                    let Some(key) = event.as_key_press_event().and_then(|k| Key::from_event(&k)) else {
-                        continue;
-                    };
                     let view = shell.view();
-                    let query = view.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
                     if view.refresh.generation != refresh.0 {
                         refresh = (view.refresh.generation, std::time::Instant::now());
                     }
-                    let screen = Screen::from_view(&view, ui.page, refresh.1.elapsed());
-                    for e in ui.input.key(key, screen, keymap, &query) {
+                    // A paste is its own event (bracketed paste is on), never typed keys.
+                    let events = if let crossterm::event::Event::Paste(text) = &event {
+                        ui.paste(text, &view, refresh.1.elapsed(), keymap)
+                    } else if let Some(key) =
+                        event.as_key_press_event().and_then(|k| Key::from_event(&k))
+                    {
+                        ui.key(key, &view, refresh.1.elapsed(), keymap)
+                    } else {
+                        continue;
+                    };
+                    for e in events {
                         shell.send(e);
                     }
                 }
@@ -381,9 +386,28 @@ async fn tui(
     // Stop whatever an action runs (its process group killed and reaped, its row logged
     // `cancelled`) and cancel the rest, then give the terminal back.
     shell.terminate().await;
+    leave_bracketed_paste();
     ratatui::restore();
     if let Some(f) = failure {
         say(&f);
     }
     code
+}
+
+/// Asks the terminal to deliver a paste as one `Event::Paste` instead of typed keys.
+///
+/// Without it a paste arrives as keystrokes: pasted `Ayuy` would turn on act mode and start an
+/// update. See [`Ui::paste`] for what a paste may do. Also undone by a panic, which would
+/// otherwise leave the operator's shell with bracketed paste on.
+fn enter_bracketed_paste() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        leave_bracketed_paste();
+        previous(info);
+    }));
+}
+
+fn leave_bracketed_paste() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
 }

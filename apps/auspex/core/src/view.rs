@@ -144,6 +144,9 @@ pub struct ConfirmView {
     pub kind: ConfirmKind,
     /// The whole question, ending in `y/N`.
     pub question: String,
+    /// Which question this is: every question asked gets a new number, so a shell can tell
+    /// that the one it drew is the one it is answering.
+    pub serial: u64,
 }
 
 /// The action in progress, or the last one to end.

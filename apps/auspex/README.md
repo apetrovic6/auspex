@@ -55,9 +55,13 @@ colour, and `A` turns it off again at once. In observe mode `u` only says `act m
 
 | Key | What it does |
 |---|---|
-| `u` | Act mode only. Asks `update luna to nixos-system-luna-…? y/N`, then runs exactly `clan machines update --host-key-check strict --flake <fleet> -- luna` with the fleet's pinned `clan` (found from its lock, never from `PATH`). One machine, named, validated against the inventory; one action at a time. |
+| `u` | Act mode only. Asks `update luna to 0a1b2c3d nixos-system-luna-…? y/N` (the pending system as the detail panel shows it, hash prefix first), then runs exactly `clan machines update --host-key-check strict --flake <fleet> -- luna` with the fleet's pinned `clan` (found from its lock, never from `PATH`). One machine, named, validated against the inventory; one action at a time. |
 | `b` | Builds the machine's pending system here (`nix build --no-link --print-out-paths --no-write-lock-file <fleet>#nixosConfigurations.luna.config.system.build.toplevel`; `darwinConfigurations.<m>.system` for darwin). Changes nothing on any machine, so it needs no act mode. Refused for a machine of another system than this one. |
 | `L` | The Log tab: the streamed output of the current and last action, standard error in its own colour, the last 10 000 lines of each, following the tail until you scroll up (`k`, `Ctrl-u`, `gg`; `G` follows again). `Tab` switches to the adapters' notes. |
+
+**Questions are answered only after they were drawn.** A `y/N` question is not answered by a key that arrived before the frame showing it (typeahead such as `Ayuy` in one burst is discarded), and a paste is never a `y`: bracketed paste is on, so pasted text is not typed, and with a question open it answers no.
+
+**`clan` deploys the working tree as it is at `y`**, not the evaluation auspex showed in the question, which may be hours old (auspex left open, the tree edited, `git pull`). auspex compares the pending system with the one it asked about: if a refresh changed it, `y` asks again about the new one and deploys nothing. Edits to the tree since the last evaluation are not seen by that check.
 
 The status bar names the running action and, at the end, how it ended. A deploy that fails at
 ssh says so, and what to change (`nixos-rebuild` strips `SSH_AUTH_SOCK`; an agent with many keys
@@ -67,7 +71,7 @@ Every `u` and `b` is a row in `$XDG_STATE_HOME/auspex/log.sqlite` (start, end, r
 and a short summary, never the output; see the schema in `crates/auspex-effects`). If the log
 cannot be written the status bar says so; the action is not affected.
 
-**Quitting during an action** asks `an update of luna is running; quit and stop it? y/N`. `y` (or a
+**Quitting during an action** asks `an update of luna is running; quit and stop it? (an activation already under way on the machine may complete) y/N`. `y` (or a
 second `Ctrl-C`) kills the whole process group, waits until it is gone, logs the row
 `cancelled` and only then exits; a third `Ctrl-C` stops waiting for that answer (the shell still
 gives the kill up to 5 s to finish). `SIGTERM`, `SIGINT` and

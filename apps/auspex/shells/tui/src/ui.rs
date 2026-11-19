@@ -9,8 +9,10 @@
 //! Widths are measured in terminal cells and everything is cut with an ellipsis, so a long
 //! or wide name never moves a column.
 
+use std::time::Duration;
+
 use auspex_core::{
-    ActionResult, ActionStatus, ActionView, Mode, Phase, PrometheusStatus, ViewModel,
+    ActionResult, ActionStatus, ActionView, Event, Mode, Phase, PrometheusStatus, ViewModel,
 };
 use auspex_domain::fleet::{Lint, TargetSource};
 use auspex_domain::observe::{HealthSource, StorePath};
@@ -22,8 +24,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
-use crate::input::{Input, Prompt};
-use crate::keymap::{Action, Keymap};
+use crate::input::{Input, Prompt, Screen};
+use crate::keymap::{Action, Key, Keymap};
 use crate::output::{Output, Stream};
 use crate::packages::{self, Kind};
 use crate::theme::{Role, Theme};
@@ -62,6 +64,74 @@ pub struct Ui {
     pub approvals: usize,
     /// The last thing auspex could not do besides the action itself (the action log failed).
     pub warning: Option<String>,
+    /// The question the last frame drew (its `ConfirmView::serial`), or none. A question is
+    /// answered only after a frame has shown it: see [`Ui::key`].
+    pub confirm_drawn: Option<u64>,
+}
+
+impl Ui {
+    /// Handles one key against `view`: the events to send, in order.
+    ///
+    /// While a question is open and no frame has drawn it yet, the key is discarded, not
+    /// answered. The question names the machine and the system; an answer typed before it
+    /// could be read (typeahead, `Ayuy` arriving in one burst) is not an answer to it. Every
+    /// question is a new one to draw, so `A` `y` `u` `y` needs a frame after `A` and after `u`.
+    pub fn key(
+        &mut self,
+        key: Key,
+        view: &ViewModel,
+        since_refresh: Duration,
+        keymap: &Keymap,
+    ) -> Vec<Event> {
+        if self.question_unseen(view) {
+            return Vec::new();
+        }
+        let query = view
+            .search
+            .as_ref()
+            .map(|s| s.query.clone())
+            .unwrap_or_default();
+        let screen = Screen::from_view(view, self.page.max(1), since_refresh);
+        self.input.key(key, screen, keymap, &query)
+    }
+
+    /// Handles pasted text (bracketed paste, so it is not typed): never an answer to a
+    /// question except no, and never a command.
+    ///
+    /// With a question open, a paste is a no once the question has been drawn (and nothing
+    /// before). With a prompt open, the text goes into it as typed, without control characters
+    /// (a pasted newline must not submit it). Otherwise it is ignored: pasted `uy` is not `u`
+    /// and `y`.
+    pub fn paste(
+        &mut self,
+        text: &str,
+        view: &ViewModel,
+        since_refresh: Duration,
+        keymap: &Keymap,
+    ) -> Vec<Event> {
+        if view.confirm.is_some() {
+            return if self.question_unseen(view) {
+                Vec::new()
+            } else {
+                vec![Event::ConfirmAnswer(false)]
+            };
+        }
+        if self.input.prompt.is_none() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        for c in text.chars().filter(|c| !c.is_control()) {
+            events.extend(self.key(Key::char(c), view, since_refresh, keymap));
+        }
+        events
+    }
+
+    /// A question is open that no frame has drawn.
+    fn question_unseen(&self, view: &ViewModel) -> bool {
+        view.confirm
+            .as_ref()
+            .is_some_and(|c| self.confirm_drawn != Some(c.serial))
+    }
 }
 
 /// Everything that does not change frame to frame.
@@ -176,6 +246,7 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
         draw_help(frame, main, ctx);
     }
     draw_confirm(frame, main, view, ctx);
+    ui.confirm_drawn = view.confirm.as_ref().map(|c| c.serial);
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, theme: &Theme) {
@@ -959,7 +1030,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
         return;
     };
     let theme = ctx.theme;
-    let width = area.width.min(72);
+    let width = area.width.min(80);
     let text_cells = usize::from(width.saturating_sub(4)).max(1);
     let mut lines: Vec<Line> = wrap(&confirm.question, text_cells)
         .into_iter()

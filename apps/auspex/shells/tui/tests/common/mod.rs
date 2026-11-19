@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 use auspex_core::{Event, ViewModel};
 use auspex_tui::backend::Backend;
 use auspex_tui::demo::{self, Demo};
-use auspex_tui::input::Screen;
 use auspex_tui::keymap::{Key, Keymap};
 use auspex_tui::log::Log;
 use auspex_tui::output::Output as ActionOutput;
@@ -55,7 +54,8 @@ pub async fn settled_demo() -> Arc<Shell> {
     shell
 }
 
-/// Types `keys` (each char a key; `\n` is Enter, `\x1b` Esc) into `ui` against `shell`.
+/// Types `keys` (each char a key; `\n` is Enter, `\x1b` Esc) into `ui` against `shell`, with no
+/// frame drawn between them: typeahead, all in one burst.
 pub fn type_keys(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
     for c in keys.chars() {
         let key = match c {
@@ -68,18 +68,44 @@ pub fn type_keys(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
     }
 }
 
-/// One key.
+/// One key, as the real loop sends it: through `Ui::key`, which discards a key that answers a
+/// question no frame has drawn yet.
 pub fn press(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, key: Key) {
     let view = shell.view();
-    let query = view
-        .search
-        .as_ref()
-        .map(|s| s.query.clone())
-        .unwrap_or_default();
     // Long after any refresh started: a test that needs "just started" builds its Screen.
-    let screen = Screen::from_view(&view, ui.page.max(1), Duration::from_secs(3600));
-    for e in ui.input.key(key, screen, keymap, &query) {
+    for e in ui.key(key, &view, Duration::from_secs(3600), keymap) {
         shell.send(e);
+    }
+}
+
+/// A paste, as the real loop sends it: through `Ui::paste`.
+pub fn paste(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, text: &str) {
+    let view = shell.view();
+    for e in ui.paste(text, &view, Duration::from_secs(3600), keymap) {
+        shell.send(e);
+    }
+}
+
+/// One frame of `shell` is drawn (and so a question open at that moment has been shown).
+pub fn frame(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap) {
+    draw(
+        &shell.view(),
+        ui,
+        keymap,
+        &shell.log.lines(),
+        shell.output(),
+        120,
+        40,
+    );
+}
+
+/// As [`type_keys`], with a frame drawn after each key: an operator who reads what is on the
+/// screen before pressing the next key, which is what a question asks of them.
+pub fn type_keys_seen(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
+    frame(shell, ui, keymap);
+    for c in keys.chars() {
+        type_keys(shell, ui, keymap, &c.to_string());
+        frame(shell, ui, keymap);
     }
 }
 

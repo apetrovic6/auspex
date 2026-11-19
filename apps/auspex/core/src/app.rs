@@ -393,6 +393,9 @@ pub struct Model {
     action: Option<act::Action>,
     /// The question waiting for y or N.
     confirm: Option<act::Confirm>,
+    /// Counts the questions asked, so a shell can tell one question from the next (it may only
+    /// accept an answer to a question it has drawn).
+    confirm_serial: u64,
 }
 
 impl Model {
