@@ -33,7 +33,7 @@ auspex evaluates it. Explicit `path:` references retain path semantics and are n
 
 The cache hashes HEAD, index records (including assume-unchanged/skip-worktree flags),
 tracked worktree contents and modes, the flake directory, and `flake.lock`. Results stream
-immediately, but successful results are written only after a second key matches the first.
+immediately (tracked files over 1 GiB in total are not hashed, and that run is not cached), but successful results are written only after a second key matches the first.
 An edit during evaluation leaves that run uncached. This is a before/after consistency
 check, not an immutable snapshot; edits that are reverted before the second key are not
 detected.

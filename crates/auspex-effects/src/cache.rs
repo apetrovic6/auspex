@@ -196,9 +196,16 @@ use crate::text::{last_line, lossy};
 /// The default git program, looked up on `PATH`.
 pub const DEFAULT_GIT: &str = "git";
 
-/// The most worktree bytes hashed for a key: 256 MiB. A fleet repository is a few megabytes
-/// of Nix; past the cap there is no caching for that run.
-pub const MAX_WORKTREE_BYTES: u64 = 256 * 1024 * 1024;
+/// The most worktree bytes hashed for a key: 1 GiB.
+///
+/// The cap bounds what a hostile tree can make one key computation read (the key is
+/// computed twice per scan); past it there is no caching for that run. A fleet's Nix is a few megabytes, but the operator's tracks 263 MiB
+/// of wallpapers, which a 256 MiB cap left uncached. At the cap a computation costs about
+/// 1.2 s with a warm page cache (263 MiB take about 0.3 s), and is bounded by
+/// [`GitParams::read_timeout`] on a cold disk. Raising the cap replaced a per-file digest
+/// memo (PR #15), abandoned after three security reviews kept finding ways to serve a stale
+/// result: re-reading the bytes cannot.
+pub const MAX_WORKTREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The address-space limit put on every git command, in bytes: 512 MiB.
 pub const GIT_MEMORY_LIMIT: u64 = 512 << 20;
@@ -257,7 +264,8 @@ pub struct GitParams<'a> {
 }
 
 impl GitParams<'_> {
-    /// `git` from `PATH`, 2 s per command, 30 s for reading the worktree.
+    /// `git` from `PATH`, 2 s per command, 30 s for reading the worktree (each key computation:
+    /// 1 GiB in 30 s needs only about 35 MiB/s, below any disk worth scanning a fleet from).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -765,7 +773,8 @@ fn worktree_digest(
                     }
                     Err(ReadError::TooBig) => {
                         return Err(Stop::NoCache(format!(
-                            "the tracked files are larger than {MAX_WORKTREE_BYTES} bytes"
+                            "the tracked files are larger than {} MiB",
+                            MAX_WORKTREE_BYTES >> 20
                         )));
                     }
                     Err(ReadError::Stopped) => return Err(Stop::Stopped),
