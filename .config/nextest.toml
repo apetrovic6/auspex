@@ -1,0 +1,25 @@
+# nextest's configuration: what `cargo nextest run` reads, in the dev shell (`just rust-test`)
+# and in ci-pure's `ci-test` (crane's cargoNextest), from the workspace root.
+
+[test-groups]
+# Tests that start several processes sharing one SQLite file and check that none of them is
+# locked out. They run at the product's own budget (a 2 s call timeout and a 5 s busy
+# timeout: `deploylog`'s DEFAULT_CALL_TIMEOUT and DEFAULT_BUSY_TIMEOUT), because a longer one
+# would also pass when a process holds the write lock for seconds, which is the lock-out they
+# exist to catch. At that budget they fail when the machine is busy with the rest of the
+# workspace's tests (the Nix sandbox ran them all at once: "the action log was busy; nothing
+# was written"), so they run one at a time and, below, with no other test beside them.
+deploylog-processes = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = '''
+package(auspex-effects) & (
+    test(deploylog::tests::several_processes_write_at_once_without_locking_each_other_out)
+    | test(deploylog::tests::processes_that_create_the_database_together_do_not_fail)
+    | test(deploylog::tests::processes_that_open_an_old_file_together_add_each_column_once)
+)
+'''
+test-group = 'deploylog-processes'
+# The group alone limits these tests among themselves, not against the other ~1100 tests
+# that run beside them. Asking for every thread makes nextest run each of them alone.
+threads-required = 'num-test-threads'

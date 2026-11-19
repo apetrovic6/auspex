@@ -164,6 +164,8 @@ let
 
       # The `xtask` alias every `cargo xtask` invocation resolves through.
       (maybe "/.cargo/config.toml")
+      # nextest reads its test groups from here (the deploylog multi-process tests run alone).
+      (maybe "/.config/nextest.toml")
 
       # Root files the build/test/check read.
       (maybe "/README.md")

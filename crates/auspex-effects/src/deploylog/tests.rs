@@ -1107,13 +1107,7 @@ async fn child() {
             touch(format!("ready-{who}"));
             wait_for(&dir.join("go"));
             let mut errors = Vec::new();
-            // These tests check that concurrent processes cause no lock-outs and no lost rows,
-            // not how long a call takes: the latency bounds (`call_timeout`, `busy_timeout`) have
-            // their own tests. Under a loaded machine (the Nix sandbox runs the whole workspace's
-            // tests at once) the 2 s and 5 s defaults expire while five processes share one
-            // file, so the children wait up to a minute.
-            let patient = params_with(path, Duration::from_secs(60), Duration::from_secs(60));
-            match ActionLog::open(patient).await {
+            match ActionLog::open(params(path, HOST)).await {
                 Err(e) => errors.push(format!("open: {e}")),
                 Ok(log) => {
                     let rounds = std::env::var(ROUNDS)
