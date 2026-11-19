@@ -8,6 +8,10 @@
 //!
 //! Skipped, with a message, when `nix`, `nix-eval-jobs` or `git` is not on `PATH`, which is
 //! the case inside the `ci-pure` sandbox: there is no Nix daemon to evaluate against there.
+//!
+//! The edit-and-undo guard test uses unique loopback HTTP fetches as worker barriers.
+//! Its impure absolute read of a tracked file observes the live edit, not the flake's
+//! immutable store snapshot; the server releases each worker only after the edit/undo.
 
 #![cfg(unix)]
 
@@ -551,16 +555,163 @@ async fn real_attempt(
     Ok(())
 }
 
-/// Review finding N2 with the real nix-eval-jobs: `extra.nix` is edited at the first
-/// result and its committed bytes written back at the second.
+/// Review finding N2: hold real workers at HTTP fetches while editing and undoing.
+///
+/// `--impure` permits loopback fetches; unlike a FIFO read, a fetch can block and
+/// still yield a successful derivation. Unique URLs prevent fetcher-cache hits.
+/// The historical name is retained, but no memory-pressure restarts are needed.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one synchronized real-evaluator scenario"
+)]
 async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
-    real_change_and_undo(
-        |_| {},
-        |r| fs::write(r.join("extra.nix"), "edited").unwrap(),
-        |r| fs::write(r.join("extra.nix"), "original").unwrap(),
+    use std::cell::Cell;
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    for tool in ["nix", "nix-eval-jobs", "git"] {
+        if find_on_path(tool).is_none() {
+            eprintln!("SKIPPED: {tool} is not on PATH");
+            return;
+        }
+    }
+    let repo = tempdir();
+    let r = repo.path();
+    let nonce = r.file_name().unwrap().to_str().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/{nonce}", listener.local_addr().unwrap());
+    fs::write(r.join("extra.nix"), "original").unwrap();
+    fs::write(
+        r.join("flake.nix"),
+        format!(
+            r#"{{
+      outputs = _: {{
+        nixosConfigurations = builtins.listToAttrs (map (name: {{
+          inherit name;
+          value.config.system.build.toplevel =
+            builtins.seq (builtins.fetchurl ("{url}/gate-" + name)) (derivation {{
+              inherit name;
+              system = "x86_64-linux";
+              builder = "/auspex-fixture-never-built";
+              source = builtins.readFile "{repo}/extra.nix";
+            }});
+        }}) ["a" "b"]);
+      }};
+    }}"#,
+            repo = r.display(),
+        ),
     )
-    .await;
+    .unwrap();
+    git(r, &["init", "-q"]);
+    git(r, &["add", "flake.nix", "extra.nix"]);
+    git(r, &["commit", "-q", "-m", "HTTP gates"]);
+    let flake = FlakeRef::new(r.to_str().unwrap()).unwrap();
+    let cache_dir = tempdir();
+    let cache = CacheParams {
+        cache_dir: Some(cache_dir.path()),
+        flake_dir: r,
+        git: GitParams::new(),
+    };
+    let machines: Vec<_> = ["a", "b"]
+        .into_iter()
+        .map(|name| EvalMachine {
+            name: name.to_owned(),
+            class: MachineClass::Nixos,
+        })
+        .collect();
+    let key = || async {
+        auspex_effects::cache::key_for(r, &GitParams::new(), &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    let requests = Cell::new(0);
+    let serve = async {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let mut line = String::new();
+            socket.read_line(&mut line).await.unwrap();
+            match requests.get() {
+                0 => {
+                    assert!(line.starts_with(&format!("GET /{nonce}/gate-a ")), "{line}");
+                    fs::write(r.join("extra.nix"), "edited").unwrap();
+                }
+                1 => {
+                    assert!(line.starts_with(&format!("GET /{nonce}/gate-b ")), "{line}");
+                    fs::write(r.join("extra.nix"), "original").unwrap();
+                }
+                _ => {}
+            }
+            requests.set(requests.get() + 1);
+            loop {
+                line.clear();
+                assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            socket
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        }
+    };
+    let scenario = async {
+        let before = key().await;
+        let mut eval = EvalParams::new();
+        eval.runtime_dir = Some(common::runtime_dir());
+        eval.workers = 1;
+        eval.max_memory_mib = 1024;
+        eval.timeout = Duration::from_secs(120);
+        let (tx, mut rx) = unbounded_channel();
+        evaluate_cached(
+            &flake,
+            &machines,
+            &eval,
+            &cache,
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+        let mut items = Vec::new();
+        while let Some(item) = rx.recv().await {
+            items.push(item);
+        }
+        assert_eq!(requests.get(), 2, "both gates must be reached");
+        assert_eq!(key().await, before, "the undo must restore the key exactly");
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                EvalItem::Note(note) if note == "eval results not cached: the worktree changed during evaluation"
+            )),
+            "{items:?}"
+        );
+        let (changed, error) = split(&items);
+        assert_eq!(error, None);
+        let (restored, error) = split(&run(&flake, &machines, &cache).await);
+        assert_eq!(error, None);
+        for name in ["a", "b"] {
+            assert!(
+                matches!(changed[name].1, EvalOutcome::Success(_)),
+                "{items:?}"
+            );
+            assert!(matches!(restored[name].1, EvalOutcome::Success(_)));
+            assert!(!restored[name].0, "{name} was cached from the changed run");
+        }
+        assert_ne!(
+            changed["a"].1, restored["a"].1,
+            "machine a must read the edit"
+        );
+    };
+    tokio::select! {
+        () = scenario => {}
+        () = serve => unreachable!(),
+    }
 }
 
 /// Review finding B1 with the real nix-eval-jobs: `reset --soft HEAD~` at the first
