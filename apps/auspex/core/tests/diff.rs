@@ -28,6 +28,7 @@ fn closure(packages: &[(char, &str)], dropped: usize) -> ClosurePaths {
 fn old() -> ClosurePaths {
     closure(
         &[
+            ('0', "nixos-system-now"),
             ('a', "linux-6.12.38"),
             ('b', "htop-3.3.0"),
             ('c', "zlib-1.3.1"),
@@ -39,6 +40,7 @@ fn old() -> ClosurePaths {
 fn new() -> ClosurePaths {
     closure(
         &[
+            ('1', "nixos-system-next"),
             ('d', "linux-6.12.41"),
             ('f', "ripgrep-14.1.1"),
             ('c', "zlib-1.3.1"),
@@ -132,26 +134,35 @@ fn closures_are_requested_only_for_an_update_pending_machine_whose_pending_closu
 }
 
 #[test]
-fn a_failed_lookup_or_no_cache_at_all_is_not_cached_and_asks_nothing() {
+fn a_no_from_the_cache_or_no_cache_at_all_is_not_cached_and_a_failed_lookup_is_failed() {
     let mut shell = scanned(diff_config());
     answer_cache(&mut shell, "luna", NarCache::Failed);
     answer_cache(&mut shell, "sol", NarCache::NotCached);
     assert!(shell.deployed.is_empty() && shell.pending_closures.is_empty());
-    for machine in ["luna", "sol"] {
-        let row = shell.row(machine);
-        assert_eq!(
-            row.package_diff.unwrap().state,
-            DiffState::NotCached,
-            "{machine}"
-        );
-        assert_eq!(row.status, Badge::UpdatePending);
-    }
+    // The cache said no: not cached.
+    let sol = shell.row("sol");
+    assert_eq!(sol.package_diff.unwrap().state, DiffState::NotCached);
+    assert_eq!(sol.status, Badge::UpdatePending);
+    // The lookup failed: nobody knows, and nobody says the path is missing.
+    let luna = shell.row("luna");
+    let diff = luna.package_diff.unwrap();
+    assert_eq!(diff.state, DiffState::Failed);
+    assert_eq!(
+        diff.reason.as_deref(),
+        Some(auspex_core::CACHE_LOOKUP_FAILED)
+    );
+    assert_eq!(luna.status, Badge::UpdatePending);
+    assert!(shell.view().binary_cache);
 
     // No binary cache configured: the question is never asked, and the answer is the same.
     let mut config = bare_config();
     config.diff = diff_config().diff;
     let shell = scanned(config);
     assert!(shell.caches.is_empty() && shell.deployed.is_empty());
+    assert!(
+        !shell.view().binary_cache,
+        "a shell can say there is no cache to ask"
+    );
     assert_eq!(
         shell.row("luna").package_diff.unwrap().state,
         DiffState::NotCached
@@ -398,7 +409,8 @@ fn a_scan_the_deadline_did_cut_short_is_still_timed_out_with_its_previews_unharm
     assert!(view.refresh.timed_out, "the lookup was cut off");
     assert_eq!(
         shell.row("sol").package_diff.unwrap().state,
-        DiffState::NotCached
+        DiffState::Failed,
+        "a lookup the deadline cut is unknown, not 'not cached'"
     );
     assert!(!view.refresh.settled, "luna's preview is still out");
     let mut deployed = shell.take_deployed("luna");
@@ -446,4 +458,135 @@ fn a_timed_out_probe_never_gets_a_preview() {
     assert_eq!(shell.row("luna").reason.as_deref(), Some(PROBE_TIMED_OUT));
     assert_eq!(shell.row("luna").package_diff, None);
     assert!(shell.deployed.is_empty() && shell.pending_closures.is_empty());
+}
+
+#[test]
+fn the_cores_own_backstop_fails_every_outstanding_preview_without_the_shell() {
+    let mut shell = scanned(diff_config());
+    answer_cache(&mut shell, "luna", NarCache::Cached);
+    answer_cache(&mut shell, "sol", NarCache::Cached);
+    let generation = shell.view().refresh.generation;
+    let ids: Vec<_> = shell
+        .deployed
+        .iter()
+        .map(|r| r.operation.id)
+        .chain(shell.pending_closures.iter().map(|r| r.operation.id))
+        .collect();
+    assert_eq!(ids.len(), 4);
+    shell.send(Event::DeadlinePassed { generation });
+    assert!(!shell.view().refresh.settled, "the previews are still out");
+
+    // A stale generation changes nothing.
+    let before = shell.view();
+    shell.send(Event::PreviewDeadlinePassed {
+        generation: auspex_core::Generation(generation.0 + 1),
+    });
+    assert_eq!(shell.view(), before);
+
+    // The backstop: nothing answered, and the fleet settles anyway.
+    shell.send(Event::PreviewDeadlinePassed { generation });
+    for id in ids {
+        assert!(
+            shell.cancels.contains(&id),
+            "{id} is cancelled by the backstop"
+        );
+    }
+    let view = shell.view();
+    assert!(view.refresh.settled);
+    assert!(
+        !view.refresh.timed_out,
+        "a preview is never a timed-out scan"
+    );
+    assert_eq!(view.refresh.diffs_pending, 0);
+    for machine in ["luna", "sol"] {
+        let row = shell.row(machine);
+        let diff = row.package_diff.unwrap();
+        assert_eq!(diff.state, DiffState::Failed, "{machine}");
+        assert_eq!(diff.reason.as_deref(), Some(auspex_core::PREVIEW_TIMED_OUT));
+        assert_eq!(row.status, Badge::UpdatePending);
+        assert!(row.settled);
+    }
+    // A late answer after the backstop is dropped.
+    assert_eq!(shell.view().report.errors, []);
+}
+
+#[test]
+fn a_failed_side_cancels_only_its_own_machines_other_side() {
+    let mut shell = scanned(diff_config());
+    answer_cache(&mut shell, "luna", NarCache::Cached);
+    answer_cache(&mut shell, "sol", NarCache::Cached);
+    let mut luna = shell.take_deployed("luna");
+    let sol_ids = [
+        shell
+            .deployed
+            .iter()
+            .find(|r| r.operation.machine == "sol")
+            .unwrap()
+            .operation
+            .id,
+        shell
+            .pending_closures
+            .iter()
+            .find(|r| r.operation.machine == "sol")
+            .unwrap()
+            .operation
+            .id,
+    ];
+    shell.resolve(&mut luna, Err("boom".to_owned()));
+    for id in sol_ids {
+        assert!(
+            !shell.cancels.contains(&id),
+            "{id}: sol's queries are not luna's to cancel"
+        );
+    }
+    assert_eq!(
+        shell.row("sol").package_diff,
+        None,
+        "sol's preview is still collecting"
+    );
+    assert!(!shell.view().refresh.settled);
+}
+
+/// luna's two closures, resolved: `deployed` and `pending` replace the usual ones.
+fn preview_of(deployed: ClosurePaths, pending: ClosurePaths) -> auspex_domain::diff::PackageDiff {
+    let mut shell = scanned(diff_config());
+    answer_cache(&mut shell, "luna", NarCache::Cached);
+    let before = shell.row("luna");
+    let mut d = shell.take_deployed("luna");
+    let mut p = shell.take_pending("luna");
+    shell.resolve(&mut d, Ok(deployed));
+    shell.resolve(&mut p, Ok(pending));
+    let row = shell.row("luna");
+    assert_eq!(row.status, before.status, "a mismatch changes no status");
+    assert_eq!(row.badges, before.badges);
+    row.package_diff.unwrap()
+}
+
+#[test]
+fn a_closure_of_another_system_than_the_scan_saw_is_failed_not_shown() {
+    // The machine switched between the probe and the query: its toplevel is not the probe's.
+    let moved = closure(&[('9', "nixos-system-switched"), ('c', "zlib-1.3.1")], 0);
+    let diff = preview_of(moved, new());
+    assert_eq!(diff.state, DiffState::Failed);
+    assert_eq!(diff.reason.as_deref(), Some(auspex_core::SYSTEM_CHANGED));
+
+    // No system toplevel in the deployed closure at all.
+    let bare = closure(&[('c', "zlib-1.3.1")], 0);
+    let diff = preview_of(bare, new());
+    assert_eq!(
+        diff.reason.as_deref(),
+        Some(auspex_core::NO_DEPLOYED_SYSTEM)
+    );
+
+    // The pending side is not the evaluated toplevel.
+    let other = closure(&[('8', "nixos-system-elsewhere"), ('c', "zlib-1.3.1")], 0);
+    let diff = preview_of(old(), other);
+    assert_eq!(diff.state, DiffState::Failed);
+    assert_eq!(
+        diff.reason.as_deref(),
+        Some(auspex_core::PENDING_SYSTEM_MISMATCH)
+    );
+
+    // And the matching pair is a computed diff, which is what the other tests use.
+    assert_eq!(preview_of(old(), new()).state, DiffState::Computed);
 }

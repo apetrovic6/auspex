@@ -134,7 +134,7 @@ unversioned packages; `d` opens the full, scrollable list (`j`/`k`, `Ctrl-d`/`Ct
 `q` or `Esc` closes it). `--plain` ends a pending machine's line with the headline; `--json`
 carries the whole preview as `package_diff` (see `auspex_domain::report`).
 
-Two lists of store paths are compared, and both are read-only queries:
+Two lists of store paths are compared, and both queries write nothing to the store:
 
 - **What the machine runs:** `nix-store --query --requisites /run/current-system`, over the
   same ssh control master the probe opened: no new approval prompt while the master is up, and
@@ -143,15 +143,27 @@ Two lists of store paths are compared, and both are read-only queries:
 - **What the update would run:** only when the binary cache already has the pending
   toplevel (the `cached` badge). If the path is valid in the local store, `nix-store --query
   --requisites` locally; otherwise `nix path-info --recursive --store <cache> <path>`, which
-  writes nothing to the local store. A pending toplevel that is not in the cache is reported
-  as `not_cached`, with no network call: a preview is built from what exists, never from a
-  build.
+  writes nothing to the local store (nix keeps its own narinfo cache under `~/.cache/nix`; the
+  query passes `--option narinfo-cache-negative-ttl 0` so a path that is missing right now is
+  not remembered as missing for an hour). A pending toplevel that the cache says it does not
+  have is reported as `not_cached`, with no network call (so is every update-pending machine
+  when no cache is configured, and the panel says which); a cache lookup that failed is a
+  `failed` preview, because nobody checked. A preview is built from what exists, never from a
+  build. Each closure's own system must be the one the scan saw (the probe's
+  `current_system`, the evaluation's out path), or the preview is `failed` ("the machine
+  changed system while it was being queried").
 
 A query that fails or runs out of `timeouts.diff` makes that machine's preview `failed`, with
 the reason; it never changes the machine's status or fails the scan. A refresh cancels
 queries still running. `timeouts.settle` does not cut a preview short: the queries start late
 in a refresh, so headless mode waits for them, at most `timeouts.diff` after they were
-requested. Set `diff.enabled = false` to switch the feature off.
+requested. Both are backed by a deadline in the core itself, `timeouts.settle` plus
+`timeouts.diff` after the refresh started, at which a preview still out is cancelled and
+`failed` ("timed out"): headless mode therefore waits at most `settle + diff` (240 s by
+default), and never depends on an adapter answering. Previews have their own small pool of
+query slots (8, both queries of four machines at a time), separate from the 32 shared by probes
+and cache lookups, so a slow preview cannot hold up another machine's `cached` badge. Set
+`diff.enabled = false` to switch the feature off.
 
 Stamp deployed machines with the **fleet's** revision, not auspex's:
 

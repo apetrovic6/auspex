@@ -429,17 +429,23 @@ async fn otherwise_the_cache_is_queried_read_only_with_exactly_this_argv() {
     .await
     .unwrap();
     assert_eq!(paths(&answer), [GLIBC, SYSTEM]);
-    // `--store` names the cache, so nothing is written to the local store; the path follows
-    // `--`, so it cannot be read as an option.
+    // `--store` names the cache, so nothing is written to the local store (nix does keep its
+    // own narinfo cache under `~/.cache/nix`, without negative entries: ttl 0); the path
+    // follows `--`, so it cannot be read as an option.
     assert_eq!(
         fs::read_to_string(dir.path().join("nix-argv")).unwrap(),
-        format!("path-info\n--recursive\n--store\nhttps://cache.example/\n--\n{SYSTEM}\n")
+        format!(
+            "path-info\n--recursive\n--option\nnarinfo-cache-negative-ttl\n0\n--store\nhttps://cache.example/\n--\n{SYSTEM}\n"
+        )
     );
     assert_eq!(
         cache_argv("https://cache.example/", &store_path()),
         [
             "path-info",
             "--recursive",
+            "--option",
+            "narinfo-cache-negative-ttl",
+            "0",
             "--store",
             "https://cache.example/",
             "--",
@@ -629,4 +635,56 @@ fn what_the_fakes_print_is_what_the_domain_reads() {
     // The fakes print one path per line; so do `nix-store -qR` and `nix path-info -r`.
     let closure = parse_closure(&format!("{GLIBC}\n{SYSTEMD}\n"));
     assert_eq!(closure.paths.len(), 2);
+}
+
+#[tokio::test]
+async fn the_deployed_query_never_prompts_and_has_no_controlling_terminal() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let program = warm_ssh(
+        &t,
+        dir.path(),
+        &format!(
+            "printf '%s|%s\\n' \"${{SSH_ASKPASS_REQUIRE-unset}}\" \"${{SSH_ASKPASS-unset}}\" > '@dir@/env'\n\
+             if (exec 3</dev/tty) 2>/dev/null; then echo tty > '@dir@/tty'; fi\n\
+             printf '%s\\n' '{GLIBC}'"
+        ),
+    );
+    let cd = control(dir.path());
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = program.as_os_str();
+    let answer = deployed(
+        &Target::parse("h").unwrap(),
+        &params,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(paths(&answer), [GLIBC]);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("env")).unwrap(),
+        "never|unset\n",
+        "SSH_ASKPASS_REQUIRE=never, SSH_ASKPASS removed"
+    );
+    assert!(!dir.path().join("tty").exists(), "a session of its own");
+}
+
+#[tokio::test]
+async fn a_local_store_closure_over_the_cap_fails_and_does_not_fall_through_to_the_cache() {
+    let Some(t) = tools(&["yes"]) else { return };
+    let dir = tempdir();
+    let f = fakes(&t, dir.path(), &format!("exec @yes@ '{GLIBC}'"), "exit 99");
+    let why = pending(
+        &store_path(),
+        &params(&f, Some("https://cache.example"), Duration::from_secs(20)),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(why.contains("printed more than 4 MiB"), "{why}");
+    assert!(
+        !dir.path().join("nix-argv").exists(),
+        "an oversized local closure is not retried over the network"
+    );
 }

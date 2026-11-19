@@ -9,17 +9,17 @@
 │ ✓    genetor              in sync                  ││          nixos-system-cypramundi-25.11.20261019.b81e2d4        │
 │ ✓    io                   in sync                  ││pending   8jx7iv6h                                              │
 │ ↑◆   luna                 update pending           ││          nixos-system-cypramundi-25.11.20261101.6a2f1c0        │
-│ ✗    mars                 unreachable              ││diff      not cached: the pending closure is not in the binary  │
-│ ✓    mechanicus-forge-wo… in sync                  ││          cache (or no cache is configured), so there is no     │
-│ ✓    phobos               in sync                  ││          preview until it is built and pushed                  │
-│ ↑◆   sol                  update pending           ││revision  6a2f1c0e9d                                            │
-│ ✓    terra                in sync                  ││systemd   running                                               │
-│ ✓    titan                in sync                  ││failed    none                                                  │
-│ ✗    triton               unreachable              ││uptime    14d 0h (prometheus)                                   │
-│ !    vulcan               eval error               ││disk      93.5 GiB of 233.7 GiB used, 128.3 GiB free            │
-│                                                    ││          (prometheus)                                          │
-│                                                    ││load      0.40 0.35 0.30 (prometheus)                           │
-│                                                    ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
+│ ✗    mars                 unreachable              ││revision  6a2f1c0e9d                                            │
+│ ✓    mechanicus-forge-wo… in sync                  ││systemd   running                                               │
+│ ✓    phobos               in sync                  ││failed    none                                                  │
+│ ↑◆   sol                  update pending           ││uptime    14d 0h (prometheus)                                   │
+│ ✓    terra                in sync                  ││disk      93.5 GiB of 233.7 GiB used, 128.3 GiB free            │
+│ ✓    titan                in sync                  ││          (prometheus)                                          │
+│ ✗    triton               unreachable              ││load      0.40 0.35 0.30 (prometheus)                           │
+│ !    vulcan               eval error               ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
+│                                                    ││diff      not cached: the binary cache does not have the pending│
+│                                                    ││          closure, so there is no preview until it is built and │
+│                                                    ││          pushed                                                │
 │                                                    ││                                                                │
 │                                                    ││                                                                │
 │                                                    ││                                                                │

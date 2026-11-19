@@ -370,3 +370,59 @@ async fn a_refresh_during_a_preview_cancels_it_and_the_next_scan_makes_its_own()
         "no token of the cancelled queries is left"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn the_shell_arms_the_cores_backstop_at_settle_plus_diff() {
+    // sol's preview would fail by itself at 990 ms; the deadline is 800 ms and the backstop
+    // 50 ms after it, so the core fails the preview first, at 850 ms, with its own reason.
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_millis(800),
+    );
+    shell.set_preview_grace(Duration::from_millis(50));
+    let start = Instant::now();
+    shell.send(Event::Start(demo::config()));
+    settle(&shell).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(850));
+    let view = shell.view();
+    let sol = row(&view, "sol");
+    assert_eq!(
+        sol.package_diff.as_ref().unwrap().reason.as_deref(),
+        Some(auspex_core::PREVIEW_TIMED_OUT)
+    );
+    assert_eq!(sol.status, Badge::UpdatePending);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(shell.in_flight(), 0, "the cancelled queries left no token");
+
+    // Without the backstop the same run settles when the preview answers itself.
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_millis(800),
+    );
+    let start = Instant::now();
+    shell.send(Event::Start(demo::config()));
+    settle(&shell).await;
+    assert_eq!(start.elapsed(), Duration::from_millis(990));
+}
+
+#[tokio::test(start_paused = true)]
+async fn previews_have_a_permit_pool_of_their_own() {
+    use auspex_tui::shell::MAX_PREVIEW_QUERIES;
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    shell.send(Event::Start(demo::config()));
+    // 800 ms: sol's two queries run (and luna's probe, a per-machine call, is out).
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(shell.running_previews() > 0);
+    assert!(shell.running_previews() <= MAX_PREVIEW_QUERIES);
+    assert!(
+        shell.running_per_machine() <= 2,
+        "previews take nothing from the shared pool: {}",
+        shell.running_per_machine()
+    );
+}

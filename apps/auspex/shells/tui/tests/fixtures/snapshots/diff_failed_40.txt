@@ -15,8 +15,6 @@
 │pending   mc4vj91q                    │
 │          nixos-system-sol-25.11.20261│
 │          101.6a2f1c0                 │
-│diff      failed: deployed closure    │
-│          query timed out after 120s  │
 │revision  6a2f1c0e9d                  │
 │systemd   running                     │
 │failed    none                        │
@@ -26,6 +24,8 @@
 │load      0.40 0.35 0.30 (prometheus) │
 │memory    20.0 GiB of 32.0 GiB free   │
 │          (prometheus)                │
+│diff      failed: deployed closure    │
+│          query timed out after 120s  │
 │                                      │
 │                                      │
 │                                      │

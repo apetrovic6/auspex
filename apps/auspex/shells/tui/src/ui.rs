@@ -305,10 +305,13 @@ const fn health_source(s: HealthSource) -> &'static str {
     clippy::too_many_lines,
     reason = "one entry per line of the panel, in the panel's order"
 )]
-pub fn detail_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
+pub fn detail_lines(m: &MachineReport, cache_configured: bool) -> Vec<(&'static str, String)> {
     let mut out = vec![
         ("status", m.status.label().to_owned()),
-        ("reason", m.reason.clone().unwrap_or_else(|| "—".to_owned())),
+        (
+            "reason",
+            packages::panel_reason(m).unwrap_or_else(|| "—".to_owned()),
+        ),
         (
             "host",
             format!(
@@ -363,9 +366,6 @@ pub fn detail_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
             .as_deref()
             .map_or_else(|| "—".to_owned(), short_path),
     ));
-    // The package preview sits with the two systems it compares, ahead of the health
-    // values, which a pending update makes less urgent.
-    out.extend(packages::panel_lines(m));
     out.push((
         "revision",
         m.deployed_revision
@@ -436,6 +436,9 @@ pub fn detail_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
             },
         ),
     ));
+    // The package preview comes last, capped at a few lines: failed units and the systemd
+    // state matter most just before an update, and the full list is on `d`.
+    out.extend(packages::panel_lines(m, cache_configured));
     out
 }
 
@@ -471,7 +474,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, theme: &Theme) {
     }
     lines.push(Line::from(badges));
     let room = usize::from(inner.height);
-    for (label, value) in detail_lines(m) {
+    for (label, value) in detail_lines(m, view.binary_cache) {
         if lines.len() >= room {
             break; // nothing below the panel is drawn, so nothing below it is wrapped
         }
@@ -611,6 +614,13 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         refresh.to_owned(),
         format!("{} pending", view.refresh.pending_machines),
     ];
+    // What the previews are doing: they are not "pending machines" (the status and badges are
+    // final), but a settled-looking bar over a still-filling panel would say nothing.
+    match view.refresh.diffs_pending {
+        0 => {}
+        1 => parts.push("1 diff collecting".to_owned()),
+        n => parts.push(format!("{n} diffs collecting")),
+    }
     if ui.approvals != 0 {
         let noun = if ui.approvals == 1 { "host" } else { "hosts" };
         parts.push(format!("ssh: connecting {} {noun}", ui.approvals));
@@ -787,7 +797,7 @@ fn draw_diff(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, ctx: 
     frame.render_widget(Clear, rect);
     let lines = machine.map_or_else(
         || vec![(Kind::Note, "no machine selected".to_owned())],
-        packages::full_lines,
+        |m| packages::full_lines(m, view.binary_cache),
     );
     let inner_height = usize::from(rect.height.saturating_sub(2));
     let last_start = lines.len().saturating_sub(inner_height.max(1));

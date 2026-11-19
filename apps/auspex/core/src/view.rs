@@ -28,6 +28,10 @@ pub struct ViewModel {
     pub refresh: RefreshView,
     /// Whether the Prometheus fallback is in effect, for the status bar.
     pub prometheus: PrometheusStatus,
+    /// Whether a binary cache is configured (`cache.url`), so a shell can say which of the two
+    /// reasons a preview is `not_cached`: the cache does not have the pending closure, or there
+    /// is no cache to ask.
+    pub binary_cache: bool,
     /// The selected row, or `None` when there are no rows.
     pub selected: Option<usize>,
     /// The search, when a query is set.

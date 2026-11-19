@@ -46,12 +46,20 @@ async fn a_computed_diff_at_120_columns() {
             .find(needle)
             .unwrap_or_else(|| panic!("{needle}\n{frame}"))
     };
+    // Health first (failed units matter most before an update), then the preview.
+    assert!(at("failed    none") < at("diff      linux"));
     assert!(at("diff      linux") < at("critical  linux 6.12.38 → 6.12.41"));
     assert!(at("critical  linux") < at("systemd 256.10 → 257.2"));
-    assert!(at("systemd 256.10") < at("glibc 2.40-66 → 2.40-77"));
+    assert!(at("systemd 256.10") < at("glibc"));
     assert!(at("glibc") < at("nix rebuilt"));
     assert!(at("nix rebuilt") < at("3 other major-version changes"));
     assert!(at("other major-version changes") < at("+3 added  −2 removed  ~10 changed"));
+    // The headline once: the reason line no longer carries it.
+    assert_eq!(
+        frame.matches("linux 6.12.38 → 6.12.41, +3").count(),
+        1,
+        "{frame}"
+    );
     expect_file("snapshots", "diff_computed_120.txt", &frame);
 }
 
@@ -61,7 +69,10 @@ async fn a_not_cached_diff_at_120_columns() {
     let (mut ui, km) = (Ui::default(), Keymap::defaults());
     type_keys(&shell, &mut ui, &km, "/cypramundi\n");
     let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 30);
-    assert!(frame.contains("not cached: the pending closure"), "{frame}");
+    assert!(
+        frame.contains("not cached: the binary cache does not have the pending"),
+        "{frame}"
+    );
     expect_file("snapshots", "diff_not_cached_120.txt", &frame);
 }
 
@@ -180,7 +191,7 @@ async fn d_on_a_machine_without_a_diff_says_why() {
     let (mut ui, km) = (Ui::default(), Keymap::defaults());
     for (name, says) in [
         ("terra", "terra is in sync: there is no update to preview"),
-        ("cypramundi", "not cached: the pending closure"),
+        ("cypramundi", "not cached: the binary cache does not have"),
         (
             "sol",
             "the preview failed: deployed closure query timed out",
@@ -215,4 +226,65 @@ async fn the_help_lists_the_key_and_the_key_can_be_rebound() {
     assert!(!ui.input.diff_open, "d is no longer bound");
     type_keys(&shell, &mut ui, &rebound, "p");
     assert!(ui.input.diff_open);
+}
+
+/// The review's finding F2: the preview used to push systemd, failed units and the health
+/// values off a 24-row panel. Now they come first and the preview is capped below them.
+#[tokio::test(start_paused = true)]
+async fn failed_units_and_systemd_stay_visible_on_a_24_row_panel() {
+    let shell = settled_demo().await;
+    let km = Keymap::defaults();
+    for (width, file) in [
+        (120, "diff_computed_120x24.txt"),
+        (100, "diff_computed_100x24.txt"),
+    ] {
+        let mut ui = Ui::default();
+        type_keys(&shell, &mut ui, &km, "/luna\n");
+        let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), width, 24);
+        for needle in ["systemd   running", "failed    none"] {
+            assert!(frame.contains(needle), "{width}: {needle}\n{frame}");
+        }
+        expect_file("snapshots", file, &frame);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ctrl_c_quits_from_the_diff_overlay_and_d_toggles_it() {
+    use auspex_tui::keymap::Key;
+    let shell = settled_demo().await;
+    let (mut ui, km) = (Ui::default(), Keymap::defaults());
+    type_keys(&shell, &mut ui, &km, "/luna\nd");
+    assert!(ui.input.diff_open);
+    // `d` again closes it (the help says it toggles).
+    type_keys(&shell, &mut ui, &km, "d");
+    assert!(!ui.input.diff_open);
+    assert!(!shell.view().quit);
+    type_keys(&shell, &mut ui, &km, "d");
+    common::press(
+        &shell,
+        &mut ui,
+        &km,
+        Key {
+            code: crossterm::event::KeyCode::Char('c'),
+            ctrl: true,
+        },
+    );
+    assert!(shell.view().quit, "ctrl-c quits, overlay or not");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_status_bar_counts_previews_that_are_still_collecting() {
+    let shell = common::started_demo();
+    // 700 ms: sol's two queries are out (the list takes 150 ms, the probe 420, the cache 120).
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let (mut ui, km) = (Ui::default(), Keymap::defaults());
+    let view = shell.view();
+    assert_eq!(view.refresh.diffs_pending, 1);
+    let frame = render(&view, &mut ui, &km, &[], 120, 24);
+    assert!(frame.contains("1 diff collecting"), "{frame}");
+    while !shell.view().refresh.settled {
+        shell.changed().await;
+    }
+    let frame = render(&shell.view(), &mut ui, &km, &[], 120, 24);
+    assert!(!frame.contains("collecting"), "{frame}");
 }

@@ -31,10 +31,21 @@ pub enum Kind {
     Note,
 }
 
-/// The sentence for a preview that has no list because the pending closure is not available.
-pub const NOT_CACHED: &str = "not cached: the pending closure is not in the binary cache (or \
-                              no cache is configured), so there is no preview until it is \
-                              built and pushed";
+/// The sentence for a `not_cached` preview.
+///
+/// It says which of its two causes applies: the cache
+/// was asked and does not have the pending closure, or there is no cache to ask
+/// (`cache_configured` is `ViewModel::binary_cache`).
+#[must_use]
+pub const fn not_cached_text(cache_configured: bool) -> &'static str {
+    if cache_configured {
+        "not cached: the binary cache does not have the pending closure, so there is no \
+         preview until it is built and pushed"
+    } else {
+        "not cached: no binary cache is configured (cache.url), so the pending packages \
+         cannot be known"
+    }
+}
 
 /// `6.12.38`, `6.12.38, 6.12.41`, or `…` after a capped set; `—` for none.
 fn versions(set: &[Option<String>], truncated: bool) -> String {
@@ -131,14 +142,21 @@ fn caveats(diff: &PackageDiff) -> Option<String> {
 /// The plain sentence for `not_cached`, `failed: <why>` for a failure. `None` for a computed
 /// preview (its headline is in the reason already), no preview, or any other status.
 #[must_use]
-pub fn plain_note(m: &MachineReport) -> Option<String> {
+pub fn plain_note(m: &MachineReport, cache_configured: bool) -> Option<String> {
     if m.status != Badge::UpdatePending {
         return None;
     }
     let diff = m.package_diff.as_ref()?;
     match diff.state {
         DiffState::Computed => None,
-        DiffState::NotCached => Some("packages: not cached, no preview".to_owned()),
+        DiffState::NotCached => Some(
+            if cache_configured {
+                "packages: not in the binary cache, no preview"
+            } else {
+                "packages: no binary cache configured, no preview"
+            }
+            .to_owned(),
+        ),
         DiffState::Failed => Some(format!(
             "packages: preview failed: {}",
             diff.reason.as_deref().unwrap_or("no reason given")
@@ -146,14 +164,43 @@ pub fn plain_note(m: &MachineReport) -> Option<String> {
     }
 }
 
-/// The detail panel's lines for the package preview: `(label, value)`, or nothing for a
-/// machine that is not update pending or has no preview to show (and is settled, so none is
-/// coming).
+/// The most lines the detail panel gives the package preview. The rest is on `d`.
+pub const PANEL_LINES: usize = 4;
+
+/// The `reason` line for the detail panel, without the package headline.
 ///
-/// Order: the headline, the critical highlights with versions, a count of the other
-/// major-version changes, then the counts.
+/// The machine's reason minus the headline
+/// that `MachineReport::with_package_diff` appended, because the panel's `diff` line carries
+/// the headline (once) when a preview is computed.
 #[must_use]
-pub fn panel_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
+pub fn panel_reason(m: &MachineReport) -> Option<String> {
+    let reason = m.reason.clone()?;
+    let Some(headline) = m.package_diff.as_ref().and_then(diff_headline) else {
+        return Some(reason);
+    };
+    if m.status != Badge::UpdatePending {
+        return Some(reason);
+    }
+    // `with_package_diff` inserts "; <headline>" before the first ';' of the reason, or at
+    // its end; as the only text it is the whole reason.
+    Some(if reason == headline {
+        "—".to_owned()
+    } else {
+        reason.replacen(&format!("; {headline}"), "", 1)
+    })
+}
+
+/// The detail panel's lines for the package preview.
+///
+/// `(label, value)`, at most [`PANEL_LINES`], or nothing for a machine that is not update pending or has no preview to
+/// show (and is settled, so none is coming).
+///
+/// Computed: the headline (once; see [`panel_reason`]), the critical highlights with
+/// versions and what was rebuilt, a count of the other major-version changes, then the
+/// counts with a note on unreadable paths or capped lists. `cache_configured` is
+/// `ViewModel::binary_cache`.
+#[must_use]
+pub fn panel_lines(m: &MachineReport, cache_configured: bool) -> Vec<(&'static str, String)> {
     if m.status != Badge::UpdatePending {
         return Vec::new();
     }
@@ -166,7 +213,9 @@ pub fn panel_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
         };
     };
     match diff.state {
-        DiffState::NotCached => return vec![("diff", NOT_CACHED.to_owned())],
+        DiffState::NotCached => {
+            return vec![("diff", not_cached_text(cache_configured).to_owned())];
+        }
         DiffState::Failed => {
             return vec![(
                 "diff",
@@ -183,11 +232,10 @@ pub fn panel_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
         out.push(("diff", headline));
     }
     let (critical, major) = split_highlights(diff);
-    for (i, h) in critical.into_iter().enumerate() {
-        out.push((if i == 0 { "critical" } else { "" }, highlight_line(h)));
-    }
-    for name in &diff.rebuilt {
-        out.push(("", format!("{name} rebuilt (same version, new build)")));
+    let mut critical: Vec<String> = critical.into_iter().map(highlight_line).collect();
+    critical.extend(diff.rebuilt.iter().map(|name| format!("{name} rebuilt")));
+    if !critical.is_empty() {
+        out.push(("critical", critical.join(", ")));
     }
     if major > 0 {
         out.push((
@@ -218,10 +266,11 @@ pub fn panel_lines(m: &MachineReport) -> Vec<(&'static str, String)> {
             diff.unversioned.added, diff.unversioned.removed
         );
     }
-    out.push(("counts", counts));
     if let Some(note) = caveats(diff) {
-        out.push(("", note));
+        let _ = write!(counts, "; {note}");
     }
+    out.push(("counts", counts));
+    debug_assert!(out.len() <= PANEL_LINES);
     out
 }
 
@@ -240,7 +289,7 @@ fn change_line(c: &PackageChange) -> String {
 /// Under a heading each, or the sentence for a preview that has none. The lists are the
 /// report's own, capped at 128 each; a note says so when a list was cut.
 #[must_use]
-pub fn full_lines(m: &MachineReport) -> Vec<(Kind, String)> {
+pub fn full_lines(m: &MachineReport, cache_configured: bool) -> Vec<(Kind, String)> {
     if m.status != Badge::UpdatePending {
         return vec![(
             Kind::Note,
@@ -262,7 +311,9 @@ pub fn full_lines(m: &MachineReport) -> Vec<(Kind, String)> {
         )];
     };
     match diff.state {
-        DiffState::NotCached => return vec![(Kind::Note, NOT_CACHED.to_owned())],
+        DiffState::NotCached => {
+            return vec![(Kind::Note, not_cached_text(cache_configured).to_owned())];
+        }
         DiffState::Failed => {
             return vec![(
                 Kind::Note,
@@ -402,7 +453,7 @@ mod tests {
         let diff = diff_closures(&deployed, Some(&pending)).unwrap().unwrap();
         let mut m = report_with(&diff);
         m.settled = true;
-        let lines: Vec<String> = full_lines(&m).into_iter().map(|(_, l)| l).collect();
+        let lines: Vec<String> = full_lines(&m, true).into_iter().map(|(_, l)| l).collect();
         assert!(lines.contains(&"changed (1)".to_owned()), "{lines:?}");
         assert!(
             lines.contains(&"linux  6.12.38 → 6.12.41".to_owned()),
@@ -426,17 +477,104 @@ mod tests {
         serde_json::from_value(json).unwrap()
     }
 
+    fn computed_with(f: impl FnOnce(&mut PackageDiff)) -> MachineReport {
+        let deployed = [path('a', "linux-6.12.38"), path('c', "zlib-1.3.1")];
+        let pending = [path('d', "linux-6.12.41"), path('c', "zlib-1.3.1")];
+        let mut diff = diff_closures(&deployed, Some(&pending)).unwrap().unwrap();
+        f(&mut diff);
+        let mut m = report_with(&diff);
+        m.settled = true;
+        m
+    }
+
+    #[test]
+    fn the_panel_is_at_most_four_lines_and_says_at_least_when_capped() {
+        let m = computed_with(|d| {
+            d.highlights = vec![
+                highlight("linux", &[HighlightKind::Kernel]),
+                highlight("systemd", &[HighlightKind::Systemd]),
+                highlight("glibc", &[HighlightKind::Glibc]),
+                highlight("firefox", &[HighlightKind::MajorVersion]),
+            ];
+            d.rebuilt = vec!["nix".to_owned()];
+            d.unversioned.added = 2;
+            d.invalid.pending = 3;
+            d.truncated.highlights = true;
+        });
+        let lines = panel_lines(&m, true);
+        assert!(lines.len() <= PANEL_LINES, "{lines:?}");
+        let text: Vec<String> = lines.iter().map(|(l, v)| format!("{l} {v}")).collect();
+        assert!(
+            text.iter()
+                .any(|l| l == "major at least 1 other major-version change"),
+            "{text:?}"
+        );
+        assert!(
+            text.iter()
+                .any(|l| l.starts_with("critical linux") && l.ends_with("nix rebuilt")),
+            "{text:?}"
+        );
+        // The unreadable-path note counts the pending side too.
+        assert!(
+            text.iter()
+                .any(|l| l.contains("3 unreadable paths (0 deployed, 3 pending)")),
+            "{text:?}"
+        );
+        let m = computed_with(|d| d.invalid.deployed = 1);
+        let text: Vec<String> = panel_lines(&m, true)
+            .iter()
+            .map(|(l, v)| format!("{l} {v}"))
+            .collect();
+        assert!(
+            text.iter()
+                .any(|l| l.contains("1 unreadable path (1 deployed, 0 pending)")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn the_headline_is_in_the_panel_once() {
+        let mut m = computed_with(|_| {});
+        let headline = diff_headline(m.package_diff.as_ref().unwrap()).unwrap();
+        m.reason = Some(format!(
+            "pending nixos-system-x; {headline}; failed units: a"
+        ));
+        assert_eq!(
+            panel_reason(&m).as_deref(),
+            Some("pending nixos-system-x; failed units: a")
+        );
+        m.reason = Some(headline.clone());
+        assert_eq!(panel_reason(&m).as_deref(), Some("—"));
+        assert_eq!(panel_lines(&m, true)[0], ("diff", headline));
+    }
+
     #[test]
     fn states_without_a_list_say_so_plainly() {
         let m = report_with(&PackageDiff::not_cached());
-        assert_eq!(panel_lines(&m), [("diff", NOT_CACHED.to_owned())]);
+        assert_eq!(
+            panel_lines(&m, true),
+            [("diff", not_cached_text(true).to_owned())]
+        );
+        assert_eq!(
+            panel_lines(&m, false),
+            [("diff", not_cached_text(false).to_owned())]
+        );
+        assert_ne!(not_cached_text(true), not_cached_text(false));
+        assert_eq!(
+            plain_note(&m, true).as_deref(),
+            Some("packages: not in the binary cache, no preview")
+        );
+        assert_eq!(
+            plain_note(&m, false).as_deref(),
+            Some("packages: no binary cache configured, no preview")
+        );
         let m = report_with(&PackageDiff::failed("ssh: Connection refused"));
         assert_eq!(
-            panel_lines(&m),
+            panel_lines(&m, true),
             [("diff", "failed: ssh: Connection refused".to_owned())]
         );
         assert_eq!(
-            full_lines(&m),
+            full_lines(&m, true),
             [(
                 Kind::Note,
                 "the preview failed: ssh: Connection refused".to_owned()

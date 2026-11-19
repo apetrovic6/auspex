@@ -78,9 +78,9 @@ const fn sgr(c: Color) -> &'static str {
 /// The reason column: the machine's `reason`, which already ends in the package headline
 /// for a computed preview, plus a few words for the two states that have none, so a scripted
 /// reader of `--plain` is told why a pending update has no preview.
-fn reason(m: &MachineReport) -> String {
+fn reason(m: &MachineReport, cache_configured: bool) -> String {
     let base = m.reason.as_deref().unwrap_or("-");
-    match packages::plain_note(m) {
+    match packages::plain_note(m, cache_configured) {
         Some(note) if m.reason.is_some() => format!("{base}; {note}"),
         Some(note) => note,
         None => base.to_owned(),
@@ -131,7 +131,7 @@ pub fn plain(view: &ViewModel, colour: bool, settle_seconds: u64) -> String {
             fit(m.status.label(), status_w),
             fit(&target, target_w),
             fit(source(m.target_source), source_w),
-            reason(m),
+            reason(m, view.binary_cache),
         );
         out.push_str(line.trim_end());
         out.push('\n');

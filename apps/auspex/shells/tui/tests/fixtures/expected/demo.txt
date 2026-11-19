@@ -1,7 +1,7 @@
 ✓     alfrost                                 in sync         root@203.0.113.7         inventory     -
 ✓     callisto                                in sync         root@192.168.1.31        inventory     -
 ✓⚠    cerberus                                in sync         root@192.168.1.2         inventory     failed units: forgejo-runner.service
-↑     cypramundi                              update pending  root@198.51.100.4:2222   override      pending nixos-system-cypramundi-25.11.20261101.6a2f1c0; packages: not cached, no preview
+↑     cypramundi                              update pending  root@198.51.100.4:2222   override      pending nixos-system-cypramundi-25.11.20261101.6a2f1c0; packages: not in the binary cache, no preview
 ?     deimos                                  not installed   root@192.168.1.41        inventory     reachable, but /run/current-system is missing
 ✓     europa                                  in sync         root@europa.lab.example  inventory     -
 ✓⟳    ganymede                                in sync         root@192.168.1.33        inventory     -

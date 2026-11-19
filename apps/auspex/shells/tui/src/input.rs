@@ -111,6 +111,17 @@ impl Input {
             return self.prompt_key(prompt, key, screen);
         }
         let esc = key == Key::plain(KeyCode::Esc);
+        // Ctrl-C quits from the diff overlay, as it does from the help overlay: `q` and Esc
+        // close it, but the chord that means "get me out" must not be swallowed by it.
+        if self.diff_open
+            && key
+                == (Key {
+                    code: KeyCode::Char('c'),
+                    ctrl: true,
+                })
+        {
+            return vec![Event::Quit];
+        }
         if esc {
             if screen.help_open {
                 return vec![Event::CloseHelp];

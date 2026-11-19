@@ -14,12 +14,6 @@
 │pending   8jx7iv6h                    │
 │          nixos-system-cypramundi-25.1│
 │          1.20261101.6a2f1c0          │
-│diff      not cached: the pending     │
-│          closure is not in the binary│
-│          cache (or no cache is       │
-│          configured), so there is no │
-│          preview until it is built   │
-│          and pushed                  │
 │revision  6a2f1c0e9d                  │
 │systemd   running                     │
 │failed    none                        │
@@ -29,6 +23,12 @@
 │load      0.40 0.35 0.30 (prometheus) │
 │memory    20.0 GiB of 32.0 GiB free   │
 │          (prometheus)                │
+│diff      not cached: the binary cache│
+│          does not have the pending   │
+│          closure, so there is no     │
+│          preview until it is built   │
+│          and pushed                  │
+│                                      │
 │                                      │
 │                                      │
 │                                      │

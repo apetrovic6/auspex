@@ -26,7 +26,8 @@
 //!
 //! [`Model::fleet_settled`] is what headless mode waits for. It always becomes true: every
 //! request either answers or is cancelled by [`Event::DeadlinePassed`], which also marks
-//! whatever is still pending as timed out.
+//! whatever is still pending as timed out, except the package previews' queries, which have
+//! the later deadline described next.
 //!
 //! The package preview's closure queries are the exception to "cancelled by the deadline".
 //! They are requested late (after a probe, an evaluation and a cache lookup), so the global
@@ -35,12 +36,17 @@
 //! which the shell enforces by answering with a failure, so the fleet is settled when the
 //! deadline has passed *and* the last preview has answered, at most `timeouts.diff` after it
 //! was requested. A refresh or a quit still cancels them like everything else.
+//!
+//! The core does not rely on the shell for that. A shell that knows `timeouts.diff` also
+//! sends [`Event::PreviewDeadlinePassed`] at `timeouts.settle + timeouts.diff`: the core then
+//! cancels any preview still outstanding and marks it `failed` ("timed out"), so the fleet
+//! settles even if an adapter task never answers. Headless worst case: `settle + diff`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use auspex_domain::closure::ClosurePaths;
-use auspex_domain::diff::{PackageDiff, diff_closures};
+use auspex_domain::diff::{DiffState, PackageDiff, diff_closures};
 use auspex_domain::eval::{EvalFailure, EvalOutcome};
 use auspex_domain::fleet::{Machine, ResolveError, ResolvedTarget, resolve_target, shared_ips};
 use auspex_domain::observe::{Health, ProbeOutcome, PromSample, StorePath, merge_health};
@@ -65,6 +71,12 @@ pub const EVAL_TIMED_OUT: &str = "error: the evaluation did not finish before th
 pub const EVAL_MISSING: &str = "error: the evaluator finished without a result for this machine";
 /// The Prometheus reason when the deadline passed first.
 pub const PROMETHEUS_TIMED_OUT: &str = "no answer before the global deadline";
+/// The reason of a `failed` preview whose cache lookup failed.
+pub const CACHE_LOOKUP_FAILED: &str =
+    "the cache lookup failed, so the pending packages are unknown";
+/// The reason a package preview still out at the backstop deadline is `failed` with.
+pub const PREVIEW_TIMED_OUT: &str =
+    "timed out: the package preview did not finish before timeouts.settle + timeouts.diff";
 /// The `inventory_timed_out` fleet error's reason.
 pub const INVENTORY_TIMED_OUT: &str = "the machine list did not arrive before the global deadline";
 
@@ -84,9 +96,20 @@ pub enum Event {
     Refresh,
     /// The shell's global deadline for refresh `generation` passed (read the generation from
     /// [`RefreshView::generation`] when the refresh starts). Everything still outstanding is
-    /// cancelled and marked as timed out, so the fleet settles. A deadline for an older
-    /// generation is ignored.
+    /// cancelled and marked as timed out, so the fleet settles, except the package previews'
+    /// queries ([`Event::PreviewDeadlinePassed`]). A deadline for an older generation is
+    /// ignored.
     DeadlinePassed {
+        /// The refresh the deadline was started for.
+        generation: Generation,
+    },
+    /// The backstop for the package previews: `timeouts.settle + timeouts.diff` after refresh
+    /// `generation` started. Every preview still outstanding is cancelled and marked `failed`
+    /// (timed out), whatever its query was doing, so the fleet settles without depending on
+    /// the shell having answered every query. A shell that does not send it (the previews'
+    /// own deadline, enforced by the shell, still applies) loses only that guarantee. A
+    /// deadline for an older generation is ignored.
+    PreviewDeadlinePassed {
         /// The refresh the deadline was started for.
         generation: Generation,
     },
@@ -354,20 +377,28 @@ impl Model {
     ///
     /// `None` while it is unknown (the preview is off, the machine is not update pending, the
     /// cache question or the closure queries are still out). A machine whose update is
-    /// pending but whose pending closure cannot be had, because the cache does not hold it or
-    /// there is no cache or its lookup failed, is `not_cached`: derived here, not stored, so
-    /// every way the cache question can end (an answer, a failure, the deadline) says the same.
+    /// pending is `not_cached` when the cache said it does not hold the pending closure or
+    /// there is no cache to ask, and `failed` ([`CACHE_LOOKUP_FAILED`]) when the lookup itself
+    /// failed or the deadline cut it: nobody checked, so nobody may say the path is missing.
+    /// Derived here, not stored, so every way the cache question can end says the same.
     fn package_diff(&self, row: &Row, update_pending: bool) -> Option<PackageDiff> {
         self.config.as_ref()?.diff?;
         match &row.diff {
             DiffSlot::Done(diff) => Some(diff.clone()),
-            DiffSlot::Collecting { .. } => None,
-            DiffSlot::Idle => (update_pending
-                && matches!(
-                    row.cache,
-                    NarCache::NotCached | NarCache::Failed | NarCache::NotApplicable
-                ))
-            .then(PackageDiff::not_cached),
+            DiffSlot::Idle if !update_pending => None,
+            // The lookup answered "no", or there is no cache to ask: the pending closure is
+            // known not to be available.
+            DiffSlot::Idle
+                if matches!(row.cache, NarCache::NotCached | NarCache::NotApplicable) =>
+            {
+                Some(PackageDiff::not_cached())
+            }
+            // The lookup itself failed (or the deadline cut it): nobody knows whether the cache
+            // has the path, so this is a failure, not "not cached".
+            DiffSlot::Idle if row.cache == NarCache::Failed => {
+                Some(PackageDiff::failed(CACHE_LOOKUP_FAILED))
+            }
+            DiffSlot::Collecting { .. } | DiffSlot::Idle => None,
         }
     }
 
@@ -473,6 +504,7 @@ impl App for Auspex {
             Event::Refresh if model.config.is_some() => refresh(model),
             Event::Refresh => Command::done(),
             Event::DeadlinePassed { generation } => deadline(model, generation),
+            Event::PreviewDeadlinePassed { generation } => preview_deadline(model, generation),
             Event::InventoryAnswered {
                 generation,
                 id,
@@ -631,6 +663,7 @@ impl App for Auspex {
             },
             report,
             prometheus: model.prometheus.clone(),
+            binary_cache: model.config.as_ref().is_some_and(|c| c.binary_cache),
             selected: model.view.index(&names),
             search: (!model.view.query.is_empty()).then(|| SearchView {
                 query: model.view.query.clone(),
@@ -1075,9 +1108,50 @@ fn closure_answered(
         Side::Pending => *pending = Some(paths),
     }
     if let (Some(deployed), Some(pending)) = (deployed.as_ref(), pending.as_ref()) {
-        row.diff = DiffSlot::Done(compare(deployed, pending));
+        let diff = compare(deployed, pending);
+        let diff = verified(row, diff);
+        row.diff = DiffSlot::Done(diff);
     }
     render()
+}
+
+/// Why a closure's system is not the one the scan saw.
+pub const SYSTEM_CHANGED: &str = "the machine changed system while it was being queried";
+/// [`SYSTEM_CHANGED`] for a closure query that found no system toplevel at all.
+pub const NO_DEPLOYED_SYSTEM: &str =
+    "the deployed closure holds no system to compare with the one the probe saw";
+/// The pending side's equivalent: the cache's closure is not the evaluated toplevel's.
+pub const PENDING_SYSTEM_MISMATCH: &str =
+    "the pending closure is not the system the evaluation produced";
+
+/// A computed preview is only a preview of *this* update if its two closures are the ones the
+/// scan saw: the deployed closure's toplevel must be the probe's `current_system` and the
+/// pending one the evaluation's out path. A deploy or switch between the probe and the query
+/// (seconds apart, an operator deploying with auspex open) would otherwise show the diff of a
+/// different system, unremarked, such as "packages unchanged" on a pending row. A mismatch
+/// makes the preview `failed`.
+fn verified(row: &Row, diff: PackageDiff) -> PackageDiff {
+    if diff.state != DiffState::Computed {
+        return diff;
+    }
+    let probed = match &row.probe {
+        Some(ProbeOutcome::Observed(o)) => o.current_system.as_ref().map(StorePath::as_str),
+        _ => None,
+    };
+    let evaluated = match &row.eval {
+        Some(EvalOutcome::Success(s)) => Some(s.out_path.as_str()),
+        _ => None,
+    };
+    if diff.deployed.is_none() {
+        return PackageDiff::failed(NO_DEPLOYED_SYSTEM);
+    }
+    if diff.deployed.as_deref() != probed {
+        return PackageDiff::failed(SYSTEM_CHANGED);
+    }
+    if diff.pending.as_deref() != evaluated {
+        return PackageDiff::failed(PENDING_SYSTEM_MISMATCH);
+    }
+    diff
 }
 
 /// The domain's comparison of two closures, with the lines the adapters dropped added to its
@@ -1104,6 +1178,23 @@ fn eval_error(machine: &str, reason: &str) -> EvalOutcome {
         attr_path: Vec::new(),
         error_tail: vec![reason.to_owned()],
     })
+}
+
+/// The previews' backstop deadline ([`Event::PreviewDeadlinePassed`]): whatever previews are
+/// still out are cancelled and failed. Nothing else changes: the scan's own deadline is
+/// [`deadline`]'s, and a preview never touches `timed_out`.
+fn preview_deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event> {
+    if generation != model.generation || model.inventory == Inventory::NotStarted {
+        return Command::done();
+    }
+    let mut commands = model.cancel_where(Pending::is_closure);
+    for row in &mut model.rows {
+        if matches!(row.diff, DiffSlot::Collecting { .. }) {
+            row.diff = DiffSlot::Done(PackageDiff::failed(PREVIEW_TIMED_OUT));
+        }
+    }
+    commands.push(render());
+    Command::all(commands)
 }
 
 /// The global deadline: cancel everything outstanding, and mark what each request was
@@ -1196,6 +1287,7 @@ fn view_update(model: &mut Model, event: Event) {
         Event::Start(_)
         | Event::Refresh
         | Event::DeadlinePassed { .. }
+        | Event::PreviewDeadlinePassed { .. }
         | Event::InventoryAnswered { .. }
         | Event::ProbeAnswered { .. }
         | Event::EvalAnswered { .. }

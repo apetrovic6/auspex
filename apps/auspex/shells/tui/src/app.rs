@@ -220,6 +220,9 @@ impl Run {
         if !self.args.demo {
             shell.expect_machines(self.settings.machines.keys().cloned().collect());
         }
+        if let Some(diff) = config.diff {
+            shell.set_preview_grace(Duration::from_secs(diff.timeout_seconds));
+        }
         match mode {
             Mode::Plain | Mode::Json => headless(&shell, config, mode, &mut term, settle).await,
             Mode::Tui => tui(&shell, config, &self.keymap, &self.theme, &shown, &mut term).await,
@@ -235,7 +238,9 @@ async fn headless(
     settle: u64,
 ) -> ExitCode {
     shell.send(Event::Start(config));
-    // `refresh.settled` always becomes true: the deadline marks whatever is still pending.
+    // `refresh.settled` always becomes true: the deadline marks whatever is still pending,
+    // and the previews, which it leaves running, have the core's backstop `timeouts.diff` later
+    // (so the worst case is `settle + diff`).
     while !shell.view().refresh.settled {
         tokio::select! {
             () = shell.changed() => {}

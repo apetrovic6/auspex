@@ -81,6 +81,12 @@ pub fn cache_argv(cache_url: &str, path: &StorePath) -> Vec<String> {
     vec![
         "path-info".to_owned(),
         "--recursive".to_owned(),
+        // Nix remembers a narinfo it did not find for an hour (a negative entry in the user's
+        // `~/.cache/nix`). A toplevel whose references are still being uploaded would then be
+        // skipped for that user's later operations against this cache; 0 turns that off.
+        "--option".to_owned(),
+        "narinfo-cache-negative-ttl".to_owned(),
+        "0".to_owned(),
         "--store".to_owned(),
         cache_url.to_owned(),
         "--".to_owned(),

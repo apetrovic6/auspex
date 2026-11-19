@@ -52,6 +52,15 @@ use crate::log::Log;
 /// the evaluation, Prometheus, DNS) are not limited: they must not queue behind hung probes.
 pub const MAX_CONCURRENT: usize = 32;
 
+/// How many package-preview queries may run at once: 8, both queries of 4 machines.
+///
+/// A pool of their own, never the one above. A preview holds its permits for up to
+/// `timeouts.diff`, and the global deadline deliberately leaves it running, so sharing would let
+/// a fleet of slow previews hold every permit past `timeouts.settle` and starve another
+/// machine's probe or cache lookup: the deadline would then cut that lookup (the machine
+/// loses its `cached` badge) and time the whole scan out.
+pub const MAX_PREVIEW_QUERIES: usize = 8;
+
 /// How long a shutdown waits for adapter calls to kill and reap what they started.
 pub const REAP_GRACE: Duration = Duration::from_secs(5);
 
@@ -70,6 +79,9 @@ pub struct Shell {
     changed: Notify,
     /// `timeouts.settle`.
     settle: Duration,
+    /// `timeouts.diff`, when the package preview is on: the backstop fires this long after
+    /// the global deadline ([`Event::PreviewDeadlinePassed`]).
+    preview_grace: Mutex<Option<Duration>>,
     /// The current refresh's deadline timer, cancelled when the next refresh arms its own.
     deadline: Mutex<Option<CancellationToken>>,
     /// Machine names the config has `[machines.<name>]` for, and whether a name the fleet
@@ -77,6 +89,8 @@ pub struct Shell {
     configured: Mutex<(BTreeSet<String>, bool)>,
     /// Permits for per-machine calls ([`MAX_CONCURRENT`]).
     limit: Arc<Semaphore>,
+    /// Permits for package-preview queries ([`MAX_PREVIEW_QUERIES`]), never taken from `limit`.
+    previews: Arc<Semaphore>,
     approvals: AtomicUsize,
     approval_noted: AtomicBool,
 }
@@ -94,9 +108,11 @@ impl Shell {
             log,
             changed: Notify::new(),
             settle,
+            preview_grace: Mutex::new(None),
             deadline: Mutex::new(None),
             configured: Mutex::new((BTreeSet::new(), false)),
             limit: Arc::new(Semaphore::new(MAX_CONCURRENT)),
+            previews: Arc::new(Semaphore::new(MAX_PREVIEW_QUERIES)),
             approvals: AtomicUsize::new(0),
             approval_noted: AtomicBool::new(false),
         })
@@ -260,7 +276,7 @@ impl Shell {
                         let shell = Arc::clone(&shell);
                         let op = op.clone();
                         async move {
-                            let _permit = shell.gate(&token).await?;
+                            let _permit = shell.preview_gate(&token).await?;
                             shell
                                 .backend
                                 .deployed_closure(&op, &token, &|waiting| shell.approval(waiting))
@@ -280,7 +296,7 @@ impl Shell {
                         let shell = Arc::clone(&shell);
                         let op = op.clone();
                         async move {
-                            let _permit = shell.gate(&token).await?;
+                            let _permit = shell.preview_gate(&token).await?;
                             shell.backend.pending_closure(&op, &token).await
                         }
                     })
@@ -418,12 +434,30 @@ impl Shell {
             old.cancel();
         }
         let settle = self.settle;
+        let grace = *lock(&self.preview_grace);
         self.tasks.spawn(async move {
             tokio::select! {
                 () = tokio::time::sleep(settle) => shell.send(Event::DeadlinePassed { generation }),
-                () = root.cancelled() => {}
+                () = root.cancelled() => return,
+            }
+            // The core's own backstop for the previews, which the global deadline leaves
+            // running: `timeouts.diff` after it, whatever is still out is failed.
+            if let Some(grace) = grace {
+                tokio::select! {
+                    () = tokio::time::sleep(grace) => {
+                        shell.send(Event::PreviewDeadlinePassed { generation });
+                    }
+                    () = root.cancelled() => {}
+                }
             }
         });
+    }
+
+    /// Turns on the previews' backstop deadline: `timeouts.settle + grace` after a refresh
+    /// starts the core fails any preview still out. `grace` is `timeouts.diff`. Call before
+    /// the first refresh; without it the previews are bounded by [`within`] alone.
+    pub fn set_preview_grace(&self, grace: Duration) {
+        *lock(&self.preview_grace) = Some(grace);
     }
 }
 
@@ -472,7 +506,21 @@ impl Shell {
         &self,
         token: &CancellationToken,
     ) -> impl Future<Output = Result<OwnedSemaphorePermit, Cancelled>> + Send + 'static {
-        let limit = Arc::clone(&self.limit);
+        Self::acquire(Arc::clone(&self.limit), token)
+    }
+
+    /// [`Self::gate`] for a package-preview query: the preview pool, not the shared one.
+    fn preview_gate(
+        &self,
+        token: &CancellationToken,
+    ) -> impl Future<Output = Result<OwnedSemaphorePermit, Cancelled>> + Send + 'static {
+        Self::acquire(Arc::clone(&self.previews), token)
+    }
+
+    fn acquire(
+        limit: Arc<Semaphore>,
+        token: &CancellationToken,
+    ) -> impl Future<Output = Result<OwnedSemaphorePermit, Cancelled>> + Send + 'static {
         let token = token.clone();
         async move {
             tokio::select! {
@@ -487,6 +535,12 @@ impl Shell {
     #[must_use]
     pub fn running_per_machine(&self) -> usize {
         MAX_CONCURRENT - self.limit.available_permits()
+    }
+
+    /// Preview queries holding a permit now, for tests.
+    #[must_use]
+    pub fn running_previews(&self) -> usize {
+        MAX_PREVIEW_QUERIES - self.previews.available_permits()
     }
 }
 

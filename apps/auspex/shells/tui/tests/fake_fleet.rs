@@ -852,14 +852,14 @@ fn the_preview_flows_through_the_binary_with_fake_ssh_nix_and_cache() {
     );
 
     // The deployed query went to luna only, once, over the probe's own ssh options; the
-    // pending query asked the cache, read-only, for exactly luna's toplevel.
+    // pending query asked the cache, writing nothing to the store, for exactly luna's toplevel.
     let queries = std::fs::read_to_string(dir.path().join("ssh.queries")).unwrap();
     assert_eq!(queries.lines().count(), 1, "{queries}");
     let path_info = std::fs::read_to_string(dir.path().join("nix.path-info")).unwrap();
     assert_eq!(
         path_info.trim(),
         format!(
-            "path-info --recursive --store {cache}/ -- {}",
+            "path-info --recursive --option narinfo-cache-negative-ttl 0 --store {cache}/ -- {}",
             store("nixos-system-luna-new")
         )
     );
@@ -950,4 +950,154 @@ printf 'auspex_probe=1\nprobe=nixos\ncurrent_system={}\nsystem_state=running\nfa
             .contains("cannot connect to daemon"),
         "{diff:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Previews and the shared permit pool (review F1)
+// ---------------------------------------------------------------------------------------
+
+/// Machines `m00`..`m17` (18, so previews alone could hold more than the 32 shared permits),
+/// all update pending and cached. Every closure query takes 5 s; `m17`'s probe takes 2 s, so
+/// its cache lookup comes after every other machine's previews have started.
+fn crowd_fakes(t: &Tools, dir: &Path, machines: usize) -> [std::path::PathBuf; 3] {
+    let name = |i: usize| format!("m{i:02}");
+    let inventory = format!(
+        "{{{}}}",
+        (0..machines)
+            .map(|i| format!(
+                r#""{}":{{"deploy":{{"targetHost":"root@192.0.2.{}"}}}}"#,
+                name(i),
+                10 + i
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let closure = |side: &str| {
+        format!(
+            "printf '%s\\n' '{GLIBC_OLD}' '{HTOP}' \"/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-$m-{side}\""
+        )
+    };
+    let nix = t.script(
+        dir,
+        "nix",
+        &format!(
+            r#"case "$1" in
+  eval) printf '%s\n' '{inventory}';;
+  path-info)
+    for last; do :; done
+    echo + >> '@dir@/conc.log'
+    @sleep@ 5
+    echo - >> '@dir@/conc.log'
+    printf '%s\n' '{GLIBC_NEW}' '{RIPGREP}' "$last";;
+  *) exit 64;;
+esac"#
+        ),
+    );
+    let eval = t.script(
+        dir,
+        "nix-eval-jobs",
+        &(0..machines)
+            .map(|i| {
+                let out = store(&format!("nixos-system-{}-new", name(i)));
+                format!(
+                    r#"printf '%s\n' '{{"attr":"{m}","attrPath":["{m}"],"drvPath":"{out}.drv","outputs":{{"out":"{out}"}}}}'"#,
+                    m = name(i)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    let ssh = t.script(
+        dir,
+        "ssh",
+        &format!(
+            r#"for a; do [ "$a" = '-O' ] && exit 0; done
+for a; do dest=$a; done
+dest=$(printf '%s' "$@" | @cat@ >/dev/null; for a; do case "$prev" in --) printf '%s' "$a";; esac; prev=$a; done)
+n=${{dest##*.}}
+m=$(printf 'm%02d' $((n - 10)))
+script=$(@cat@)
+case "$script" in
+  *'nix-store --query --requisites'*)
+    echo + >> '@dir@/conc.log'
+    @sleep@ 5
+    echo - >> '@dir@/conc.log'
+    {}
+    ;;
+  *)
+    [ "$m" = 'm{:02}' ] && @sleep@ 2
+    printf 'auspex_probe=1\nprobe=nixos\ncurrent_system=/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-%s-old\nsystem_state=running\nfailed_units=[]\nauspex_end=1\n' "$m";;
+esac"#,
+            closure("old"),
+            machines - 1
+        ),
+    );
+    [nix, eval, ssh]
+}
+
+#[test]
+fn many_previews_never_starve_a_late_machines_cache_lookup() {
+    let Some(t) = tools(&["cat", "sleep"]) else {
+        return;
+    };
+    let dir = tempdir();
+    let [nix, eval, ssh] = crowd_fakes(&t, dir.path(), 18);
+    let nix_store = t.script(
+        dir.path(),
+        "nix-store",
+        "echo 'error: path is not valid' >&2\nexit 1",
+    );
+    let cache = cache_that_has_everything();
+    let cfg = config(
+        dir.path(),
+        &format!("[cache]\nurl = \"{cache}\"\n[timeouts]\nsettle = 4\ndiff = 40\n"),
+    );
+    let mut cmd = auspex(dir.path());
+    cmd.args(["--json", "--config"])
+        .arg(&cfg)
+        .arg("--flake")
+        .arg(flake_dir(dir.path()))
+        .env("AUSPEX_NIX_STORE", &nix_store);
+    with_fakes(&mut cmd, &nix, &eval, &ssh);
+    let out = run_within(&mut cmd, LIMIT);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "slow previews must not time the scan out: {stderr}"
+    );
+    // Both kinds of query count against the preview pool of 8 (4 machines, two queries each),
+    // and that pool is not the shared one: replay the + / - log the fakes wrote.
+    let log = std::fs::read_to_string(dir.path().join("conc.log")).unwrap();
+    let (mut now, mut peak) = (0i32, 0i32);
+    for line in log.lines() {
+        now += if line == "+" { 1 } else { -1 };
+        peak = peak.max(now);
+    }
+    assert_eq!(now, 0, "every query ended: {log}");
+    assert!(
+        (1..=8).contains(&peak),
+        "at most 8 closure queries at once, saw {peak}"
+    );
+    let report: auspex_domain::report::FleetReport = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(report.settled && report.errors.is_empty());
+    let late = report.machines.iter().find(|m| m.name == "m17").unwrap();
+    assert!(
+        late.badges.contains(&auspex_domain::status::Badge::Cached),
+        "the late machine keeps its cached badge: {late:?}"
+    );
+    for m in &report.machines {
+        let state = m.package_diff.as_ref().map(|d| d.state);
+        assert!(
+            matches!(
+                state,
+                Some(
+                    auspex_domain::diff::DiffState::Computed
+                        | auspex_domain::diff::DiffState::Failed
+                )
+            ),
+            "{}: {state:?}",
+            m.name
+        );
+    }
 }
