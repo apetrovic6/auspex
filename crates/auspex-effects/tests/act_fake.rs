@@ -388,6 +388,7 @@ async fn b_runs_exactly_nix_build_no_link_print_out_paths_installable() {
             "build".to_owned(),
             "--no-link".to_owned(),
             "--print-out-paths".to_owned(),
+            "--no-write-lock-file".to_owned(),
             format!("{}#{attr}", flake.as_str()),
         ];
         assert_eq!(recorded(dir.path()), expected, "{machine}");

@@ -422,9 +422,17 @@ async fn a_build_runs_nix_build_streams_and_is_logged_as_a_build() {
         ["/nix/store/0123456789abcdfghijklmnpqrsvwxyz-built"]
     );
     let argv = recorded(w.dir.path());
-    assert_eq!(&argv[..3], ["build", "--no-link", "--print-out-paths"]);
+    assert_eq!(
+        &argv[..4],
+        [
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            "--no-write-lock-file"
+        ]
+    );
     assert!(
-        argv[3].ends_with("#nixosConfigurations.alfrost.config.system.build.toplevel"),
+        argv[4].ends_with("#nixosConfigurations.alfrost.config.system.build.toplevel"),
         "{argv:?}"
     );
     w.shell.shutdown().await;

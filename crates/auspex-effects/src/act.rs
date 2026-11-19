@@ -8,7 +8,7 @@
 //!
 //! `u`: `clan machines update --host-key-check strict --flake <fleet> -- <machine>`.
 //!
-//! `b`: `nix build --no-link --print-out-paths <fleet>#nixosConfigurations.<m>.config.system.build.toplevel`
+//! `b`: `nix build --no-link --print-out-paths --no-write-lock-file <fleet>#nixosConfigurations.<m>.config.system.build.toplevel`
 //! (darwin: `<fleet>#darwinConfigurations.<m>.system`).
 //!
 //! # Safety, enforced here and not only by the caller
@@ -170,6 +170,10 @@ pub fn build_argv(
         OsString::from("build"),
         OsString::from("--no-link"),
         OsString::from("--print-out-paths"),
+        // `b` runs in observe mode, so it must not edit the fleet's repository: without this
+        // nix writes a stale `flake.lock` into the working tree and, for a `git+file` flake,
+        // stages it. (`--no-update-lock-file` is left out: next to this one nix only warns.)
+        OsString::from("--no-write-lock-file"),
         OsString::from(build_installable(flake, machine, class)?),
     ])
 }
