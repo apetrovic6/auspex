@@ -1030,7 +1030,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
         return;
     };
     let theme = ctx.theme;
-    let width = area.width.min(80);
+    let width = area.width.min(78);
     let text_cells = usize::from(width.saturating_sub(4)).max(1);
     let mut lines: Vec<Line> = wrap(&confirm.question, text_cells)
         .into_iter()

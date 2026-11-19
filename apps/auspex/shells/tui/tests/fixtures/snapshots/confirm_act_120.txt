@@ -9,11 +9,11 @@
 │ ✓    genetor              in sync                  ││pending   27bglqx1 nixos-system-alfrost-25.11.20261101.6a2f1c0  │
 │ ✓    io                   in sync                  ││revision  6a2f1c0e9d                                            │
 │ ↑◆   luna                 update pending           ││systemd   running                                               │
-│ ✗    mars         ┌ confirm ─────────────────────────────────────────────────────────────────────┐                   │
-│ ✓    mechanicus-fo│turn on act mode? updates will be possible. y/N                               │                   │
-│ ✓    phobos       │                                                                              │iB free            │
-│ ↑◆   sol          │y confirms; any other key cancels                                             │                   │
-│ ✓    terra        └──────────────────────────────────────────────────────────────────────────────┘                   │
+│ ✗    mars          ┌ confirm ───────────────────────────────────────────────────────────────────┐                    │
+│ ✓    mechanicus-for│turn on act mode? updates will be possible. y/N                             │                    │
+│ ✓    phobos        │                                                                            │GiB free            │
+│ ↑◆   sol           │y confirms; any other key cancels                                           │                    │
+│ ✓    terra         └────────────────────────────────────────────────────────────────────────────┘                    │
 │ ✓    titan                in sync                  ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
 │ ✗    triton               unreachable              ││                                                                │
 │ !    vulcan               eval error               ││                                                                │
