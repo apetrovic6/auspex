@@ -1224,6 +1224,13 @@ fn store_path(c: char, name: &str) -> auspex_domain::observe::StorePath {
 /// preview on, its own closure (`now`, zlib, a huge library) and the pending one (`next`, zlib,
 /// a small tool) come back from the preview; without it, only the checks' own answer is there.
 fn luna_with_a_preview(preview: bool, free_gib: u64) -> Shell {
+    luna_with_a_preview_of(preview, free_gib, true)
+}
+
+/// [`luna_with_a_preview`], where the closure the preview fetched from luna may not contain the
+/// system its probe saw (`deployed_has_current` false): luna changed system in between, so that
+/// closure is not luna's.
+fn luna_with_a_preview_of(preview: bool, free_gib: u64, deployed_has_current: bool) -> Shell {
     let config = Config {
         flake: "/fleet".to_owned(),
         allow_act: true,
@@ -1264,11 +1271,14 @@ fn luna_with_a_preview(preview: bool, free_gib: u64) -> Shell {
         s.resolve(
             &mut deployed,
             Ok(auspex_domain::closure::ClosurePaths {
-                paths: vec![
-                    store_path('0', "nixos-system-now"),
-                    store_path('c', "zlib-1.3.1"),
-                    store_path('g', "huge-library-1.0"),
-                ],
+                paths: [
+                    deployed_has_current.then(|| store_path('0', "nixos-system-now")),
+                    Some(store_path('c', "zlib-1.3.1")),
+                    Some(store_path('g', "huge-library-1.0")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
                 dropped: 0,
             }),
         );
@@ -1393,5 +1403,54 @@ fn a_typed_name_while_a_refresh_is_running_is_refused_too() {
     assert_eq!(
         notice(&s),
         "a refresh is running; ask again when it has finished"
+    );
+}
+
+/// A closure fetched from a machine that has since changed system is not that machine's: it is
+/// not used to lower the estimate (the reviewer's mutation F09).
+#[test]
+fn a_closure_that_does_not_contain_the_probed_system_is_not_used() {
+    let mut s = luna_with_a_preview_of(true, 3, false);
+    let confirm = dialog(&mut s, sized_closure());
+    assert_eq!(confirm.kind, ConfirmKind::Refused);
+    assert!(
+        confirm.refusals[0].contains("the whole closure's"),
+        "{:?}",
+        confirm.refusals
+    );
+}
+
+/// After an update the machine is probed and evaluated again, and what it has is not what it had:
+/// its closure is forgotten until the preview fetches it again (mutation F10).
+#[test]
+fn after_an_update_the_machines_closure_is_forgotten_until_it_is_fetched_again() {
+    let mut s = luna_with_a_preview(true, 3);
+    let confirm = dialog(&mut s, sized_closure());
+    assert_eq!(confirm.kind, ConfirmKind::Update, "precondition");
+    let mut action = proceeds(&mut s);
+    s.resolve(
+        &mut action,
+        auspex_core::effects::ActionEnd {
+            result: auspex_core::effects::ActionResult::Succeeded,
+            exit_code: Some(0),
+            summary: Vec::new(),
+            explanation: None,
+        },
+    );
+    // luna is probed and evaluated again, and answers; the preview is not asked again.
+    s.probe("luna", probe_with_store("luna", Some(3)));
+    let mut eval = s.evals.pop().expect("luna's own evaluation");
+    s.eval_item(
+        &mut eval,
+        "luna",
+        evaluated("luna", &path('1', "nixos-system-next")),
+    );
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    let confirm = dialog(&mut s, sized_closure());
+    assert_eq!(confirm.kind, ConfirmKind::Refused, "{:?}", confirm.warnings);
+    assert!(
+        confirm.refusals[0].contains("the whole closure's"),
+        "{:?}",
+        confirm.refusals
     );
 }
