@@ -257,6 +257,20 @@ pub fn diff_headline(diff: &PackageDiff) -> Option<String> {
 }
 
 impl MachineReport {
+    /// The tags worth showing next to the class: Clan's inventory adds `all` and the
+    /// machine's class (`nixos` or `darwin`) to every machine, and those say nothing the class
+    /// does not. [`Self::tags`] and `--json` keep the full list; this is for display only.
+    pub fn display_tags(&self) -> impl Iterator<Item = &str> {
+        let class = match self.class {
+            MachineClass::Nixos => "nixos",
+            MachineClass::Darwin => "darwin",
+        };
+        self.tags
+            .iter()
+            .map(String::as_str)
+            .filter(move |t| *t != "all" && *t != class)
+    }
+
     /// Attaches a pure preview; only computed update-pending rows gain a short headline.
     ///
     /// Status, badges and settlement never depend on the preview. Call this once for a

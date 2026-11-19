@@ -345,10 +345,13 @@ pub fn detail_lines(
                 auspex_domain::fleet::MachineClass::Nixos => "nixos",
                 auspex_domain::fleet::MachineClass::Darwin => "darwin",
             },
-            if m.tags.is_empty() {
-                String::new()
-            } else {
-                format!("  tags: {}", m.tags.join(", "))
+            {
+                let tags: Vec<&str> = m.display_tags().collect();
+                if tags.is_empty() {
+                    String::new()
+                } else {
+                    format!("  tags: {}", tags.join(", "))
+                }
             }
         ),
     ));

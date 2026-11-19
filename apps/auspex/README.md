@@ -34,6 +34,10 @@ terminal, the report could not be written, a closed pipe on stdout); 128 + n aft
 Unreachable or out-of-date machines are findings, not failures. With Prometheus configured
 but unreachable, headless mode says so on stderr and takes health from ssh.
 
+Clan's inventory adds `all` and the machine's class (`nixos` or `darwin`) to every machine's
+tags. The TUI's detail panel leaves those two out of its `tags:` list (they say nothing the
+class does not); `--json` keeps the inventory's full list, and `--plain` prints no tags.
+
 The package carries `nix-eval-jobs` (used only when none is on `PATH`), which with the nix
 libraries it links adds about 170 MiB to the closure: the price of `nix run` working on a
 system without it.
