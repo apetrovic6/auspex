@@ -251,6 +251,12 @@ nothing to remember to invalidate. Measured: 14.9 min cold, 4.3 min warm.
 And there is no Apple job — every runner is Linux and `xcodebuild` needs macOS natively, so
 `just apps/<app>/apple` is a manual check.
 
+The approval-window and queued-preview regression tests deliberately take longer than one
+timeout across the whole fake fleet, while leaving scheduling margin within each operation.
+Keep that distinction when changing their timings: increasing only the timeout can hide the
+regression. The worktree-cap regression uses a smaller injected cap, not a gigabyte of hashing,
+and checks that individually acceptable files are refused when their total exceeds it.
+
 Advisories run on a schedule as well as per-change, in `.forgejo/workflows/advisories.yaml`,
 because RUSTSEC publishing against a dependency you already have is a function of the date
 rather than of the commit. The nightly is also the only thing that writes back to the forge: it
