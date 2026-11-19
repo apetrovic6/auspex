@@ -199,12 +199,12 @@ pub const DEFAULT_GIT: &str = "git";
 /// The most worktree bytes hashed for a key: 1 GiB.
 ///
 /// The cap bounds what a hostile tree can make one key computation read (the key is
-/// computed twice per scan); past it there is no caching for that run. A fleet's Nix is a few megabytes, but the operator's tracks 263 MiB
-/// of wallpapers, which a 256 MiB cap left uncached. At the cap a computation costs about
-/// 1.2 s with a warm page cache (263 MiB take about 0.3 s), and is bounded by
-/// [`GitParams::read_timeout`] on a cold disk. Raising the cap replaced a per-file digest
-/// memo (PR #15), abandoned after three security reviews kept finding ways to serve a stale
-/// result: re-reading the bytes cannot.
+/// computed twice per scan); past it there is no caching for that run. A fleet's Nix is a
+/// few megabytes, but a fleet that tracks a few hundred MiB of assets, such as wallpapers,
+/// was left uncached by a 256 MiB cap. At the cap a computation costs about 1.2 s with a
+/// warm page cache, and is bounded by [`GitParams::read_timeout`] on a cold disk. Raising
+/// the cap replaced a per-file digest memo, which kept being found to serve a stale result;
+/// re-reading the bytes cannot.
 pub const MAX_WORKTREE_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The address-space limit put on every git command, in bytes: 512 MiB.
