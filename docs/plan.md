@@ -179,7 +179,10 @@ ssh options:
   `ControlPersist=600s` by default (`ssh.control_persist`, 60..3600 seconds);
 - `--` before the destination.
 - cold destinations authenticate separately (`timeouts.ssh_approval`, default 60 s,
-  5..600 s), then run the script under `timeouts.probe`; warm masters skip authentication.
+  5..600 s; the window is serialised, not the connections: the agent shows its prompts one at a
+  time, so a host's window ends `ssh_approval` after the later of its own start and the last
+  connection's end), then run the script under `timeouts.probe`; warm
+  masters skip authentication.
 
 Exit code 255 means ssh itself failed. Show ssh's last stderr line ("Host key verification
 failed"), not a bare `✗`.

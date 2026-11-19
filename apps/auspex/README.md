@@ -93,7 +93,7 @@ control_persist = 600 # seconds; 60..3600
 
 [timeouts]
 ssh_connect = 5      # TCP connection timeout; 1..60 seconds
-ssh_approval = 60    # authentication/agent approval; 5..600 seconds
+ssh_approval = 60    # authentication/agent approval, per host; 5..600 seconds
 probe = 10          # script execution, after authentication
 settle = 120        # global refresh deadline, including approval
 diff = 120          # one machine's package preview; 1..86400 seconds (see below)
@@ -114,14 +114,35 @@ one connection notice to stderr, never to JSON stdout. A stalled DNS lookup or
 authentication can use the entire `ssh_approval` allowance. The global `settle` deadline
 still bounds the whole refresh; the loader warns when it is shorter than approval plus probe.
 
+**Why approval prompts come one at a time.** An ssh agent that asks before it signs (Bitwarden,
+for one) shows its prompts one after another, and a prompt that is answered after ssh gave up
+is wasted. auspex connects to every cold host at once, because most of a connection (the
+network, a down host's timeout) needs no agent, but it serialises the *approval window*: a
+host's `ssh_approval` window ends that long after the later of its own start and the moment the
+most recent connection in this run ended (approved, refused, failed, timed out or cancelled),
+and it is worked out again whenever another connection ends. So each answered prompt gives
+the hosts still waiting a fresh window, and nine prompts answered a few seconds apart all
+land within their windows. A host that is down fails at SSH's connect timeout, in parallel
+with the others, and costs nothing extra; a host that stalls without a prompt holds up nobody
+and only times out on its own window. Hosts whose master is already up are never involved.
+The status bar and the headless note count the hosts connecting, which may or may not be
+waiting for the agent. A fleet of N cold hosts needs `settle` to cover the N prompts, answered
+one by one. Two limits: the window is per auspex process (a TUI and a `--json` run do not see
+each other's connections, so their prompts can interleave at the agent), and auspex assumes that
+killing a waiting ssh (on refresh, quit or timeout) withdraws its request from the agent. If your
+agent keeps showing the prompt of a client that has gone, the next prompt can appear
+behind it.
+
 Masters remain reusable for ten idle minutes by default. Any process running as the
 operator can reuse that authenticated connection; the checked, operator-owned 0700
 control directory (never a symlink) restricts access to the operator. Increase persistence
 only if that longer authenticated lifetime is acceptable.
 These SSH connections stay open for up to `ssh.control_persist` idle seconds **after
 auspex quits**. Lower the value to shorten that window, or close a known master explicitly:
-`ssh -S "$XDG_RUNTIME_DIR/auspex/<socket-hash>" -O exit -- user@host` (use its actual
-socket path and destination).
+`ssh -o ControlPath="$XDG_RUNTIME_DIR/auspex/%C" -O exit user@host` (add `-p PORT` for a
+non-default port): ssh works out the socket name itself. Without `XDG_RUNTIME_DIR` (or with a
+relative one) the directory is `auspex-<uid>` under `$TMPDIR`, or `/tmp`; use that in place of
+`$XDG_RUNTIME_DIR/auspex`.
 
 ## Package preview
 
