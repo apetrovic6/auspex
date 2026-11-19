@@ -122,8 +122,16 @@ fn act_on(shell: &Arc<Shell>) {
     shell.send(Event::ConfirmAnswer(true));
 }
 
-fn start_update(shell: &Arc<Shell>) {
+async fn start_update(shell: &Arc<Shell>) {
     shell.send(Event::UpdateSelected);
+    // The checks before the update run first (the demo answers them after a moment), then
+    // the question opens.
+    until(shell, "the checks before the update", |v| {
+        v.confirm
+            .as_ref()
+            .is_some_and(|c| c.kind != ConfirmKind::Checking)
+    })
+    .await;
     assert_eq!(
         shell.view().confirm.expect("a question").kind,
         ConfirmKind::Update
@@ -201,7 +209,7 @@ async fn an_update_runs_the_exact_argv_streams_and_is_logged_succeeded() {
     );
     ready(&w.shell).await;
     act_on(&w.shell);
-    start_update(&w.shell);
+    start_update(&w.shell).await;
     let end = ended(&w.shell).await;
     assert_eq!(end.result, ActionResult::Succeeded);
     assert_eq!(end.exit_code, Some(0));
@@ -280,7 +288,7 @@ async fn a_failed_update_is_logged_failed_with_a_summary_and_never_the_output() 
     let w = world(&t, &body, "exit 99");
     ready(&w.shell).await;
     act_on(&w.shell);
-    start_update(&w.shell);
+    start_update(&w.shell).await;
     let end = ended(&w.shell).await;
     assert_eq!(end.result, ActionResult::Failed);
     assert_eq!(end.exit_code, Some(1));
@@ -312,7 +320,7 @@ async fn a_nonzero_exit_that_is_not_ssh_is_not_blamed_on_ssh() {
     let w = world(&t, "echo \"error: builder failed\" >&2\nexit 2", "exit 99");
     ready(&w.shell).await;
     act_on(&w.shell);
-    start_update(&w.shell);
+    start_update(&w.shell).await;
     let end = ended(&w.shell).await;
     assert_eq!(end.exit_code, Some(2));
     assert!(end.explanation.is_none());
@@ -473,7 +481,7 @@ async fn a_log_that_cannot_be_used_is_a_warning_and_the_update_still_succeeds() 
     ));
     ready(&w.shell).await;
     act_on(&w.shell);
-    start_update(&w.shell);
+    start_update(&w.shell).await;
     let end = ended(&w.shell).await;
     assert_eq!(
         end.result,
@@ -500,7 +508,7 @@ const SLOW_CLAN: &str =
 async fn running_update(w: &World) -> Vec<i32> {
     ready(&w.shell).await;
     act_on(&w.shell);
-    start_update(&w.shell);
+    start_update(&w.shell).await;
     let pids = tokio::task::spawn_blocking({
         let p = w.dir.path().join("pids");
         move || wait_for_pids(&p, 2)

@@ -500,7 +500,15 @@ fn a_u_and_b_are_the_act_update_and_build_keys() {
 #[test]
 fn with_a_question_open_only_y_is_a_yes_and_nothing_else_acts() {
     let km = Keymap::defaults();
-    for kind in [ConfirmKind::Act, ConfirmKind::Update, ConfirmKind::Quit] {
+    for kind in [
+        ConfirmKind::Act,
+        ConfirmKind::Update,
+        ConfirmKind::Quit,
+        // The checks are running, or refused: any key answers, and the core ignores a yes
+        // there (it was never shown the question).
+        ConfirmKind::Checking,
+        ConfirmKind::Refused,
+    ] {
         let screen = Screen {
             confirm: Some(kind),
             ..SCREEN
@@ -545,7 +553,11 @@ fn ctrl_c_escalates_ask_then_stop_then_force() {
     );
     assert_eq!(feed(&mut input, &km, SCREEN, &[ctrl('c')]), ["Quit"]);
     // But not to the other questions: Ctrl-C never turns act mode on or starts an update.
-    for kind in [ConfirmKind::Act, ConfirmKind::Update] {
+    for kind in [
+        ConfirmKind::Act,
+        ConfirmKind::Update,
+        ConfirmKind::UpdateTyped,
+    ] {
         let screen = Screen {
             confirm: Some(kind),
             ..SCREEN
@@ -606,4 +618,49 @@ fn the_help_lists_the_new_keys_from_the_live_keymap() {
             "{keys} {what}: {lines:?}"
         );
     }
+}
+
+/// A typed confirmation takes text: characters are typed, Enter submits, Backspace deletes,
+/// Esc and Ctrl-C cancel, and no other key does anything. In particular `y` is a letter, and
+/// no key but Enter can confirm.
+#[test]
+fn a_typed_confirmation_takes_text_and_only_enter_submits() {
+    let km = Keymap::defaults();
+    let screen = Screen {
+        confirm: Some(ConfirmKind::UpdateTyped),
+        act: true,
+        ..SCREEN
+    };
+    let feed_one = |key: Key| feed(&mut Input::default(), &km, screen, &[key]);
+    for c in [
+        'l', 'U', 'y', 'N', '-', '_', '7', 'q', 'j', 'A', 'u', 'b', ' ', '/',
+    ] {
+        assert_eq!(
+            feed_one(Key::char(c)),
+            [format!("ConfirmChar({c:?})")],
+            "{c:?} is text, not a command"
+        );
+    }
+    assert_eq!(feed_one(Key::plain(KeyCode::Enter)), ["ConfirmSubmit"]);
+    assert_eq!(
+        feed_one(Key::plain(KeyCode::Backspace)),
+        ["ConfirmBackspace"]
+    );
+    assert_eq!(feed_one(esc()), ["ConfirmAnswer(false)"]);
+    assert_eq!(feed_one(ctrl('c')), ["ConfirmAnswer(false)"]);
+    // Nothing else means anything: a control chord is not a letter, an arrow is not a yes.
+    for key in [
+        ctrl('y'),
+        ctrl('m'),
+        Key::plain(KeyCode::Tab),
+        Key::plain(KeyCode::Up),
+        Key::plain(KeyCode::F(5)),
+    ] {
+        assert_eq!(feed_one(key), NOTHING, "{key}");
+    }
+    // And no count or pending key survives into the dialog.
+    let mut input = Input::default();
+    let _ = feed(&mut input, &km, SCREEN, &chars("5g"));
+    let _ = feed(&mut input, &km, screen, &chars("x"));
+    assert_eq!((input.count, input.pending.len()), (None, 0));
 }

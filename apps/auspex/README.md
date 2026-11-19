@@ -55,13 +55,48 @@ colour, and `A` turns it off again at once. In observe mode `u` only says `act m
 
 | Key | What it does |
 |---|---|
-| `u` | Act mode only. Asks `update luna to 0a1b2c3d nixos-system-luna-…? y/N` (the pending system as the detail panel shows it, hash prefix first), then runs exactly `clan machines update --host-key-check strict --flake <fleet> -- luna` with the fleet's pinned `clan` (found from its lock, never from `PATH`). One machine, named, validated against the inventory; one action at a time. |
+| `u` | Act mode only. Runs the checks below, then asks `update luna to 0a1b2c3d nixos-system-luna-…? y/N` (the pending system as the detail panel shows it, hash prefix first; the machine's name typed, for a public one), then runs exactly `clan machines update --host-key-check strict --flake <fleet> -- luna` with the fleet's pinned `clan` (found from its lock, never from `PATH`). One machine, named, validated against the inventory; one action at a time. |
 | `b` | Builds the machine's pending system here (`nix build --no-link --print-out-paths --no-write-lock-file <fleet>#nixosConfigurations.luna.config.system.build.toplevel`; `darwinConfigurations.<m>.system` for darwin). Changes nothing on any machine, so it needs no act mode. Refused for a machine of another system than this one. |
 | `L` | The Log tab: the streamed output of the current and last action, standard error in its own colour, the last 10 000 lines of each, following the tail until you scroll up (`k`, `Ctrl-u`, `gg`; `G` follows again). `Tab` switches to the adapters' notes. |
 
 **Questions are answered only once they could be read.** A `y/N` question is not answered by a key that arrives before it has been on screen, whole, for 0.3 s (typeahead such as `Ayuy` in one burst, or a `y` typed by habit right behind the `u`, is discarded and the question stays open). A pane too small to show the whole question shows "terminal too small to ask" instead, and nothing answers it until the pane is large enough and the 0.3 s have passed. A paste is never a `y`: bracketed paste is on, so pasted text is not typed, and with a readable question open it answers no. A second `Ctrl-C` that arrives within that 0.3 s of the quit question is ignored for the same reason.
 
 **`clan` deploys the working tree as it is at `y`**, not the evaluation auspex showed in the question, which may be hours old (auspex left open, the tree edited, `git pull`). auspex compares the pending system with the one it asked about: if a refresh changed it, `y` asks again about the new one and deploys nothing. Edits to the tree since the last evaluation are not seen by that check.
+
+### Before an update: the checks and the confirmation
+
+`u` does not ask at once. It first looks at what the update is about to do, and then shows
+**one dialog** with everything it found: what **refuses** the update first (there is no way to
+proceed; any key closes the dialog), then the **warnings**, then the question. While it looks
+(a `git status` and a size query, at most `timeouts.diff`) the dialog says so, and any key
+cancels the look.
+
+| Check | Refuses | Warns |
+|---|---|---|
+| **The fleet repository** (`git status` in the fleet directory, read-only: no hooks, no filters, no index rewrite) | never | uncommitted changes to tracked files (untracked files do not count: nix ignores them); `HEAD` ahead of its upstream; no upstream (or a deleted one, or a detached `HEAD`); the check could not run |
+| **Free disk on the target's `/nix/store`** (the probe's `df -Pk /nix/store`, not `/`: with impermanence `/` is a tmpfs) | free is less than the pending closure's size plus 1 GiB | the free space or the closure's size is not known (the size is the sum of NAR sizes from `nix path-info --recursive --size`, against the local store first and then the binary cache) |
+| **Duplicate address** (the shared-IP lint) | the machine's target resolves to an address another machine's does too (the dialog names which), **or its address is not known** (the rule fails closed: a hostname that did not resolve cannot be told apart from another machine) | other machines' addresses are not known |
+
+A check that fails to *run* is a warning, not a refusal, except the duplicate-address rule.
+The free space is the probe's, from the last scan, and the closure size is the whole closure
+(a deploy copies less, since the target already has most of it): the check errs towards
+refusing, by design.
+
+The question is `update luna to 0a1b2c3d nixos-system-luna-…? y/N` for a machine that is not **public**.
+For a machine marked public (`machines.<m>.public = true`, see Configuration) it is `type luna,
+then Enter`: `y` is just a letter there, only the machine's exact name confirms, and Esc
+cancels. Each stage is a question of its own (the "checking" dialog, then the dialog with what
+the checks found, a refusal or a warning included): a key typed before the frame that shows it
+is discarded, so a key pressed while the checks ran counts for none of them. Everything is
+decided again at the moment you confirm, so a refresh that happened while the dialog was open
+cannot let a refused update through; and if it changed the pending system, nothing is deployed
+and the checks run again for the new one.
+
+*Not yet:* the plan also asks for the typed name when the update's NixOS **option diff**
+touches openssh, the firewall or networking. That needs a diff of options between the deployed
+and the pending system, which does not exist (AUS-22). The decision is one function,
+`auspex_domain::preflight::option_diff_touches_network`, which says `false` today and is
+already consulted; it is not approximated from package names.
 
 The status bar names the running action and, at the end, how it ended. A deploy that fails at
 ssh says so, and what to change (`nixos-rebuild` strips `SSH_AUTH_SOCK`; an agent with many keys
@@ -129,10 +164,13 @@ ssh_connect = 5      # TCP connection timeout; 1..60 seconds
 ssh_approval = 60    # authentication/agent approval, per host; 5..600 seconds
 probe = 10          # script execution, after authentication
 settle = 120        # global refresh deadline, including approval
-diff = 120          # one machine's package preview; 1..86400 seconds (see below)
+diff = 120          # one machine's package preview, and the checks before an update; 1..86400 seconds (see below)
 
 [diff]
 enabled = true      # false: never query a closure; package_diff stays null
+
+[machines.alfrost]
+public = true       # updating it asks for its name to be typed, not y (default false)
 ```
 
 The config file's `flake` and `CLAN_DIR` take a leading `~/` (your `$HOME`; `~user/` is refused);

@@ -1,0 +1,24 @@
+┌ machines (18) ───────────────────────┐
+│ ✓    alfrost         in sync         │
+│ ✓    callisto        in sync         │
+│ ✓⚠   cerberus        in sync         │
+┌ confirm ─────────────────────────────┐
+│update cypramundi to 8jx7iv6h         │
+│nixos-system-cypramundi-25.11.202611  │
+│01.6a2f1c0? it is marked public:      │
+│type cypramundi, then Enter. Esc      │
+│cancels                               │
+│                                      │
+│> cypramund▏                          │
+│that is not cypramundi                │
+│                                      │
+│Enter confirms the exact name; Esc    │
+│cancels                               │
+└──────────────────────────────────────┘
+│ ✗    triton          unreachable     │
+│ !    vulcan          eval error      │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+log: eval results stored in the cache: …
+ACT │ settled │ 0 pending │ prom: ok

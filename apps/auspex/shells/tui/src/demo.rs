@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use auspex_core::effects::{
     CacheRequest, ClosureAnswer, DeployedClosureRequest, EvalRequest, InventoryAnswer,
-    PendingClosureRequest, ProbeRequest, PrometheusAnswer, PrometheusRequest, ResolveRequest,
+    PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer, PrometheusRequest,
+    ResolveRequest,
 };
 use auspex_core::{Config, DiffConfig, PrometheusConfig};
 use auspex_domain::closure::ClosurePaths;
@@ -27,6 +28,7 @@ use auspex_domain::fleet::parse_inventory;
 use auspex_domain::observe::{
     DiskUsage, Load, Memory, ProbeExit, ProbeOutcome, PromSample, StorePath, parse_probe,
 };
+use auspex_domain::preflight::{TreeState, Upstream};
 use auspex_domain::status::NarCache;
 use auspex_effects::clan::{ClanRun, RunEnd};
 use auspex_effects::nix::EvalItem;
@@ -40,6 +42,9 @@ pub const LOCAL_SYSTEM: &str = "x86_64-linux";
 
 /// The demo's flake, shown as the fleet's location.
 pub const FLAKE: &str = "demo:omnissiah";
+
+/// The demo machine marked public, so its update asks for its name to be typed.
+pub const PUBLIC_MACHINE: &str = "cypramundi";
 
 /// The core configuration the demo starts with: Prometheus and a binary cache configured,
 /// so every badge can appear.
@@ -61,6 +66,9 @@ pub fn config() -> Config {
         }),
         allow_act: true,
         local_system: LOCAL_SYSTEM.to_owned(),
+        // The demo has one machine whose update asks for its name typed.
+        public_machines: std::collections::BTreeSet::from([PUBLIC_MACHINE.to_owned()]),
+        preflight_timeout_seconds: 5,
     }
 }
 
@@ -255,7 +263,8 @@ fn probe_text(s: &Script) -> ProbeOutcome {
             &format!(
                 "auspex_probe=1\nprobe=darwin\ncurrent_system={current}\n\
                  configuration_revision=null\nuptime_seconds=432000\nload=1.21 1.05 0.98\n\
-                 root_disk_kb=494384795 211234400 283150395\nauspex_end=1\n"
+                 root_disk_kb=494384795 211234400 283150395\n\
+                 store_disk_kb=494384795 211234400 283150395\nauspex_end=1\n"
             ),
             "",
             ProbeExit::Code(0),
@@ -287,7 +296,8 @@ fn probe_text(s: &Script) -> ProbeOutcome {
              booted_kernel={booted}\nbooted_initrd=\ncurrent_kernel={kernel}\ncurrent_initrd=\n\
              configuration_revision={revision}\nsystem_state={state}\nfailed_units={failed}\n\
              uptime_seconds=1209600\nload=0.42 0.37 0.31\n\
-             root_disk_kb=245000000 98000000 134500000\nauspex_end=1\n"
+             root_disk_kb=245000000 98000000 134500000\n\
+             store_disk_kb=245000000 98000000 134500000\nauspex_end=1\n"
         ),
         "",
         ProbeExit::Code(0),
@@ -422,6 +432,9 @@ pub struct Demo {
     /// Run `u` and `b` for real, with these adapters (fake `clan` and `nix` programs), over the
     /// scripted fleet. `None`: actions are scripted too and touch nothing.
     pub real_actions: Option<Box<crate::backend::Real>>,
+    /// What the checks before an update find in the shell. `None`: a clean, pushed tree and a
+    /// closure of 2.3 GiB. The shell's own tests set it to make each check warn or refuse.
+    pub preflight_answer: Option<PreflightAnswer>,
 }
 
 impl Demo {
@@ -566,6 +579,30 @@ impl Demo {
     ) -> Result<ClosureAnswer, Cancelled> {
         after(500, cancel).await?;
         Ok(Ok(closure(&op.machine, true)))
+    }
+
+    pub(crate) async fn preflight(
+        &self,
+        op: &auspex_core::effects::PreflightRequest,
+        cancel: &CancellationToken,
+    ) -> Result<PreflightAnswer, Cancelled> {
+        after(250, cancel).await?;
+        let _ = op;
+        Ok(self
+            .preflight_answer
+            .clone()
+            .unwrap_or_else(|| PreflightAnswer {
+                tree: Ok(TreeState {
+                    changed_files: 0,
+                    upstream: Upstream::Tracking {
+                        name: "origin/main".to_owned(),
+                        ahead: 0,
+                        behind: 0,
+                    },
+                }),
+                // 2.3 GiB.
+                closure_bytes: Ok(2_469_606_195),
+            }))
     }
 }
 

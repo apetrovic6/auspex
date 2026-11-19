@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use auspex_core::effects::{
     ActionRequest, CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest, InventoryRequest,
-    PendingClosureRequest, ProbeRequest, PrometheusRequest, ResolveRequest,
+    PendingClosureRequest, PreflightRequest, ProbeRequest, PrometheusRequest, ResolveRequest,
 };
 use auspex_core::{
     Auspex, Config, Core, DiffConfig, Effect, Event, PrometheusConfig, RequestId, ViewModel,
@@ -117,6 +117,8 @@ pub fn full_config() -> Config {
         diff: None,
         allow_act: false,
         local_system: String::new(),
+        public_machines: std::collections::BTreeSet::new(),
+        preflight_timeout_seconds: 90,
     }
 }
 
@@ -151,6 +153,8 @@ pub struct Shell {
     pub pending_closures: Vec<Request<PendingClosureRequest>>,
     /// Update and build requests, which the test answers as the shell would.
     pub actions: Vec<Request<ActionRequest>>,
+    /// The checks before an update, which the test answers as the shell would.
+    pub preflights: Vec<Request<PreflightRequest>>,
     /// Every cancel the core has emitted, in order.
     pub cancels: Vec<RequestId>,
     /// Every request id the core has issued, in order.
@@ -176,6 +180,7 @@ impl Shell {
             deployed: Vec::new(),
             pending_closures: Vec::new(),
             actions: Vec::new(),
+            preflights: Vec::new(),
             cancels: Vec::new(),
             issued: Vec::new(),
         }
@@ -227,6 +232,10 @@ impl Shell {
                     self.issued.push(r.operation.id);
                     self.pending_closures.push(r);
                 }
+                Effect::Preflight(r) => {
+                    self.issued.push(r.operation.id);
+                    self.preflights.push(r);
+                }
                 Effect::RunAction(r) => {
                     self.issued.push(r.operation.id);
                     self.actions.push(r);
@@ -257,6 +266,7 @@ impl Shell {
         self.resolves.retain(|r| live(&r.operation.id));
         self.deployed.retain(|r| live(&r.operation.id));
         self.pending_closures.retain(|r| live(&r.operation.id));
+        self.preflights.retain(|r| live(&r.operation.id));
     }
 
     /// The number of requests of every kind not yet taken by the test.
@@ -372,6 +382,15 @@ impl Shell {
         assert_eq!(self.actions.len(), 1, "one action request outstanding");
         self.actions.remove(0)
     }
+
+    pub fn take_preflight(&mut self) -> Request<PreflightRequest> {
+        assert_eq!(
+            self.preflights.len(),
+            1,
+            "one pre-update check request outstanding"
+        );
+        self.preflights.remove(0)
+    }
 }
 
 /// [`full_config`] that may enter act mode, on a machine whose system is `x86_64-linux`.
@@ -380,5 +399,22 @@ pub fn act_config() -> Config {
         allow_act: true,
         local_system: "x86_64-linux".to_owned(),
         ..full_config()
+    }
+}
+
+/// What the shell finds when the fleet repository is clean and pushed and the closure is
+/// 2 GiB: nothing for the checks to say about either (the probe of [`observed`] reports no
+/// `/nix/store` disk, so the disk check, which needs it, says it is unknown).
+pub fn clean_preflight() -> auspex_core::PreflightAnswer {
+    auspex_core::PreflightAnswer {
+        tree: Ok(auspex_domain::preflight::TreeState {
+            changed_files: 0,
+            upstream: auspex_domain::preflight::Upstream::Tracking {
+                name: "origin/main".to_owned(),
+                ahead: 0,
+                behind: 0,
+            },
+        }),
+        closure_bytes: Ok(2 << 30),
     }
 }

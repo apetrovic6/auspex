@@ -61,8 +61,8 @@ use crate::config::Config;
 use crate::effects::{
     ActionEnd, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest, Effect,
     EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
-    PendingClosureRequest, ProbeRequest, PrometheusAnswer, PrometheusRequest, RequestId,
-    ResolveRequest,
+    PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer, PrometheusRequest,
+    RequestId, ResolveRequest,
 };
 use crate::view::{Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState};
 
@@ -235,8 +235,27 @@ pub enum Event {
     /// Build the selected machine's pending system here (`b`). Changes nothing on any machine,
     /// so it needs no act mode; refused for another system's machine.
     BuildSelected,
-    /// The answer to the open question: `true` for `y`, `false` for anything else.
+    /// The answer to the open question: `true` for `y`, `false` for anything else. For a
+    /// question that asks for a typed name ([`crate::ConfirmKind::UpdateTyped`]) `true` is
+    /// ignored: only [`Event::ConfirmSubmit`] with the exact name confirms, and `false`
+    /// cancels. For a refusal either answer just closes it.
     ConfirmAnswer(bool),
+    /// A character typed into a typed confirmation. Ignored unless one is open, and for
+    /// anything a machine name cannot contain.
+    ConfirmChar(char),
+    /// Backspace in a typed confirmation.
+    ConfirmBackspace,
+    /// Enter in a typed confirmation: confirms only when the text is the machine's name,
+    /// exactly.
+    ConfirmSubmit,
+    /// [`PreflightRequest`](crate::effects::PreflightRequest) answered: the checks before an
+    /// update have what they need from the shell. Built by the core; a shell never sends it.
+    PreflightAnswered {
+        /// The request.
+        id: RequestId,
+        /// What it found.
+        answer: PreflightAnswer,
+    },
     /// The operator wants to quit. Cancels everything outstanding and sets
     /// [`ViewModel::quit`], except while an action is running: then it asks, and quits once
     /// the action has been stopped, killed and reaped. A second quit while it is stopping
@@ -636,6 +655,10 @@ impl App for Auspex {
             | Event::UpdateSelected
             | Event::BuildSelected
             | Event::ConfirmAnswer(_)
+            | Event::ConfirmChar(_)
+            | Event::ConfirmBackspace
+            | Event::ConfirmSubmit
+            | Event::PreflightAnswered { .. }
             | Event::ActionEnded { .. }) => act::event(model, event),
             view_event => {
                 view_update(model, view_event);
@@ -1430,6 +1453,10 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::UpdateSelected
         | Event::BuildSelected
         | Event::ConfirmAnswer(_)
+        | Event::ConfirmChar(_)
+        | Event::ConfirmBackspace
+        | Event::ConfirmSubmit
+        | Event::PreflightAnswered { .. }
         | Event::ActionEnded { .. }
         | Event::Terminate
         | Event::Quit => {}

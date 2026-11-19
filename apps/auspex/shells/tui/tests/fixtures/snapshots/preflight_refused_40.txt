@@ -1,0 +1,30 @@
+┌ machines (18) ───────────────────────┐
+│ ✓    alfrost         in sync         │
+│ ✓    callisto        in sync         │
+│ ✓⚠   cerberus        in sync         │
+│ ↑    cypramundi      update pending  │
+┌ confirm ─────────────────────────────┐
+│refused: europa's target resolves to  │
+│  192.168.1.30, which io and vulcan   │
+│  also resolve to: an update could    │
+│  land on the wrong machine           │
+│warning: the fleet repository has     │
+│  uncommitted changes to 2 tracked    │
+│  files: the update deploys them, and │
+│  no commit says what was deployed    │
+│warning: the fleet repository's HEAD  │
+│  is 1 commit ahead of origin/main:   │
+│  what is deployed has not been pushed│
+│                                      │
+│europa will not be updated.           │
+│                                      │
+│any key closes                        │
+└──────────────────────────────────────┘
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+log: eval results stored in the cache: …
+ACT │ settled │ 0 pending │ prom: ok

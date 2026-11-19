@@ -30,6 +30,7 @@ use auspex_domain::closure::ClosurePaths;
 use auspex_domain::eval::EvalOutcome;
 use auspex_domain::fleet::{Machine, MachineClass, Target};
 use auspex_domain::observe::{ProbeOutcome, PromSample, StorePath};
+use auspex_domain::preflight::TreeState;
 use auspex_domain::status::NarCache;
 use crux_core::capability::Operation;
 use crux_core::macros::effect;
@@ -284,6 +285,43 @@ impl Operation for ResolveRequest {
     type Output = BTreeMap<String, Vec<IpAddr>>;
 }
 
+/// The checks that need the world, run after `u` and before the confirmation: the state of
+/// the fleet repository and the size of the closure the update would copy.
+///
+/// The shell fulfils it with `auspex-effects`'s `preflight` adapters (one read-only `git
+/// status`, one `nix path-info --recursive --size`), both bounded by `timeout_seconds`, and
+/// answers once with both results. Each is a value, so a check that could not run says why
+/// and the core shows it as a warning; the shell never drops this request. What the core adds
+/// to the answer (the probe's free space, the machine addresses, the `public` flag) it
+/// already holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The machine, for logging.
+    pub machine: String,
+    /// The fleet flake, as configured: where the repository to check is.
+    pub flake: String,
+    /// The pending toplevel, whose closure is sized.
+    pub store_path: StorePath,
+    /// `timeouts.diff`.
+    pub timeout_seconds: u64,
+}
+
+/// What the shell found out for the checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreflightAnswer {
+    /// The fleet repository's state, or one line on why it could not be read (not a local
+    /// directory, not a git repository, git failed or timed out).
+    pub tree: Result<TreeState, String>,
+    /// The pending closure's NAR size in bytes, or one line on why it is not known.
+    pub closure_bytes: Result<u64, String>,
+}
+
+impl Operation for PreflightRequest {
+    type Output = PreflightAnswer;
+}
+
 /// What an action does to a machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActionKind {
@@ -422,6 +460,8 @@ pub enum Effect {
     DeployedClosure(DeployedClosureRequest),
     /// [`PendingClosureRequest`].
     PendingClosure(PendingClosureRequest),
+    /// [`PreflightRequest`]: the checks before an update.
+    Preflight(PreflightRequest),
     /// [`CancelRequest`].
     Cancel(CancelRequest),
     /// [`ActionRequest`]: an update or a build, with its output streamed to the shell's log.

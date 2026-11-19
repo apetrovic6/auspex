@@ -11,8 +11,8 @@ use std::time::{Duration, SystemTime};
 
 use auspex_core::effects::{
     ActionKind, ActionRequest, CacheRequest, ClosureAnswer, DeployedClosureRequest, EvalRequest,
-    InventoryAnswer, InventoryRequest, PendingClosureRequest, ProbeRequest, PrometheusAnswer,
-    PrometheusRequest, ResolveRequest,
+    InventoryAnswer, InventoryRequest, PendingClosureRequest, PreflightAnswer, PreflightRequest,
+    ProbeRequest, PrometheusAnswer, PrometheusRequest, ResolveRequest,
 };
 use auspex_domain::fleet::ConnectTimeout;
 use auspex_domain::observe::ProbeOutcome;
@@ -23,7 +23,7 @@ use auspex_effects::closure::{self, PendingParams};
 use auspex_effects::http::HttpClient;
 use auspex_effects::nix::{self, EvalItem, EvalMachine, EvalParams, FlakeRef};
 use auspex_effects::ssh::{self, ControlDir, ProbeParams};
-use auspex_effects::{CancellationToken, Cancelled, act, dns, narinfo, prometheus};
+use auspex_effects::{CancellationToken, Cancelled, act, dns, narinfo, preflight, prometheus};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::config::{FlakeSource, Settings};
@@ -212,6 +212,23 @@ impl Backend {
         }
     }
 
+    /// `Effect::Preflight`: the checks before an update that need the world. The tree check
+    /// and the closure size run together, each bounded by `op.timeout_seconds`.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn preflight(
+        &self,
+        op: &PreflightRequest,
+        cancel: &CancellationToken,
+    ) -> Result<PreflightAnswer, Cancelled> {
+        match self {
+            Self::Real(r) => r.preflight(op, cancel).await,
+            Self::Demo(d) => d.preflight(op, cancel).await,
+        }
+    }
+
     /// `Effect::RunAction`: the process's lines go to `sink` as they are printed; the result is
     /// how it ended, or why it could not be started or was refused.
     ///
@@ -330,7 +347,7 @@ impl Real {
             nix: program("AUSPEX_NIX", OsString::from(nix::DEFAULT_NIX)),
             nix_store: program("AUSPEX_NIX_STORE", OsString::from(nix::DEFAULT_NIX_STORE)),
             nix_eval_jobs: program("AUSPEX_NIX_EVAL_JOBS", nix_eval_jobs()),
-            git: OsString::from(cache::DEFAULT_GIT),
+            git: program("AUSPEX_GIT", OsString::from(cache::DEFAULT_GIT)),
             control_dir: ControlDir::prepare(&ControlDir::default_path()).map_err(|e| e.0),
             connect_timeout: ConnectTimeout::new(t.ssh_connect).unwrap_or(ConnectTimeout::DEFAULT),
             control_persist: settings.ssh.control_persist,
@@ -398,6 +415,15 @@ impl Real {
             clan: ClanLocator::new(),
             clan_path,
         }
+    }
+
+    /// These adapters with `git` and a binary cache URL as given: for the shell's own tests,
+    /// which run the checks before an update against a fake `git` and a fake `nix`.
+    #[must_use]
+    pub fn with_git_and_cache(mut self, git: OsString, cache_url: Option<String>) -> Self {
+        self.git = git;
+        self.cache_url = cache_url;
+        self
     }
 
     /// What is wrong locally and will affect every request of a kind, said once at start
@@ -583,6 +609,39 @@ impl Real {
             timeout: Duration::from_secs(op.timeout_seconds),
         };
         closure::pending(&op.store_path, &params, cancel).await
+    }
+
+    async fn preflight(
+        &self,
+        op: &PreflightRequest,
+        cancel: &CancellationToken,
+    ) -> Result<PreflightAnswer, Cancelled> {
+        // The same bound for both; never "none". Each adapter enforces it on its own children.
+        let timeout = Duration::from_secs(op.timeout_seconds.max(1));
+        let tree = async {
+            let flake = match FlakeRef::new(&op.flake) {
+                Ok(f) => f,
+                Err(e) => return Ok(Err(self.fleet_error(&op.flake, &e.0))),
+            };
+            let mut git = GitParams::new();
+            git.program = &self.git;
+            git.timeout = timeout;
+            preflight::fleet_tree(&git, &flake, cancel).await
+        };
+        let size = async {
+            let params = PendingParams {
+                nix: &self.nix,
+                nix_store: &self.nix_store,
+                cache_url: self.cache_url.as_deref(),
+                timeout,
+            };
+            preflight::closure_size(&op.store_path, &params, cancel).await
+        };
+        let (tree, closure_bytes) = tokio::join!(tree, size);
+        Ok(PreflightAnswer {
+            tree: tree?,
+            closure_bytes: closure_bytes?,
+        })
     }
 
     /// `Update`: resolve the fleet's pinned `clan` (a build of `clan-cli` the first time, which

@@ -12,7 +12,8 @@
 use std::time::{Duration, Instant};
 
 use auspex_core::{
-    ActionResult, ActionStatus, ActionView, Event, Mode, Phase, PrometheusStatus, ViewModel,
+    ActionResult, ActionStatus, ActionView, ConfirmKind, Event, Mode, Phase, PrometheusStatus,
+    ViewModel,
 };
 use auspex_domain::fleet::{Lint, TargetSource};
 use auspex_domain::observe::{HealthSource, StorePath};
@@ -1056,8 +1057,12 @@ const TOO_SMALL: &str = "terminal too small to ask: make it larger";
 /// The narrowest box the question is asked in. Narrower, it wraps into a column nobody reads.
 const MIN_CONFIRM_WIDTH: u16 = 28;
 
-/// The question waiting for y or N, in a box of its own: a one-line prompt would cut the very
+/// The question waiting for an answer, in a box of its own: a one-line prompt would cut the very
 /// words that say what `y` does at 40 columns.
+///
+/// For an update the box carries everything the checks found, in the order that matters:
+/// what **refused** it (the update cannot go ahead), then the **warnings**, then the question,
+/// then what to press. A refused update says there is nothing to press but a key to close it.
 ///
 /// Returns whether the whole question, and the line saying what `y` does, fitted. A pane too
 /// small to show it is not asking anything: the box then says so, the question is not counted
@@ -1069,15 +1074,57 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
     let theme = ctx.theme;
     let width = area.width.min(78);
     let text_cells = usize::from(width.saturating_sub(4)).max(1);
-    let mut lines: Vec<Line> = wrap(&confirm.question, text_cells)
-        .into_iter()
-        .map(|l| Line::from(Span::styled(l, theme.style(Role::Warning))))
-        .collect();
+    let mut lines: Vec<Line> = Vec::new();
+    // Sentences from the checks start with their kind in words, so the colour is not the only
+    // thing that says which is which (a monochrome terminal, a colour-blind operator).
+    let mut section = |label: &str, role: Role, items: &[String]| {
+        for item in items {
+            for (i, l) in wrap(&format!("{label}: {item}"), text_cells)
+                .into_iter()
+                .enumerate()
+            {
+                // Continuation lines are indented under the sentence.
+                let l = if i == 0 { l } else { format!("  {l}") };
+                lines.push(Line::from(Span::styled(l, theme.style(role))));
+            }
+        }
+    };
+    section("refused", Role::Error, &confirm.refusals);
+    section("warning", Role::Warning, &confirm.warnings);
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.extend(
+        wrap(&confirm.question, text_cells)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, theme.style(Role::Warning)))),
+    );
+    if let Some(typed) = &confirm.typed {
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled("> ", theme.style(Role::Dim)),
+            Span::styled(typed.text.clone(), theme.style(Role::Text)),
+            Span::styled("▏", theme.style(Role::Dim)),
+        ]));
+        if typed.mismatch {
+            lines.push(Line::from(Span::styled(
+                format!("that is not {}", typed.expected),
+                theme.style(Role::Error),
+            )));
+        }
+    }
     lines.push(Line::default());
-    lines.push(Line::from(Span::styled(
-        "y confirms; any other key cancels",
-        theme.style(Role::Dim),
-    )));
+    let hint = match confirm.kind {
+        ConfirmKind::Refused => "any key closes",
+        ConfirmKind::Checking => "any key cancels",
+        ConfirmKind::UpdateTyped => "Enter confirms the exact name; Esc cancels",
+        _ => "y confirms; any other key cancels",
+    };
+    lines.extend(
+        wrap(hint, text_cells)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, theme.style(Role::Dim)))),
+    );
     let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
     let whole = width >= MIN_CONFIRM_WIDTH && height <= area.height;
     let (width, height) = if whole {

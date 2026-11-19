@@ -121,6 +121,21 @@ impl Screen {
     }
 }
 
+/// A key in a typed confirmation: Esc and Ctrl-C cancel, Enter submits, Backspace deletes, a
+/// printable character is typed. Anything else is nothing: no key may confirm by accident.
+fn typed_confirmation_key(key: Key) -> Vec<Event> {
+    if key == Key::plain(KeyCode::Esc) || key == Key::ctrl('c') {
+        return vec![Event::ConfirmAnswer(false)];
+    }
+    if key == Key::plain(KeyCode::Enter) {
+        return vec![Event::ConfirmSubmit];
+    }
+    if key == Key::plain(KeyCode::Backspace) {
+        return vec![Event::ConfirmBackspace];
+    }
+    key.text().map(Event::ConfirmChar).into_iter().collect()
+}
+
 impl Input {
     /// Handles one key. Returns the core events to send, in order.
     pub fn key(
@@ -140,6 +155,12 @@ impl Input {
             self.count = None;
             self.pending.clear();
             self.prompt = None;
+            // A typed confirmation takes text, so its keys are not "y or anything": every
+            // character goes to the core, which keeps only what a machine name can contain,
+            // and only Enter with the exact name confirms.
+            if kind == ConfirmKind::UpdateTyped {
+                return typed_confirmation_key(key);
+            }
             let yes = matches!(key.text(), Some('y' | 'Y'))
                 || (kind == ConfirmKind::Quit && key == Key::ctrl('c'));
             return vec![Event::ConfirmAnswer(yes)];

@@ -3,7 +3,7 @@
 //! The shell builds this from clap and `config.toml`; reading either is not the core's
 //! business, so there is no parsing here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The scan's configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -32,6 +32,13 @@ pub struct Config {
     /// evaluated system is another one: auspex never builds another system's derivations. Empty
     /// means unknown, which refuses every build.
     pub local_system: String,
+    /// Machines marked public (`machines.<m>.public = true`): updating one asks the operator
+    /// to type its name instead of `y`. A name the inventory does not list is ignored.
+    pub public_machines: BTreeSet<String>,
+    /// How long the checks before an update may take (`timeouts.diff`: they size the same
+    /// closure the package preview does), enforced by the shell. `0` is treated as one second
+    /// by the shell, never as "no limit".
+    pub preflight_timeout_seconds: u64,
 }
 
 /// Prometheus settings the core decides with. The URL is the adapter's, not the core's.

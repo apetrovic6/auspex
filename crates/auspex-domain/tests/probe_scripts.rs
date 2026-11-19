@@ -9,7 +9,7 @@
 //!
 //! How it stays off the real system:
 //!
-//! - Every absolute path the scripts read (`/run/…`, `/proc/…`, `/nix/var/…`) is rewritten
+//! - Every absolute path the scripts read (`/run/…`, `/proc/…`, `/nix/var/…`, `/nix/store`) is rewritten
 //!   to the same path under a fresh temporary root, and the test first asserts the scripts
 //!   name no other absolute path except `/dev/null` and the `/` that `df` is asked about.
 //!   The rewrite is the only change to the script text.
@@ -131,7 +131,7 @@ impl Root {
         let s = dir.to_str().unwrap();
         assert!(
             !s.contains(char::is_whitespace)
-                && !["/run/", "/proc/", "/nix/var/"]
+                && !["/run/", "/proc/", "/nix/var/", "/nix/store"]
                     .iter()
                     .any(|p| s.contains(p)),
             "unusable temporary directory {s:?}"
@@ -152,6 +152,21 @@ impl Root {
 
     fn store(&self, name: &str) -> PathBuf {
         self.dir.join("nix/store").join(name)
+    }
+
+    /// A `df` that answers for `/` and for `/nix/store` (relocated under this root, as the
+    /// script is), each with its own line: two different filesystems, so a probe that asked
+    /// about the wrong one reports the wrong numbers.
+    fn df(&self, root_line: &str, store_line: &str) {
+        let header = "Filesystem 1024-blocks Used Available Capacity Mounted on\n";
+        let store_args = format!("-Pk {}/nix/store", self.dir.display());
+        let root = format!("{header}{root_line}");
+        let store = format!("{header}{store_line}");
+        shim(
+            &self.dir.join("shims").join("df"),
+            &self.sh,
+            &[("-Pk /", &root), (&store_args, &store)],
+        );
     }
 
     fn file(&self, rel: &str, contents: &str) {
@@ -238,7 +253,7 @@ fn relocate(script: &str, root: &str) -> String {
     for p in absolute_paths(script) {
         assert!(
             p == "/dev/null"
-                || ["/run/", "/proc/", "/nix/var/"]
+                || ["/run/", "/proc/", "/nix/var/", "/nix/store"]
                     .iter()
                     .any(|r| p.starts_with(r)),
             "the script reads {p}, which the test does not relocate"
@@ -247,7 +262,8 @@ fn relocate(script: &str, root: &str) -> String {
     let out = script
         .replace("/run/", &format!("{root}/run/"))
         .replace("/proc/", &format!("{root}/proc/"))
-        .replace("/nix/var/", &format!("{root}/nix/var/"));
+        .replace("/nix/var/", &format!("{root}/nix/var/"))
+        .replace("/nix/store", &format!("{root}/nix/store"));
     assert!(
         !absolute_paths(&out)
             .iter()
@@ -302,17 +318,22 @@ fn nixos_root(case: &str, sh: &Path, tools: &[(&str, PathBuf)]) -> Root {
     let r = Root::new(case, sh, tools);
     r.file("proc/uptime", "864123.45 1728000.10\n");
     r.file("proc/loadavg", "0.15 0.22 0.30 1/234 5678\n");
-    r.shim(
-        "df",
-        &[(
-            "-Pk /",
-            "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/sda1 488281250 122070312 341796875 27% /",
-        )],
+    // `/` is a tmpfs (impermanence) and the store is on a disk of its own: the two must not be
+    // mixed up.
+    r.df(
+        "tmpfs 8000000 100000 7900000 2% /",
+        "/dev/sda1 488281250 122070312 341796875 27% /nix/store",
     );
     r
 }
 
 const DISK: DiskUsage = DiskUsage {
+    total_bytes: 8_000_000 * 1024,
+    used_bytes: 100_000 * 1024,
+    available_bytes: 7_900_000 * 1024,
+};
+
+const STORE_DISK: DiskUsage = DiskUsage {
     total_bytes: 488_281_250 * 1024,
     used_bytes: 122_070_312 * 1024,
     available_bytes: 341_796_875 * 1024,
@@ -350,6 +371,7 @@ fn nixos_probe_runs_and_parses() {
             ssh_health: SshHealth {
                 uptime_seconds: Some(864_123),
                 root_disk: Some(DISK),
+                store_disk: Some(STORE_DISK),
                 load: Some(Load {
                     one: 0.15,
                     five: 0.22,
@@ -412,12 +434,10 @@ fn darwin_probe_runs_and_parses() {
             ],
         );
         r.shim("date", &[("+%s", "1700302400")]);
-        r.shim(
-            "df",
-            &[(
-                "-Pk /",
-                "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk3s1s1 971350180 412113220 559236960 43% /",
-            )],
+        // On macOS `/` is the sealed system volume and the store is on the Nix volume.
+        r.df(
+            "/dev/disk3s1s1 971350180 412113220 559236960 43% /",
+            "/dev/disk3s6 971350180 100000000 559236960 15% /nix",
         );
         r
     };
@@ -448,6 +468,11 @@ fn darwin_probe_runs_and_parses() {
                 root_disk: Some(DiskUsage {
                     total_bytes: 971_350_180 * 1024,
                     used_bytes: 412_113_220 * 1024,
+                    available_bytes: 559_236_960 * 1024,
+                }),
+                store_disk: Some(DiskUsage {
+                    total_bytes: 971_350_180 * 1024,
+                    used_bytes: 100_000_000 * 1024,
                     available_bytes: 559_236_960 * 1024,
                 }),
                 load: Some(Load {

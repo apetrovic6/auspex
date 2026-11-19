@@ -16,6 +16,7 @@ use auspex_tui::theme::{Role, Theme};
 use auspex_tui::ui::Ui;
 use common::{
     draw, expect_file, paste, render, render_with, settled_demo, type_keys, type_keys_seen,
+    until_asked,
 };
 
 /// Waits (time is paused, so this is instant) until the action is over.
@@ -147,6 +148,7 @@ async fn the_confirmations_at_40_and_120_columns() {
     type_keys_seen(&shell, &mut ui, &km, "y");
 
     type_keys_seen(&shell, &mut ui, &km, "/luna\nu");
+    until_asked(&shell, &mut ui, &km).await;
     let q = shell.view().confirm.unwrap().question;
     assert!(
         q.starts_with("update luna to g1j4m7qa nixos-system-luna-") && q.ends_with("? y/N"),
@@ -174,7 +176,9 @@ async fn an_update_streams_into_the_log_tab_and_the_status_bar_says_how_it_ended
     let shell = settled_demo().await;
     let mut ui = Ui::default();
     let km = Keymap::defaults();
-    type_keys_seen(&shell, &mut ui, &km, "Ay/luna\nuy");
+    type_keys_seen(&shell, &mut ui, &km, "Ay/luna\nu");
+    until_asked(&shell, &mut ui, &km).await;
+    type_keys_seen(&shell, &mut ui, &km, "y");
     // Running: the bar names it.
     let running = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 30);
     assert!(
@@ -259,7 +263,9 @@ async fn a_failed_update_says_where_it_failed_at_ssh_and_the_fix() {
     let mut ui = Ui::default();
     let km = Keymap::defaults();
     // mars is the demo's dead host: its scripted update fails with ssh's own line.
-    type_keys_seen(&shell, &mut ui, &km, "Ay/mars\nuy");
+    type_keys_seen(&shell, &mut ui, &km, "Ay/mars\nu");
+    until_asked(&shell, &mut ui, &km).await;
+    type_keys_seen(&shell, &mut ui, &km, "y");
     until_action_ends(&shell).await;
     let view = shell.view();
     let ActionStatus::Ended(end) = &view.action.as_ref().unwrap().status else {
@@ -537,6 +543,7 @@ async fn a_paste_deploys_nothing_and_answers_a_drawn_question_no() {
 
     // The same for an update's question.
     type_keys_seen(&shell, &mut ui, &km, "Ay/luna\nu");
+    until_asked(&shell, &mut ui, &km).await;
     assert_eq!(shell.view().mode, Mode::Act);
     assert_eq!(
         shell.view().confirm.map(|c| c.kind),
@@ -575,8 +582,8 @@ async fn each_question_seen_then_answered_deploys() {
     assert_eq!(shell.view().mode, Mode::Act);
     assert!(shell.view().action.is_none(), "the update is only asked");
     // The `y` typed with the `u` is not in the burst: it would be an answer before the frame.
-    common::frame(&shell, &mut ui, &km);
-    common::elapse(auspex_tui::ui::QUESTION_DWELL);
+    // The checks run first; the dialog they open is drawn before `y` counts.
+    until_asked(&shell, &mut ui, &km).await;
     type_keys(&shell, &mut ui, &km, "y");
     let action = shell.view().action.expect("the update started");
     assert_eq!(action.machine, "luna");
@@ -598,10 +605,20 @@ async fn a_second_question_is_not_answered_by_the_first_ones_frame() {
         shell.view().action.is_none(),
         "the update's question was never drawn"
     );
+    // What was asked is the checking dialog, which the typeahead `y` did not cancel ...
+    assert_eq!(
+        shell.view().confirm.map(|c| c.kind),
+        Some(ConfirmKind::Checking)
+    );
+    // ... and the dialog it turns into is a question of its own: undrawn, so a `y` is discarded.
+    common::until_checked(&shell).await;
     assert_eq!(
         shell.view().confirm.map(|c| c.kind),
         Some(ConfirmKind::Update)
     );
+    type_keys(&shell, &mut ui, &km, "y");
+    assert!(shell.view().action.is_none(), "the dialog was never drawn");
+    assert!(shell.view().confirm.is_some());
 }
 
 // ---------------------------------------------------------------------------------------

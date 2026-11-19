@@ -23,6 +23,8 @@
 //! - [`narinfo`]: the "already cached" badge.
 //! - [`closure`]: the two closure queries behind the package preview: a machine's
 //!   `/run/current-system` over ssh, and the pending toplevel from the local store or the cache.
+//! - [`preflight`]: what the checks before an update look up: `git status` of the fleet repository
+//!   and the pending closure's size.
 //! - [`deploylog`]: the local SQLite log of every action (deploy, build, reboot, …), a documented
 //!   schema the weekly digest reads, under `$XDG_STATE_HOME/auspex/log.sqlite`.
 //! - [`dns`]: hostname resolution for the shared-IP lint.
@@ -109,6 +111,7 @@ pub mod dns;
 pub mod http;
 pub mod narinfo;
 pub mod nix;
+pub mod preflight;
 pub mod prometheus;
 pub mod ssh;
 

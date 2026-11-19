@@ -94,7 +94,7 @@ pub fn cache_argv(cache_url: &str, path: &StorePath) -> Vec<String> {
     ]
 }
 
-const fn limits() -> Limits {
+pub(crate) const fn limits() -> Limits {
     Limits {
         stdout: STDOUT_CAP,
         stderr: STDERR_CAP,
@@ -102,13 +102,12 @@ const fn limits() -> Limits {
     }
 }
 
-/// Turns a finished run into the closure it printed, or one line saying why not. `what` names
-/// the query ("deployed closure query"); `timeout` is the budget it ran under.
+/// The whole stdout of a finished run as text, or one line saying why there is none. `what`
+/// names the query ("deployed closure query"); `timeout` is the budget it ran under.
 ///
-/// A run that exited 0 but printed no store path at all is an error too: a closure always
-/// contains its own root, so an empty one is a broken query, and comparing against it would
-/// show every package as added.
-fn closure_of(ran: &Ran, what: &str, timeout: Duration) -> Result<ClosurePaths, Failure> {
+/// Only an output read to its end and within the cap is an answer: a prefix would be compared
+/// or summed as if it were all of it.
+pub(crate) fn text_of(ran: &Ran, what: &str, timeout: Duration) -> Result<String, Failure> {
     let stderr = lossy(&ran.stderr);
     let with_stderr = |text: String| match reason(&stderr) {
         Some(r) => format!("{text}: {r}"),
@@ -128,17 +127,7 @@ fn closure_of(ran: &Ran, what: &str, timeout: Duration) -> Result<ClosurePaths, 
             describe_status(Some(*status))
         )))),
         End::Exited(_) => match ran.whole_stdout() {
-            Ok(out) => {
-                let closure = parse_closure(&lossy(out));
-                if closure.paths.is_empty() {
-                    Err(Failure::Why(with_stderr(format!(
-                        "{what} printed no store paths ({} lines dropped)",
-                        closure.dropped
-                    ))))
-                } else {
-                    Ok(closure)
-                }
-            }
+            Ok(out) => Ok(lossy(out)),
             Err(true) => Err(Failure::Why(format!(
                 "{what} printed more than {} MiB; not compared",
                 STDOUT_CAP / (1024 * 1024)
@@ -151,14 +140,37 @@ fn closure_of(ran: &Ran, what: &str, timeout: Duration) -> Result<ClosurePaths, 
     }
 }
 
-enum Failure {
+/// Turns a finished run into the closure it printed, or one line saying why not.
+///
+/// A run that exited 0 but printed no store path at all is an error too: a closure always
+/// contains its own root, so an empty one is a broken query, and comparing against it would
+/// show every package as added.
+fn closure_of(ran: &Ran, what: &str, timeout: Duration) -> Result<ClosurePaths, Failure> {
+    let text = text_of(ran, what, timeout)?;
+    let closure = parse_closure(&text);
+    if closure.paths.is_empty() {
+        let stderr = lossy(&ran.stderr);
+        let line = format!(
+            "{what} printed no store paths ({} lines dropped)",
+            closure.dropped
+        );
+        Err(Failure::Why(match reason(&stderr) {
+            Some(r) => format!("{line}: {r}"),
+            None => line,
+        }))
+    } else {
+        Ok(closure)
+    }
+}
+
+pub(crate) enum Failure {
     Cancelled,
     Why(String),
 }
 
 impl Failure {
     /// `Err(Cancelled)` for a cancellation, the line otherwise.
-    fn answer(self) -> Result<ClosureAnswer, Cancelled> {
+    pub(crate) fn answer(self) -> Result<ClosureAnswer, Cancelled> {
         match self {
             Self::Cancelled => Err(Cancelled),
             Self::Why(line) => Ok(Err(line)),

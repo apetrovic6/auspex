@@ -139,6 +139,9 @@ pub struct MachineSettings {
     pub target: Option<String>,
     /// The Prometheus `instance` label; default `<name>:9100`.
     pub prometheus_instance: Option<String>,
+    /// `public`: the machine faces the internet, so updating it asks for its name to be typed
+    /// instead of `y` (default `false`).
+    pub public: bool,
 }
 
 /// The longest timeout accepted, in seconds: a day.
@@ -364,6 +367,7 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                             "prometheus_instance" => {
                                 m.prometheus_instance = Some(w.string(v, &name)?);
                             }
+                            "public" => m.public = w.boolean(v, &name)?,
                             _ => w.unknown(&name),
                         }
                     }

@@ -16,7 +16,7 @@ use auspex_domain::fleet::{Machine, MachineClass};
 use auspex_domain::observe::StorePath;
 use auspex_domain::status::Badge;
 use crux_core::Request;
-use support::{Shell, THREE, evaluated, inventory, observed, path, unreachable};
+use support::{Shell, THREE, clean_preflight, evaluated, inventory, observed, path, unreachable};
 
 /// Act mode allowed, no Prometheus and no cache: a scan is probes and one evaluation.
 fn config() -> Config {
@@ -60,9 +60,18 @@ fn act_on(s: &mut Shell) {
     assert_eq!(s.view().mode, Mode::Act);
 }
 
-/// `u` and `y` on the selected machine: the request the core made.
+/// The shell's answer to the checks before an update (the one request `u` made).
+fn answer_checks(s: &mut Shell, answer: auspex_core::PreflightAnswer) {
+    let mut request = s.take_preflight();
+    s.resolve(&mut request, answer);
+}
+
+/// `u`, a clean answer from the checks, and `y` on the selected machine: the request the core
+/// made.
 fn update(s: &mut Shell) -> Request<ActionRequest> {
     s.send(Event::UpdateSelected);
+    assert!(s.actions.is_empty(), "nothing runs before the answer");
+    answer_checks(s, clean_preflight());
     assert!(s.actions.is_empty(), "nothing runs before the answer");
     s.send(Event::ConfirmAnswer(true));
     s.take_action()
@@ -152,6 +161,12 @@ fn update_asks_naming_the_machine_and_its_pending_system_and_waits_for_yes() {
     let mut s = settled(config());
     act_on(&mut s);
     s.send(Event::UpdateSelected);
+    // First the checks run; nothing is asked yet.
+    assert_eq!(
+        s.view().confirm.expect("checking").kind,
+        ConfirmKind::Checking
+    );
+    answer_checks(&mut s, clean_preflight());
     let confirm = s.view().confirm.expect("a question");
     assert_eq!(confirm.kind, ConfirmKind::Update);
     assert_eq!(
@@ -163,9 +178,7 @@ fn update_asks_naming_the_machine_and_its_pending_system_and_waits_for_yes() {
     assert!(s.actions.is_empty(), "N asks for nothing");
     assert!(s.view().action.is_none());
 
-    s.send(Event::UpdateSelected);
-    s.send(Event::ConfirmAnswer(true));
-    let req = s.take_action();
+    let req = update(&mut s);
     assert_eq!(req.operation.kind, ActionKind::Update);
     assert_eq!(req.operation.machine, "luna");
     assert_eq!(req.operation.flake, "/fleet");
@@ -225,20 +238,38 @@ fn update_refuses_a_name_the_domain_does_not_allow_and_asks_nothing() {
 
 #[test]
 fn update_refuses_a_machine_the_inventory_no_longer_has() {
+    let gone = r#"{"sol": {"deploy": {"targetHost": "root@192.168.1.12"}}}"#;
+
+    // The list is read again while the checks run, and luna is gone from it: the answer of the
+    // checks opens no dialog.
     let mut s = settled(config());
     act_on(&mut s);
     s.send(Event::UpdateSelected);
-    assert!(s.view().confirm.is_some(), "the question for luna is open");
-    // The list is read again while the question is open, and luna is gone from it.
     s.send(Event::Refresh);
     let mut list = s.take_inventory();
-    s.resolve(
-        &mut list,
-        Ok(inventory(
-            r#"{"sol": {"deploy": {"targetHost": "root@192.168.1.12"}}}"#,
-        )),
+    s.resolve(&mut list, Ok(inventory(gone)));
+    answer_checks(&mut s, clean_preflight());
+    assert!(
+        s.view().confirm.is_none(),
+        "no dialog for a machine that is gone"
     );
-    // The refresh has finished (a yes during it is refused for that reason, below).
+    assert!(s.actions.is_empty());
+    assert!(
+        notice(&s).contains("luna is not in the inventory"),
+        "{}",
+        notice(&s)
+    );
+
+    // Or while the dialog is open: the `y` is checked again.
+    let mut s = settled(config());
+    act_on(&mut s);
+    s.send(Event::UpdateSelected);
+    answer_checks(&mut s, clean_preflight());
+    assert!(s.view().confirm.is_some(), "the question for luna is open");
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(gone)));
+    // The refresh has finished (a yes during it is refused for that reason).
     let mut eval = s.take_eval();
     s.eval_item(&mut eval, "sol", evaluated("sol", &new("sol")));
     s.resolve(&mut eval, EvalAnswer::Finished { error: None });
@@ -293,6 +324,7 @@ fn the_question_shows_the_hash_prefix_so_two_systems_of_one_name_differ() {
     let mut s = settled(config());
     act_on(&mut s);
     s.send(Event::UpdateSelected);
+    answer_checks(&mut s, clean_preflight());
     let question = s.view().confirm.expect("a question").question;
     assert_eq!(
         question,
@@ -318,21 +350,37 @@ fn a_yes_to_a_system_that_is_no_longer_the_pending_one_asks_again_and_deploys_no
     let mut s = settled(config());
     act_on(&mut s);
     s.send(Event::UpdateSelected);
+    answer_checks(&mut s, clean_preflight());
     let asked = s.view().confirm.expect("a question");
     // Same name, another hash: what `clan` would deploy now is not what was shown.
     luna_evaluates_to(&mut s, &path('c', "nixos-system-luna-new"));
     s.send(Event::ConfirmAnswer(true));
     assert!(s.actions.is_empty(), "nothing runs on a stale yes");
+    // The checks were about the old closure: they run again, for the new one, as a question
+    // of their own.
     let again = s.view().confirm.expect("asked again");
-    assert_eq!(
-        again.question,
-        "update luna to c1234567 nixos-system-luna-new? y/N"
-    );
+    assert_eq!(again.kind, ConfirmKind::Checking);
     assert_ne!(
         again.serial, asked.serial,
         "a new question, to be drawn anew"
     );
     assert!(notice(&s).contains("changed"), "{}", notice(&s));
+    let request = s.take_preflight();
+    assert_eq!(
+        request.operation.store_path.as_str(),
+        path('c', "nixos-system-luna-new")
+    );
+    let mut request = request;
+    s.resolve(&mut request, clean_preflight());
+    let question = s.view().confirm.expect("the dialog for the new system");
+    assert_eq!(
+        question.question,
+        "update luna to c1234567 nixos-system-luna-new? y/N"
+    );
+    assert_ne!(
+        question.serial, again.serial,
+        "the dialog is drawn anew too"
+    );
     // A yes to the new question deploys.
     s.send(Event::ConfirmAnswer(true));
     assert_eq!(s.take_action().operation.machine, "luna");
@@ -343,6 +391,7 @@ fn a_yes_to_the_system_still_pending_after_a_refresh_deploys() {
     let mut s = settled(config());
     act_on(&mut s);
     s.send(Event::UpdateSelected);
+    answer_checks(&mut s, clean_preflight());
     luna_evaluates_to(&mut s, &new("luna"));
     s.send(Event::ConfirmAnswer(true));
     assert_eq!(s.take_action().operation.machine, "luna");
@@ -357,6 +406,10 @@ fn every_question_has_its_own_serial() {
     s.send(Event::UpdateSelected);
     let second = s.view().confirm.expect("a question").serial;
     assert_ne!(first, second);
+    // The dialog the checks open is a question of its own, not the checking one drawn again.
+    answer_checks(&mut s, clean_preflight());
+    let third = s.view().confirm.expect("a question").serial;
+    assert_ne!(second, third);
 }
 
 #[test]

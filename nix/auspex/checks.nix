@@ -34,7 +34,7 @@ let
     eval = { workers = 4; max_memory_mb = 4096; };
     prometheus = { url = "http://prometheus.example:9090"; stale_after = 60; };
     cache.url = "https://ncps.example";
-    machines.terra = { target = "root@192.168.1.10"; prometheus_instance = "terra:9100"; };
+    machines.terra = { target = "root@192.168.1.10"; prometheus_instance = "terra:9100"; public = true; };
     keymap = { quit = [ "q" "esc" ]; down = "j"; };
     theme.file = "~/.config/auspex/theme.toml";
   };
@@ -164,6 +164,20 @@ let
       rejected = value: !(builtins.tryEval (builtins.deepSeq (probe value) true)).success;
     in probe true == true && probe false == false
       && !type.check 1 && rejected 1 && !type.check "yes" && rejected "yes";
+  # `machines.<m>.public` is a boolean: a number or a string is refused at evaluation, and a
+  # machine that does not say is `null`, which is pruned from the file, so the config says
+  # nothing the operator did not.
+  publicOK =
+    let
+      machine = value: (evaluate {
+        programs.auspex.settings.machines.terra.public = value;
+      }).config.programs.auspex.settings.machines.terra;
+      rejected = value: !(builtins.tryEval (builtins.deepSeq (machine value) true)).success;
+      unset = (evaluate {
+        programs.auspex.settings.machines.terra.target = "root@192.168.1.10";
+      }).config.programs.auspex.settings.machines.terra;
+    in (machine true).public == true && (machine false).public == false
+      && rejected 1 && rejected "yes" && unset.public == null;
 in {
   auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;
@@ -218,6 +232,7 @@ in {
   auspex-flake-store-path = check "flake-store-path" (storeFlakeRejected
     && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeFlake pathFlake ]);
   auspex-diff-types = check "diff-types" diffEnabledOK;
+  auspex-public-type = check "public-type" publicOK;
   auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision

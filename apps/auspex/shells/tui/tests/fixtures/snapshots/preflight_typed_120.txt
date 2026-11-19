@@ -1,0 +1,30 @@
+┌ machines (18) ─────────────────────────────────────┐┌ cypramundi ────────────────────────────────────────────────────┐
+│ ✓    alfrost              in sync                  ││badges    ↑ update pending                                      │
+│ ✓    callisto             in sync                  ││status    update pending                                        │
+│ ✓⚠   cerberus             in sync                  ││reason    pending nixos-system-cypramundi-25.11.20261101.6a2f1c0│
+│›↑    cypramundi           update pending           ││diff      not cached (d)                                        │
+│ ?    deimos               not installed            ││host      root@198.51.100.4:2222 (config override)              │
+│ ✓    europa               in sync                  ││class     nixos  tags: base, server                             │
+│ ✓⟳   ganymede             in sync                  ││lints     none                                                  │
+│ ✓    genetor              in sync                  ││current   i4payi4p                                              │
+│ ✓    io            ┌ confirm ───────────────────────────────────────────────────────────────────┐1019.b81e2d4        │
+│ ↑◆   luna          │update cypramundi to 8jx7iv6h                                               │                    │
+│ ✗    mars          │nixos-system-cypramundi-25.11.20261101.6a2f1c0? it is marked public: type   │1101.6a2f1c0        │
+│ ✓    mechanicus-for│cypramundi, then Enter. Esc cancels                                         │                    │
+│ ✓    phobos        │                                                                            │                    │
+│ ↑◆   sol           │> cypramundi▏                                                               │                    │
+│ ✓    terra         │                                                                            │                    │
+│ ✓    titan         │Enter confirms the exact name; Esc cancels                                  │GiB free            │
+│ ✗    triton        └────────────────────────────────────────────────────────────────────────────┘                    │
+│ !    vulcan               eval error               ││load      0.40 0.35 0.30 (prometheus)                           │
+│                                                    ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
+│                                                    ││diff      not cached: the binary cache does not have the pending│
+│                                                    ││          closure, so there is no preview until it is built and │
+│                                                    ││          pushed                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+log: eval results stored in the cache: cypramundi, deimos, luna
+ACT │ settled │ 0 pending │ prom: ok                                                                              ? help

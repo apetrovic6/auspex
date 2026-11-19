@@ -55,6 +55,7 @@ kv failed_units "$(systemctl --failed --output=json --no-pager 2>/dev/null)"
 kv uptime_seconds "$(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
 kv load "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
 kv root_disk_kb "$(df -Pk / 2>/dev/null | awk 'NR==2 {print $2 " " $3 " " $4}')"
+kv store_disk_kb "$(df -Pk /nix/store 2>/dev/null | awk 'NR==2 {print $2 " " $3 " " $4}')"
 printf 'auspex_end=1\n'
 "#;
 
@@ -71,6 +72,7 @@ boot=$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/^{ sec = \([0-9]*\),.*/\1
 if [ -n "$boot" ]; then kv uptime_seconds "$(( $(date +%s) - boot ))"; fi
 kv load "$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}')"
 kv root_disk_kb "$(df -Pk / 2>/dev/null | awk 'NR==2 {print $2 " " $3 " " $4}')"
+kv store_disk_kb "$(df -Pk /nix/store 2>/dev/null | awk 'NR==2 {print $2 " " $3 " " $4}')"
 printf 'auspex_end=1\n'
 "#;
 
@@ -237,6 +239,13 @@ pub struct SshHealth {
     pub uptime_seconds: Option<u64>,
     /// Root filesystem usage.
     pub root_disk: Option<DiskUsage>,
+    /// The filesystem `/nix/store` is on, which is what an update fills. Not `/`: with
+    /// impermanence `/` is a tmpfs whose free space says nothing about the disk the store
+    /// lives on, and a free-space check against it would pass or refuse for the wrong
+    /// reason. Left out of the JSON when unknown, so the observation fixtures of a probe that
+    /// did not report it are as they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_disk: Option<DiskUsage>,
     /// Load averages.
     pub load: Option<Load>,
 }
@@ -513,6 +522,7 @@ pub fn parse_probe(stdout: &str, stderr: &str, exit: ProbeExit) -> ProbeOutcome 
             "uptime_seconds" => obs.ssh_health.uptime_seconds = parse_uptime(value),
             "load" => obs.ssh_health.load = parse_load(value),
             "root_disk_kb" => obs.ssh_health.root_disk = parse_disk(value),
+            "store_disk_kb" => obs.ssh_health.store_disk = parse_disk(value),
             _ => {}
         }
     }
@@ -855,6 +865,7 @@ mod tests {
                 used_bytes: 5,
                 available_bytes: 5,
             }),
+            store_disk: None,
             load: None,
         };
         let h = merge_health(Some(&ssh), Some(&prom(30)), 60);
