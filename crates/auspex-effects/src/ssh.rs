@@ -24,6 +24,7 @@ use auspex_domain::fleet::{
     ConnectTimeout, MachineClass, PROBE_REMOTE_COMMAND, SshOptions, Target, ssh_args,
 };
 use auspex_domain::observe::{ProbeExit, ProbeOutcome, parse_probe, probe_script};
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -182,7 +183,9 @@ pub struct ProbeParams<'a> {
     pub connect_timeout: ConnectTimeout,
     /// How long an idle master remains available, in seconds.
     pub control_persist: u64,
-    /// The separate connect/authentication allowance.
+    /// The separate connect/authentication allowance, per connect phase and counted from the
+    /// moment the phase starts running, not from when it was queued behind another host's
+    /// (see `connect`: the agent shows its prompts one at a time).
     pub approval_deadline: Duration,
     /// Shell-side phase signal: true on entry, false on every exit, including drop.
     pub on_approval: Option<&'a (dyn Fn(bool) + Sync)>,
@@ -232,25 +235,38 @@ impl Drop for ApprovalGuard<'_> {
     }
 }
 
-// The directory and destination inputs identify the control path; query options do not.
-// Keep coordination process-wide so separately prepared handles for the same directory
-// still share an approval. Entries exist only while calls hold the flight.
+// What ssh hashes into `%C` (besides the local host name, the same for every call here): the
+// remote user as written, the host lowercased, and the port, 22 when none is given. Keying on
+// those rather than on the target as spelled makes one socket one flight: `root@H`, `root@h`
+// and `root@h:22` are one socket, and ssh itself cannot tell them apart. Query options are
+// not part of the key, because `%C` ignores them. The directory is, so that separately
+// prepared handles for the same directory still share a flight. Coordination is process-wide
+// for the same reason. Entries exist only while calls hold the flight.
 #[derive(PartialEq, Eq, Hash)]
 struct ControlKey {
     directory: String,
-    destination: String,
-    port: Option<u16>,
+    user: Option<String>,
+    host: String,
+    port: u16,
 }
 
-enum ConnectionResult {
+/// ssh's default port, which `%C` hashes when the target names none.
+const DEFAULT_SSH_PORT: u16 = 22;
+
+/// What the callers of one flight share. Only "a master now exists" is: a failure belongs to
+/// the target that had it. Target options (`PubkeyAuthentication=no`, `IdentitiesOnly`,
+/// `AddressFamily`, ...) change whether authentication succeeds without changing the socket,
+/// so one target's refusal says nothing about another target on the same socket.
+enum ConnectionState {
+    /// No known master. A cancelled or failed owner leaves this, so the next caller runs its
+    /// own connect phase.
     Pending,
-    Finished(Option<ProbeOutcome>),
+    MasterUp,
 }
 
 struct ConnectionFlight {
     key: Arc<ControlKey>,
-    // A cancelled/dropped initializer leaves Pending so another caller can retry.
-    result: tokio::sync::Mutex<ConnectionResult>,
+    state: tokio::sync::Mutex<ConnectionState>,
 }
 
 static CONNECTIONS: LazyLock<Mutex<HashMap<Arc<ControlKey>, Weak<ConnectionFlight>>>> =
@@ -273,8 +289,9 @@ impl Drop for ConnectionFlight {
 fn connection_flight(target: &Target, control_dir: &ControlDir) -> Arc<ConnectionFlight> {
     let key = Arc::new(ControlKey {
         directory: control_dir.as_str().to_owned(),
-        destination: target.destination(),
-        port: target.port(),
+        user: target.user().map(str::to_owned),
+        host: target.host().to_ascii_lowercase(),
+        port: target.port().unwrap_or(DEFAULT_SSH_PORT),
     });
     let mut connections = CONNECTIONS
         .lock()
@@ -286,11 +303,38 @@ fn connection_flight(target: &Target, control_dir: &ControlDir) -> Arc<Connectio
     }
     let flight = Arc::new(ConnectionFlight {
         key,
-        result: tokio::sync::Mutex::new(ConnectionResult::Pending),
+        state: tokio::sync::Mutex::new(ConnectionState::Pending),
     });
     *entry = Arc::downgrade(&flight);
     drop(connections);
     flight
+}
+
+/// The one connect phase allowed to run at a time, per control directory.
+///
+/// A connect phase is the step that may need the agent's approval, and an agent such as
+/// Bitwarden shows its prompts one at a time. Started all at once, each phase's window
+/// (`approval_deadline`) ran from its own start, so later prompts appeared with their window
+/// nearly gone, were answered too late, and the answer was thrown away with the killed ssh.
+/// Behind this slot a phase starts when the previous one has finished, and its window starts
+/// then. tokio's semaphore queues its waiters first in, first out.
+///
+/// Per control directory rather than one static: the agent is the shared resource, and
+/// auspex prepares one control directory per run, so in the program this is process-wide.
+/// Tests give every case a directory of its own, and a global slot would make their timing
+/// assertions depend on which other test happens to hold an "approval".
+static CONNECT_SLOTS: LazyLock<Mutex<HashMap<String, Arc<Semaphore>>>> =
+    LazyLock::new(Mutex::default);
+
+fn connect_slot(control_dir: &ControlDir) -> Arc<Semaphore> {
+    // Never removed: bounded by the number of control directories, which is one.
+    Arc::clone(
+        CONNECT_SLOTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(control_dir.as_str().to_owned())
+            .or_insert_with(|| Arc::new(Semaphore::new(1))),
+    )
 }
 
 fn approval_timeout() -> ProbeOutcome {
@@ -300,33 +344,41 @@ fn approval_timeout() -> ProbeOutcome {
     }
 }
 
+/// Makes sure a master exists for `target`'s control socket: `None` when one does, or the
+/// outcome to report when none could be made.
+///
+/// Callers for one socket take turns, and only the one holding the turn runs ssh. A caller
+/// waits for its turn with no timer of its own: the holder is bounded (by `ConnectTimeout`
+/// for the check, by `approval_deadline` for the connect phase, plus the kill), and so is the
+/// whole refresh, by `timeouts.settle`, which cancels. A timer on the wait cut off waiters
+/// whose holder went on to succeed. When the holder fails, each waiter runs a connect phase
+/// of its own (in the queue), because the failure may be the holder's own.
+///
+/// # Errors
+///
+/// [`Cancelled`] when `cancel` fired, whether waiting for the socket's turn, for the agent's,
+/// or while ssh ran; what ssh started has been killed and reaped, and the next caller finds
+/// the flight [`ConnectionState::Pending`].
 pub(crate) async fn connect(
     target: &Target,
     params: &ProbeParams<'_>,
     cancel: &CancellationToken,
 ) -> Result<Option<ProbeOutcome>, Cancelled> {
     let flight = connection_flight(target, params.control_dir);
-    // Only the initializer runs ssh. Cancelling a waiter never drops the owner's run;
-    // cancelling the owner goes through run's explicit kill-and-reap before unlocking.
-    let mut result = tokio::select! {
+    let mut state = tokio::select! {
         biased;
         () = cancel.cancelled() => return Err(Cancelled),
-        result = tokio::time::timeout(params.approval_deadline, flight.result.lock()) => {
-            match result {
-                Ok(result) => result,
-                Err(_) => return Ok(Some(approval_timeout())),
-            }
-        }
+        state = flight.state.lock() => state,
     };
-    match &*result {
-        ConnectionResult::Pending => {
-            let outcome = connect_once(target, params, cancel).await?;
-            *result = ConnectionResult::Finished(outcome.clone());
-            drop(result);
-            Ok(outcome)
-        }
-        ConnectionResult::Finished(outcome) => Ok(outcome.clone()),
+    if matches!(&*state, ConnectionState::MasterUp) {
+        return Ok(None);
     }
+    let outcome = connect_once(target, params, cancel).await?;
+    if outcome.is_none() {
+        *state = ConnectionState::MasterUp;
+    }
+    drop(state);
+    Ok(outcome)
 }
 
 /// A check never connects; only a missing master starts the separately bounded approval.
@@ -350,13 +402,26 @@ async fn connect_once(
                 }));
             }
         };
-        let _approval = if operation == SshOperation::Connect {
+        // The connect phase is the one that may need the agent, so it takes the control
+        // directory's turn ([`CONNECT_SLOTS`]). The check needs no approval and never waits,
+        // so a machine whose master is already up is not delayed by the queue. The phase
+        // counts as waiting from here, queued or running, and stops counting when the guard
+        // drops: on return, on cancel and on drop.
+        let (_approval, _turn) = if operation == SshOperation::Connect {
             if let Some(signal) = params.on_approval {
                 signal(true);
             }
-            Some(ApprovalGuard(params.on_approval))
+            let approval = ApprovalGuard(params.on_approval);
+            let turn = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(Cancelled),
+                turn = connect_slot(params.control_dir).acquire_owned() => {
+                    turn.expect("the connect slot is never closed")
+                }
+            };
+            (Some(approval), Some(turn))
         } else {
-            None
+            (None, None)
         };
         let mut cmd = match command(params.ssh_program) {
             Ok(cmd) => cmd,
@@ -372,11 +437,19 @@ async fn connect_once(
         // `auto` recovers stale sockets and lets cross-process race losers run `true`
         // and exit. Only ssh's own ControlPersist path detaches a reusable master;
         // unlike -N -f, there is no socketless, unbounded background fallback.
+        // The window starts here: for the connect phase, when it holds the turn, not when it
+        // was queued.
         let allowance = if operation == SshOperation::Check {
             Duration::from_secs(params.connect_timeout.seconds())
         } else {
             params.approval_deadline
         };
+        // `LeaveGroup`, not `KillGroup`: with `ControlPersist` ssh forks the master, and a
+        // `ProxyJump` or `ProxyCommand` hop from `~/.ssh/config` (forked by this leader
+        // before authentication, so in its group) carries that master's transport after the
+        // leader has exited. Killing the group then would kill the hop, the master would
+        // lose its connection, and every refresh would prompt again for every machine
+        // behind a jump host. A cancel or a timeout still kills the group.
         let ran = match run(
             cmd,
             None,
@@ -480,7 +553,9 @@ pub async fn probe(
     // `daemon()`, which runs `setsid()`, so the master is in a session of its own and no
     // group kill reaches it. What remains is caution: a live master could not be observed
     // in review (no ssh connections were allowed), and whatever else ssh leaves in its
-    // group (a `ProxyJump` hop is its child and ends with it) has not been seen to linger.
+    // group has not been seen to linger. (A `ProxyJump` hop is the case that matters: it
+    // carries a detached master's transport and ends with the master, not with this
+    // process, so leaving it alone is load-bearing; see `connect_once`.)
     // A cancel, a timeout or a drop still kills the whole group.
     let ran = match run(
         cmd,

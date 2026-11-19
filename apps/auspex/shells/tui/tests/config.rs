@@ -395,3 +395,12 @@ fn stale_after_reaches_the_core() {
         33
     );
 }
+
+/// One warning per cause: `settle < probe` implies `settle < ssh_approval + probe`, and the
+/// second condition must not repeat the first.
+#[test]
+fn a_settle_shorter_than_the_probe_is_one_warning_not_two() {
+    let (_, warnings) = config::parse("[timeouts]\nprobe = 30\nsettle = 20\n").unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("timeouts.probe"), "{warnings:?}");
+}

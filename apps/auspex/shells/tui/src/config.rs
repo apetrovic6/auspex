@@ -279,18 +279,23 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                 // naming the key, rather than on every probe.
                 auspex_domain::fleet::ConnectTimeout::new(s.timeouts.ssh_connect)
                     .map_err(|e| format!("`timeouts.ssh_connect`: {e}"))?;
+                // One warning per cause: a `settle` shorter than `probe` is also shorter than
+                // approval plus probe, so the second says nothing the first has not.
                 if s.timeouts.settle < s.timeouts.probe {
                     w.warnings.push(format!(
                         "`timeouts.settle` ({} s) is shorter than `timeouts.probe` ({} s), so a slow \
                          host is cut off by the global deadline before its own probe timeout",
                         s.timeouts.settle, s.timeouts.probe
                     ));
-                }
-                if s.timeouts.settle < s.timeouts.ssh_approval + s.timeouts.probe {
+                } else if s.timeouts.settle < s.timeouts.ssh_approval + s.timeouts.probe {
+                    // Approvals are one at a time, so with several cold hosts the later ones
+                    // wait for the earlier ones as well; the sum here is the least one host
+                    // may need, not what a fleet needs.
                     w.warnings.push(format!(
                         "`timeouts.settle` ({} s) is shorter than `timeouts.ssh_approval` ({} s) \
                          plus `timeouts.probe` ({} s), so the global deadline can cut off \
-                         connection/authentication or the probe",
+                         connection/authentication or the probe (ssh agent approvals are one \
+                         at a time, so with several cold hosts the later ones wait for the earlier)",
                         s.timeouts.settle, s.timeouts.ssh_approval, s.timeouts.probe
                     ));
                 }

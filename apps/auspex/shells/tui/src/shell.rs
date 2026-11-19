@@ -63,6 +63,13 @@ pub const MAX_CONCURRENT: usize = 32;
 /// loses its `cached` badge) and time the whole scan out.
 pub const MAX_PREVIEW_QUERIES: usize = 8;
 
+/// How long the note waits for the fleet to be counted: 500 ms.
+///
+/// It is sent after the first host starts waiting for the ssh agent, and says how many do.
+/// Each host first checks for a live master (milliseconds), so by now every host that needs
+/// an approval is counted.
+pub const APPROVAL_NOTE_DELAY: Duration = Duration::from_millis(500);
+
 /// How long a shutdown waits for adapter calls to kill and reap what they started.
 pub const REAP_GRACE: Duration = Duration::from_secs(5);
 
@@ -164,12 +171,29 @@ impl Shell {
         self.approvals.load(Ordering::Relaxed)
     }
 
-    fn approval(&self, waiting: bool) {
+    fn approval(self: &Arc<Self>, waiting: bool) {
         if waiting {
             self.approvals.fetch_add(1, Ordering::Relaxed);
             if !self.approval_noted.swap(true, Ordering::Relaxed) {
-                self.log
-                    .line("ssh: connecting/authenticating (agent approval may be pending)");
+                // One note for the whole round, naming how many hosts wait. Every host's
+                // phase is counted as it starts to wait, so the count is only the fleet's
+                // after a beat; and an approval that is over in that beat needs no note.
+                let shell = Arc::clone(self);
+                self.tasks.spawn(async move {
+                    tokio::select! {
+                        () = shell.root.cancelled() => return,
+                        () = tokio::time::sleep(APPROVAL_NOTE_DELAY) => {}
+                    }
+                    match shell.approvals() {
+                        0 => shell.approval_noted.store(false, Ordering::Relaxed),
+                        1 => shell
+                            .log
+                            .line("ssh: waiting for ssh agent approval for 1 host"),
+                        n => shell.log.line(&format!(
+                            "ssh: waiting for ssh agent approval for {n} hosts, one at a time"
+                        )),
+                    }
+                });
             }
         } else {
             self.approvals.fetch_sub(1, Ordering::Relaxed);

@@ -670,7 +670,9 @@ fn headless_reports_approval_once_and_uses_the_configured_allowance() {
         "ssh-approval",
         r#"for arg; do
 case "$arg" in
-  -O) exit 1;;
+  -O) # One host is slower to find that it has no master: the note must still count both.
+    case "$*" in *192.0.2.11*) @sleep@ 0.3;; esac
+    exit 1;;
   true) exec @sleep@ 15;;
 esac
 done
@@ -691,11 +693,9 @@ exit 99"#,
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
-    assert_eq!(
-        stderr
-            .matches("ssh: connecting/authenticating (agent approval may be pending)")
-            .count(),
-        1,
+    assert_eq!(stderr.matches("ssh agent approval").count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("ssh: waiting for ssh agent approval for 2 hosts, one at a time"),
         "{stderr}"
     );
     assert_eq!(
@@ -706,8 +706,8 @@ exit 99"#,
         "{stdout}"
     );
     assert!(
-        start.elapsed() < Duration::from_secs(12),
-        "configured 5s approval not used"
+        start.elapsed() < Duration::from_secs(20),
+        "configured 5s approval not used (two hosts, one at a time: about 10 s; the default 60 s would be 120 s)"
     );
 }
 
