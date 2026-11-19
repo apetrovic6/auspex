@@ -1,0 +1,30 @@
+┌ machines (18) ─────────────────────────────────────┐┌ luna ──────────────────────────────────────────────────────────┐
+│┌ log ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+││── update luna ──                                                                                                   ││
+││demo: nothing is run; update luna is scripted                                                                       ││
+││building the system configuration...                                                                                ││
+││copying closure to the target host...                                                                               ││
+││warning: the demo has no real machine                                                                               ││
+││activating the new configuration...                                                                                 ││
+││done                                                                                                                ││
+││── succeeded, exit 0 ──                                                                                             ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+│└Tab notes · q/esc close ────────────────────────────────────────────────────────────────────────────────────────────┘│
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+log: demo: a scripted fleet; no machine, cache or network is contacted
+ACT │ update luna: succeeded │ scanning │ 1 pending │ prom: ok                                                    ? help

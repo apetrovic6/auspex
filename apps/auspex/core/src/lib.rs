@@ -12,6 +12,9 @@
 //! - [`effects`]: the ports, one operation per request, with what each answers.
 //! - [`Event`]: what the shell tells the core, including the answers the core builds itself.
 //! - [`ViewModel`]: what a shell draws; [`Model::fleet_settled`] is when headless mode prints.
+//! - Acting: [`Event::ToggleAct`], [`Event::UpdateSelected`] and [`Event::BuildSelected`] (with the
+//!   question each asks, and [`Event::ConfirmAnswer`]) end in one [`effects::ActionRequest`]; see
+//!   `app/act.rs` for what the core guarantees before it asks the shell to run anything.
 //!
 //! No I/O, no async runtime and no clock: a rule that needs "now" receives an age, and the
 //! global deadline arrives as [`Event::DeadlinePassed`].
@@ -29,5 +32,10 @@ pub use app::{
 pub use auspex_domain::report::{FleetError, FleetErrorKind};
 pub use config::{Config, DiffConfig, PrometheusConfig};
 pub use crux_core::Core;
-pub use effects::{Effect, Generation, RequestId};
-pub use view::{Mode, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel};
+pub use effects::{
+    ActionEnd, ActionKind, ActionRequest, ActionResult, Effect, Generation, RequestId,
+};
+pub use view::{
+    ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode, Phase, PrometheusStatus, RefreshView,
+    SearchView, ViewModel,
+};

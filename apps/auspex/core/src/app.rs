@@ -42,6 +42,8 @@
 //! cancels any preview still outstanding and marks it `failed` ("timed out"), so the fleet
 //! settles even if an adapter task never answers. Headless worst case: `settle + diff`.
 
+mod act;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
@@ -57,11 +59,12 @@ use crux_core::{App, Command};
 
 use crate::config::Config;
 use crate::effects::{
-    CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest, Effect, EvalAnswer,
-    EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest, PendingClosureRequest,
-    ProbeRequest, PrometheusAnswer, PrometheusRequest, RequestId, ResolveRequest,
+    ActionEnd, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest, Effect,
+    EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
+    PendingClosureRequest, ProbeRequest, PrometheusAnswer, PrometheusRequest, RequestId,
+    ResolveRequest,
 };
-use crate::view::{Mode, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState};
+use crate::view::{Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState};
 
 /// The reason a probe still out at the global deadline is shown with.
 pub const PROBE_TIMED_OUT: &str = "timed out: no answer from the probe before the global deadline";
@@ -225,8 +228,31 @@ pub enum Event {
     ToggleHelp,
     /// Close the help overlay (`Esc` while it is open).
     CloseHelp,
-    /// Quit: cancel everything outstanding and set [`ViewModel::quit`].
+    /// Toggle act mode (`A`): turning it on asks first, turning it off does not.
+    ToggleAct,
+    /// Update the selected machine (`u`). Act mode only; asks "update luna to …? y/N" first.
+    UpdateSelected,
+    /// Build the selected machine's pending system here (`b`). Changes nothing on any machine,
+    /// so it needs no act mode; refused for another system's machine.
+    BuildSelected,
+    /// The answer to the open question: `true` for `y`, `false` for anything else.
+    ConfirmAnswer(bool),
+    /// The operator wants to quit. Cancels everything outstanding and sets
+    /// [`ViewModel::quit`], except while an action is running: then it asks, and quits once
+    /// the action has been stopped, killed and reaped. A second quit while it is stopping
+    /// forces.
     Quit,
+    /// A termination signal, or the shell tearing down: as [`Event::Quit`] without the question.
+    Terminate,
+
+    // --- the action's answer (built by the core) ----------------------------------------
+    /// [`ActionRequest`](crate::effects::ActionRequest) answered: the process is over.
+    ActionEnded {
+        /// The request.
+        id: RequestId,
+        /// How it ended.
+        end: ActionEnd,
+    },
 }
 
 /// What a request id is waiting for.
@@ -237,6 +263,9 @@ enum Pending {
     Probe(String),
     /// The evaluation stream; ends with [`EvalAnswer::Finished`].
     Eval,
+    /// One machine's evaluation, asked for on its own after an update: a stream of its own, so
+    /// its `Finished` can only mark that machine's row.
+    EvalOne(String),
     Prometheus,
     /// The cache lookup for this machine.
     Cache(String),
@@ -356,6 +385,14 @@ pub struct Model {
     /// ... with something still outstanding.
     timed_out: bool,
     view: ViewState,
+    /// Act mode. Starts off, is never persisted, and can only be turned on when
+    /// [`Config::allow_act`] is set.
+    act: bool,
+    /// The action in progress, or the last one to end. Not in `outstanding`: a refresh must not
+    /// cancel it, and it must not hold the fleet unsettled.
+    action: Option<act::Action>,
+    /// The question waiting for y or N.
+    confirm: Option<act::Confirm>,
 }
 
 impl Model {
@@ -546,19 +583,7 @@ impl App for Auspex {
                 generation,
                 id,
                 answer,
-            } => match model.accept(generation, id, |p| *p == Pending::Prometheus) {
-                Some(_) => {
-                    match answer {
-                        Ok(samples) => {
-                            model.samples = samples;
-                            model.prometheus = PrometheusStatus::Available;
-                        }
-                        Err(reason) => model.prometheus = PrometheusStatus::Unavailable { reason },
-                    }
-                    render()
-                }
-                None => Command::done(),
-            },
+            } => prometheus_answered(model, generation, id, answer),
             Event::CacheAnswered {
                 generation,
                 id,
@@ -602,12 +627,13 @@ impl App for Auspex {
                 }
                 _ => Command::done(),
             },
-            Event::Quit => {
-                model.view.quit = true;
-                let mut commands = model.cancel_all();
-                commands.push(render());
-                Command::all(commands)
-            }
+            event @ (Event::Quit
+            | Event::Terminate
+            | Event::ToggleAct
+            | Event::UpdateSelected
+            | Event::BuildSelected
+            | Event::ConfirmAnswer(_)
+            | Event::ActionEnded { .. }) => act::event(model, event),
             view_event => {
                 view_update(model, view_event);
                 render()
@@ -656,6 +682,7 @@ impl App for Auspex {
             },
         );
         let settled = model.fleet_settled();
+        let (mode, action, confirm) = act::views(model);
 
         let names = model.names();
         let phase = match model.inventory {
@@ -687,7 +714,10 @@ impl App for Auspex {
             }),
             help_open: model.view.help_open,
             quit: model.view.quit,
-            mode: Mode::Observe,
+            mode,
+            action,
+            confirm,
+            notice: model.view.notice.clone(),
         }
     }
 }
@@ -885,6 +915,28 @@ fn ask_prometheus(model: &mut Model, config: &Config) -> Option<Command<Effect, 
     )
 }
 
+fn prometheus_answered(
+    model: &mut Model,
+    generation: Generation,
+    id: RequestId,
+    answer: PrometheusAnswer,
+) -> Command<Effect, Event> {
+    if model
+        .accept(generation, id, |p| *p == Pending::Prometheus)
+        .is_none()
+    {
+        return Command::done();
+    }
+    match answer {
+        Ok(samples) => {
+            model.samples = samples;
+            model.prometheus = PrometheusStatus::Available;
+        }
+        Err(reason) => model.prometheus = PrometheusStatus::Unavailable { reason },
+    }
+    render()
+}
+
 /// Records IP-literal targets' addresses, and asks to resolve the hostname ones.
 fn ask_addresses(model: &mut Model) -> Option<Command<Effect, Event>> {
     let mut hostnames = BTreeMap::new();
@@ -933,12 +985,19 @@ fn eval_answered(
     id: RequestId,
     answer: EvalAnswer,
 ) -> Command<Effect, Event> {
-    // A stream: per-machine items leave the request outstanding, `Finished` ends it.
-    if generation != model.generation || model.outstanding.get(&id) != Some(&Pending::Eval) {
-        return Command::done();
-    }
+    // A stream: per-machine items leave the request outstanding, `Finished` ends it. The
+    // fleet-wide stream answers for every machine; the one asked for after an update only for
+    // its own, and its `Finished` marks no other row.
+    let scope: Option<String> = match model.outstanding.get(&id) {
+        Some(Pending::Eval) if generation == model.generation => None,
+        Some(Pending::EvalOne(name)) if generation == model.generation => Some(name.clone()),
+        _ => return Command::done(),
+    };
     match answer {
         EvalAnswer::Machine { machine, outcome } => {
+            if scope.as_ref().is_some_and(|s| *s != machine) {
+                return Command::done(); // not the machine this stream was asked about
+            }
             let Some(row) = model.row_mut(&machine) else {
                 return Command::done(); // not a machine we asked about
             };
@@ -951,10 +1010,14 @@ fn eval_answered(
         EvalAnswer::Finished { error } => {
             model.outstanding.remove(&id);
             let reason = error.clone().unwrap_or_else(|| EVAL_MISSING.to_owned());
-            for row in model.rows.iter_mut().filter(|r| r.eval.is_none()) {
+            for row in model
+                .rows
+                .iter_mut()
+                .filter(|r| r.eval.is_none() && scope.as_ref().is_none_or(|s| *s == r.machine.name))
+            {
                 row.eval = Some(eval_error(&row.machine.name, &reason));
             }
-            if let Some(reason) = error {
+            if let Some(reason) = error.filter(|_| scope.is_none()) {
                 model
                     .fleet_errors
                     .push(FleetError::new(FleetErrorKind::EvaluationFailed, &reason));
@@ -1307,6 +1370,7 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
             Pending::Resolve(_)
             | Pending::Probe(_)
             | Pending::Eval
+            | Pending::EvalOne(_)
             | Pending::Deployed(_)
             | Pending::Update(_) => {}
         }
@@ -1328,6 +1392,7 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
 }
 
 fn view_update(model: &mut Model, event: Event) {
+    model.view.notice = None;
     let names: Vec<String> = model.rows.iter().map(|r| r.machine.name.clone()).collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let v = &mut model.view;
@@ -1358,6 +1423,12 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::DeployedClosureAnswered { .. }
         | Event::PendingClosureAnswered { .. }
         | Event::AddressesResolved { .. }
+        | Event::ToggleAct
+        | Event::UpdateSelected
+        | Event::BuildSelected
+        | Event::ConfirmAnswer(_)
+        | Event::ActionEnded { .. }
+        | Event::Terminate
         | Event::Quit => {}
     }
 }

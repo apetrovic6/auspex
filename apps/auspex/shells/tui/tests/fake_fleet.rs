@@ -11,7 +11,10 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Tools, alive, auspex, cleanup, run_within, tempdir, tools, wait_for_pids};
+use common::{
+    Tools, alive, auspex, cleanup, run_within, still_alive_after_wait, tempdir, tools,
+    wait_for_pids,
+};
 use rustix::process::{Pid, Signal, kill_process};
 
 const LIMIT: Duration = Duration::from_secs(60);
@@ -214,7 +217,7 @@ fn the_deadline_settles_the_scan_kills_the_stragglers_and_exits_1() {
     // The core cancelled them at the deadline, and the adapters killed every process.
     let mut pids = wait_for_pids(&dir.path().join("ssh.pids"), 2);
     pids.extend(wait_for_pids(&dir.path().join("eval.pids"), 2));
-    let left: Vec<i32> = pids.iter().copied().filter(|&p| alive(p)).collect();
+    let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     assert!(left.is_empty(), "still alive after exit: {left:?}");
 }
@@ -257,7 +260,7 @@ fn signal_kills_everything(signal: Signal, name: &str) {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let left: Vec<i32> = pids.iter().copied().filter(|&p| alive(p)).collect();
+    let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     let out = child.wait_with_output().unwrap();
     assert!(left.is_empty(), "{name}: children still alive: {left:?}");

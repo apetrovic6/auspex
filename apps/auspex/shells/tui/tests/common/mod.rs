@@ -23,6 +23,7 @@ use auspex_tui::demo::{self, Demo};
 use auspex_tui::input::Screen;
 use auspex_tui::keymap::{Key, Keymap};
 use auspex_tui::log::Log;
+use auspex_tui::output::Output as ActionOutput;
 use auspex_tui::shell::Shell;
 use auspex_tui::theme::Theme;
 use auspex_tui::ui::{self, Context, Ui};
@@ -59,6 +60,7 @@ pub fn type_keys(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
     for c in keys.chars() {
         let key = match c {
             '\n' => Key::plain(crossterm::event::KeyCode::Enter),
+            '\t' => Key::plain(crossterm::event::KeyCode::Tab),
             '\x1b' => Key::plain(crossterm::event::KeyCode::Esc),
             c => Key::char(c),
         };
@@ -90,15 +92,28 @@ pub fn render(
     width: u16,
     height: u16,
 ) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    let ctx = Context {
-        theme: &Theme::Ansi,
+    render_with(
+        view,
+        ui,
         keymap,
-        flake: demo::FLAKE,
         log,
-    };
-    terminal.draw(|f| ui::draw(f, view, ui, &ctx)).unwrap();
-    let buffer = terminal.backend().buffer();
+        &ActionOutput::default(),
+        width,
+        height,
+    )
+}
+
+/// [`render`] with the streamed action output the Log tab draws.
+pub fn render_with(
+    view: &ViewModel,
+    ui: &mut Ui,
+    keymap: &Keymap,
+    log: &[String],
+    output: &ActionOutput,
+    width: u16,
+    height: u16,
+) -> String {
+    let buffer = draw(view, ui, keymap, log, output, width, height);
     let mut out = String::new();
     for y in 0..buffer.area.height {
         let mut line = String::new();
@@ -109,6 +124,28 @@ pub fn render(
         out.push('\n');
     }
     out
+}
+
+/// One frame as ratatui's buffer, for tests that look at styles as well as symbols.
+pub fn draw(
+    view: &ViewModel,
+    ui: &mut Ui,
+    keymap: &Keymap,
+    log: &[String],
+    output: &ActionOutput,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let ctx = Context {
+        theme: &Theme::Ansi,
+        keymap,
+        flake: demo::FLAKE,
+        log,
+        output,
+    };
+    terminal.draw(|f| ui::draw(f, view, ui, &ctx)).unwrap();
+    terminal.backend().buffer().clone()
 }
 
 /// The crate's directory.
@@ -300,5 +337,18 @@ pub fn cleanup(pids: &[i32]) {
         if let Some(pid) = rustix::process::Pid::from_raw(p) {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
+    }
+}
+
+/// Waits up to 3 s for every pid to be gone; returns the ones still alive. A process killed
+/// with SIGKILL is gone within moments, but not at the instant its group leader is reaped.
+pub fn still_alive_after_wait(pids: &[i32]) -> Vec<i32> {
+    let start = Instant::now();
+    loop {
+        let left: Vec<i32> = pids.iter().copied().filter(|&p| alive(p)).collect();
+        if left.is_empty() || start.elapsed() > Duration::from_secs(3) {
+            return left;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

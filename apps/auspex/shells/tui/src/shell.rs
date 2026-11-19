@@ -26,23 +26,30 @@
 //! as a failure, which the core turns into a `failed` preview.
 
 use std::collections::{BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use auspex_core::effects::{EvalAnswer, Generation, RequestId};
-use auspex_core::{Auspex, Core, Effect, Event, ViewModel};
+use auspex_core::{ActionEnd, ActionKind, ActionResult, Auspex, Core, Effect, Event, ViewModel};
+use auspex_effects::clan::{ClanRun, RunEnd};
+use auspex_effects::deploylog::{
+    ActionKind as LoggedKind, ActionLog, ActionResult as LoggedResult, NewAction, OpenParams,
+    Outcome,
+};
 use auspex_effects::nix::EvalItem;
 use auspex_effects::{CancellationToken, Cancelled};
 use crux_core::Request;
 use crux_core::capability::Operation;
 use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio_util::task::TaskTracker;
 
 use crate::backend::Backend;
 use crate::log::Log;
+use crate::output::{Output, Stream};
 
 /// How many per-machine calls (probes, cache lookups) may run at once.
 ///
@@ -102,6 +109,14 @@ pub struct Shell {
     previews: Arc<Semaphore>,
     approvals: AtomicUsize,
     approval_noted: AtomicBool,
+    /// What the Log tab draws: the output of the current and last action.
+    output: Output,
+    /// How to open the action log, when one is configured.
+    action_log_params: Mutex<Option<OpenParams>>,
+    /// The action log, opened on first use (`None` inside: it could not be).
+    action_log: OnceCell<Option<ActionLog>>,
+    /// The last thing auspex could not do besides the action itself, for the status bar.
+    warning: Mutex<Option<String>>,
 }
 
 impl Shell {
@@ -124,6 +139,10 @@ impl Shell {
             previews: Arc::new(Semaphore::new(MAX_PREVIEW_QUERIES)),
             approvals: AtomicUsize::new(0),
             approval_noted: AtomicBool::new(false),
+            output: Output::default(),
+            action_log_params: Mutex::new(None),
+            action_log: OnceCell::new(),
+            warning: Mutex::new(None),
         })
     }
 
@@ -162,6 +181,7 @@ impl Shell {
         ctx: &crate::ui::Context<'_>,
     ) {
         ui.approvals = self.approvals();
+        ui.warning = self.warning();
         crate::ui::draw(frame, &self.view(), ui, ctx);
     }
 
@@ -259,19 +279,7 @@ impl Shell {
         match effect {
             // The TUI's frame timer repaints; headless mode waits on `changed`.
             Effect::Render(_) => {}
-            Effect::Inventory(request) => {
-                let op = request.operation.clone();
-                self.arm_deadline(op.generation);
-                let token = self.open(op.id);
-                let shell = Arc::clone(self);
-                self.one_shot(op.id, request, async move {
-                    let answer = shell.backend.inventory(&op, &token).await;
-                    if let Ok(Ok(machines)) = &answer {
-                        shell.check_configured(machines);
-                    }
-                    answer
-                });
-            }
+            Effect::Inventory(request) => self.inventory(request),
             Effect::Probe(request) => {
                 let op = request.operation.clone();
                 let token = self.open(op.id);
@@ -357,8 +365,24 @@ impl Shell {
                     .await
                 });
             }
+            Effect::RunAction(request) => self.run_action(request),
             Effect::Cancel(request) => self.cancel(request.operation.id),
         }
+    }
+
+    /// The machine list, which also arms the global deadline for its refresh.
+    fn inventory(self: &Arc<Self>, request: Request<auspex_core::effects::InventoryRequest>) {
+        let op = request.operation.clone();
+        self.arm_deadline(op.generation);
+        let token = self.open(op.id);
+        let shell = Arc::clone(self);
+        self.one_shot(op.id, request, async move {
+            let answer = shell.backend.inventory(&op, &token).await;
+            if let Ok(Ok(machines)) = &answer {
+                shell.check_configured(machines);
+            }
+            answer
+        });
     }
 
     fn open(&self, id: RequestId) -> CancellationToken {
@@ -548,6 +572,212 @@ where
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Actions: `u` and `b`
+// ---------------------------------------------------------------------------------------
+
+/// How many of the last lines the ssh explanation reads.
+const EXPLAIN_LINES: usize = 40;
+
+impl Shell {
+    /// Where the action log is, and who is writing it. Call before the first action; without
+    /// it actions are not recorded (the demo, most tests).
+    pub fn set_action_log(&self, params: OpenParams) {
+        *lock(&self.action_log_params) = Some(params);
+    }
+
+    /// The last warning about something auspex could not do besides the action itself (the
+    /// action log failed). Shown in the status bar; never the action's result.
+    #[must_use]
+    pub fn warning(&self) -> Option<String> {
+        lock(&self.warning).clone()
+    }
+
+    fn warn(&self, text: &str) {
+        self.log.line(text);
+        *lock(&self.warning) = Some(text.to_owned());
+        self.changed.notify_one();
+    }
+
+    /// The streamed output of updates and builds, for the Log tab.
+    #[must_use]
+    pub const fn output(&self) -> &Output {
+        &self.output
+    }
+
+    /// A termination signal, or the end of the run: asks the core to stop whatever runs and
+    /// quit (without a question: nobody can answer one), then waits for the adapters to kill
+    /// and reap what they started and for the action log to be written. The caller exits
+    /// after this returns, so a process group is never left behind by a quit.
+    pub async fn terminate(self: &Arc<Self>) {
+        self.send(Event::Terminate);
+        self.shutdown().await;
+    }
+
+    /// The action log, opened on first use. `None` when none was configured or it could not be
+    /// opened (said once as a warning: the action itself goes ahead regardless).
+    async fn action_log(&self) -> Option<ActionLog> {
+        self.action_log
+            .get_or_init(|| async {
+                let params = lock(&self.action_log_params).clone()?;
+                match ActionLog::open(params).await {
+                    Ok(log) => Some(log),
+                    Err(e) => {
+                        self.warn(&format!("action log: not logging: {e}"));
+                        None
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// Starts the row for an action beside it, and returns where to send how it ended.
+    ///
+    /// **Off the action's path** (the rule in `deploylog`'s documentation): the row is
+    /// written by a task of its own, the action never waits for it, and a failure is a warning,
+    /// never the action's result. The task is tracked, so a quit waits for the row to be
+    /// finished (`cancelled`) before the process exits.
+    fn log_action(
+        self: &Arc<Self>,
+        op: &auspex_core::effects::ActionRequest,
+    ) -> oneshot::Sender<Outcome> {
+        let (done, outcome) = oneshot::channel();
+        let shell = Arc::clone(self);
+        let new = NewAction {
+            kind: match op.kind {
+                ActionKind::Update => LoggedKind::Deploy,
+                ActionKind::Build => LoggedKind::Build,
+            },
+            machine: op.machine.clone(),
+            fleet_commit: None,
+            fleet_dirty: None,
+        };
+        self.tasks.spawn(async move {
+            let Some(log) = shell.action_log().await else {
+                return;
+            };
+            let id = match log.start(new).await {
+                Ok(id) => id,
+                Err(e) => {
+                    shell.warn(&format!("action log: this action is not logged: {e}"));
+                    return;
+                }
+            };
+            // The sender is dropped without a result only if the action's task is gone
+            // (a panic): the row then says so rather than staying "running".
+            let outcome = outcome.await.unwrap_or(Outcome {
+                result: LoggedResult::Interrupted,
+                exit_code: None,
+                detail: None,
+            });
+            if let Err(e) = log.finish(id, outcome).await {
+                shell.warn(&format!("action log: the result was not logged: {e}"));
+            }
+        });
+        done
+    }
+
+    fn run_action(self: &Arc<Self>, mut request: Request<auspex_core::effects::ActionRequest>) {
+        let op = request.operation.clone();
+        let token = self.open(op.id);
+        self.output
+            .begin(&format!("{} {}", op.kind.label(), op.machine));
+        let logged = self.log_action(&op);
+        let shell = Arc::clone(self);
+        self.tasks.spawn(async move {
+            let ran = shell
+                .backend
+                .run_action(&op, &token, &|stream, text| shell.output.push(stream, text))
+                .await;
+            shell.forget(op.id);
+            let end = action_end(&shell.output, &op, ran);
+            shell.output.finish(&ended_line(&end));
+            // The result is the action's. The row is a record of it: a closed receiver (the
+            // log task gave up) is not an error here.
+            let _ = logged.send(Outcome {
+                result: match end.result {
+                    ActionResult::Succeeded => LoggedResult::Succeeded,
+                    ActionResult::Failed => LoggedResult::Failed,
+                    ActionResult::TimedOut => LoggedResult::TimedOut,
+                    ActionResult::Cancelled => LoggedResult::Cancelled,
+                },
+                exit_code: end.exit_code,
+                detail: (!end.summary.is_empty()).then(|| end.summary.join(" | ")),
+            });
+            // Answered on cancellation too: quitting waits for this.
+            shell.resolve(&mut request, end);
+        });
+    }
+}
+
+/// How an action ended, from what the backend said and what it printed.
+///
+/// The summary is the last few lines (stderr's when there are any), never the output; a
+/// failed update also gets the plain words for an ssh failure when its output shows one.
+fn action_end(
+    output: &Output,
+    op: &auspex_core::effects::ActionRequest,
+    ran: Result<Result<ClanRun, String>, Cancelled>,
+) -> ActionEnd {
+    let summary = || {
+        auspex_domain::act::summary_lines(
+            &output.tail(Stream::Stderr, 8),
+            &output.tail(Stream::Stdout, 8),
+        )
+    };
+    match ran {
+        Err(Cancelled) => ActionEnd {
+            result: ActionResult::Cancelled,
+            exit_code: None,
+            summary: summary(),
+            explanation: None,
+        },
+        Ok(Err(reason)) => {
+            output.push(Stream::Note, &reason);
+            ActionEnd {
+                result: ActionResult::Failed,
+                exit_code: None,
+                summary: vec![reason],
+                explanation: None,
+            }
+        }
+        Ok(Ok(run)) => {
+            let (result, exit_code) = match run.end {
+                RunEnd::Exited { code: Some(0), .. } => (ActionResult::Succeeded, Some(0)),
+                RunEnd::Exited { code, .. } => (ActionResult::Failed, code),
+                RunEnd::TimedOut => (ActionResult::TimedOut, None),
+            };
+            let ok = result == ActionResult::Succeeded;
+            ActionEnd {
+                result,
+                exit_code,
+                summary: if ok {
+                    output.tail(Stream::Stdout, 1)
+                } else {
+                    summary()
+                },
+                explanation: (!ok && op.kind == ActionKind::Update)
+                    .then(|| output.last_lines(EXPLAIN_LINES))
+                    .and_then(|lines| auspex_domain::act::explain_ssh_failure(&lines))
+                    .map(|e| e.line()),
+            }
+        }
+    }
+}
+
+/// The line under an action's output.
+fn ended_line(end: &ActionEnd) -> String {
+    let mut line = end.result.label().to_owned();
+    if let Some(code) = end.exit_code {
+        let _ = write!(line, ", exit {code}");
+    }
+    if let Some(why) = &end.explanation {
+        let _ = write!(line, ". {why}");
+    }
+    line
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

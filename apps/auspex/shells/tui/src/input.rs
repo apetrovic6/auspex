@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use auspex_core::{Event, Phase, ViewModel};
+use auspex_core::{ConfirmKind, Event, Mode, Phase, ViewModel};
 use auspex_domain::text::sanitize_line;
 use crossterm::event::KeyCode;
 
@@ -44,6 +44,22 @@ pub enum Prompt {
     },
 }
 
+/// The Log tab'"'"'s scroll state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogTab {
+    /// Shows the adapters'"'"' notes instead of the actions'"'"' output (Tab).
+    pub notes: bool,
+    /// The first visible row. Written back by the drawing every frame, so the keys scroll from
+    /// where the operator is looking, whether or not the tab was following.
+    pub scroll: usize,
+    /// The operator scrolled up: the tab stays where it is instead of following the tail.
+    /// Cleared by `G`, and by the drawing when the view reaches the end again.
+    pub unfollowed: bool,
+    /// The action output'"'"'s dropped-line count when `scroll` was last drawn: a scrolled-up view
+    /// moves back by what was dropped since, so it keeps showing the same lines.
+    pub dropped_seen: u64,
+}
+
 /// The shell's own interaction state (the core keeps selection, search and help).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Input {
@@ -62,6 +78,8 @@ pub struct Input {
     /// Its first visible line. Only ever set by keys; the drawing clamps it to the list (and
     /// writes the clamped value back), so `G` can say "the end" without knowing how long it is.
     pub diff_scroll: usize,
+    /// The Log tab's own state: which text, and where it is scrolled to.
+    pub log: LogTab,
     /// A one-line message for the prompt row (an unknown command), until the next key.
     pub message: Option<String>,
 }
@@ -80,6 +98,10 @@ pub struct Screen {
     pub listing_for: Option<Duration>,
     /// How many rows the list has: no count needs to move further than that.
     pub rows: usize,
+    /// Act mode is on.
+    pub act: bool,
+    /// A question is open, and which: every key answers it.
+    pub confirm: Option<ConfirmKind>,
 }
 
 impl Screen {
@@ -93,6 +115,8 @@ impl Screen {
             matches: view.search.as_ref().map_or(0, |s| s.matches.len()),
             listing_for: (view.refresh.phase == Phase::ListingMachines).then_some(since_refresh),
             rows: view.report.machines.len(),
+            act: view.mode == Mode::Act,
+            confirm: view.confirm.as_ref().map(|c| c.kind),
         }
     }
 }
@@ -107,6 +131,19 @@ impl Input {
         current_query: &str,
     ) -> Vec<Event> {
         self.message = None;
+        // A question is open: every key answers it, and only `y` is a yes. Nothing else may
+        // act while it is open (a key that moved the list or started a refresh would act
+        // unseen behind it). Ctrl-C is also a yes to the quit question, so the first Ctrl-C
+        // asks, the second stops the action and quits, and a third (the core's `Quit` while
+        // it is stopping) forces.
+        if let Some(kind) = screen.confirm {
+            self.count = None;
+            self.pending.clear();
+            self.prompt = None;
+            let yes = matches!(key.text(), Some('y' | 'Y'))
+                || (kind == ConfirmKind::Quit && key == Key::ctrl('c'));
+            return vec![Event::ConfirmAnswer(yes)];
+        }
         if let Some(prompt) = self.prompt.take() {
             return self.prompt_key(prompt, key, screen);
         }
@@ -160,14 +197,14 @@ impl Input {
         // Over the diff overlay a plain quit key (`q`, Esc by default) closes it; a quit key
         // that is a control chord (`ctrl-c` by default) still quits, as it does from help. It
         // is the keymap's own Quit binding either way, so a rebound or unbound chord follows.
-        if self.diff_open && action == Action::Quit && key.ctrl {
+        if (self.diff_open || self.log_open) && action == Action::Quit && key.ctrl {
             return vec![Event::Quit];
         }
         if screen.help_open && !matches!(action, Action::Help | Action::Quit) {
             // The overlay covers the list; keys that move it would act unseen.
             return Vec::new();
         }
-        self.action(action, count, screen, current_query)
+        self.action(action, count, screen, keymap, current_query)
     }
 
     fn action(
@@ -175,6 +212,7 @@ impl Input {
         action: Action,
         count: Option<usize>,
         screen: Screen,
+        keymap: &Keymap,
         current_query: &str,
     ) -> Vec<Event> {
         let n = count.unwrap_or(1);
@@ -182,7 +220,24 @@ impl Input {
         if self.diff_open {
             return self.diff_action(action, n, half);
         }
+        if self.log_open {
+            return self.log_action(action, n, half);
+        }
         match action {
+            Action::Act => vec![Event::ToggleAct],
+            // Observe mode: the key does nothing but say why. The core refuses too (it is the
+            // one that must), but only this layer knows which key the operator bound to act.
+            Action::Update if !screen.act => {
+                let key = keymap
+                    .keys_for(Action::Act)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "unbound".to_owned());
+                self.message = Some(format!("act mode is off ({key})"));
+                Vec::new()
+            }
+            Action::Update => vec![Event::UpdateSelected],
+            Action::Build => vec![Event::BuildSelected],
             Action::Down => vec![Event::MoveDown(n)],
             Action::Up => vec![Event::MoveUp(n)],
             // Counted: `n` half pages as one move of `n * max(page / 2, 1)` rows (the core's
@@ -259,7 +314,66 @@ impl Input {
             | Action::Help
             | Action::Command
             | Action::Detail
-            | Action::Log => {}
+            | Action::Log
+            | Action::Act
+            | Action::Update
+            | Action::Build => {}
+        }
+        Vec::new()
+    }
+
+    /// What an action does while the Log tab is open: scroll it, switch it, or close it.
+    ///
+    /// The tab follows the tail until the operator scrolls up (`k`, `Ctrl-u`, `gg`); `G`, or
+    /// scrolling down to the end, follows again. The drawing knows how long the output is and
+    /// writes the first visible row back into [`LogTab::scroll`] each frame, so "up" is
+    /// always one row up from what is on screen. As with the diff overlay, nothing else acts
+    /// unseen behind it, and a plain `q` closes the tab instead of quitting.
+    fn log_action(&mut self, action: Action, n: usize, half: usize) -> Vec<Event> {
+        let step = n.saturating_mul(half / 2).max(1);
+        match action {
+            Action::Quit | Action::Log => self.log_open = false,
+            // Between the actions' output and the adapters' notes.
+            Action::Detail => {
+                self.log.notes = !self.log.notes;
+                self.log.scroll = 0;
+                self.log.unfollowed = false;
+            }
+            Action::Up => {
+                self.log.unfollowed = true;
+                self.log.scroll = self.log.scroll.saturating_sub(n);
+            }
+            Action::HalfPageUp => {
+                self.log.unfollowed = true;
+                self.log.scroll = self.log.scroll.saturating_sub(step);
+            }
+            Action::Top => {
+                self.log.unfollowed = true;
+                self.log.scroll = 0;
+            }
+            // Following: down has nowhere to go.
+            Action::Down if self.log.unfollowed => {
+                self.log.scroll = self.log.scroll.saturating_add(n);
+            }
+            Action::HalfPageDown if self.log.unfollowed => {
+                self.log.scroll = self.log.scroll.saturating_add(step);
+            }
+            Action::Bottom => {
+                self.log.unfollowed = false;
+                self.log.scroll = usize::MAX;
+            }
+            Action::Down
+            | Action::HalfPageDown
+            | Action::Search
+            | Action::SearchNext
+            | Action::SearchPrevious
+            | Action::Refresh
+            | Action::Help
+            | Action::Command
+            | Action::Diff
+            | Action::Act
+            | Action::Update
+            | Action::Build => {}
         }
         Vec::new()
     }

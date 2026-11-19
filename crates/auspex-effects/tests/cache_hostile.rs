@@ -336,6 +336,7 @@ fn success(machine: &str) -> EvalSuccess {
             "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-{machine}"
         ))
         .unwrap(),
+        system: Some("x86_64-linux".to_owned()),
     }
 }
 

@@ -10,8 +10,9 @@
 //!
 //! [`ActionLog::open`] once per run, then [`ActionLog::start`] when an action begins and
 //! [`ActionLog::finish`] when it ends. [`ActionLog::recent`] and [`ActionLog::since`] read
-//! it back for the timeline. Nothing calls this yet: the core and the shell wire it in with
-//! the actions.
+//! it back for the timeline. The TUI shell calls it for every `u` (kind `deploy`) and `b` (kind
+//! `build`): it opens the log on the first action, writes the row from a task of its own beside
+//! the action, and shows a failure as a warning in the status bar (`shell.rs`, `log_action`).
 //!
 //! **The log is a record of the action, never part of it.** A caller must not await a log
 //! call on a deploy's critical path (start the deploy, and write the row beside it, for

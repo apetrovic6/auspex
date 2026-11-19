@@ -126,6 +126,7 @@ async fn a_stream_that_ends_without_finished_still_finishes() {
     let backend = Backend::Demo(Demo {
         end_without_finished: true,
         omit_from_eval: vec!["terra".to_owned()],
+        ..Demo::default()
     });
     let shell = Shell::new(backend, Log::memory(), Duration::from_secs(120));
     let start = Instant::now();
@@ -193,6 +194,7 @@ fn connection_status(shell: &Shell, ui: &mut auspex_tui::ui::Ui) -> String {
         keymap: &Keymap::defaults(),
         flake: "fake",
         log: &[],
+        output: shell.output(),
     };
     terminal.draw(|frame| shell.draw(frame, ui, &ctx)).unwrap();
     (0..160)

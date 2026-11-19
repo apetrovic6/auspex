@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 
 use auspex_core::effects::{
-    CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest, InventoryRequest,
+    ActionRequest, CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest, InventoryRequest,
     PendingClosureRequest, ProbeRequest, PrometheusRequest, ResolveRequest,
 };
 use auspex_core::{
@@ -68,6 +68,7 @@ pub fn evaluated(machine: &str, out: &str) -> EvalOutcome {
         attr_path: vec![machine.to_owned()],
         drv_path: StorePath::new(format!("{out}.drv")).unwrap(),
         out_path: StorePath::new(out).unwrap(),
+        system: Some("x86_64-linux".to_owned()),
     })
 }
 
@@ -114,6 +115,8 @@ pub fn full_config() -> Config {
         }),
         binary_cache: true,
         diff: None,
+        allow_act: false,
+        local_system: String::new(),
     }
 }
 
@@ -146,6 +149,8 @@ pub struct Shell {
     pub resolves: Vec<Request<ResolveRequest>>,
     pub deployed: Vec<Request<DeployedClosureRequest>>,
     pub pending_closures: Vec<Request<PendingClosureRequest>>,
+    /// Update and build requests, which the test answers as the shell would.
+    pub actions: Vec<Request<ActionRequest>>,
     /// Every cancel the core has emitted, in order.
     pub cancels: Vec<RequestId>,
     /// Every request id the core has issued, in order.
@@ -170,6 +175,7 @@ impl Shell {
             resolves: Vec::new(),
             deployed: Vec::new(),
             pending_closures: Vec::new(),
+            actions: Vec::new(),
             cancels: Vec::new(),
             issued: Vec::new(),
         }
@@ -220,6 +226,10 @@ impl Shell {
                 Effect::PendingClosure(r) => {
                     self.issued.push(r.operation.id);
                     self.pending_closures.push(r);
+                }
+                Effect::RunAction(r) => {
+                    self.issued.push(r.operation.id);
+                    self.actions.push(r);
                 }
                 Effect::Cancel(r) => self.cancels.push(r.operation.id),
             }
@@ -353,5 +363,22 @@ impl Shell {
             .into_iter()
             .find(|m| m.name == machine)
             .unwrap_or_else(|| panic!("no row for {machine}"))
+    }
+}
+
+impl Shell {
+    /// The one action request outstanding.
+    pub fn take_action(&mut self) -> Request<ActionRequest> {
+        assert_eq!(self.actions.len(), 1, "one action request outstanding");
+        self.actions.remove(0)
+    }
+}
+
+/// [`full_config`] that may enter act mode, on a machine whose system is `x86_64-linux`.
+pub fn act_config() -> Config {
+    Config {
+        allow_act: true,
+        local_system: "x86_64-linux".to_owned(),
+        ..full_config()
     }
 }

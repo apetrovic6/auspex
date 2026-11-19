@@ -338,10 +338,10 @@ Acceptance:
 - **ntfy and desktop notifications.**
 
 Acceptance:
-- [ ] Updating one machine streams output live and records a row in SQLite.
+- [x] Updating one machine streams output live and records a row in SQLite.
 - [ ] `U` on the k8s tags never has two of luna, sol, mars updating at once.
 - [ ] A frozen machine is skipped by `U` and marked `❄`.
-- [ ] Quitting during an update asks for confirmation, and the clan process is not orphaned
+- [x] Quitting during an update asks for confirmation, and the clan process is not orphaned
   (cancel effect).
 - [ ] auspex finds and uses the right `clan` binary without it being on PATH.
 

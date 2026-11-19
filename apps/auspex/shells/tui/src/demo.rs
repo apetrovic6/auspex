@@ -28,9 +28,15 @@ use auspex_domain::observe::{
     DiskUsage, Load, Memory, ProbeExit, ProbeOutcome, PromSample, StorePath, parse_probe,
 };
 use auspex_domain::status::NarCache;
+use auspex_effects::clan::{ClanRun, RunEnd};
 use auspex_effects::nix::EvalItem;
 use auspex_effects::{CancellationToken, Cancelled};
 use tokio::sync::mpsc::UnboundedSender;
+
+use crate::output::Stream;
+
+/// The system the demo pretends to run on: `b` refuses the darwin host (`genetor`).
+pub const LOCAL_SYSTEM: &str = "x86_64-linux";
 
 /// The demo's flake, shown as the fleet's location.
 pub const FLAKE: &str = "demo:omnissiah";
@@ -53,6 +59,8 @@ pub fn config() -> Config {
         diff: Some(DiffConfig {
             timeout_seconds: 120,
         }),
+        allow_act: true,
+        local_system: LOCAL_SYSTEM.to_owned(),
     }
 }
 
@@ -306,6 +314,14 @@ fn outcome(s: &Script) -> EvalOutcome {
         drv_path: StorePath::new(format!("/nix/store/{}-{}.drv", hash(s.name, 5), "toplevel"))
             .expect("the demo's paths are store paths"),
         out_path: StorePath::new(out).expect("the demo's paths are store paths"),
+        system: Some(
+            if darwin(s.name) {
+                "aarch64-darwin"
+            } else {
+                LOCAL_SYSTEM
+            }
+            .to_owned(),
+        ),
     })
 }
 
@@ -403,6 +419,9 @@ pub struct Demo {
     pub omit_from_eval: Vec<String>,
     /// The evaluator's stream ends with no `Finished` at all.
     pub end_without_finished: bool,
+    /// Run `u` and `b` for real, with these adapters (fake `clan` and `nix` programs), over the
+    /// scripted fleet. `None`: actions are scripted too and touch nothing.
+    pub real_actions: Option<Box<crate::backend::Real>>,
 }
 
 impl Demo {
@@ -547,5 +566,72 @@ impl Demo {
     ) -> Result<ClosureAnswer, Cancelled> {
         after(500, cancel).await?;
         Ok(Ok(closure(&op.machine, true)))
+    }
+}
+
+impl Demo {
+    /// `Effect::RunAction`: a few scripted lines and a result, touching nothing. An update of
+    /// the unreachable host fails at ssh, so the explanation can be seen.
+    pub(crate) async fn run_action(
+        &self,
+        op: &auspex_core::effects::ActionRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<Result<ClanRun, String>, Cancelled> {
+        use auspex_core::ActionKind;
+        if let Some(real) = &self.real_actions {
+            return real.run_action(op, cancel, sink).await;
+        }
+        let unreachable =
+            script(&op.machine).is_some_and(|s| matches!(s.probe, Probe::Unreachable(_)));
+        sink(
+            Stream::Note,
+            &format!(
+                "demo: nothing is run; {} {} is scripted",
+                op.kind.label(),
+                op.machine
+            ),
+        );
+        let steps: &[(Stream, &str)] = match op.kind {
+            ActionKind::Build => &[
+                (Stream::Stderr, "these 3 derivations will be built:"),
+                (Stream::Stdout, "building the system configuration..."),
+                (
+                    Stream::Stdout,
+                    "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-demo",
+                ),
+            ],
+            ActionKind::Update if unreachable => &[
+                (Stream::Stdout, "building the system configuration..."),
+                (
+                    Stream::Stderr,
+                    "ssh: connect to host 192.168.1.20 port 22: Connection timed out",
+                ),
+            ],
+            ActionKind::Update => &[
+                (Stream::Stdout, "building the system configuration..."),
+                (Stream::Stdout, "copying closure to the target host..."),
+                (Stream::Stderr, "warning: the demo has no real machine"),
+                (Stream::Stdout, "activating the new configuration..."),
+                (Stream::Stdout, "done"),
+            ],
+        };
+        for (stream, text) in steps {
+            after(400, cancel).await?;
+            sink(*stream, text);
+        }
+        let code = if unreachable && op.kind == ActionKind::Update {
+            255
+        } else {
+            0
+        };
+        Ok(Ok(ClanRun {
+            end: RunEnd::Exited {
+                code: Some(code),
+                signal: None,
+            },
+            lines_dropped: 0,
+            long_lines: 0,
+        }))
     }
 }

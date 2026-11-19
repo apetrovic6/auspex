@@ -809,6 +809,6 @@ async fn the_key_of_a_fixed_repository_is_pinned() {
     );
     assert_eq!(
         key(r.path()).await.unwrap().as_str(),
-        "v1-1aecae61c518e1837e9cc6720f719d1ce33bcbdbe7f1543da606d89a2d4de668"
+        "v2-71451c8e29e86e59a2bd3be004df05e8a725aee5481e3a9ee3454b16b6bf2ab9"
     );
 }

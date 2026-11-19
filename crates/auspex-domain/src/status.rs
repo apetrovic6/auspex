@@ -463,6 +463,7 @@ mod tests {
             attr_path: vec![],
             drv_path: StorePath::new(format!("{out}.drv")).unwrap(),
             out_path: StorePath::new(out).unwrap(),
+            system: None,
         })
     }
 
