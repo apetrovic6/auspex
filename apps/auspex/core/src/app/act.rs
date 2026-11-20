@@ -445,6 +445,18 @@ fn resolving(model: &Model) -> bool {
         .any(|p| matches!(p, Pending::Resolve(_)))
 }
 
+/// `machine`'s probe was cut off at the settle deadline: it never answered. (A probe that
+/// answered, even to say the machine is unreachable, is another matter: that is information.)
+fn probe_timed_out(model: &Model, machine: &str) -> bool {
+    model.rows.iter().any(|r| {
+        r.machine.name == machine
+            && matches!(
+                &r.probe,
+                Some(ProbeOutcome::Unreachable { reason }) if reason == super::PROBE_TIMED_OUT
+            )
+    })
+}
+
 /// Why an update of `machine` cannot be asked about yet, when what the checks need from the
 /// core is still on its way. Refused at `u` rather than shown as a warning: "not known yet"
 /// must not read as "not known".
@@ -452,7 +464,17 @@ fn not_yet(model: &Model, machine: &str) -> Option<String> {
     if probing(model, machine) {
         return Some(format!("still probing {machine}; try again in a moment"));
     }
-    resolving(model).then(|| "still resolving addresses; try again in a moment".to_owned())
+    if probe_timed_out(model, machine) {
+        return Some(format!(
+            "{machine}'s probe timed out; an update needs ssh: refresh and try again"
+        ));
+    }
+    if resolving(model) {
+        return Some("still resolving addresses; try again in a moment".to_owned());
+    }
+    model
+        .resolution_timed_out
+        .then(|| "address resolution timed out: refresh and try again".to_owned())
 }
 
 /// What the checks decide for `machine` now: the shell's `answer` and what the core holds.
@@ -500,11 +522,13 @@ fn review(model: &Model, machine: &str, answer: &PreflightAnswer) -> Preflight {
             .map_err(String::as_str),
         free_bytes,
         probing: probing(model, machine),
+        probe_timed_out: probe_timed_out(model, machine),
         addresses: Addresses {
             own_known: known(machine),
             shared: &shared,
             others_unknown,
             resolving: resolving(model),
+            resolution_timed_out: model.resolution_timed_out,
         },
         public,
     })

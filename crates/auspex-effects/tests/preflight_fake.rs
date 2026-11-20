@@ -114,8 +114,9 @@ async fn the_tree_check_lists_the_config_then_runs_one_read_only_hardened_git_st
          -c\ncore.fsmonitor=false\n--no-optional-locks\n-c\ncore.hooksPath=/dev/null\n\
          -c\ncore.attributesFile=/dev/null\n\
          -c\nfilter.evil.clean=\n-c\nfilter.evil.smudge=\n-c\nfilter.evil.process=\n\
+         -c\nfilter.evil.required=false\n\
          -c\nfilter.my.driver.clean=\n-c\nfilter.my.driver.smudge=\n\
-         -c\nfilter.my.driver.process=\n\
+         -c\nfilter.my.driver.process=\n-c\nfilter.my.driver.required=false\n\
          status\n--porcelain=v1\n-b\n-z\n--untracked-files=no\n--ignore-submodules=all\n\
          --no-renames\n--\n"
     );
@@ -994,4 +995,91 @@ async fn a_filter_driver_that_cannot_be_blanked_makes_the_check_not_run() {
     .unwrap();
     let why = real_tree(r).await.unwrap_err();
     assert!(why.contains("cannot be turned off"), "{why}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2 (re-review 3, 4): a driver that is not UTF-8, and a required one
+// ---------------------------------------------------------------------------------------
+
+/// A repository whose `host.nix` has had its stat changed without its content, with a filter
+/// driver named by raw bytes in `.git/config` and `.git/info/attributes`.
+fn repo_with_raw_driver(t: &Tools, dir: &Path, name: &[u8], extra: &str) -> (PathBuf, PathBuf) {
+    let r = dir.join("repo");
+    fs::create_dir(&r).unwrap();
+    real_git(&r, &["init", "-q", "-b", "main"]);
+    fs::write(r.join("host.nix"), "1\n").unwrap();
+    real_git(&r, &["add", "host.nix"]);
+    real_git(&r, &["commit", "-q", "-m", "one"]);
+    let ran = dir.join("FILTER-RAN");
+    let mut config = fs::read(r.join(".git/config")).unwrap();
+    config.extend_from_slice(b"[filter \"");
+    config.extend_from_slice(name);
+    config.extend_from_slice(
+        format!(
+            "\"]\n\tclean = {} '{}'; {}\n{extra}",
+            t.get("touch").display(),
+            ran.display(),
+            t.get("cat").display()
+        )
+        .as_bytes(),
+    );
+    fs::write(r.join(".git/config"), config).unwrap();
+    let mut attrs = b"* filter=".to_vec();
+    attrs.extend_from_slice(name);
+    attrs.push(b'\n');
+    fs::create_dir_all(r.join(".git/info")).unwrap();
+    fs::write(r.join(".git/info/attributes"), attrs).unwrap();
+    std::thread::sleep(Duration::from_millis(1100));
+    let now = fs::read(r.join("host.nix")).unwrap();
+    fs::write(r.join("host.nix"), now).unwrap();
+    (r, ran)
+}
+
+#[tokio::test]
+async fn a_filter_driver_whose_name_is_not_utf8_makes_the_check_not_run_and_runs_nothing() {
+    let Some(t) = with_real_git() else { return };
+    for name in [&b"\xff"[..], b"ev\xc3il"] {
+        let dir = tempdir();
+        let (r, ran) = repo_with_raw_driver(&t, dir.path(), name, "");
+        // The sanity check: an ordinary status does run this driver.
+        real_git(&r, &["status", "--porcelain"]);
+        assert!(ran.exists(), "{name:?}: the route proves nothing");
+        fs::remove_file(&ran).unwrap();
+        std::thread::sleep(Duration::from_millis(1100));
+        let now = fs::read(r.join("host.nix")).unwrap();
+        fs::write(r.join("host.nix"), now).unwrap();
+
+        let why = real_tree(&r).await.unwrap_err();
+        assert!(why.contains("not UTF-8"), "{name:?}: {why}");
+        assert!(!ran.exists(), "{name:?}: the filter ran");
+    }
+}
+
+#[tokio::test]
+async fn a_required_filter_is_turned_off_and_the_check_still_answers() {
+    let Some(t) = with_real_git() else { return };
+    let dir = tempdir();
+    // `git lfs install` writes `required = true` into the operator's global config.
+    let (r, ran) = repo_with_raw_driver(&t, dir.path(), b"lfs", "\trequired = true\n");
+    // Without the blanking this repository's status fails outright once the driver has no
+    // command (the sanity check that `required` is what is being tested).
+    let blanked = Command::new("git")
+        .current_dir(&r)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(["-c", "filter.lfs.clean=", "status", "--porcelain"])
+        .output()
+        .unwrap();
+    assert!(
+        !blanked.status.success(),
+        "an emptied required driver must be an error without `required=false`: {blanked:?}"
+    );
+    fs::remove_file(&ran).ok();
+
+    let answer = real_tree(&r).await.unwrap();
+    assert_eq!(answer.changed_files, 0, "same content: not a change");
+    assert!(!ran.exists(), "the filter ran");
+    // And a real change is seen.
+    fs::write(r.join("host.nix"), "2\n").unwrap();
+    assert_eq!(real_tree(&r).await.unwrap().changed_files, 1);
 }

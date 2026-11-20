@@ -418,6 +418,9 @@ pub struct Model {
     /// Counts the questions asked, so a shell can tell one question from the next (it may only
     /// accept an answer to a question it has drawn).
     confirm_serial: u64,
+    /// Address resolution was cut off at this refresh's settle deadline: it never answered. An
+    /// update is refused while this holds (see `app/act.rs`); a refresh starts it afresh.
+    resolution_timed_out: bool,
 }
 
 impl Model {
@@ -761,6 +764,7 @@ fn refresh(model: &mut Model) -> Command<Effect, Event> {
     model.rows.clear();
     model.samples.clear();
     model.addresses.clear();
+    model.resolution_timed_out = false;
     model.fleet_errors.clear();
     model.deadline_passed = false;
     model.started.clear();
@@ -1408,8 +1412,10 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
             //
             // The previews' queries are not here: filtered out above, they keep their own
             // deadline.
-            Pending::Resolve(_)
-            | Pending::Probe(_)
+            // ... but not for the update's checks: "the lookup never answered" is not "this name
+            // does not resolve", so it is remembered.
+            Pending::Resolve(_) => model.resolution_timed_out = true,
+            Pending::Probe(_)
             | Pending::Eval
             | Pending::EvalOne(_)
             | Pending::Deployed(_)

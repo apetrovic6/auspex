@@ -82,7 +82,7 @@ pub const LIST_CONFIG_ARGS: [&str; 4] = ["config", "--list", "--name-only", "-z"
 
 /// The filter drivers the repository's configuration defines, sorted and unique.
 ///
-/// Every `<name>` of a key `filter.<name>.clean`, `.smudge` or `.process`, read from the output
+/// Every `<name>` of a key `filter.<name>.clean`, `.smudge`, `.process` or `.required`, read from the output
 /// of `git config --list --name-only -z` ([`LIST_CONFIG_ARGS`]).
 ///
 /// A *filter driver* is a command git runs on file contents; `git status` runs the `clean` (or
@@ -92,18 +92,31 @@ pub const LIST_CONFIG_ARGS: [&str; 4] = ["config", "--list", "--name-only", "-z"
 /// # Errors
 ///
 /// One line when a driver cannot be blanked (see [`status_args`]): its name has a character a
-/// `-c key=value` argument cannot carry (`=`, or a control character). Failing is the safe
+/// `-c key=value` argument cannot carry (`=`, a control character, bytes that are not UTF-8).\n/// Failing is the safe
 /// answer: the check then says it could not run, and no filter was left to run.
-pub fn parse_filter_names(text: &str) -> Result<Vec<String>, String> {
+pub fn parse_filter_names(text: &[u8]) -> Result<Vec<String>, String> {
+    const SUFFIXES: [&str; 4] = [".clean", ".smudge", ".process", ".required"];
     let mut names = BTreeSet::new();
-    for key in text.split('\0') {
+    for record in text.split(|b| *b == 0) {
+        let Ok(key) = std::str::from_utf8(record) else {
+            // A key that is not UTF-8 cannot be written back as a `-c` argument, so if it is a
+            // filter's it cannot be turned off: decoding it lossily would blank *another* key
+            // and leave the real driver running.
+            let is_filter = record.starts_with(b"filter.")
+                && SUFFIXES.iter().any(|s| record.ends_with(s.as_bytes()));
+            if is_filter {
+                return Err(format!(
+                    "a filter driver of this repository ({:?}) has a name that is not UTF-8, so \
+                     it cannot be turned off",
+                    sanitize_line(&String::from_utf8_lossy(record))
+                ));
+            }
+            continue;
+        };
         let Some(rest) = key.strip_prefix("filter.") else {
             continue;
         };
-        let Some(name) = [".clean", ".smudge", ".process"]
-            .iter()
-            .find_map(|suffix| rest.strip_suffix(suffix))
-        else {
+        let Some(name) = SUFFIXES.iter().find_map(|suffix| rest.strip_suffix(suffix)) else {
             continue;
         };
         if name.is_empty() || name.contains('=') || name.chars().any(char::is_control) {
@@ -158,6 +171,11 @@ pub fn status_args(filters: &[String]) -> Vec<String> {
             args.push("-c".to_owned());
             args.push(format!("filter.{name}.{what}="));
         }
+        // A *required* driver whose command is empty is an error ("clean filter 'lfs' failed"):
+        // git status would exit 128 on any stat-dirty file, and `git lfs install` puts
+        // `required = true` in the operator's global config.
+        args.push("-c".to_owned());
+        args.push(format!("filter.{name}.required=false"));
     }
     args.extend(
         [
@@ -338,7 +356,8 @@ impl Basis {
     fn describe(self, bytes: u64) -> String {
         match self {
             Self::WholeClosure => format!(
-                "the whole closure's {}; which of its paths the machine has already is not known",
+                "{} to add, being the whole closure (which of its paths the machine has already \
+                 is not known)",
                 format_bytes(bytes)
             ),
             Self::NotOnMachine {
@@ -346,8 +365,8 @@ impl Basis {
                 total_paths,
                 whole_bytes,
             } => format!(
-                "the {} of the {new_paths} of the closure's {total_paths} paths it does not have \
-                 yet, of {} in all",
+                "{} to add, being the {new_paths} of the closure's {total_paths} paths the \
+                 machine does not have yet (the whole closure is {})",
                 format_bytes(bytes),
                 format_bytes(whole_bytes)
             ),
@@ -412,6 +431,9 @@ pub struct Addresses<'a> {
     /// Address resolution is still out for this refresh. "Not known yet" is not "resolution
     /// failed": until it answers, no collision can be ruled out, so the rule refuses.
     pub resolving: bool,
+    /// Address resolution was cut off at the settle deadline: it never answered, which is not
+    /// "failed" either. Refused like pending: refresh and try again.
+    pub resolution_timed_out: bool,
 }
 
 /// Everything the rules need, gathered by the core.
@@ -430,6 +452,10 @@ pub struct Facts<'a> {
     /// but not here yet. The disk rule refuses until it answers: a refresh clears the probes,
     /// and without this a refusal for disk would turn into a warning for a few seconds.
     pub probing: bool,
+    /// The machine's probe was cut off at the settle deadline: it never answered, so its free
+    /// space is neither "not here yet" nor "not reported". An update needs ssh anyway; refused
+    /// like pending ("refresh and try again").
+    pub probe_timed_out: bool,
     /// The duplicate-address rule's inputs.
     pub addresses: Addresses<'a>,
     /// `machines.<m>.public`.
@@ -512,6 +538,12 @@ fn disk_check(facts: &Facts<'_>, out: &mut Preflight) {
         ));
         return;
     }
+    if facts.probe_timed_out {
+        out.refusals.push(format!(
+            "{machine}'s probe timed out; an update needs ssh: refresh and try again"
+        ));
+        return;
+    }
     let need = match facts.closure {
         Ok(n) => n,
         Err(why) => {
@@ -526,15 +558,15 @@ fn disk_check(facts: &Facts<'_>, out: &mut Preflight) {
     let Some(free) = facts.free_bytes else {
         out.warnings.push(format!(
             "free space on {machine}'s /nix/store is not known (its last probe did not report \
-             it), so it is not checked against the {} the update is expected to add",
-            format_bytes(need.bytes)
+             it), so it is not checked against what the update is expected to add: {}",
+            need.basis.describe(need.bytes)
         ));
         return;
     };
     let needed = need.bytes.saturating_add(FREE_MARGIN_BYTES);
     if free < needed {
         out.refusals.push(format!(
-            "{machine}'s /nix/store has {} free, and this update needs {} ({}, plus {} to spare)",
+            "{machine}'s /nix/store has {} free, and this update needs {}: {}, plus {} to spare",
             format_bytes(free),
             format_bytes(needed),
             need.basis.describe(need.bytes),
@@ -550,6 +582,13 @@ fn address_check(facts: &Facts<'_>, out: &mut Preflight) {
         out.refusals.push(format!(
             "still resolving addresses, so whether {machine}'s address is shared with another \
              machine cannot be told yet: try again in a moment"
+        ));
+        return;
+    }
+    if a.resolution_timed_out {
+        out.refusals.push(format!(
+            "address resolution timed out, so whether {machine}'s address is shared with another \
+             machine cannot be told: refresh and try again"
         ));
         return;
     }
@@ -614,6 +653,7 @@ mod tests {
         shared: &[],
         others_unknown: 0,
         resolving: false,
+        resolution_timed_out: false,
     };
 
     fn facts<'a>(
@@ -630,6 +670,7 @@ mod tests {
             }),
             free_bytes: free,
             probing: false,
+            probe_timed_out: false,
             addresses: NO_ADDRESS_TROUBLE,
             public: false,
         }
@@ -861,6 +902,49 @@ mod tests {
     }
 
     #[test]
+    fn a_probe_cut_off_at_the_deadline_is_refused_not_warned() {
+        // Neither "not here yet" nor "answered without it": it never answered, and an update
+        // needs ssh anyway.
+        let t = tree(0, tracking(0));
+        let mut f = facts(&t, Ok(GIB), None);
+        f.probe_timed_out = true;
+        let p = preflight(&f);
+        assert_eq!(p.refusals.len(), 1, "{:?}", p.refusals);
+        assert!(
+            p.refusals[0].contains("luna's probe timed out")
+                && p.refusals[0].contains("an update needs ssh")
+                && p.refusals[0].contains("refresh and try again"),
+            "{:?}",
+            p.refusals
+        );
+        assert_eq!(
+            p.warnings,
+            Vec::<String>::new(),
+            "no second, softer sentence"
+        );
+        // Even when the closure's size is not known either.
+        f.closure = Err("timed out");
+        assert_eq!(preflight(&f).refusals.len(), 1);
+    }
+
+    #[test]
+    fn address_resolution_cut_off_at_the_deadline_is_refused_not_warned() {
+        let t = tree(0, tracking(0));
+        let mut f = facts(&t, Ok(GIB), Some(10 * GIB));
+        f.addresses.resolution_timed_out = true;
+        f.addresses.others_unknown = 3;
+        let p = preflight(&f);
+        assert_eq!(p.refusals.len(), 1, "{:?}", p.refusals);
+        assert!(
+            p.refusals[0].contains("address resolution timed out")
+                && p.refusals[0].contains("refresh and try again"),
+            "{:?}",
+            p.refusals
+        );
+        assert_eq!(p.warnings, Vec::<String>::new());
+    }
+
+    #[test]
     fn the_address_rule_fails_closed_for_this_machine_only() {
         let t = tree(0, tracking(0));
         let mut f = facts(&t, Ok(GIB), Some(10 * GIB));
@@ -963,7 +1047,7 @@ mod tests {
         f.closure = Ok(whole);
         let why = preflight(&f).refusals.remove(0);
         assert!(
-            why.contains("the whole closure's 4.0 GiB") && why.contains("not known"),
+            why.contains("4.0 GiB to add, being the whole closure") && why.contains("not known"),
             "{why}"
         );
         let deployed: BTreeSet<StorePath> = std::iter::once(p('z')).collect();
@@ -971,7 +1055,9 @@ mod tests {
         f.closure = Ok(part);
         let why = preflight(&f).refusals.remove(0);
         assert!(
-            why.contains("the 4.0 GiB of the 2 of the closure's 2 paths it does not have yet"),
+            why.contains(
+                "4.0 GiB to add, being the 2 of the closure's 2 paths the machine does not have yet"
+            ),
             "{why}"
         );
     }
@@ -994,21 +1080,42 @@ mod tests {
         let keys = "core.bare\0filter.lfs.clean\0filter.lfs.smudge\0filter.lfs.required\0\
                     filter.my.driver.process\0filter.evil.clean\0user.name\0filter.x.y\0";
         assert_eq!(
-            parse_filter_names(keys),
+            parse_filter_names(keys.as_bytes()),
             Ok(vec![
                 "evil".to_owned(),
                 "lfs".to_owned(),
                 "my.driver".to_owned()
             ])
         );
-        assert_eq!(parse_filter_names(""), Ok(Vec::new()));
+        assert_eq!(parse_filter_names(b""), Ok(Vec::new()));
+        // A driver known only by its `required` key is listed too (it is turned off as well).
+        assert_eq!(
+            parse_filter_names(b"filter.only.required\0"),
+            Ok(vec!["only".to_owned()])
+        );
+        // A key that is not UTF-8 is a problem only if it is a filter's: then the driver cannot
+        // be named in a `-c` argument, so it cannot be turned off. Lossy decoding would blank
+        // another key and leave it running.
+        for bad in [
+            &b"filter.\xff.clean\0"[..],
+            b"filter.ev\xc3il.process\0",
+            b"filter.\xff.required\0",
+        ] {
+            let why = parse_filter_names(bad).unwrap_err();
+            assert!(why.contains("not UTF-8"), "{why}");
+        }
+        assert_eq!(
+            parse_filter_names(b"core.\xff\0filter.ok.clean\0user.\xfe.name\0"),
+            Ok(vec!["ok".to_owned()]),
+            "an odd key that is not a filter's does not matter"
+        );
         // A name `-c key=value` cannot carry: the check cannot run, and says so.
         for bad in [
             "filter.a=b.clean\0",
             "filter.a\u{1b}b.clean\0",
             "filter..clean\0",
         ] {
-            assert!(parse_filter_names(bad).is_err(), "{bad:?}");
+            assert!(parse_filter_names(bad.as_bytes()).is_err(), "{bad:?}");
         }
     }
 
@@ -1032,22 +1139,17 @@ mod tests {
             ]
         );
         let args = status_args(&["a".to_owned(), "b.c".to_owned()]);
-        let want = [
-            "-c",
-            "filter.a.clean=",
-            "-c",
-            "filter.a.smudge=",
-            "-c",
-            "filter.a.process=",
-            "-c",
-            "filter.b.c.clean=",
-            "-c",
-            "filter.b.c.smudge=",
-            "-c",
-            "filter.b.c.process=",
-        ];
+        // Every driver: its three commands emptied, and `required` off (an empty required
+        // driver is an error, not a no-op).
+        let mut want: Vec<String> = Vec::new();
+        for name in ["a", "b.c"] {
+            for what in ["clean=", "smudge=", "process=", "required=false"] {
+                want.push("-c".to_owned());
+                want.push(format!("filter.{name}.{what}"));
+            }
+        }
         let at = args.iter().position(|a| a == "filter.a.clean=").unwrap() - 1;
-        assert_eq!(args[at..at + 12], want);
+        assert_eq!(args[at..at + want.len()], want);
         // The status command comes after every override, or they would not apply to it.
         let status = args.iter().position(|a| a == "status").unwrap();
         assert!(args.iter().rposition(|a| a.starts_with("filter.")).unwrap() < status);

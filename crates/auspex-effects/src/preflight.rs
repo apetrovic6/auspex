@@ -65,7 +65,8 @@ pub async fn tree_state(
         Ok(out) => out,
         Err(why) => return Ok(Err(why)),
     };
-    let filters = match parse_filter_names(&String::from_utf8_lossy(&listing)) {
+    // As bytes: a driver name that is not UTF-8 must not be decoded into another name.
+    let filters = match parse_filter_names(&listing) {
         Ok(f) => f,
         Err(why) => return Ok(Err(why)),
     };

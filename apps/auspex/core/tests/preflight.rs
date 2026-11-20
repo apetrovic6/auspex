@@ -1318,7 +1318,7 @@ fn without_it_the_whole_closure_is_counted_and_the_dialog_says_so() {
     let confirm = dialog(&mut s, sized_closure());
     assert_eq!(confirm.kind, ConfirmKind::Refused);
     assert!(
-        confirm.refusals[0].contains("the whole closure's 6.1 GiB")
+        confirm.refusals[0].contains("6.1 GiB to add, being the whole closure")
             && confirm.refusals[0]
                 .contains("which of its paths the machine has already is not known"),
         "{:?}",
@@ -1334,8 +1334,9 @@ fn the_refusal_names_the_paths_it_counted_when_what_is_new_is_still_too_big() {
     let confirm = dialog(&mut s, sized_closure());
     assert_eq!(confirm.kind, ConfirmKind::Refused);
     assert!(
-        confirm.refusals[0]
-            .contains("the 150.0 MiB of the 2 of the closure's 4 paths it does not have yet"),
+        confirm.refusals[0].contains(
+            "150.0 MiB to add, being the 2 of the closure's 4 paths the machine does not have yet"
+        ),
         "{:?}",
         confirm.refusals
     );
@@ -1365,7 +1366,7 @@ fn a_refresh_forgets_the_machines_closure_until_the_preview_fetches_it_again() {
     let confirm = dialog(&mut s, sized_closure());
     assert_eq!(confirm.kind, ConfirmKind::Refused);
     assert!(
-        confirm.refusals[0].contains("the whole closure's"),
+        confirm.refusals[0].contains("being the whole closure"),
         "{:?}",
         confirm.refusals
     );
@@ -1414,7 +1415,7 @@ fn a_closure_that_does_not_contain_the_probed_system_is_not_used() {
     let confirm = dialog(&mut s, sized_closure());
     assert_eq!(confirm.kind, ConfirmKind::Refused);
     assert!(
-        confirm.refusals[0].contains("the whole closure's"),
+        confirm.refusals[0].contains("being the whole closure"),
         "{:?}",
         confirm.refusals
     );
@@ -1449,8 +1450,246 @@ fn after_an_update_the_machines_closure_is_forgotten_until_it_is_fetched_again()
     let confirm = dialog(&mut s, sized_closure());
     assert_eq!(confirm.kind, ConfirmKind::Refused, "{:?}", confirm.warnings);
     assert!(
-        confirm.refusals[0].contains("the whole closure's"),
+        confirm.refusals[0].contains("being the whole closure"),
         "{:?}",
         confirm.refusals
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2: a probe or a resolution cut off at the settle deadline is not "unknown"
+// ---------------------------------------------------------------------------------------
+
+fn deadline(s: &mut Shell) {
+    let generation = s.view().refresh.generation;
+    s.send(Event::DeadlinePassed { generation });
+}
+
+/// The re-reviewer's CP1. luna is refused for disk. Then a refresh whose probe never answers
+/// before `timeouts.settle`: the probe is marked timed out. `u` and `y` must not deploy.
+#[test]
+fn cp1_a_disk_refusal_survives_a_probe_cut_off_at_the_deadline() {
+    let mut s = ready(config(), FLEET, Some(2));
+    let confirm = dialog(&mut s, closure(4));
+    assert_eq!(confirm.kind, ConfirmKind::Refused, "precondition");
+    s.send(Event::ConfirmAnswer(false));
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    deadline(&mut s);
+    s.send(Event::UpdateSelected);
+    assert!(
+        notice(&s).contains("luna's probe timed out")
+            && notice(&s).contains("an update needs ssh")
+            && notice(&s).contains("refresh and try again"),
+        "{}",
+        notice(&s)
+    );
+    assert!(s.preflights.is_empty());
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+}
+
+/// The same at `y`: a dialog is open, a refresh happens, and the probe is cut off.
+#[test]
+fn y_after_a_refresh_whose_probe_was_cut_off_is_refused() {
+    let mut s = ready(config(), FLEET, Some(100));
+    let confirm = dialog(&mut s, closure(4));
+    assert_eq!(confirm.kind, ConfirmKind::Update, "precondition");
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    deadline(&mut s);
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    assert!(
+        notice(&s).contains("luna's probe timed out"),
+        "{}",
+        notice(&s)
+    );
+}
+
+/// A probe that answered, even "unreachable", is information, not a timeout: the first-round
+/// decision (a warning, since the update itself will say what is wrong) stands.
+#[test]
+fn a_probe_that_answered_unreachable_is_not_a_timeout() {
+    let mut s = Shell::new();
+    s.start_with(config(), FLEET);
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    s.probe(
+        "luna",
+        support::unreachable("ssh: connect to host: Connection refused"),
+    );
+    s.probe("sol", probe_with_store("sol", Some(100)));
+    s.probe("terra", probe_with_store("terra", Some(100)));
+    s.send(Event::ToggleAct);
+    s.send(Event::ConfirmAnswer(true));
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    assert!(
+        confirm.warnings[0].contains("not known"),
+        "{:?}",
+        confirm.warnings
+    );
+}
+
+/// The re-reviewer's CP2. The shared-address setup; after a refresh, resolution is cut off at the
+/// deadline. `u` and `y` must not deploy.
+#[test]
+fn cp2_a_shared_address_refusal_survives_a_resolution_cut_off_at_the_deadline() {
+    let luna: IpAddr = "192.168.1.11".parse().unwrap();
+    let mut s = ready(config(), SOL_BY_NAME, Some(100));
+    let mut resolve = s.resolves.remove(0);
+    s.resolve(
+        &mut resolve,
+        std::iter::once(("sol".to_owned(), vec![luna])).collect(),
+    );
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Refused, "precondition");
+    s.send(Event::ConfirmAnswer(false));
+    rescan(&mut s, SOL_BY_NAME, 100);
+    deadline(&mut s);
+    assert!(
+        s.view().refresh.timed_out,
+        "the deadline cut the resolution off"
+    );
+    s.send(Event::UpdateSelected);
+    assert!(
+        notice(&s).contains("address resolution timed out")
+            && notice(&s).contains("refresh and try again"),
+        "{}",
+        notice(&s)
+    );
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+}
+
+#[test]
+fn y_after_a_refresh_whose_resolution_was_cut_off_is_refused() {
+    let mut s = ready(config(), SOL_BY_NAME, Some(100));
+    let mut resolve = s.resolves.remove(0);
+    s.resolve(
+        &mut resolve,
+        std::iter::once(("sol".to_owned(), vec!["192.168.1.12".parse().unwrap()])).collect(),
+    );
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update, "precondition");
+    rescan(&mut s, SOL_BY_NAME, 100);
+    deadline(&mut s);
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    assert!(
+        notice(&s).contains("address resolution timed out"),
+        "{}",
+        notice(&s)
+    );
+}
+
+/// The timeout belongs to the refresh it happened in: the next one starts clean, and an answered
+/// resolution makes the update askable again.
+#[test]
+fn a_new_refresh_forgets_a_resolution_timeout() {
+    let mut s = ready(config(), SOL_BY_NAME, Some(100));
+    deadline(&mut s);
+    s.drop_cancelled(); // the cut-off resolution is gone, as in a real shell
+    s.send(Event::UpdateSelected);
+    assert!(
+        notice(&s).contains("address resolution timed out"),
+        "{}",
+        notice(&s)
+    );
+    rescan(&mut s, SOL_BY_NAME, 100);
+    let mut resolve = s.resolves.remove(0);
+    s.resolve(
+        &mut resolve,
+        std::iter::once(("sol".to_owned(), vec!["192.168.1.12".parse().unwrap()])).collect(),
+    );
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2: survivors N3 and N4
+// ---------------------------------------------------------------------------------------
+
+/// N4: the disk rule refuses while probing even when the closure's size is not known (the
+/// common case before `clan` builds). A dialog that said "size not known", a refresh with the
+/// probes out, and `y`: refused, not deployed.
+#[test]
+fn n4_the_probing_refusal_does_not_need_the_closure_size() {
+    let mut s = ready(config(), FLEET, Some(100));
+    let confirm = dialog(
+        &mut s,
+        PreflightAnswer {
+            closure: Err("closure size query timed out after 90s".to_owned()),
+            ..clean_preflight()
+        },
+    );
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    assert_eq!(confirm.warnings.len(), 1, "{:?}", confirm.warnings);
+    s.send(Event::Refresh);
+    let mut list = s.take_inventory();
+    s.resolve(&mut list, Ok(inventory(FLEET)));
+    let mut eval = s.take_eval();
+    for m in ["luna", "sol", "terra"] {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    assert!(notice(&s).contains("still probing luna"), "{}", notice(&s));
+}
+
+/// N3: "asks again when the warnings changed" holds for a change in *what* a warning says, not
+/// only in how many there are: "1 of the other machines ..." becomes "2 of the other machines ...".
+#[test]
+fn n3_a_warning_that_changed_its_content_with_the_same_count_asks_again() {
+    let json = r#"{
+      "luna":  {"deploy": {"targetHost": "root@192.168.1.11"}},
+      "sol":   {"deploy": {"targetHost": "root@sol.lab.example"}},
+      "terra": {"deploy": {"targetHost": "root@terra.lab.example"}}
+    }"#;
+    let mut s = ready(config(), json, Some(100));
+    // sol did not resolve (finished and failed), terra did: one other machine unknown.
+    let mut resolve = s.resolves.remove(0);
+    s.resolve(
+        &mut resolve,
+        std::iter::once(("terra".to_owned(), vec!["192.168.1.10".parse().unwrap()])).collect(),
+    );
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.kind, ConfirmKind::Update);
+    assert_eq!(confirm.warnings.len(), 1, "{:?}", confirm.warnings);
+    assert!(
+        confirm.warnings[0].contains("1 of the other machines"),
+        "{:?}",
+        confirm.warnings
+    );
+    // Refreshed: now neither resolved. Still exactly one warning, saying something else.
+    rescan(&mut s, json, 100);
+    let mut resolve = s.resolves.remove(0);
+    s.resolve(&mut resolve, std::collections::BTreeMap::new());
+    s.send(Event::ConfirmAnswer(true));
+    nothing_runs(&s);
+    let again = s.view().confirm.expect("asked again");
+    assert_eq!(again.warnings.len(), 1, "{:?}", again.warnings);
+    assert!(
+        again.warnings[0].contains("2 of the other machines"),
+        "{:?}",
+        again.warnings
+    );
+    assert_ne!(again.serial, confirm.serial);
 }
