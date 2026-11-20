@@ -4,7 +4,7 @@
 │ ✓⚠   cerberus             in sync                  ││reason    pending nixos-system-luna-25.11.20261101.6a2f1c0      │
 │ ↑❄   cypramundi           update pending           ││frozen    unknown: the state file /x/state.toml is not valid    │
 │ ?    deimos               not installed            ││          (not TOML)                                            │
-│ ✓    europa               in sync                  ││diff      +3 −2 ~10 packages (d)                                │
+│ ✓    europa               in sync                  ││diff      +3 −2 ~12 packages (d)                                │
 │ ✓⟳   ganymede             in sync                  ││host      root@192.168.1.11 (inventory deploy.targetHost)       │
 │ ✓    genetor              in sync                  ││build     localhost                                             │
 │ ✓    io                   in sync                  ││class     nixos  tags: k8s, k8s-server                          │
@@ -19,10 +19,10 @@
 │ !    vulcan               eval error               ││          (prometheus)                                          │
 │                                                    ││load      0.40 0.35 0.30 (prometheus)                           │
 │                                                    ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
-│                                                    ││diff      linux 6.12.38 → 6.12.41, +3 −2 ~10                    │
+│                                                    ││diff      linux 6.12.38 → 6.12.41, +3 −2 ~12                    │
 │                                                    ││critical  linux 6.12.38 → 6.12.41, systemd 256.10 → 257.2, glibc│
 │                                                    ││          2.40-66 → 2.40-77, nix rebuilt                        │
-│                                                    ││counts    3 other major-version changes; +3 −2 ~10  1 rebuilt … │
+│                                                    ││counts    4 other major-version changes; +3 −2 ~12  1 rebuilt … │
 │                                                    ││                                                                │
 │                                                    ││                                                                │
 └────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘

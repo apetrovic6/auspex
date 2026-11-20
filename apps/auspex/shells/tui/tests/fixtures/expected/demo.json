@@ -575,7 +575,7 @@
         "cached"
       ],
       "settled": true,
-      "reason": "pending nixos-system-luna-25.11.20261101.6a2f1c0; linux 6.12.38 → 6.12.41, +3 −2 ~10",
+      "reason": "pending nixos-system-luna-25.11.20261101.6a2f1c0; linux 6.12.38 → 6.12.41, +3 −2 ~12",
       "current_system": "/nix/store/0357acgiknqsxz2469bdhjmprwy0358a-nixos-system-luna-25.11.20261019.b81e2d4",
       "pending_system": "/nix/store/g1j4m7qavdyh1k4n7rawdzh2k5n8rbwf-nixos-system-luna-25.11.20261101.6a2f1c0",
       "package_diff": {
@@ -673,6 +673,28 @@
             ],
             "after": [
               "134.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "firefox-unwrapped",
+            "before": [
+              "133.0"
+            ],
+            "after": [
+              "134.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "gnome-settings-daemon-gsettings-schemas",
+            "before": [
+              "47.2"
+            ],
+            "after": [
+              "48.0"
             ],
             "before_truncated": false,
             "after_truncated": false
@@ -803,6 +825,34 @@
             "after_truncated": false
           },
           {
+            "name": "firefox-unwrapped",
+            "kinds": [
+              "major_version"
+            ],
+            "before": [
+              "133.0"
+            ],
+            "after": [
+              "134.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
+            "name": "gnome-settings-daemon-gsettings-schemas",
+            "kinds": [
+              "major_version"
+            ],
+            "before": [
+              "47.2"
+            ],
+            "after": [
+              "48.0"
+            ],
+            "before_truncated": false,
+            "after_truncated": false
+          },
+          {
             "name": "nodejs",
             "kinds": [
               "major_version"
@@ -845,7 +895,7 @@
         "counts": {
           "added": 3,
           "removed": 2,
-          "changed": 10
+          "changed": 12
         },
         "truncated": {
           "added": false,

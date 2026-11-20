@@ -492,8 +492,9 @@ pub fn diff_closures<S: AsRef<str>>(
     let Some(pending) = pending else {
         return Ok(None);
     };
-    let deployed = index(deployed)?;
-    let pending = index(pending)?;
+    let mut deployed = index(deployed)?;
+    let mut pending = index(pending)?;
+    move_shared_suffixes(&mut deployed, &mut pending);
     let mut diff = PackageDiff {
         state: DiffState::Computed,
         deployed: unique_toplevel(&deployed),
@@ -570,6 +571,77 @@ pub fn diff_closures<S: AsRef<str>>(
     fill_preview(&mut diff, lists);
     diff.truncated.highlights |= diff.highlights.len() < highlight_count;
     Ok(Some(diff))
+}
+
+/// A trailing `-<word>` that every version on both sides carries is a derivation-name part
+/// (`gnome-settings-daemon 50.1-gsettings-schemas`), not a version: it moves into the name.
+///
+/// Only names present in both closures qualify, so a suffix on one side alone stays in the
+/// version and is shown as the change it is; the number before it is kept, so no version
+/// change is hidden. Pre-release words and the critical packages are never moved.
+fn move_shared_suffixes(deployed: &mut Closure, pending: &mut Closure) {
+    let names: Vec<String> = deployed
+        .packages
+        .keys()
+        .filter(|n| pending.packages.contains_key(*n) && critical(n).is_none())
+        .cloned()
+        .collect();
+    for name in names {
+        let Some(suffix) = shared_suffix(&deployed.packages[&name], &pending.packages[&name])
+        else {
+            continue;
+        };
+        let renamed = format!("{name}-{suffix}");
+        let tail = format!("-{suffix}");
+        for closure in [&mut *deployed, &mut *pending] {
+            let versions = closure.packages.remove(&name).unwrap_or_default();
+            closure.packages.entry(renamed.clone()).or_default().extend(
+                versions
+                    .iter()
+                    .map(|v| v.strip_suffix(&tail).unwrap_or(v).to_owned()),
+            );
+        }
+    }
+}
+
+fn shared_suffix(old: &Versions, new: &Versions) -> Option<String> {
+    let words = |v: &str| -> Vec<String> {
+        let mut parts: Vec<&str> = v.split('-').collect();
+        let mut tail = Vec::new();
+        while parts.len() > 1 {
+            let word = parts[parts.len() - 1];
+            let is_word = word.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                && word
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && !prerelease(word);
+            if !is_word {
+                break;
+            }
+            tail.push(word.to_owned());
+            parts.pop();
+        }
+        tail
+    };
+    let mut all = old.iter().chain(new).map(|v| words(v));
+    let mut common = all.next()?;
+    for other in all {
+        let same = common
+            .iter()
+            .zip(&other)
+            .take_while(|(a, b)| a == b)
+            .count();
+        common.truncate(same);
+    }
+    common.reverse();
+    (!common.is_empty()).then(|| common.join("-"))
+}
+
+fn prerelease(word: &str) -> bool {
+    matches!(
+        word.trim_end_matches(|c: char| c.is_ascii_digit()),
+        "alpha" | "beta" | "rc" | "pre" | "git" | "unstable" | "dev" | "snapshot" | "nightly"
+    )
 }
 
 fn unique_toplevel(closure: &Closure) -> Option<String> {
