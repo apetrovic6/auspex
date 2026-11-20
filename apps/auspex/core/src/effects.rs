@@ -377,6 +377,40 @@ pub struct ActionRequest {
     pub system: Option<String>,
     /// The fleet flake, as configured.
     pub flake: String,
+    /// The inventory's `deploy.buildHost` (sanitised), which decides where `clan machines
+    /// update` builds. Only shown, in [`ActionRequest::start_note`].
+    pub build_host: Option<String>,
+    /// The machine's resolved ssh target in its canonical spelling, when it has one.
+    pub target: Option<String>,
+}
+
+impl ActionRequest {
+    /// The first Log tab line of this action: where it builds. A build is always local; an
+    /// update builds where the inventory's `deploy.buildHost` says, and clan builds on the
+    /// target itself when it says nothing.
+    ///
+    /// The build host is inventory text, so it is sanitised again here: the line is drawn
+    /// as it is.
+    #[must_use]
+    pub fn start_note(&self) -> String {
+        use auspex_domain::text::sanitize_line;
+        if self.kind == ActionKind::Build {
+            return "building on this machine".to_owned();
+        }
+        let host = self.build_host.as_deref().map(sanitize_line);
+        match host.as_deref() {
+            None | Some("") => "building on the target itself (no deploy.buildHost set)".to_owned(),
+            Some("localhost") => {
+                let copy = self
+                    .target
+                    .as_deref()
+                    .map(|t| format!(", then copying to {}", sanitize_line(t)))
+                    .unwrap_or_default();
+                format!("building on this machine (deploy.buildHost = localhost){copy}")
+            }
+            Some(h) => format!("building on {h} (deploy.buildHost)"),
+        }
+    }
 }
 
 /// How an action ended.

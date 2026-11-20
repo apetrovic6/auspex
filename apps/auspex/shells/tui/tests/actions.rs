@@ -238,16 +238,20 @@ async fn an_update_runs_the_exact_argv_streams_and_is_logged_succeeded() {
     // The tab: the command, then the output in order, stderr marked as such.
     let out = output(&w.shell);
     assert_eq!(out[0], "note: ── update alfrost ──");
-    assert!(out[1].starts_with("note: resolving"), "{out:?}");
-    assert!(out[2].starts_with("note: clan: "), "{out:?}");
     assert_eq!(
-        out[3],
+        out[1], "note: building on the target itself (no deploy.buildHost set)",
+        "where it builds comes before clan's own words"
+    );
+    assert!(out[2].starts_with("note: resolving"), "{out:?}");
+    assert!(out[3].starts_with("note: clan: "), "{out:?}");
+    assert_eq!(
+        out[4],
         format!(
             "note: $ clan machines update --host-key-check strict --flake {} -- alfrost",
             fleet.display()
         )
     );
-    let streamed: Vec<&str> = out[4..out.len() - 1].iter().map(String::as_str).collect();
+    let streamed: Vec<&str> = out[5..out.len() - 1].iter().map(String::as_str).collect();
     assert!(streamed.contains(&"out: building"), "{out:?}");
     assert!(streamed.contains(&"err: a warning"), "{out:?}");
     assert!(
@@ -365,6 +369,8 @@ fn request(kind: ActionKind, machine: &str, system: Option<&str>, flake: &str) -
         class: MachineClass::Nixos,
         system: system.map(str::to_owned),
         flake: flake.to_owned(),
+        build_host: None,
+        target: None,
     }
 }
 
