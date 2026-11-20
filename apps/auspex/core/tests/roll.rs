@@ -1701,3 +1701,30 @@ fn u_is_refused_while_the_evaluation_is_still_running() {
     );
     assert!(s.view().confirm.is_none() && s.kubes.is_empty());
 }
+
+/// Round 2. A refresh between the `y` and the lock's answer would clear every row, and the roll
+/// would then begin to find every machine "not evaluated" and refuse them all: `r` is refused from
+/// the `y`, not only from the moment the roll exists.
+#[test]
+fn a_refresh_between_the_y_and_the_lock_is_refused() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    s.hold_lock = true;
+    s.send(Event::ConfirmAnswer(true));
+    assert_eq!(s.held_locks.len(), 1, "the lock is being taken");
+    assert!(s.view().roll.is_none());
+    s.send(Event::Refresh);
+    assert!(
+        notice(&s).starts_with("an update of all machines is running: refresh"),
+        "{}",
+        notice(&s)
+    );
+    assert_eq!(s.inventory.len(), 0, "no refresh began");
+    // The lock arrives and the roll starts on the rows it was planned on.
+    let mut lock = s.held_locks.remove(0);
+    s.hold_lock = false;
+    s.resolve(&mut lock, Ok(()));
+    assert_eq!(state(&s, "luna"), RollState::Checking);
+    assert!(preflights(&s).contains("luna"));
+}

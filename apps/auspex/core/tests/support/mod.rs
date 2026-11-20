@@ -186,6 +186,9 @@ pub struct Shell {
     pub tree_answer: Result<auspex_domain::preflight::TreeState, String>,
     pub hold_tree: bool,
     pub trees: Vec<Request<TreeRequest>>,
+    /// Hold the fleet-lock requests instead of answering them at once.
+    pub hold_lock: bool,
+    pub held_locks: Vec<Request<FleetLockRequest>>,
     /// Every cancel the core has emitted, in order.
     pub cancels: Vec<RequestId>,
     /// Every request id the core has issued, in order.
@@ -226,6 +229,8 @@ impl Shell {
             tree_answer: clean_preflight().tree,
             hold_tree: false,
             trees: Vec::new(),
+            hold_lock: false,
+            held_locks: Vec::new(),
             cancels: Vec::new(),
             issued: Vec::new(),
         }
@@ -241,6 +246,10 @@ impl Shell {
         self.absorb(effects);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per effect of the core: the harness keeps every kind of request"
+    )]
     fn absorb(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
@@ -318,12 +327,16 @@ impl Shell {
                 Effect::FleetLock(mut r) => {
                     self.issued.push(r.operation.id);
                     self.lock_requests.push(r.operation.clone());
-                    let answer = self.lock_answer.clone();
-                    let more = self
-                        .core
-                        .resolve(&mut r, answer)
-                        .expect("the request resolves");
-                    self.absorb(more);
+                    if self.hold_lock {
+                        self.held_locks.push(r);
+                    } else {
+                        let answer = self.lock_answer.clone();
+                        let more = self
+                            .core
+                            .resolve(&mut r, answer)
+                            .expect("the request resolves");
+                        self.absorb(more);
+                    }
                 }
                 Effect::FleetUnlock(r) => self.unlocks.push(r.operation.id),
                 Effect::Tree(mut r) => {

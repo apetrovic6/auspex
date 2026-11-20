@@ -1005,7 +1005,31 @@ impl Real {
                 pump(work, &mut rx, &forward).await?
             }
         };
-        Ok(ran.map_err(|e| e.to_string()))
+        Ok(run_outcome(ran, sink))
+    }
+}
+
+/// What a `clan` run came to. An error is **nothing done**: no binary, a refused name, a spawn that
+/// failed. The one error after the process exists (it could not be waited for, and was killed)
+/// is a run that ended without a code: what it was doing may have happened, so it is a failure, not
+/// a refusal (a drained node is not put back in service on it).
+fn run_outcome(
+    ran: Result<ClanRun, auspex_effects::clan::ClanError>,
+    sink: &(dyn Fn(Stream, &str) + Sync),
+) -> Result<ClanRun, String> {
+    match ran {
+        Err(e) if e.started => {
+            sink(Stream::Note, &e.to_string());
+            Ok(ClanRun {
+                end: clan::RunEnd::Exited {
+                    code: None,
+                    signal: None,
+                },
+                lines_dropped: 0,
+                long_lines: 0,
+            })
+        }
+        other => other.map_err(|e| e.to_string()),
     }
 }
 
@@ -1044,6 +1068,35 @@ async fn pump<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `clan` that never started is an error (nothing was done); one that was started and then
+    /// lost is a run that ended without a code, said in the output.
+    #[test]
+    fn only_a_clan_that_never_started_is_an_error() {
+        use auspex_effects::clan::{ClanError, ClanStep};
+        let said = std::sync::Mutex::new(Vec::<String>::new());
+        let sink = |_: Stream, t: &str| said.lock().unwrap().push(t.to_owned());
+        let never = ClanError {
+            step: ClanStep::Run,
+            reason: "not found".to_owned(),
+            started: false,
+        };
+        assert_eq!(
+            run_outcome(Err(never), &sink),
+            Err("running clan: not found".to_owned())
+        );
+        let lost = ClanError {
+            started: true,
+            reason: "waiting for clan failed: x".to_owned(),
+            step: ClanStep::Run,
+        };
+        let run = run_outcome(Err(lost), &sink).expect("it ran");
+        assert!(!run.end.success());
+        assert_eq!(
+            said.lock().unwrap().as_slice(),
+            ["running clan: waiting for clan failed: x"]
+        );
+    }
 
     /// `u` runs the fleet's pinned `clan`, found from its lock. An environment variable that
     /// named another binary would silently replace it in the release build, so none is read:

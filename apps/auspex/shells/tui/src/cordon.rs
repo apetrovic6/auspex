@@ -139,6 +139,21 @@ impl Cordons {
         })
     }
 
+    /// What a panic hook does: [`Cordons::last_resort`] **if the panic is on `loop_thread`**, the
+    /// thread that runs the interactive loop, where a panic ends auspex; nothing otherwise.
+    ///
+    /// The runtime is multi-threaded and a panic in an adapter's task is *not* the end of auspex:
+    /// the roll goes on. Uncordoning then would put a drained node back in service just before
+    /// its update, and empty the record the exit report is made from.
+    #[must_use]
+    pub fn on_panic(&self, loop_thread: std::thread::ThreadId, bound: Duration) -> Vec<String> {
+        if std::thread::current().id() == loop_thread {
+            self.last_resort(bound)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Uncordons every node still pending, one at a time, each within `bound`; the result is a
     /// line for every node that is **still** cordoned by auspex afterwards (the ones that could
     /// not be uncordoned, and the ones left on purpose), with the command that gives it back.
@@ -253,5 +268,28 @@ mod tests {
         assert_eq!(c.held(), ["sol", "luna"]);
         // Releasing a node it never held is nothing.
         c.release("nobody");
+    }
+
+    /// A panic in some other thread (an adapter's task) is not the end of auspex, so the hook must
+    /// not uncordon anything; one on the loop's thread is, and does.
+    #[test]
+    fn a_panic_hook_acts_only_on_the_loop_thread() {
+        let c = std::sync::Arc::new(Cordons::default());
+        held(&c, "luna");
+        let loop_thread = std::thread::current().id();
+        let elsewhere = {
+            let c = std::sync::Arc::clone(&c);
+            std::thread::spawn(move || c.on_panic(loop_thread, Duration::from_secs(1)))
+                .join()
+                .unwrap()
+        };
+        assert_eq!(elsewhere, Vec::<String>::new(), "nothing is said or done");
+        assert_eq!(c.held(), ["luna"], "and the node is still on the record");
+        let here = c.on_panic(loop_thread, Duration::from_secs(1));
+        assert!(
+            here.iter()
+                .any(|l| l.starts_with("node luna is STILL CORDONED")),
+            "{here:?}"
+        );
     }
 }

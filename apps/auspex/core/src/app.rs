@@ -672,7 +672,7 @@ impl App for Auspex {
                 model.config = Some(config);
                 refresh(model)
             }
-            Event::Refresh if model.roll_active() => {
+            Event::Refresh if model.roll_active() || model.lock_wait.is_some() => {
                 model.notice("an update of all machines is running: refresh when it has ended")
             }
             Event::Refresh if model.config.is_some() => refresh(model),

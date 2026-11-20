@@ -211,7 +211,12 @@ fn world_in(
 ) -> World {
     let dir = tempdir();
     let fleet = tempdir();
-    let clan = t.script(dir.path(), "clan", clan);
+    // `MISSING`: no `clan` at all, so nothing can be started.
+    let clan = if clan == "MISSING" {
+        dir.path().join("no-such-clan")
+    } else {
+        t.script(dir.path(), "clan", clan)
+    };
     let nix = t.script(dir.path(), "nix", "exit 0");
     let kubectl = t.script(dir.path(), "kubectl", kubectl);
     let real = Real::for_actions(nix.into_os_string(), Some(clan))
@@ -1088,4 +1093,45 @@ async fn a_node_that_never_becomes_ready_fails_the_machine_and_stops_the_group()
         w.clan_events()
     );
     w.shell.shutdown().await;
+}
+
+/// Round 2. A `clan` that cannot be found or started has done nothing to the machine: the update
+/// is a refusal, and a node drained for it goes **back** (it is not left cordoned as "may be
+/// broken"). The group goes on, as for any refusal.
+#[tokio::test]
+async fn a_clan_that_cannot_be_started_refuses_the_machine_and_gives_the_node_back() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let w = world(
+        &t,
+        "MISSING",
+        &kubectl_body(NODES_READY, 0),
+        kube_rule(true),
+        20,
+    );
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_over(&w.shell).await;
+    for m in ["luna", "sol"] {
+        match state(&w.shell, m) {
+            RollState::Refused(why) => assert!(why.contains("clan"), "{m}: {why}"),
+            other => panic!("{m}: {other:?}"),
+        }
+    }
+    let calls = w.kubectl_calls();
+    for m in ["luna", "sol"] {
+        assert!(
+            calls.iter().any(|c| c.ends_with(&format!("uncordon {m}"))),
+            "{m} was put back: {calls:#?}"
+        );
+    }
+    assert_eq!(w.shell.view().roll.unwrap().left_cordoned.len(), 0);
+    w.shell.terminate().await;
+    assert_eq!(
+        w.shell.exit_report(),
+        Vec::<String>::new(),
+        "nothing is left"
+    );
 }

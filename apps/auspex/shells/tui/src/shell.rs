@@ -1238,9 +1238,10 @@ fn action_end(
         )
     };
     match ran {
-        // The freeze file's last look said no: nothing was started, which is a refusal and
-        // not a failure of the machine (an update of all skips it and goes on).
-        Ok(Err(reason)) if refused => {
+        // Nothing was started (the freeze file's last look said no, or no `clan` could be found or
+        // run): a refusal and not a failure of the machine, which an update of all skips, and
+        // puts a drained node back for. A build that did not start stays a failure.
+        Ok(Err(reason)) if refused || op.kind == ActionKind::Update => {
             output.push_to(key, Stream::Note, &reason);
             ActionEnd {
                 result: ActionResult::Refused,

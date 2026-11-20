@@ -403,10 +403,12 @@ async fn tui(
     // uncordons what was cordoned for an update that had not started.
     {
         let cordons = shell.cordons();
+        // Only a panic on this thread ends auspex; one in an adapter's task does not.
+        let loop_thread = std::thread::current().id();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             previous(info);
-            for line in cordons.last_resort(Duration::from_secs(10)) {
+            for line in cordons.on_panic(loop_thread, Duration::from_secs(10)) {
                 say(&line);
             }
         }));
