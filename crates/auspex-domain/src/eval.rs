@@ -38,6 +38,12 @@ pub struct EvalSuccess {
     /// The toplevel's output path (`outputs.out`): what `/run/current-system` will point to
     /// once deployed.
     pub out_path: StorePath,
+    /// The nix system the toplevel is built for (`x86_64-linux`), from nix-eval-jobs'
+    /// `system` field. What decides whether this machine's toplevel may be built here: auspex
+    /// never builds another system's derivations. `None` only when the line carried none.
+    /// Not part of the `--json` report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
 }
 
 /// A machine's toplevel failed to evaluate.
@@ -239,6 +245,10 @@ pub fn parse_eval_line(line: &str) -> Result<EvalOutcome, EvalLineError> {
             attr_path,
             drv_path,
             out_path,
+            system: match obj.get("system") {
+                Some(Value::String(s)) if !s.is_empty() => Some(sanitize_line(s)),
+                _ => None,
+            },
         })),
         Err(what) => Ok(failure(&malformed(&machine, &what))),
     }
@@ -251,7 +261,11 @@ pub fn parse_eval_line(line: &str) -> Result<EvalOutcome, EvalLineError> {
 /// The cache format version. Part of every key and every entry, so bumping it orphans every
 /// old entry rather than misreading one. Bump it whenever what is cached, or how it is
 /// evaluated, changes meaning.
-pub const CACHE_FORMAT_VERSION: u32 = 1;
+///
+/// 2: an entry carries the toplevel's `system`, which `b` (build) needs to refuse another
+/// system's derivation. A version-1 entry reads as having none and would make every build
+/// refuse until the flake changed; orphaning it makes the next scan evaluate afresh.
+pub const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// The working tree's state, as the effects layer read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -624,7 +638,7 @@ mod tests {
     #[test]
     fn cache_key_shape_and_stability() {
         let k = key(HEAD, Some(b"{}"), Tree::Clean);
-        assert!(k.as_str().starts_with("v1-"));
+        assert!(k.as_str().starts_with("v2-"));
         assert_eq!(k.as_str().len(), 3 + 64);
         assert!(k.as_str()[3..].bytes().all(|b| b.is_ascii_hexdigit()));
         // Deterministic, and the trailing newline from git is ignored.
@@ -731,6 +745,7 @@ mod tests {
             attr_path: vec!["terra".to_owned()],
             drv_path: StorePath::new(DRV).unwrap(),
             out_path: StorePath::new(OUT).unwrap(),
+            system: Some("x86_64-linux".to_owned()),
         }
     }
 
@@ -773,10 +788,10 @@ mod tests {
             CacheEntry::read(nested.as_bytes(), &k, "terra"),
             Err(CacheMiss::Mismatch)
         );
-        let future = bytes.replacen("\"version\":1", "\"version\":2", 1);
+        let future = bytes.replacen("\"version\":2", "\"version\":3", 1);
         assert_eq!(
             CacheEntry::read(future.as_bytes(), &k, "terra"),
-            Err(CacheMiss::Version(2))
+            Err(CacheMiss::Version(3))
         );
         assert!(matches!(
             CacheEntry::read(&bytes.as_bytes()[..bytes.len() / 2], &k, "terra"),

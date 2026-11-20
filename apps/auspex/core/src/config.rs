@@ -23,6 +23,15 @@ pub struct Config {
     /// The package preview, or `None` for none (the default: a core that is not told to
     /// preview never asks for a closure).
     pub diff: Option<DiffConfig>,
+    /// Whether this run may ever enter act mode. Only an interactive shell sets it: the
+    /// terminal UI, where an operator can answer a confirmation. Headless runs (`--plain`,
+    /// `--json`) leave it `false`, so "act mode is never on in headless mode" holds because
+    /// the core cannot be put there, not because nothing happens to ask.
+    pub allow_act: bool,
+    /// This machine's nix system (`x86_64-linux`). A build is refused for a machine whose
+    /// evaluated system is another one: auspex never builds another system's derivations. Empty
+    /// means unknown, which refuses every build.
+    pub local_system: String,
 }
 
 /// Prometheus settings the core decides with. The URL is the adapter's, not the core's.

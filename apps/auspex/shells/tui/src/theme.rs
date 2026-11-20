@@ -24,6 +24,10 @@
 //! Chrome: text `base05` (ANSI: the terminal's default), borders and dim text `base03`
 //! (dark grey), titles `base0D` (blue), the selected row `base02` behind `base07` (ANSI:
 //! reversed), errors `base08` (red), background `base00` (ANSI: none).
+//!
+//! Act mode and the confirmations use a warning colour (`base0A`, ANSI yellow, bold): `ACT` in the
+//! status bar must not be missed. What an action's process printed on standard error is drawn
+//! in `base09` (ANSI light red), so the two streams of the Log tab can be told apart.
 
 use std::path::Path;
 
@@ -54,6 +58,10 @@ pub enum Role {
     Error,
     /// Search matches in the list.
     Match,
+    /// Act mode, and a confirmation: something that changes a machine is possible or asked.
+    Warning,
+    /// What an action's process printed on standard error.
+    Stderr,
 }
 
 impl Theme {
@@ -87,6 +95,10 @@ impl Theme {
             (Role::Selected, Self::Ansi) => Style::default().add_modifier(Modifier::REVERSED),
             (Role::Selected, Self::Base16(p)) => Style::default().bg(p[2]).fg(p[7]),
             (Role::Error, _) => Style::default().fg(self.slot(8, Color::Red)),
+            (Role::Warning, _) => Style::default()
+                .fg(self.slot(0xA, Color::Yellow))
+                .add_modifier(Modifier::BOLD),
+            (Role::Stderr, _) => Style::default().fg(self.slot(9, Color::LightRed)),
             (Role::Match, _) => Style::default()
                 .fg(self.slot(0xA, Color::Yellow))
                 .add_modifier(Modifier::UNDERLINED),

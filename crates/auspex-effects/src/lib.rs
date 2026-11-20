@@ -13,6 +13,8 @@
 //! Modules, one per adapter:
 //!
 //! - [`ssh`]: the probe, and the control-socket directory it needs.
+//! - [`act`]: what auspex does to a machine: `clan machines update` and a local `nix build`, both
+//!   streamed, with the argv built here and the machine name checked here.
 //! - [`clan`]: which `clan` binary the fleet pins (built from its lock), and running it.
 //! - [`nix`]: the machine list (`nix eval`) and the evaluation (`nix-eval-jobs`).
 //! - [`cache`]: the evaluation cache under `$XDG_CACHE_HOME/auspex/`, and
@@ -98,6 +100,7 @@
 // alone is not enough: the child keeps the terminal.
 #![feature(process_setsid)]
 
+pub mod act;
 pub mod cache;
 pub mod clan;
 pub mod closure;

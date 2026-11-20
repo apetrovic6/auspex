@@ -7,7 +7,8 @@
       ],
       "drv_path": "/nix/store/6123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.05.drv",
       "kind": "success",
-      "out_path": "/nix/store/7123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.05"
+      "out_path": "/nix/store/7123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.05",
+      "system": "x86_64-linux"
     }
   },
   {
@@ -35,7 +36,8 @@
       ],
       "drv_path": "/nix/store/a123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05.drv",
       "kind": "success",
-      "out_path": "/nix/store/b123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05"
+      "out_path": "/nix/store/b123456789abcdfghijklmnpqrsvwxyz-darwin-system-25.05",
+      "system": "aarch64-darwin"
     }
   },
   {

@@ -211,7 +211,7 @@ pub struct ClanError {
 }
 
 impl ClanError {
-    fn new(step: ClanStep, reason: impl Into<String>) -> Self {
+    pub(crate) fn new(step: ClanStep, reason: impl Into<String>) -> Self {
         Self {
             step,
             reason: reason.into(),
@@ -1142,6 +1142,16 @@ fn run_end(status: ExitStatus) -> RunEnd {
 /// and the normalised `git+file://` reference [`FlakeRef`] gives nix is for nix.
 #[must_use]
 pub fn run_argv(flake: &FlakeRef, args: &[OsString]) -> Vec<OsString> {
+    run_argv_with_tail(flake, args, &[])
+}
+
+/// [`run_argv`] with `tail` after `--flake <dir>`.
+///
+/// For a command that ends its options with `--` and names its operands after it (`clan
+/// machines update --flake <dir> -- <machine>`): the flake must come before the `--`, or it
+/// would be read as an operand.
+#[must_use]
+pub fn run_argv_with_tail(flake: &FlakeRef, args: &[OsString], tail: &[OsString]) -> Vec<OsString> {
     let mut full = args.to_vec();
     full.push(OsString::from("--flake"));
     full.push(
@@ -1149,6 +1159,7 @@ pub fn run_argv(flake: &FlakeRef, args: &[OsString]) -> Vec<OsString> {
             .local_dir()
             .map_or_else(|| OsString::from(flake.as_str()), PathBuf::into_os_string),
     );
+    full.extend(tail.iter().cloned());
     full
 }
 
@@ -1172,10 +1183,39 @@ pub async fn run(
     cancel: &CancellationToken,
     tx: UnboundedSender<ClanLine>,
 ) -> Result<Result<ClanRun, ClanError>, Cancelled> {
-    let mut sp = match start(program, flake, args) {
+    run_with_tail(program, flake, args, &[], params, cancel, tx).await
+}
+
+/// [`run`] with `tail` after `--flake <dir>` ([`run_argv_with_tail`]).
+///
+/// # Errors
+///
+/// As [`run`].
+pub async fn run_with_tail(
+    program: &Path,
+    flake: &FlakeRef,
+    args: &[OsString],
+    tail: &[OsString],
+    params: &RunParams,
+    cancel: &CancellationToken,
+    tx: UnboundedSender<ClanLine>,
+) -> Result<Result<ClanRun, ClanError>, Cancelled> {
+    let sp = match start(program, flake, args, tail) {
         Ok(s) => s,
         Err(e) => return Ok(Err(e)),
     };
+    stream(sp, params, cancel, tx).await
+}
+
+/// Streams a spawned process's lines until it ends: the body of [`run`], shared with the
+/// other long actions (`nix build`), which need the same caps, the same cancellation and the
+/// same rule that an exit that is already there is what gets reported.
+pub(crate) async fn stream(
+    mut sp: Spawned,
+    params: &RunParams,
+    cancel: &CancellationToken,
+    tx: UnboundedSender<ClanLine>,
+) -> Result<Result<ClanRun, ClanError>, Cancelled> {
     let mut out = sp
         .child
         .stdout
@@ -1264,7 +1304,12 @@ pub async fn run(
 
 /// Spawns `<program> <args> --flake <dir>` in the fleet's directory, refusing a flake
 /// reference `clan` cannot be given safely.
-fn start(program: &Path, flake: &FlakeRef, args: &[OsString]) -> Result<Spawned, ClanError> {
+fn start(
+    program: &Path,
+    flake: &FlakeRef,
+    args: &[OsString],
+    tail: &[OsString],
+) -> Result<Spawned, ClanError> {
     // `clan` takes a directory (or a URL), and neither can be got from a query or from a local
     // reference with no directory without guessing: `path:/x?dir=sub` would run clan against
     // `/x`, and a reference clan resolves against auspex's own working directory is the wrong
@@ -1279,7 +1324,7 @@ fn start(program: &Path, flake: &FlakeRef, args: &[OsString]) -> Result<Spawned,
         )
     };
     let mut cmd = command(program.as_os_str()).map_err(|e| cannot(&e))?;
-    cmd.args(run_argv(flake, args));
+    cmd.args(run_argv_with_tail(flake, args, tail));
     apply_run_environment(&mut cmd);
     if let Some(dir) = flake.local_dir() {
         cmd.current_dir(dir);
@@ -1294,7 +1339,7 @@ fn start(program: &Path, flake: &FlakeRef, args: &[OsString]) -> Result<Spawned,
 /// (git, for a `git+ssh` input) and `SUDO_ASKPASS` (`sudo -A`) are removed. `DISPLAY` and
 /// `SSH_AUTH_SOCK` are left alone: an agent's approval (the operator's Bitwarden agent) goes
 /// through the socket, and that is the one approval a deploy is meant to wait for.
-fn apply_run_environment(cmd: &mut tokio::process::Command) {
+pub(crate) fn apply_run_environment(cmd: &mut tokio::process::Command) {
     cmd.env_remove("SSH_ASKPASS")
         .env_remove("GIT_ASKPASS")
         .env_remove("SUDO_ASKPASS")

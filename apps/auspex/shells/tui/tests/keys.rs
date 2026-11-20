@@ -9,7 +9,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use auspex_core::Event;
+use auspex_core::{ConfirmKind, Event};
 use auspex_tui::input::{Input, Prompt, Screen};
 use auspex_tui::keymap::{Key, Keymap};
 use auspex_tui::ui::{Ui, help_lines};
@@ -25,6 +25,8 @@ const SCREEN: Screen = Screen {
     matches: 3,
     listing_for: None,
     rows: 18,
+    act: false,
+    confirm: None,
 };
 
 const fn ctrl(c: char) -> Key {
@@ -467,4 +469,141 @@ fn keys_the_terminal_never_delivers_are_refused() {
     assert!(e.contains("keymap.quit"), "{e}");
     // The keys they arrive as are bindable.
     assert!(auspex_tui::keymap::parse_chord("ctrl-d").is_ok());
+}
+
+// ---------------------------------------------------------------------------------------
+// Act mode, the action keys, the confirmations, the Log tab
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_u_and_b_are_the_act_update_and_build_keys() {
+    let km = Keymap::defaults();
+    let mut input = Input::default();
+    assert_eq!(feed(&mut input, &km, SCREEN, &chars("A")), ["ToggleAct"]);
+    assert_eq!(
+        feed(&mut input, &km, SCREEN, &chars("b")),
+        ["BuildSelected"]
+    );
+    // `u` in observe mode: no event, and the prompt row says why.
+    assert_eq!(feed(&mut input, &km, SCREEN, &chars("u")), NOTHING);
+    assert_eq!(input.message.as_deref(), Some("act mode is off (A)"));
+    // In act mode it is the update.
+    let act = Screen {
+        act: true,
+        ..SCREEN
+    };
+    let mut input = Input::default();
+    assert_eq!(feed(&mut input, &km, act, &chars("u")), ["UpdateSelected"]);
+    assert!(input.message.is_none());
+}
+
+#[test]
+fn with_a_question_open_only_y_is_a_yes_and_nothing_else_acts() {
+    let km = Keymap::defaults();
+    for kind in [ConfirmKind::Act, ConfirmKind::Update, ConfirmKind::Quit] {
+        let screen = Screen {
+            confirm: Some(kind),
+            ..SCREEN
+        };
+        for (key, yes) in [
+            (Key::char('y'), true),
+            (Key::char('Y'), true),
+            (Key::char('n'), false),
+            (Key::char('N'), false),
+            (Key::char('j'), false),
+            (Key::char('q'), false),
+            (esc(), false),
+            (Key::plain(KeyCode::Enter), false),
+            (Key::char(' '), false),
+        ] {
+            let mut input = Input::default();
+            let events = feed(&mut input, &km, screen, &[key]);
+            assert_eq!(
+                events,
+                [format!("ConfirmAnswer({yes})")],
+                "{kind:?}, {key}: exactly one answer and nothing else"
+            );
+        }
+    }
+}
+
+/// The first Ctrl-C asks, the second answers yes, and a third (once it is stopping and no
+/// question is open) is an ordinary quit, which the core takes as "force".
+#[test]
+fn ctrl_c_escalates_ask_then_stop_then_force() {
+    let km = Keymap::defaults();
+    let mut input = Input::default();
+    assert_eq!(feed(&mut input, &km, SCREEN, &[ctrl('c')]), ["Quit"]);
+    let asking = Screen {
+        confirm: Some(ConfirmKind::Quit),
+        ..SCREEN
+    };
+    assert_eq!(
+        feed(&mut input, &km, asking, &[ctrl('c')]),
+        ["ConfirmAnswer(true)"],
+        "the second Ctrl-C is a yes to the quit question"
+    );
+    assert_eq!(feed(&mut input, &km, SCREEN, &[ctrl('c')]), ["Quit"]);
+    // But not to the other questions: Ctrl-C never turns act mode on or starts an update.
+    for kind in [ConfirmKind::Act, ConfirmKind::Update] {
+        let screen = Screen {
+            confirm: Some(kind),
+            ..SCREEN
+        };
+        assert_eq!(
+            feed(&mut Input::default(), &km, screen, &[ctrl('c')]),
+            ["ConfirmAnswer(false)"],
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn the_log_tab_scrolls_with_the_list_keys_and_q_closes_it_instead_of_quitting() {
+    let km = Keymap::defaults();
+    let mut input = Input::default();
+    assert_eq!(feed(&mut input, &km, SCREEN, &chars("L")), NOTHING);
+    assert!(input.log_open);
+    // Following: down has nowhere to go; up lets go.
+    assert_eq!(feed(&mut input, &km, SCREEN, &chars("j")), NOTHING);
+    assert!(!input.log.unfollowed);
+    input.log.scroll = 40;
+    assert_eq!(feed(&mut input, &km, SCREEN, &chars("kk")), NOTHING);
+    assert!(input.log.unfollowed);
+    assert_eq!(input.log.scroll, 38);
+    feed(&mut input, &km, SCREEN, &chars("j"));
+    assert_eq!(input.log.scroll, 39);
+    feed(&mut input, &km, SCREEN, &chars("gg"));
+    assert_eq!((input.log.scroll, input.log.unfollowed), (0, true));
+    feed(&mut input, &km, SCREEN, &chars("G"));
+    assert!(!input.log.unfollowed, "G follows again");
+    // The action keys do nothing unseen behind the tab.
+    let act = Screen {
+        act: true,
+        ..SCREEN
+    };
+    assert_eq!(feed(&mut input, &km, act, &chars("u")), NOTHING);
+    assert_eq!(feed(&mut input, &km, act, &chars("b")), NOTHING);
+    assert_eq!(feed(&mut input, &km, SCREEN, &chars("r")), NOTHING);
+    // Tab: the notes; q closes the tab and does not quit; Ctrl-C still quits.
+    feed(&mut input, &km, SCREEN, &[Key::plain(KeyCode::Tab)]);
+    assert!(input.log.notes);
+    assert!(feed(&mut input, &km, SCREEN, &[ctrl('c')]).contains(&"Quit".to_owned()));
+    assert_eq!(feed(&mut input, &km, SCREEN, &chars("q")), NOTHING);
+    assert!(!input.log_open);
+}
+
+#[test]
+fn the_help_lists_the_new_keys_from_the_live_keymap() {
+    let lines = help_lines(&Keymap::defaults());
+    for (keys, what) in [
+        ("A", "toggle act mode"),
+        ("u", "update the machine"),
+        ("b", "build its pending system"),
+    ] {
+        assert!(
+            lines.iter().any(|(k, d)| k == keys && d.contains(what)),
+            "{keys} {what}: {lines:?}"
+        );
+    }
 }

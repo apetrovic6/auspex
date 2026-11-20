@@ -10,23 +10,25 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use auspex_core::effects::{
-    CacheRequest, ClosureAnswer, DeployedClosureRequest, EvalRequest, InventoryAnswer,
-    InventoryRequest, PendingClosureRequest, ProbeRequest, PrometheusAnswer, PrometheusRequest,
-    ResolveRequest,
+    ActionKind, ActionRequest, CacheRequest, ClosureAnswer, DeployedClosureRequest, EvalRequest,
+    InventoryAnswer, InventoryRequest, PendingClosureRequest, ProbeRequest, PrometheusAnswer,
+    PrometheusRequest, ResolveRequest,
 };
 use auspex_domain::fleet::ConnectTimeout;
 use auspex_domain::observe::ProbeOutcome;
 use auspex_domain::status::NarCache;
 use auspex_effects::cache::{self, CacheParams, GitParams};
+use auspex_effects::clan::{self, ClanLine, ClanLocator, ClanRun, ResolveParams, RunParams};
 use auspex_effects::closure::{self, PendingParams};
 use auspex_effects::http::HttpClient;
 use auspex_effects::nix::{self, EvalItem, EvalMachine, EvalParams, FlakeRef};
 use auspex_effects::ssh::{self, ControlDir, ProbeParams};
-use auspex_effects::{CancellationToken, Cancelled, dns, narinfo, prometheus};
-use tokio::sync::mpsc::UnboundedSender;
+use auspex_effects::{CancellationToken, Cancelled, act, dns, narinfo, prometheus};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::config::{FlakeSource, Settings};
 use crate::demo::Demo;
+use crate::output::Stream;
 
 /// The Prometheus `instance` label a machine has when the config names none.
 #[must_use]
@@ -209,6 +211,24 @@ impl Backend {
             Self::Demo(d) => d.pending_closure(op, cancel).await,
         }
     }
+
+    /// `Effect::RunAction`: the process's lines go to `sink` as they are printed; the result is
+    /// how it ended, or why it could not be started or was refused.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired: the process group has been killed and reaped.
+    pub async fn run_action(
+        &self,
+        op: &ActionRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<Result<ClanRun, String>, Cancelled> {
+        match self {
+            Self::Real(r) => r.run_action(op, cancel, sink).await,
+            Self::Demo(d) => d.run_action(op, cancel, sink).await,
+        }
+    }
 }
 
 /// An absolute path to `name` on an absolute `PATH` entry, as `auspex-effects` would find
@@ -276,6 +296,17 @@ pub struct Real {
     cache_url: Option<String>,
     cache_dir: Option<PathBuf>,
     flake_source: FlakeSource,
+    /// Which `clan` each fleet pins, found once and kept for the run.
+    clan: ClanLocator,
+    /// An explicit path to `clan`, set only by [`Self::for_actions`] (the tests' fake): wins over
+    /// resolution. A real run always resolves the fleet's pinned `clan` from its lock.
+    clan_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Real {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Real").finish_non_exhaustive()
+    }
 }
 
 impl Real {
@@ -317,6 +348,55 @@ impl Real {
             cache_url: settings.cache_url.clone(),
             cache_dir: cache::default_dir(),
             flake_source,
+            clan: ClanLocator::new(),
+            // Never from the environment: an inherited variable (a profile, a wrapper, a
+            // leftover from debugging) would change which binary deploys. Only the tests'
+            // constructor, `for_actions`, sets it.
+            clan_path: None,
+        }
+    }
+
+    /// How the fleet's pinned `clan` is found for `u`: with the locator's own `nix` (from
+    /// `PATH`), not this backend's, which `AUSPEX_NIX` or the tests' constructor may have set. The locator
+    /// runs that program to build the clan that then deploys, so an inherited override (a profile,
+    /// a wrapper, a leftover) must not be able to choose it.
+    fn resolve_params(&self) -> ResolveParams<'_> {
+        let mut resolve = ResolveParams::new();
+        resolve.config_path = self.clan_path.as_deref();
+        resolve
+    }
+
+    /// Adapters that can run actions and nothing else: for the shell's own tests, which run
+    /// the real `u` and `b` against fake `clan` and `nix` programs over a scripted fleet
+    /// ([`crate::demo::Demo::real_actions`]). No control directory is created and no other
+    /// adapter has what it needs, so a request of any other kind answers with a failure.
+    #[must_use]
+    pub fn for_actions(nix: OsString, clan_path: Option<PathBuf>) -> Self {
+        let off = || "this backend only runs actions".to_owned();
+        Self {
+            ssh: OsString::from(ssh::DEFAULT_SSH),
+            nix,
+            nix_store: OsString::from(nix::DEFAULT_NIX_STORE),
+            nix_eval_jobs: OsString::from(nix::DEFAULT_NIX_EVAL_JOBS),
+            git: OsString::from(cache::DEFAULT_GIT),
+            control_dir: Err(off()),
+            connect_timeout: ConnectTimeout::DEFAULT,
+            control_persist: 60,
+            approval_deadline: Duration::from_secs(60),
+            probe_deadline: Duration::from_secs(30),
+            eval_timeout: Duration::from_secs(60),
+            workers: 1,
+            max_memory_mib: 1024,
+            http: Err(off()),
+            http_timeout: Duration::from_secs(5),
+            dns_timeout: Duration::from_secs(5),
+            prometheus_url: None,
+            explicit_instances: BTreeSet::new(),
+            cache_url: None,
+            cache_dir: None,
+            flake_source: FlakeSource::Default,
+            clan: ClanLocator::new(),
+            clan_path,
         }
     }
 
@@ -504,11 +584,161 @@ impl Real {
         };
         closure::pending(&op.store_path, &params, cancel).await
     }
+
+    /// `Update`: resolve the fleet's pinned `clan` (a build of `clan-cli` the first time, which
+    /// can take minutes and is said in the output), then run it. `Build`: `nix build` here.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired: the process group has been killed and reaped. A refusal,
+    /// or a program that cannot be started, is the inner `Err`.
+    pub async fn run_action(
+        &self,
+        op: &ActionRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<Result<ClanRun, String>, Cancelled> {
+        let flake = match FlakeRef::new(&op.flake) {
+            Ok(f) => f,
+            Err(e) => return Ok(Err(self.fleet_error(&op.flake, &e.0))),
+        };
+        let params = RunParams::new();
+        let (tx, mut rx) = unbounded_channel::<ClanLine>();
+        let forward = |l: ClanLine| {
+            let stream = match l.stream {
+                clan::Stream::Stdout => Stream::Stdout,
+                clan::Stream::Stderr => Stream::Stderr,
+            };
+            sink(stream, &l.text);
+        };
+        let ran = match op.kind {
+            ActionKind::Update => {
+                // Checked here as well as by `act::update`, before the (slow) resolution: a
+                // refused name must not cost a build of clan.
+                if let Err(r) = act::update_args(&op.machine) {
+                    return Ok(Err(format!("refused: {r}")));
+                }
+                sink(Stream::Note, "resolving the fleet's pinned clan…");
+                let resolve = self.resolve_params();
+                let binary = match self.clan.resolve(&resolve, &flake, cancel).await? {
+                    Ok(b) => b,
+                    Err(e) => return Ok(Err(e.to_string())),
+                };
+                sink(
+                    Stream::Note,
+                    &format!("clan: {} ({})", binary.path.display(), binary.source),
+                );
+                sink(
+                    Stream::Note,
+                    &format!(
+                        "$ clan {}",
+                        act::update_argv(&flake, &op.machine)
+                            .map(|a| shown(&a))
+                            .unwrap_or_default()
+                    ),
+                );
+                let work = act::update(&binary.path, &flake, &op.machine, &params, cancel, tx);
+                pump(work, &mut rx, &forward).await?
+            }
+            ActionKind::Build => {
+                let local = clan::current_system();
+                let work = act::build(
+                    &self.nix,
+                    &flake,
+                    &op.machine,
+                    op.class,
+                    op.system.as_deref(),
+                    &local,
+                    &params,
+                    cancel,
+                    tx,
+                );
+                sink(
+                    Stream::Note,
+                    &format!(
+                        "$ nix {}",
+                        act::build_argv(&flake, &op.machine, op.class)
+                            .map(|a| shown(&a))
+                            .unwrap_or_default()
+                    ),
+                );
+                pump(work, &mut rx, &forward).await?
+            }
+        };
+        Ok(ran.map_err(|e| e.to_string()))
+    }
+}
+
+/// An argv as one line, for the output's first line. Only shown, never run.
+fn shown(argv: &[OsString]) -> String {
+    argv.iter()
+        .map(|a| a.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Runs `work` (which owns the sending half of `rx`) while handing each line to `forward` as
+/// it arrives, then hands over whatever was still queued when `work` finished.
+///
+/// Lines first: when both are ready the line is taken, so the order the process printed in
+/// is the order shown.
+async fn pump<T>(
+    work: impl std::future::Future<Output = T>,
+    rx: &mut UnboundedReceiver<ClanLine>,
+    forward: &impl Fn(ClanLine),
+) -> T {
+    tokio::pin!(work);
+    let result = loop {
+        tokio::select! {
+            biased;
+            Some(line) = rx.recv() => forward(line),
+            r = &mut work => break r,
+        }
+    };
+    while let Ok(line) = rx.try_recv() {
+        forward(line);
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `u` runs the fleet's pinned `clan`, found from its lock. An environment variable that
+    /// named another binary would silently replace it in the release build, so none is read:
+    /// the only way to name one is the tests' constructor.
+    /// `AUSPEX_NIX` (and the tests' `nix`) is for evaluation and `b`; it must not be the program
+    /// that builds the clan `u` deploys with.
+    #[test]
+    fn the_nix_that_resolves_clan_is_not_the_overridable_one() {
+        let real = Real::for_actions(OsString::from("/overridden/nix"), None);
+        let params = real.resolve_params();
+        assert_eq!(params.nix, std::ffi::OsStr::new(nix::DEFAULT_NIX));
+    }
+
+    #[test]
+    fn no_environment_variable_names_the_clan_that_deploys() {
+        fn walk(dir: &std::path::Path, name: &str, read: &mut usize) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, name, read);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    *read += 1;
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    assert!(!text.contains(name), "{} mentions {name}", path.display());
+                }
+            }
+        }
+        let mut read = 0;
+        walk(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src")),
+            concat!("AUSPEX", "_CLAN"),
+            &mut read,
+        );
+        assert!(read > 5, "the sources were found");
+    }
 
     #[test]
     fn unnamed_instances_are_asked_as_name_9100_and_answered_by_name() {

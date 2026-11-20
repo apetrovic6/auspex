@@ -1,0 +1,24 @@
+┌ machines (18) ───────────────────────┐
+│ ✓    alfrost         in sync         │
+│ ✓    callisto        in sync         │
+│ ✓⚠   cerberus        in sync         │
+│ ↑    cypramundi      update pending  │
+│ ?    deimos          not installed   │
+│ ✓    europa          in sync         │
+┌ confirm ─────────────────────────────┐
+│update luna to g1j4m7qa               │
+│nixos-system-luna-25.11.20261101.6a2  │
+│f1c0? y/N                             │
+│                                      │
+│y confirms; any other key cancels     │
+└──────────────────────────────────────┘
+│ ↑◆   sol             update pending  │
+│ ✓    terra           in sync         │
+│ ✓    titan           in sync         │
+│ ✗    triton          unreachable     │
+│ !    vulcan          eval error      │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+log: eval results stored in the cache: …
+ACT │ settled │ 0 pending │ prom: ok

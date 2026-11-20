@@ -2,7 +2,7 @@
 
 use auspex_domain::report::FleetReport;
 
-use crate::effects::Generation;
+use crate::effects::{ActionEnd, ActionKind, Generation};
 
 /// Everything a shell draws, and nothing it has to compute.
 ///
@@ -38,11 +38,19 @@ pub struct ViewModel {
     pub search: Option<SearchView>,
     /// Whether the help overlay is open.
     pub help_open: bool,
-    /// The user asked to quit. The shell exits once it has drawn this (every outstanding
-    /// request has already been cancelled).
+    /// The user asked to quit and nothing is left running. The shell exits once it has drawn
+    /// this: every outstanding request has been cancelled, and an action that was running has
+    /// been killed, reaped and answered.
     pub quit: bool,
-    /// Always [`Mode::Observe`] in step 1.
+    /// Observe or act mode.
     pub mode: Mode,
+    /// The action in progress, or the last one to end; `None` before the first.
+    pub action: Option<ActionView>,
+    /// A question waiting for y or N.
+    pub confirm: Option<ConfirmView>,
+    /// A one-line refusal or note about the last thing the operator asked for ("act mode is
+    /// off (A)"), until their next request.
+    pub notice: Option<String>,
 }
 
 /// Where a refresh is.
@@ -107,12 +115,68 @@ pub struct SearchView {
     pub matches: Vec<usize>,
 }
 
-/// The interaction mode. Act mode (deploys) is step 2.
+/// The interaction mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// Read-only.
+    /// Read-only: every key changes nothing on any machine. The default, never persisted.
     #[default]
     Observe,
+    /// Act mode: `u` can update the selected machine. Entered by the operator, after a
+    /// confirmation, for the life of this run only; never in headless mode.
+    Act,
+}
+
+/// Which question is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmKind {
+    /// Turn act mode on.
+    Act,
+    /// Update a machine.
+    Update,
+    /// Quit while an action runs.
+    Quit,
+}
+
+/// A question the operator has to answer before anything happens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmView {
+    /// What is being asked.
+    pub kind: ConfirmKind,
+    /// The whole question, ending in `y/N`.
+    pub question: String,
+    /// Which question this is: every question asked gets a new number, so a shell can tell
+    /// that the one it drew is the one it is answering.
+    pub serial: u64,
+}
+
+/// The action in progress, or the last one to end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionView {
+    /// Update or build.
+    pub kind: ActionKind,
+    /// The machine.
+    pub machine: String,
+    /// Where it is.
+    pub status: ActionStatus,
+}
+
+/// Where an action is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionStatus {
+    /// The process is running.
+    Running,
+    /// The operator asked to stop it; the process group is being killed and reaped.
+    Stopping,
+    /// Over.
+    Ended(ActionEnd),
+}
+
+impl ActionView {
+    /// Whether the process is still there (running, or being stopped).
+    #[must_use]
+    pub const fn active(&self) -> bool {
+        matches!(self.status, ActionStatus::Running | ActionStatus::Stopping)
+    }
 }
 
 /// The pure view state, kept by machine *name* so a refresh that reorders or removes rows
@@ -125,6 +189,7 @@ pub(crate) struct ViewState {
     pub query: String,
     pub help_open: bool,
     pub quit: bool,
+    pub notice: Option<String>,
 }
 
 fn matches(name: &str, query: &str) -> bool {

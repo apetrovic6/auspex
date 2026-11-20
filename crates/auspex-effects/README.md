@@ -2,7 +2,9 @@
 
 auspex's adapters: everything that touches the outside world. The ssh probe, the machine
 list (`nix eval`), the evaluation (`nix-eval-jobs`), the eval cache, which `clan` binary
-the fleet pins (`clan`: built from its lock, never taken from `PATH`) and running it, Prometheus, the narinfo
+the fleet pins (`clan`: built from its lock, never taken from `PATH`) and running it, the two actions
+(`act`: `clan machines update` for one validated machine, and a local `nix build`, both streamed),
+Prometheus, the narinfo
 "cached" badge, DNS, and the local action log (`deploylog`, a SQLite database whose schema is a
 documented contract: see "The action log" below). This crate is the only one in auspex with tokio.
 

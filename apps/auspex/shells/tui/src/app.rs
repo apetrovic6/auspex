@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use auspex_core::{Config, DiffConfig, Event, PrometheusConfig, PrometheusStatus};
 use auspex_effects::Termination;
+use auspex_effects::deploylog::{self, Identity, OpenParams};
 use clap::Parser as _;
 use crossterm::event::EventStream;
 use tokio_stream::StreamExt as _;
@@ -32,7 +33,6 @@ use crate::cli::{Args, Mode};
 use crate::config::{self, FlakeSource, Settings};
 use crate::demo::{self, Demo};
 use crate::headless;
-use crate::input::Screen;
 use crate::keymap::{Key, Keymap};
 use crate::log::{Log, say};
 use crate::shell::Shell;
@@ -72,7 +72,21 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
         diff: settings.diff.enabled.then_some(DiffConfig {
             timeout_seconds: settings.timeouts.diff,
         }),
+        // Clamped to the TUI where the run is built: a headless run never acts.
+        allow_act: true,
+        local_system: auspex_effects::clan::current_system(),
     }
+}
+
+/// The core's configuration for how this run is shown.
+///
+/// Act mode is for the terminal UI, where an operator can answer a confirmation. A headless
+/// run (`--plain`, `--json`) cannot be put in it: the core is told so here, once, and refuses
+/// to enter it whatever events it is sent.
+#[must_use]
+pub fn for_mode(mut config: Config, mode: Mode) -> Config {
+    config.allow_act &= mode == Mode::Tui;
+    config
 }
 
 const fn signal_exit(name: &str) -> u8 {
@@ -215,10 +229,24 @@ impl Run {
                 format!("{} (from {})", self.flake, self.source.describe()),
             )
         };
+        let config = for_mode(config, mode);
         let settle = self.settings.timeouts.settle;
         let shell = Shell::new(backend, log, Duration::from_secs(settle));
         if !self.args.demo {
             shell.expect_machines(self.settings.machines.keys().cloned().collect());
+        }
+        if !self.args.demo && mode == Mode::Tui {
+            if let Some(path) = deploylog::default_path() {
+                shell.set_action_log(OpenParams::new(
+                    path,
+                    Identity::current(env!("CARGO_PKG_VERSION")),
+                    std::path::PathBuf::from(&self.flake),
+                ));
+            } else {
+                shell.log.line(
+                    "no usable state directory (XDG_STATE_HOME or HOME), so actions are not logged",
+                );
+            }
         }
         if let Some(diff) = config.diff {
             shell.set_preview_grace(Duration::from_secs(diff.timeout_seconds));
@@ -295,6 +323,7 @@ async fn tui(
             return ExitCode::from(USAGE);
         }
     };
+    enter_bracketed_paste();
     shell.send(Event::Start(config));
     let mut ui = Ui::default();
     let mut events = EventStream::new();
@@ -309,7 +338,7 @@ async fn tui(
             _ = frames.tick() => {
                 ui.frame = ui.frame.wrapping_add(1);
                 let log = shell.log.lines();
-                let ctx = Context { theme, keymap, flake, log: &log };
+                let ctx = Context { theme, keymap, flake, log: &log, output: shell.output(), now: std::time::Instant::now() };
                 if let Err(e) = terminal.draw(|f| shell.draw(f, &mut ui, &ctx)) {
                     failure = Some(format!("cannot draw: {e}"));
                     code = ExitCode::from(USAGE);
@@ -318,16 +347,21 @@ async fn tui(
             }
             event = events.next() => match event {
                 Some(Ok(event)) => {
-                    let Some(key) = event.as_key_press_event().and_then(|k| Key::from_event(&k)) else {
-                        continue;
-                    };
                     let view = shell.view();
-                    let query = view.search.as_ref().map(|s| s.query.clone()).unwrap_or_default();
                     if view.refresh.generation != refresh.0 {
                         refresh = (view.refresh.generation, std::time::Instant::now());
                     }
-                    let screen = Screen::from_view(&view, ui.page, refresh.1.elapsed());
-                    for e in ui.input.key(key, screen, keymap, &query) {
+                    // A paste is its own event (bracketed paste is on), never typed keys.
+                    let events = if let crossterm::event::Event::Paste(text) = &event {
+                        ui.paste(text, &view, refresh.1.elapsed(), keymap, std::time::Instant::now())
+                    } else if let Some(key) =
+                        event.as_key_press_event().and_then(|k| Key::from_event(&k))
+                    {
+                        ui.key(key, &view, refresh.1.elapsed(), keymap, std::time::Instant::now())
+                    } else {
+                        continue;
+                    };
+                    for e in events {
                         shell.send(e);
                     }
                 }
@@ -340,7 +374,7 @@ async fn tui(
                     code = ExitCode::from(USAGE);
                     break;
                 }
-                None => shell.send(Event::Quit),
+                None => shell.send(Event::Terminate),
             },
             signal = term.recv() => {
                 code = ExitCode::from(signal_exit(signal));
@@ -349,11 +383,31 @@ async fn tui(
         }
     }
     // Cancel and reap first, then give the terminal back.
-    shell.send(Event::Quit);
-    shell.shutdown().await;
+    // Stop whatever an action runs (its process group killed and reaped, its row logged
+    // `cancelled`) and cancel the rest, then give the terminal back.
+    shell.terminate().await;
+    leave_bracketed_paste();
     ratatui::restore();
     if let Some(f) = failure {
         say(&f);
     }
     code
+}
+
+/// Asks the terminal to deliver a paste as one `Event::Paste` instead of typed keys.
+///
+/// Without it a paste arrives as keystrokes: pasted `Ayuy` would turn on act mode and start an
+/// update. See [`Ui::paste`] for what a paste may do. Also undone by a panic, which would
+/// otherwise leave the operator's shell with bracketed paste on.
+fn enter_bracketed_paste() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        leave_bracketed_paste();
+        previous(info);
+    }));
+}
+
+fn leave_bracketed_paste() {
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
 }

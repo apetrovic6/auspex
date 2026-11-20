@@ -284,6 +284,106 @@ impl Operation for ResolveRequest {
     type Output = BTreeMap<String, Vec<IpAddr>>;
 }
 
+/// What an action does to a machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ActionKind {
+    /// `clan machines update`: deploy to the machine.
+    Update,
+    /// `nix build` of the pending system, here, changing nothing on the machine.
+    Build,
+}
+
+impl ActionKind {
+    /// The word for the status bar and the confirmation: `update`, `build`.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Update => "update",
+            Self::Build => "build",
+        }
+    }
+}
+
+/// Run one action against one machine, streaming its output.
+///
+/// **The one request that is not a pure question.** It starts a process that changes a machine
+/// (`Update`) or fills the local store (`Build`), so the core issues it only after the
+/// operator has said yes, and only for a machine it holds a row for. The shell resolves `Update`
+/// with the fleet's pinned `clan` (resolved here, not by the core), runs exactly
+/// `clan machines update --host-key-check strict --flake <fleet> -- <machine>`, and `Build`
+/// with `nix build --no-link --print-out-paths <fleet>#…`; it re-checks the machine name and,
+/// for a build, the system, and refuses before spawning anything.
+///
+/// The process's output goes to the shell's own log buffer, line by line, never through the
+/// core: a deploy can print hundreds of thousands of lines, and nothing the core decides
+/// depends on them. The core hears once, with [`ActionEnd`].
+///
+/// **Answered on cancellation too.** Unlike every other request, the shell answers a cancelled
+/// action ([`ActionResult::Cancelled`]), after the process group has been killed and reaped:
+/// quitting waits for that answer, which is how "auspex exits only when nothing is left
+/// running" is a fact the core knows rather than one it hopes for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionRequest {
+    /// This request.
+    pub id: RequestId,
+    /// What to do.
+    pub kind: ActionKind,
+    /// The machine, validated against the inventory and the domain's name rules.
+    pub machine: String,
+    /// NixOS or darwin: which flake output a build names.
+    pub class: MachineClass,
+    /// The nix system of the machine's evaluated toplevel, when the evaluation said. A build
+    /// of a machine whose system is not this one's is refused.
+    pub system: Option<String>,
+    /// The fleet flake, as configured.
+    pub flake: String,
+}
+
+/// How an action ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionResult {
+    /// The process exited 0.
+    Succeeded,
+    /// It ran and failed, or could not be started, or was refused.
+    Failed,
+    /// It took too long and was killed.
+    TimedOut,
+    /// The operator stopped it; the process group is gone.
+    Cancelled,
+}
+
+impl ActionResult {
+    /// For the status bar.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed out",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// What an action did, once it is over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionEnd {
+    /// How it ended.
+    pub result: ActionResult,
+    /// The exit code, when the process exited with one.
+    pub exit_code: Option<i32>,
+    /// A short summary: the last few lines it printed (stderr's, else stdout's), or why it
+    /// could not start. Never the whole output.
+    pub summary: Vec<String>,
+    /// Plain words about a deploy that failed at ssh, and the fix
+    /// ([`auspex_domain::act::explain_ssh_failure`]).
+    pub explanation: Option<String>,
+}
+
+impl Operation for ActionRequest {
+    type Output = ActionEnd;
+}
+
 /// Stop request `id`: kill its process and drop its `Request`. Fire and forget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelRequest {
@@ -324,4 +424,6 @@ pub enum Effect {
     PendingClosure(PendingClosureRequest),
     /// [`CancelRequest`].
     Cancel(CancelRequest),
+    /// [`ActionRequest`]: an update or a build, with its output streamed to the shell's log.
+    RunAction(ActionRequest),
 }

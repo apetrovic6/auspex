@@ -114,7 +114,12 @@ fn non_empty(s: Option<String>) -> Option<String> {
 }
 
 /// The machine-name rule; see [`InventoryError::BadName`].
-fn is_plain_name(name: &str) -> bool {
+///
+/// Public because an action's argv is built from a machine name, and the one thing that must
+/// never reach `clan machines update` is an empty name (which updates the whole fleet) or one
+/// that reads as an option: the rule starts with a letter or digit, so neither can pass.
+#[must_use]
+pub fn is_plain_name(name: &str) -> bool {
     (1..=63).contains(&name.len())
         && name.starts_with(|c: char| c.is_ascii_alphanumeric())
         && name

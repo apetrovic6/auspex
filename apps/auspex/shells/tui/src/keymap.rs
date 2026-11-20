@@ -21,7 +21,7 @@ use std::fmt;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// Everything a key can do in step 1 (observe mode).
+/// Everything a key can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Action {
     /// Down one row (or a count).
@@ -50,17 +50,24 @@ pub enum Action {
     Command,
     /// Show the detail of the selected machine (narrow layout; the wide one always shows it).
     Detail,
-    /// The log: the adapters' notes and the config's warnings.
+    /// The Log tab: the streamed output of the current and last action (Tab: the adapters' notes
+    /// and the config's warnings instead).
     Log,
     /// The selected machine's package diff, in full (changed, added, removed).
     Diff,
+    /// Toggle act mode (asks first; off again at once).
+    Act,
+    /// Update the selected machine (act mode only).
+    Update,
+    /// Build the selected machine's pending system here (changes nothing on any machine).
+    Build,
     /// Quit.
     Quit,
 }
 
 impl Action {
     /// Every action, in the order the help overlay lists them.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::Down,
         Self::Up,
         Self::HalfPageDown,
@@ -73,6 +80,9 @@ impl Action {
         Self::Detail,
         Self::Log,
         Self::Diff,
+        Self::Act,
+        Self::Update,
+        Self::Build,
         Self::Refresh,
         Self::Command,
         Self::Help,
@@ -98,6 +108,9 @@ impl Action {
             Self::Detail => "detail",
             Self::Log => "log",
             Self::Diff => "diff",
+            Self::Act => "act",
+            Self::Update => "update",
+            Self::Build => "build",
             Self::Quit => "quit",
         }
     }
@@ -119,8 +132,11 @@ impl Action {
             Self::Help => "this help",
             Self::Command => "command (:q, :refresh)",
             Self::Detail => "machine detail (narrow)",
-            Self::Log => "log",
+            Self::Log => "log tab: action output (Tab: notes)",
             Self::Diff => "package diff (q closes)",
+            Self::Act => "toggle act mode (asks first)",
+            Self::Update => "update the machine (act mode)",
+            Self::Build => "build its pending system here",
             Self::Quit => "quit",
         }
     }
@@ -144,6 +160,9 @@ impl Action {
             Self::Detail => &["enter", "tab"],
             Self::Log => &["L"],
             Self::Diff => &["d"],
+            Self::Act => &["A"],
+            Self::Update => &["u"],
+            Self::Build => &["b"],
             Self::Quit => &["q", "esc", "ctrl-c"],
         }
     }
@@ -170,6 +189,15 @@ impl Key {
         Self {
             code: KeyCode::Char(c),
             ctrl: false,
+        }
+    }
+
+    /// A control chord of a lower-case letter (`ctrl-c`).
+    #[must_use]
+    pub const fn ctrl(c: char) -> Self {
+        Self {
+            code: KeyCode::Char(c),
+            ctrl: true,
         }
     }
 

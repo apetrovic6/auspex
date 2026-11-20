@@ -30,6 +30,7 @@ fn success(machine: &str, n: u8) -> EvalSuccess {
         attr_path: vec![machine.to_owned()],
         drv_path: StorePath::new(format!("/nix/store/{h}-nixos-system-{machine}.drv")).unwrap(),
         out_path: StorePath::new(format!("/nix/store/{h}-nixos-system-{machine}")).unwrap(),
+        system: Some("x86_64-linux".to_owned()),
     }
 }
 

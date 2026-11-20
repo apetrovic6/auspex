@@ -1,0 +1,24 @@
+┌ machines (18) ───────────────────────┐
+│┌ log ───────────────────────────────┐│
+││── update luna ──                   ││
+││demo: nothing is run; update luna i…││
+││building the system configuration...││
+││copying closure to the target host.…││
+││warning: the demo has no real machi…││
+││activating the new configuration... ││
+││done                                ││
+││── succeeded, exit 0 ──             ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+│└Tab notes · q/esc close ────────────┘│
+└──────────────────────────────────────┘
+log: demo: a scripted fleet; no machine…
+ACT │ update luna: succeeded │ scanning…

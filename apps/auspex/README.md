@@ -20,7 +20,7 @@ just apps/auspex/shells/tui/run
 ## Running it
 
 ```sh
-auspex                       # the TUI, read-only (observe mode)
+auspex                       # the TUI; starts read-only (observe mode), `A` turns act mode on
 auspex --plain               # scan once, print one line per machine, exit
 auspex --json                # scan once, print the fleet report (the versioned contract)
 auspex --demo                # a scripted fleet: no machine, nix, cache or network is touched
@@ -43,10 +43,39 @@ libraries it links adds about 170 MiB to the closure: the price of `nix run` wor
 system without it.
 
 In the TUI, `?` lists the live keymap (`[keymap]` in the config rebinds any action; an empty
-list unbinds it) and `L` shows the log: eval cache hits, caching off and why, config
-warnings. A plain-path fleet inside a git repository is evaluated as a `git+file`
+list unbinds it). A plain-path fleet inside a git repository is evaluated as a `git+file`
 reference, so **a machine file that is not tracked yet is not evaluated** (the same rule as
 `nix build .#…`): `git add` it.
+
+## Acting on a machine
+
+auspex starts in **observe** mode, always: nothing is persisted, and `--plain` and `--json` can
+never leave it. `A` asks `turn on act mode? y/N`; the status bar then shows `ACT` in a warning
+colour, and `A` turns it off again at once. In observe mode `u` only says `act mode is off (A)`.
+
+| Key | What it does |
+|---|---|
+| `u` | Act mode only. Asks `update luna to 0a1b2c3d nixos-system-luna-…? y/N` (the pending system as the detail panel shows it, hash prefix first), then runs exactly `clan machines update --host-key-check strict --flake <fleet> -- luna` with the fleet's pinned `clan` (found from its lock, never from `PATH`). One machine, named, validated against the inventory; one action at a time. |
+| `b` | Builds the machine's pending system here (`nix build --no-link --print-out-paths --no-write-lock-file <fleet>#nixosConfigurations.luna.config.system.build.toplevel`; `darwinConfigurations.<m>.system` for darwin). Changes nothing on any machine, so it needs no act mode. Refused for a machine of another system than this one. |
+| `L` | The Log tab: the streamed output of the current and last action, standard error in its own colour, the last 10 000 lines of each, following the tail until you scroll up (`k`, `Ctrl-u`, `gg`; `G` follows again). `Tab` switches to the adapters' notes. |
+
+**Questions are answered only once they could be read.** A `y/N` question is not answered by a key that arrives before it has been on screen, whole, for 0.3 s (typeahead such as `Ayuy` in one burst, or a `y` typed by habit right behind the `u`, is discarded and the question stays open). A pane too small to show the whole question shows "terminal too small to ask" instead, and nothing answers it until the pane is large enough and the 0.3 s have passed. A paste is never a `y`: bracketed paste is on, so pasted text is not typed, and with a readable question open it answers no. A second `Ctrl-C` that arrives within that 0.3 s of the quit question is ignored for the same reason.
+
+**`clan` deploys the working tree as it is at `y`**, not the evaluation auspex showed in the question, which may be hours old (auspex left open, the tree edited, `git pull`). auspex compares the pending system with the one it asked about: if a refresh changed it, `y` asks again about the new one and deploys nothing. Edits to the tree since the last evaluation are not seen by that check.
+
+The status bar names the running action and, at the end, how it ended. A deploy that fails at
+ssh says so, and what to change (`nixos-rebuild` strips `SSH_AUTH_SOCK`; an agent with many keys
+makes the server give up). After an update the machine is probed and evaluated again.
+
+Every `u` and `b` is a row in `$XDG_STATE_HOME/auspex/log.sqlite` (start, end, result, exit code
+and a short summary, never the output: the last stderr lines of a failure or a cancel (which can include whatever a failing script printed there), the fixed text `exit 0, N lines` for a success; see the schema in `crates/auspex-effects`). If the log
+cannot be written the status bar says so; the action is not affected.
+
+**Quitting during an action** asks `an update of luna is running; quit and stop it? (an activation already under way on the machine may complete) y/N`. `y` (or a
+second `Ctrl-C`) kills the whole process group, waits until it is gone, logs the row
+`cancelled` and only then exits; a third `Ctrl-C` stops waiting for that answer (the shell still
+gives the kill up to 5 s to finish). `SIGTERM`, `SIGINT` and
+`SIGHUP` take the same path without the question.
 
 ## Installing
 

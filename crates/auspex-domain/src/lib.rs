@@ -15,6 +15,7 @@
 //!
 //! Modules, one per concern:
 //!
+//! - [`act`]: how an action ended: its short summary and the plain words for an ssh failure.
 //! - [`fleet`]: machines, the inventory parser, ssh targets, their resolution and the
 //!   ssh argument vector, and the homelab-safety lints.
 //! - [`observe`]: the probe scripts, their parser, and merging Prometheus samples.
@@ -25,6 +26,7 @@
 //! - [`report`]: the versioned `--json` contract.
 //! - [`text`]: making remote-controlled text safe for a terminal, for adapters too.
 
+pub mod act;
 pub mod closure;
 pub mod diff;
 pub mod eval;

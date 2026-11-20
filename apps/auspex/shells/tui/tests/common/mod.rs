@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 use auspex_core::{Event, ViewModel};
 use auspex_tui::backend::Backend;
 use auspex_tui::demo::{self, Demo};
-use auspex_tui::input::Screen;
 use auspex_tui::keymap::{Key, Keymap};
 use auspex_tui::log::Log;
+use auspex_tui::output::Output as ActionOutput;
 use auspex_tui::shell::Shell;
 use auspex_tui::theme::Theme;
 use auspex_tui::ui::{self, Context, Ui};
@@ -54,11 +54,13 @@ pub async fn settled_demo() -> Arc<Shell> {
     shell
 }
 
-/// Types `keys` (each char a key; `\n` is Enter, `\x1b` Esc) into `ui` against `shell`.
+/// Types `keys` (each char a key; `\n` is Enter, `\x1b` Esc) into `ui` against `shell`, with no
+/// frame drawn between them: typeahead, all in one burst.
 pub fn type_keys(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
     for c in keys.chars() {
         let key = match c {
             '\n' => Key::plain(crossterm::event::KeyCode::Enter),
+            '\t' => Key::plain(crossterm::event::KeyCode::Tab),
             '\x1b' => Key::plain(crossterm::event::KeyCode::Esc),
             c => Key::char(c),
         };
@@ -66,18 +68,61 @@ pub fn type_keys(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
     }
 }
 
-/// One key.
+thread_local! {
+    static CLOCK: (Instant, std::cell::Cell<Duration>) = (Instant::now(), std::cell::Cell::new(Duration::ZERO));
+}
+
+/// The test's own clock: it moves only when [`elapse`] says so, so "the question has been on
+/// screen for 0.3 s" is not a race with the machine's load. One per test thread.
+pub fn now() -> Instant {
+    CLOCK.with(|(base, offset)| *base + offset.get())
+}
+
+/// Lets `d` pass on the test's clock.
+pub fn elapse(d: Duration) {
+    CLOCK.with(|(_, offset)| offset.set(offset.get() + d));
+}
+
+/// One key, as the real loop sends it: through `Ui::key`, which discards a key that answers a
+/// question that has not been on screen, whole, for `QUESTION_DWELL` (on [`now`]'s clock).
 pub fn press(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, key: Key) {
     let view = shell.view();
-    let query = view
-        .search
-        .as_ref()
-        .map(|s| s.query.clone())
-        .unwrap_or_default();
     // Long after any refresh started: a test that needs "just started" builds its Screen.
-    let screen = Screen::from_view(&view, ui.page.max(1), Duration::from_secs(3600));
-    for e in ui.input.key(key, screen, keymap, &query) {
+    for e in ui.key(key, &view, Duration::from_secs(3600), keymap, now()) {
         shell.send(e);
+    }
+}
+
+/// A paste, as the real loop sends it: through `Ui::paste`.
+pub fn paste(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, text: &str) {
+    let view = shell.view();
+    for e in ui.paste(text, &view, Duration::from_secs(3600), keymap, now()) {
+        shell.send(e);
+    }
+}
+
+/// One frame of `shell` is drawn (and so a question open at that moment has been shown).
+pub fn frame(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap) {
+    draw(
+        &shell.view(),
+        ui,
+        keymap,
+        &shell.log.lines(),
+        shell.output(),
+        120,
+        40,
+    );
+}
+
+/// As [`type_keys`], with a frame drawn after each key and a second let pass: an operator who
+/// reads what is on the screen before pressing the next key, which is what a question asks of
+/// them.
+pub fn type_keys_seen(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap, keys: &str) {
+    frame(shell, ui, keymap);
+    for c in keys.chars() {
+        type_keys(shell, ui, keymap, &c.to_string());
+        frame(shell, ui, keymap);
+        elapse(Duration::from_secs(1));
     }
 }
 
@@ -90,15 +135,28 @@ pub fn render(
     width: u16,
     height: u16,
 ) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    let ctx = Context {
-        theme: &Theme::Ansi,
+    render_with(
+        view,
+        ui,
         keymap,
-        flake: demo::FLAKE,
         log,
-    };
-    terminal.draw(|f| ui::draw(f, view, ui, &ctx)).unwrap();
-    let buffer = terminal.backend().buffer();
+        &ActionOutput::default(),
+        width,
+        height,
+    )
+}
+
+/// [`render`] with the streamed action output the Log tab draws.
+pub fn render_with(
+    view: &ViewModel,
+    ui: &mut Ui,
+    keymap: &Keymap,
+    log: &[String],
+    output: &ActionOutput,
+    width: u16,
+    height: u16,
+) -> String {
+    let buffer = draw(view, ui, keymap, log, output, width, height);
     let mut out = String::new();
     for y in 0..buffer.area.height {
         let mut line = String::new();
@@ -109,6 +167,29 @@ pub fn render(
         out.push('\n');
     }
     out
+}
+
+/// One frame as ratatui's buffer, for tests that look at styles as well as symbols.
+pub fn draw(
+    view: &ViewModel,
+    ui: &mut Ui,
+    keymap: &Keymap,
+    log: &[String],
+    output: &ActionOutput,
+    width: u16,
+    height: u16,
+) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    let ctx = Context {
+        theme: &Theme::Ansi,
+        keymap,
+        flake: demo::FLAKE,
+        log,
+        output,
+        now: now(),
+    };
+    terminal.draw(|f| ui::draw(f, view, ui, &ctx)).unwrap();
+    terminal.backend().buffer().clone()
 }
 
 /// The crate's directory.
@@ -293,6 +374,17 @@ pub fn alive(pid: i32) -> bool {
         .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
 }
 
+/// Whether `pid` exists at all, zombies included: a child that has exited but was never
+/// reaped still exists. What "the leader was reaped" is checked with: `alive` counts a zombie
+/// as gone.
+pub fn pid_exists(pid: i32) -> bool {
+    if Path::new("/proc/self/stat").exists() {
+        return Path::new(&format!("/proc/{pid}")).exists();
+    }
+    rustix::process::Pid::from_raw(pid)
+        .is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
+}
+
 /// Kills pids this test spawned that are still alive, so a failing assertion leaves
 /// nothing behind.
 pub fn cleanup(pids: &[i32]) {
@@ -300,5 +392,18 @@ pub fn cleanup(pids: &[i32]) {
         if let Some(pid) = rustix::process::Pid::from_raw(p) {
             let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
         }
+    }
+}
+
+/// Waits up to 3 s for every pid to be gone; returns the ones still alive. A process killed
+/// with SIGKILL is gone within moments, but not at the instant its group leader is reaped.
+pub fn still_alive_after_wait(pids: &[i32]) -> Vec<i32> {
+    let start = Instant::now();
+    loop {
+        let left: Vec<i32> = pids.iter().copied().filter(|&p| alive(p)).collect();
+        if left.is_empty() || start.elapsed() > Duration::from_secs(3) {
+            return left;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }

@@ -9,7 +9,11 @@
 //! Widths are measured in terminal cells and everything is cut with an ellipsis, so a long
 //! or wide name never moves a column.
 
-use auspex_core::{Phase, PrometheusStatus, ViewModel};
+use std::time::{Duration, Instant};
+
+use auspex_core::{
+    ActionResult, ActionStatus, ActionView, Event, Mode, Phase, PrometheusStatus, ViewModel,
+};
 use auspex_domain::fleet::{Lint, TargetSource};
 use auspex_domain::observe::{HealthSource, StorePath};
 use auspex_domain::report::MachineReport;
@@ -20,8 +24,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
-use crate::input::{Input, Prompt};
-use crate::keymap::{Action, Keymap};
+use crate::input::{Input, Prompt, Screen};
+use crate::keymap::{Action, Key, Keymap};
+use crate::output::{Output, Stream};
 use crate::packages::{self, Kind};
 use crate::theme::{Role, Theme};
 
@@ -57,6 +62,93 @@ pub struct Ui {
     pub frame: u64,
     /// Probes currently waiting in the SSH connect/authentication phase.
     pub approvals: usize,
+    /// The last thing auspex could not do besides the action itself (the action log failed).
+    pub warning: Option<String>,
+    /// The question the last frame drew whole (its `ConfirmView::serial`), and when a frame
+    /// first did. A question is answered only after it has been on screen for
+    /// [`QUESTION_DWELL`]: see [`Ui::key`].
+    pub confirm_seen: Option<(u64, Instant)>,
+}
+
+/// How long a question must have been on screen, whole, before a key may answer it.
+///
+/// A frame is drawn every 33 ms, so "a frame has drawn it" alone is passed by a `y` typed
+/// right behind the `u` by habit (80 to 150 ms between keys), and over a slow link a frame can
+/// still be in flight. The question names the machine and the system: it has to be readable
+/// first. A deliberate operator loses 0.3 s.
+pub const QUESTION_DWELL: Duration = Duration::from_millis(300);
+
+impl Ui {
+    /// Handles one key against `view`: the events to send, in order.
+    ///
+    /// While a question is open and has not been on screen, whole, for [`QUESTION_DWELL`], the
+    /// key is discarded, not answered. The question names the machine and the system; an answer
+    /// typed before it could be read (typeahead, `Ayuy` in one burst, a `y` typed right behind
+    /// the `u` by habit) is not an answer to it. Every question is a new one to draw and wait
+    /// for. `now` is when the key arrived.
+    pub fn key(
+        &mut self,
+        key: Key,
+        view: &ViewModel,
+        since_refresh: Duration,
+        keymap: &Keymap,
+        now: Instant,
+    ) -> Vec<Event> {
+        if self.question_unseen(view, now) {
+            return Vec::new();
+        }
+        let query = view
+            .search
+            .as_ref()
+            .map(|s| s.query.clone())
+            .unwrap_or_default();
+        let screen = Screen::from_view(view, self.page.max(1), since_refresh);
+        self.input.key(key, screen, keymap, &query)
+    }
+
+    /// Handles pasted text (bracketed paste, so it is not typed): never an answer to a
+    /// question except no, and never a command.
+    ///
+    /// With a question open, a paste is a no once the question could be read (and nothing
+    /// before). With a prompt open, the text goes into it as typed, without control characters
+    /// (a pasted newline must not submit it). Otherwise it is ignored: pasted `uy` is not `u`
+    /// and `y`.
+    pub fn paste(
+        &mut self,
+        text: &str,
+        view: &ViewModel,
+        since_refresh: Duration,
+        keymap: &Keymap,
+        now: Instant,
+    ) -> Vec<Event> {
+        if view.confirm.is_some() {
+            return if self.question_unseen(view, now) {
+                Vec::new()
+            } else {
+                vec![Event::ConfirmAnswer(false)]
+            };
+        }
+        if self.input.prompt.is_none() {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        for c in text.chars().filter(|c| !c.is_control()) {
+            events.extend(self.key(Key::char(c), view, since_refresh, keymap, now));
+        }
+        events
+    }
+
+    /// A question is open that has not been on screen, whole, for [`QUESTION_DWELL`] at `now`.
+    fn question_unseen(&self, view: &ViewModel, now: Instant) -> bool {
+        view.confirm
+            .as_ref()
+            .is_some_and(|c| match self.confirm_seen {
+                Some((serial, since)) if serial == c.serial => {
+                    now.saturating_duration_since(since) < QUESTION_DWELL
+                }
+                _ => true,
+            })
+    }
 }
 
 /// Everything that does not change frame to frame.
@@ -69,6 +161,10 @@ pub struct Context<'a> {
     pub flake: &'a str,
     /// The log, oldest first.
     pub log: &'a [String],
+    /// The streamed output of updates and builds, for the Log tab.
+    pub output: &'a Output,
+    /// When this frame is drawn: the time a question is first on screen is read from it.
+    pub now: Instant,
 }
 
 /// `s` cut to `width` cells, with `…` when cut, and padded with spaces to exactly `width`.
@@ -160,7 +256,7 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
     draw_status(frame, status_row, view, ui, ctx);
 
     if ui.input.log_open {
-        draw_log(frame, main, ctx);
+        draw_log(frame, main, ui, ctx);
     }
     if ui.input.diff_open {
         draw_diff(frame, main, view, ui, ctx);
@@ -168,6 +264,16 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
     if view.help_open {
         draw_help(frame, main, ctx);
     }
+    // A question counts as drawn only if all of it fitted; one that did not (a small pane, a
+    // resize that shrank it) starts its dwell afresh when it does.
+    let whole = draw_confirm(frame, main, view, ctx);
+    ui.confirm_seen = match (&view.confirm, whole) {
+        (Some(c), true) => match ui.confirm_seen {
+            Some((serial, since)) if serial == c.serial => Some((serial, since)),
+            _ => Some((c.serial, ctx.now)),
+        },
+        _ => None,
+    };
 }
 
 fn draw_list(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, theme: &Theme) {
@@ -588,21 +694,26 @@ fn draw_prompt_row(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &Ui, ctx
             cut(&format!(":{input}▏"), width),
             theme.style(Role::Text),
         )),
-        None => ui.input.message.as_ref().map_or_else(
-            || {
-                Line::from(Span::styled(
-                    cut(
-                        &ctx.log.last().map_or_else(
-                            || format!("fleet {}", ctx.flake),
-                            |l| format!("log: {l}"),
+        None => ui
+            .input
+            .message
+            .as_ref()
+            .or(view.notice.as_ref())
+            .map_or_else(
+                || {
+                    Line::from(Span::styled(
+                        cut(
+                            &ctx.log.last().map_or_else(
+                                || format!("fleet {}", ctx.flake),
+                                |l| format!("log: {l}"),
+                            ),
+                            width,
                         ),
-                        width,
-                    ),
-                    theme.style(Role::Dim),
-                ))
-            },
-            |m| Line::from(Span::styled(cut(m, width), theme.style(Role::Error))),
-        ),
+                        theme.style(Role::Dim),
+                    ))
+                },
+                |m| Line::from(Span::styled(cut(m, width), theme.style(Role::Error))),
+            ),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -625,10 +736,14 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         PrometheusStatus::Unavailable { .. } => Some("prom: down, ssh".to_owned()),
     };
     let mut parts = vec![
-        "OBSERVE".to_owned(),
+        mode_label(view).to_owned(),
         refresh.to_owned(),
         format!("{} pending", view.refresh.pending_machines),
     ];
+    // The action first: what is running (or how the last one ended) matters more than the scan.
+    if let Some(a) = &view.action {
+        parts.insert(1, action_text(a));
+    }
     // What the previews are doing: they are not "pending machines" (the status and badges are
     // final), but a settled-looking bar over a still-filling panel would say nothing.
     match view.refresh.diffs_pending {
@@ -646,12 +761,30 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
     if let Some(c) = ui.input.count {
         parts.push(format!("count {c}"));
     }
-    let errors = match view.report.errors.as_slice() {
-        [] => None,
-        [one] => Some(format!("fleet error: {}", one.reason)),
-        many => Some(format!("{} fleet errors: {}", many.len(), many[0].reason)),
-    };
-    (parts.join(" │ "), errors)
+    let mut errors: Vec<String> = Vec::new();
+    match view.report.errors.as_slice() {
+        [] => {}
+        [one] => errors.push(format!("fleet error: {}", one.reason)),
+        many => errors.push(format!("{} fleet errors: {}", many.len(), many[0].reason)),
+    }
+    if let Some(a) = &view.action
+        && let ActionStatus::Ended(end) = &a.status
+        && matches!(end.result, ActionResult::Failed | ActionResult::TimedOut)
+    {
+        // Plainly where it failed, and the fix when it is ssh's: the explanation first.
+        errors.push(
+            end.explanation
+                .clone()
+                .unwrap_or_else(|| end.summary.join(" | ")),
+        );
+    }
+    if let Some(w) = &ui.warning {
+        errors.push(format!("⚠ {w}"));
+    }
+    (
+        (parts.join(" │ ")),
+        (!errors.is_empty()).then(|| errors.join(" │ ")),
+    )
 }
 
 fn draw_status(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &Ui, ctx: &Context<'_>) {
@@ -664,7 +797,24 @@ fn draw_status(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &Ui, ctx: &C
         .first()
         .map(|k| format!(" {k} help"))
         .unwrap_or_default();
-    let mut spans = vec![Span::styled(cut(&text, width), theme.style(Role::Title))];
+    // The mode word on its own: ACT in the warning colour, so it cannot be missed.
+    let label = mode_label(view);
+    let shown = cut(&text, width);
+    // Split by characters, not bytes: a bar cut to a few cells ends in `…`, which is three bytes.
+    let split = shown
+        .char_indices()
+        .nth(label.chars().count())
+        .map_or(shown.len(), |(i, _)| i);
+    let (head, tail) = shown.split_at(split);
+    let head_role = if view.mode == Mode::Act {
+        Role::Warning
+    } else {
+        Role::Title
+    };
+    let mut spans = vec![
+        Span::styled(head.to_owned(), theme.style(head_role)),
+        Span::styled(tail.to_owned(), theme.style(Role::Title)),
+    ];
     let mut used = text.width().min(width);
     if let Some(e) = errors {
         let room = width.saturating_sub(used + 3);
@@ -768,9 +918,59 @@ fn draw_help(frame: &mut Frame, area: Rect, ctx: &Context<'_>) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The log overlay, newest line last, each cut to fit.
-fn draw_log(frame: &mut Frame, area: Rect, ctx: &Context<'_>) {
-    let (lines, theme) = (ctx.log, ctx.theme);
+/// The rows of the Log tab from row `start`, each cut to `width` cells and coloured by where it
+/// came from: standard output as text, standard error in its own colour, auspex's own words
+/// dimmed.
+fn log_rows(
+    ctx: &Context<'_>,
+    notes: bool,
+    start: usize,
+    height: usize,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let theme = ctx.theme;
+    if notes {
+        return ctx
+            .log
+            .iter()
+            .skip(start)
+            .take(height)
+            .map(|l| Line::from(Span::styled(cut(l, width), theme.style(Role::Text))))
+            .collect();
+    }
+    if ctx.output.is_empty() {
+        return [
+            "no action has run yet.",
+            "u updates the selected machine (act mode, A); b builds its pending system here.",
+        ]
+        .into_iter()
+        .map(|l| Line::from(Span::styled(cut(l, width), theme.style(Role::Dim))))
+        .collect();
+    }
+    ctx.output
+        .window(start, height)
+        .into_iter()
+        .map(|l| {
+            let role = match l.stream {
+                Stream::Stdout => Role::Text,
+                Stream::Stderr => Role::Stderr,
+                Stream::Note => Role::Dim,
+            };
+            Line::from(Span::styled(cut(&l.text, width), theme.style(role)))
+        })
+        .collect()
+}
+
+/// The Log tab: the streamed output of the current and last action, or (Tab) the adapters'
+/// notes. Scrollable; follows the tail until the operator scrolls up.
+///
+/// What is drawn is one window of the output, taken under the buffer's lock, never a copy of
+/// the whole of it. The first visible row is written back into
+/// [`LogTab::scroll`](crate::input::LogTab::scroll), and the drawing is what decides
+/// whether the tab is still following: it is when nothing was scrolled up, or when the scroll
+/// has come back to the end.
+fn draw_log(frame: &mut Frame, area: Rect, ui: &mut Ui, ctx: &Context<'_>) {
+    let theme = ctx.theme;
     let rect = Rect {
         x: area.x + 1,
         y: area.y + 1,
@@ -778,21 +978,132 @@ fn draw_log(frame: &mut Frame, area: Rect, ctx: &Context<'_>) {
         height: area.height.saturating_sub(2),
     };
     frame.render_widget(Clear, rect);
+    let notes = ui.input.log.notes || ctx.output.is_empty() && !ctx.log.is_empty();
+    let inner_height = usize::from(rect.height.saturating_sub(2)).max(1);
+    let (total, dropped, older) = if notes {
+        (ctx.log.len(), 0, 0)
+    } else {
+        (
+            ctx.output.rows(),
+            ctx.output.dropped(),
+            ctx.output.last_rows(),
+        )
+    };
+    let last_start = total.saturating_sub(inner_height);
+    let input = &mut ui.input;
+    if input.log.unfollowed {
+        // Lines dropped from the front since the last frame move every row of the current
+        // action up: keep showing the same ones (the older action's rows do not move).
+        let shift =
+            usize::try_from(dropped.saturating_sub(input.log.dropped_seen)).unwrap_or(usize::MAX);
+        if input.log.scroll >= older {
+            input.log.scroll = input.log.scroll.saturating_sub(shift).max(older);
+        }
+    }
+    input.log.dropped_seen = dropped;
+    let start = if input.log.unfollowed {
+        input.log.scroll.min(last_start)
+    } else {
+        last_start
+    };
+    if start >= last_start {
+        input.log.unfollowed = false;
+    }
+    input.log.scroll = start;
+    let following = !input.log.unfollowed;
+
+    let shown = log_rows(
+        ctx,
+        notes,
+        start,
+        inner_height,
+        usize::from(rect.width.saturating_sub(2)),
+    );
+    let position = if total > inner_height {
+        format!(
+            " {}–{}/{}{} ",
+            start + 1,
+            (start + inner_height).min(total),
+            total,
+            if following { " following" } else { "" }
+        )
+    } else {
+        String::new()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(Span::styled(" log ", theme.style(Role::Title)))
+        .title(Span::styled(
+            if notes { " log: notes " } else { " log " },
+            theme.style(Role::Title),
+        ))
+        .title_bottom(Span::styled(
+            format!(
+                "{position}Tab {} · q/esc close ",
+                if notes { "output" } else { "notes" }
+            ),
+            theme.style(Role::Dim),
+        ))
         .border_style(theme.style(Role::Dim))
         .style(theme.base());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    let width = usize::from(inner.width);
-    let height = usize::from(inner.height);
-    let shown: Vec<Line> = lines
-        .iter()
-        .skip(lines.len().saturating_sub(height))
-        .map(|l| Line::from(Span::styled(cut(l, width), theme.style(Role::Text))))
-        .collect();
     frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// What the box says when the pane cannot show the question.
+const TOO_SMALL: &str = "terminal too small to ask: make it larger";
+
+/// The narrowest box the question is asked in. Narrower, it wraps into a column nobody reads.
+const MIN_CONFIRM_WIDTH: u16 = 28;
+
+/// The question waiting for y or N, in a box of its own: a one-line prompt would cut the very
+/// words that say what `y` does at 40 columns.
+///
+/// Returns whether the whole question, and the line saying what `y` does, fitted. A pane too
+/// small to show it is not asking anything: the box then says so, the question is not counted
+/// as drawn, and no key can answer it.
+fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'_>) -> bool {
+    let Some(confirm) = &view.confirm else {
+        return false;
+    };
+    let theme = ctx.theme;
+    let width = area.width.min(78);
+    let text_cells = usize::from(width.saturating_sub(4)).max(1);
+    let mut lines: Vec<Line> = wrap(&confirm.question, text_cells)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, theme.style(Role::Warning))))
+        .collect();
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "y confirms; any other key cancels",
+        theme.style(Role::Dim),
+    )));
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let whole = width >= MIN_CONFIRM_WIDTH && height <= area.height;
+    let (width, height) = if whole {
+        (width, height)
+    } else {
+        // Not the question: a message, wrapped to what room there is.
+        let cells = usize::from(area.width.saturating_sub(2)).max(1);
+        lines = wrap(TOO_SMALL, cells)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, theme.style(Role::Warning))))
+            .collect();
+        (
+            area.width,
+            u16::try_from(lines.len() + 2).unwrap_or(u16::MAX),
+        )
+    };
+    let rect = centred(area, width, height);
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(Span::styled(" confirm ", theme.style(Role::Warning)))
+        .border_style(theme.style(Role::Warning))
+        .style(theme.base());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(lines), inner);
+    whole
 }
 
 /// The package diff overlay (`d`): the selected machine's full list, scrollable.
@@ -870,4 +1181,27 @@ fn draw_diff(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, ctx: 
         })
         .collect();
     frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// `ACT` or `OBSERVE`: the status bar's first word.
+const fn mode_label(view: &ViewModel) -> &'static str {
+    match view.mode {
+        Mode::Observe => "OBSERVE",
+        Mode::Act => "ACT",
+    }
+}
+
+/// What the action is doing, or how it ended: `update luna: running`.
+fn action_text(a: &ActionView) -> String {
+    let what = match &a.status {
+        ActionStatus::Running => "running".to_owned(),
+        ActionStatus::Stopping => "stopping".to_owned(),
+        ActionStatus::Ended(end) => match end.exit_code {
+            Some(code) if end.result != ActionResult::Succeeded => {
+                format!("{} (exit {code})", end.result.label())
+            }
+            _ => end.result.label().to_owned(),
+        },
+    };
+    format!("{} {}: {what}", a.kind.label(), a.machine)
 }

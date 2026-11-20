@@ -329,7 +329,9 @@ Acceptance:
   after, and refuse if any node is already NotReady.
 - **Freezing:** `f` freezes a machine so `U` skips it; freezes persist in the config.
 - **Before any update:**
-  - warn if the fleet tree is dirty or unpushed;
+  - warn if the fleet tree is dirty or unpushed, or **changed since it was evaluated** (clan
+    deploys the tree as it is at `y`; today only a changed pending store path is caught, by commit
+    and dirty state or a re-evaluation of that one machine before running would catch the rest);
   - check free disk on the target against the new closure size;
   - apply the typed-confirmation rule;
   - apply the duplicate-IP refusal.
@@ -338,10 +340,10 @@ Acceptance:
 - **ntfy and desktop notifications.**
 
 Acceptance:
-- [ ] Updating one machine streams output live and records a row in SQLite.
+- [x] Updating one machine streams output live and records a row in SQLite.
 - [ ] `U` on the k8s tags never has two of luna, sol, mars updating at once.
 - [ ] A frozen machine is skipped by `U` and marked `❄`.
-- [ ] Quitting during an update asks for confirmation, and the clan process is not orphaned
+- [x] Quitting during an update asks for confirmation, and the clan process is not orphaned
   (cancel effect).
 - [ ] auspex finds and uses the right `clan` binary without it being on PATH.
 

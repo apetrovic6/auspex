@@ -39,7 +39,7 @@ async fn the_help_overlay() {
     let km = Keymap::defaults();
     type_keys(&shell, &mut ui, &km, "?");
     assert!(shell.view().help_open);
-    let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 36);
+    let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 40);
     expect_file("snapshots", "help_120.txt", &frame);
 }
 
