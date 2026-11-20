@@ -133,9 +133,23 @@ does not care. There are two ways to freeze one.
   switch.
 
 A freeze is applied the moment `f` is pressed, and saved beside it; if the save fails the machine
-stays frozen for this run and the notice says it was not kept. An unfreeze is applied only once it
+stays frozen for this run and the notice says it was not kept. It stays frozen, whatever a later
+save answers, until you unfreeze it (`f`, then `y`: the file never held it, so nothing has to be
+written), and the next save that works writes it into the file too. An unfreeze is applied only once it
 has been saved (the file is what the next run believes), so a failed unfreeze leaves the machine
 frozen and says so.
+
+**Two terminals on one fleet.** Each auspex reads the file when it starts, and reads it again at
+the `y` of every update and once more right before `clan` is started: a machine frozen from the
+other terminal in the meantime is refused (`luna is frozen; f to unfreeze`) and the ❄ appears here
+too, and an update whose file cannot be read at that point is refused too. The list does not
+redraw other terminals' freezes until then (or until your own next `f`).
+
+**The key is the fleet's path.** Freezes are filed under the fleet flake's canonical path
+(`path:` and `git+file://` spellings of a plain directory are the same fleet as the directory).
+A fleet that is **moved or renamed is another fleet**: its freezes are not found under the new
+path (they stay in the file, under the old one), so freeze again, or edit the key in
+`state.toml`. A reference with a query (`?dir=`) or a remote host is keyed as written.
 
 **When it is not known which machines are frozen, nothing is updated.** If the state file is
 corrupt, was written by a newer auspex, or there is no usable state directory (neither
@@ -146,7 +160,11 @@ file is not overwritten nor a newer one downgraded. Fix or delete the file and r
 `config.toml` still apply, and a build is unaffected.
 
 `--json` carries `frozen` (a boolean) on every machine, and `frozen` among its `badges`, for both
-kinds of freeze; it is `false` where it is unknown. The JSON version stays 1.
+kinds of freeze. **When the freezes made with `f` are unknown, `frozen` is only what the config
+declares, and the report says so in band**: an entry in `errors` with `kind` `freezes_unknown`
+(and the run exits 1, as for any fleet error). A script that updates "every machine whose `frozen`
+is false" must check `errors` first. The JSON version stays 1: the kind is new, as an unknown
+`kind` is for any reader of version 1.
 
 ## Installing
 

@@ -346,8 +346,8 @@ async fn when_it_is_unknown_which_machines_are_frozen_every_screen_says_so() {
     type_keys(&shell, &mut ui, &km, "/luna\n");
     let frame = render(&shell.view(), &mut ui, &km, &[], 120, 30);
     assert!(
-        frame.contains("freezes unknown: u and f refused"),
-        "{frame}"
+        frame.contains("fleet error: freezes made with f are unknown"),
+        "the report's fleet error is on the status bar:\n{frame}"
     );
     assert!(frame.contains("unknown: the state file"), "{frame}");
     expect_file("snapshots", "freeze_unknown_120.txt", &frame);
@@ -847,6 +847,20 @@ impl Fleet {
         freeze::fleet_key(self.flake.to_str().unwrap())
     }
 
+    fn plain(&self, config: &str) -> std::process::Output {
+        let cfg = self.dir.path().join("auspex.toml");
+        fs::write(&cfg, config).unwrap();
+        let mut cmd = auspex(self.dir.path());
+        cmd.args(["--plain", "--config"])
+            .arg(&cfg)
+            .arg("--flake")
+            .arg(&self.flake)
+            .env("AUSPEX_NIX", &self.nix)
+            .env("AUSPEX_NIX_EVAL_JOBS", &self.eval)
+            .env("AUSPEX_SSH", &self.ssh);
+        run_within(&mut cmd, LIMIT)
+    }
+
     fn json(&self, config: &str) -> (std::process::Output, serde_json::Value) {
         let cfg = self.dir.path().join("auspex.toml");
         fs::write(&cfg, config).unwrap();
@@ -968,13 +982,28 @@ fn json_does_not_report_another_fleets_freeze() {
 }
 
 #[test]
-fn json_with_a_corrupt_state_file_still_reports_and_says_why_on_stderr() {
+fn json_with_a_corrupt_state_file_says_so_in_band_and_in_the_exit_status() {
     let Some(t) = tools(&[]) else { return };
     let f = fleet(&t);
     damage(&f.state(), b"this is { not toml\n");
     let (out, json) = f.json("[machines.terra]\nfrozen = true\n");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    // The report cannot be trusted for `frozen`, so the run says so where a script looks: an error
+    // in the report, and exit 1. A silent `frozen: false` would have a script update the machine
+    // the operator froze.
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    let errors = json["errors"].as_array().expect("errors");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0]["kind"], "freezes_unknown");
+    let reason = errors[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("not valid") && reason.contains("unknown"),
+        "{reason}"
+    );
+    assert_eq!(
+        json["settled"], false,
+        "a report with an error is not a settled one"
+    );
     assert!(
         stderr.contains("freezes made with f are unknown") && stderr.contains("not valid"),
         "{stderr}"
@@ -1068,4 +1097,265 @@ async fn without_a_state_directory_the_setup_marks_freezes_unknown_and_says_so_i
         "{:?}",
         shell.log.lines()
     );
+}
+
+#[test]
+fn json_with_readable_freezes_has_no_freeze_error_and_exits_0() {
+    let Some(t) = tools(&[]) else { return };
+    let f = fleet(&t);
+    FreezeStore::new(f.state(), f.key())
+        .set_blocking("luna", true)
+        .unwrap();
+    let (out, json) = f.json("");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(json["errors"].as_array().unwrap().len(), 0);
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1: F1 (run-only freezes), F2 (the last look at the file)
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_freeze_whose_save_failed_is_kept_in_the_next_save_that_works() {
+    let dir = tempdir();
+    let state = state_file(dir.path());
+    let r = run(&state, "/fleet", &[]).await;
+    // The file is bad when luna is frozen, so that save fails: frozen for this run only.
+    damage(&state, b"garbage {\n");
+    r.toggle("luna", true).await;
+    assert!(
+        notice(&r.shell).contains("this run only"),
+        "{}",
+        notice(&r.shell)
+    );
+    // The file is repaired (deleted); the next freeze works, and carries luna into the file.
+    fs::remove_file(&state).unwrap();
+    r.toggle("sol", true).await;
+    assert!(
+        row_frozen(&r.view(), "luna"),
+        "still frozen: nothing lifted it"
+    );
+    assert!(row_frozen(&r.view(), "sol"));
+    assert!(r.view().freeze.run_only.is_empty(), "the file holds it now");
+    r.quit().await;
+    let store = FreezeStore::new(state, "/fleet".to_owned());
+    assert_eq!(store.load().await.unwrap(), set(&["luna", "sol"]));
+}
+
+/// Waits until the update question is open (the checks have answered).
+async fn until_update_question(shell: &Arc<Shell>) {
+    let wait = async {
+        while !shell
+            .view()
+            .confirm
+            .as_ref()
+            .is_some_and(|c| c.kind == ConfirmKind::Update)
+        {
+            tokio::select! {
+                () = shell.changed() => {}
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), wait)
+        .await
+        .expect("the question about the update");
+}
+
+/// The demo is scanned and alfrost, the first row, is evaluated.
+async fn ready(r: &Run) {
+    let wait = async {
+        while !(r.view().refresh.settled
+            && r.view()
+                .report
+                .machines
+                .first()
+                .is_some_and(|m| m.name == "alfrost" && m.pending_system.is_some()))
+        {
+            tokio::select! {
+                () = r.shell.changed() => {}
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), wait)
+        .await
+        .expect("the scan to settle");
+}
+
+fn act_on(r: &Run) {
+    r.shell.send(Event::ToggleAct);
+    r.shell.send(Event::ConfirmAnswer(true));
+    assert_eq!(r.view().mode, Mode::Act);
+}
+
+#[tokio::test]
+async fn a_freeze_made_by_another_auspex_is_honoured_at_the_y() {
+    let dir = tempdir();
+    let state = state_file(dir.path());
+    // Two running auspex processes on one fleet; both read an empty file at start-up.
+    let a = run(&state, "/fleet", &[]).await;
+    let b = run(&state, "/fleet", &[]).await;
+    ready(&a).await;
+    act_on(&a);
+    a.select("alfrost");
+    a.shell.send(Event::UpdateSelected);
+    until_update_question(&a.shell).await;
+    // The operator freezes alfrost in the other terminal while the question is open here.
+    b.toggle("alfrost", true).await;
+    a.shell.send(Event::ConfirmAnswer(true));
+    let wait = async {
+        while a.view().notice.is_none() {
+            a.shell.changed().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), wait)
+        .await
+        .expect("an answer to the y");
+    assert_eq!(notice(&a.shell), "alfrost is frozen; f to unfreeze");
+    assert!(a.view().action.is_none(), "nothing was started");
+    assert!(
+        row_frozen(&a.view(), "alfrost"),
+        "and this process shows the ❄"
+    );
+    a.quit().await;
+    b.quit().await;
+}
+
+#[tokio::test]
+async fn a_state_file_that_cannot_be_read_at_the_y_refuses_the_update() {
+    let dir = tempdir();
+    let state = state_file(dir.path());
+    let a = run(&state, "/fleet", &[]).await;
+    ready(&a).await;
+    act_on(&a);
+    a.select("alfrost");
+    a.shell.send(Event::UpdateSelected);
+    until_update_question(&a.shell).await;
+    damage(&state, b"garbage {\n");
+    a.shell.send(Event::ConfirmAnswer(true));
+    let wait = async {
+        while a.view().notice.is_none() {
+            a.shell.changed().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), wait)
+        .await
+        .expect("an answer to the y");
+    let n = notice(&a.shell);
+    assert!(
+        n.contains("could not read which machines are frozen") && n.contains("not valid"),
+        "{n}"
+    );
+    assert!(a.view().action.is_none(), "nothing was started");
+    a.quit().await;
+}
+
+#[tokio::test]
+async fn the_gate_before_the_spawn_refuses_a_frozen_machine_and_an_unreadable_file() {
+    let dir = tempdir();
+    let state = state_file(dir.path());
+    let store = FreezeStore::new(state.clone(), "/fleet".to_owned());
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    shell.set_freeze_store(store.clone());
+    // Nothing frozen (no file at all): through.
+    assert_eq!(shell.freeze_gate("luna").await, Ok(()));
+    store.set("sol", true).await.unwrap();
+    assert_eq!(
+        shell.freeze_gate("luna").await,
+        Ok(()),
+        "another machine's freeze"
+    );
+    let why = shell.freeze_gate("sol").await.unwrap_err();
+    assert!(why.contains("sol is frozen"), "{why}");
+    damage(&state, b"garbage {\n");
+    let why = shell.freeze_gate("luna").await.unwrap_err();
+    assert!(
+        why.contains("could not read which machines are frozen") && why.contains("not valid"),
+        "{why}"
+    );
+}
+
+/// The shell looks again right before `clan` is started, after the core's own look at the `y`:
+/// two reads for an update that goes through (and `clan` really ran).
+#[tokio::test]
+async fn an_update_reads_the_state_file_at_the_y_and_again_before_clan_starts() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let clan = t.script(dir.path(), "clan", "echo deploying\nexit 0");
+    let nix = t.script(dir.path(), "nix", "exit 99");
+    let real = auspex_tui::backend::Real::for_actions(nix.into_os_string(), Some(clan));
+    let shell = Shell::new(
+        Backend::Demo(Demo {
+            real_actions: Some(Box::new(real)),
+            ..Demo::default()
+        }),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    let state = state_file(dir.path());
+    let mut config = Config {
+        flake: fleet.path().to_str().unwrap().to_owned(),
+        ..demo::config()
+    };
+    setup_freezes(
+        &shell,
+        &mut config,
+        Some(FreezeStore::new(state, "/fleet".to_owned())),
+    )
+    .await;
+    shell.send(Event::Start(config));
+    let r = Run {
+        shell: Arc::clone(&shell),
+    };
+    ready(&r).await;
+    act_on(&r);
+    assert_eq!(shell.freeze_reads(), 0, "reading is for updates");
+    shell.send(Event::UpdateSelected);
+    until_update_question(&shell).await;
+    shell.send(Event::ConfirmAnswer(true));
+    let wait = async {
+        while !shell
+            .view()
+            .action
+            .as_ref()
+            .is_some_and(|a| matches!(a.status, auspex_core::ActionStatus::Ended(_)))
+        {
+            shell.changed().await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), wait)
+        .await
+        .expect("the update to end");
+    assert_eq!(
+        shell.freeze_reads(),
+        2,
+        "once for the core, once for the spawn"
+    );
+    shell.shutdown().await;
+}
+
+#[test]
+fn plain_with_a_corrupt_state_file_prints_the_freeze_error() {
+    let Some(t) = tools(&[]) else { return };
+    let f = fleet(&t);
+    damage(&f.state(), b"this is { not toml\n");
+    let out = f.plain("");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("error: freezes_unknown"))
+        .unwrap_or_else(|| panic!("no freeze error in:\n{stdout}"));
+    assert!(line.contains("not valid"), "{line}");
 }

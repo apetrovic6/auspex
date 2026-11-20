@@ -33,7 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use auspex_core::effects::{
-    EvalAnswer, Generation, RequestId, SaveFreezeAnswer, ShellEnd, ShellRequest,
+    EvalAnswer, Generation, LoadFreezesAnswer, RequestId, SaveFreezeAnswer, ShellEnd, ShellRequest,
 };
 use auspex_core::{ActionEnd, ActionKind, ActionResult, Auspex, Core, Effect, Event, ViewModel};
 use auspex_effects::clan::{ClanRun, RunEnd};
@@ -129,6 +129,9 @@ pub struct Shell {
     /// What `f` froze in a run with no state file (the demo, most tests): kept for the run, so
     /// that freezing and unfreezing work as they do with a file.
     frozen_in_memory: Mutex<BTreeSet<String>>,
+    /// How many times the freeze state was read for an update (the core's look at the `y` and the
+    /// shell's before the spawn), for tests.
+    freeze_reads: AtomicUsize,
 }
 
 impl Shell {
@@ -158,6 +161,7 @@ impl Shell {
             handoff: Mutex::new(None),
             freeze_store: Mutex::new(None),
             frozen_in_memory: Mutex::new(BTreeSet::new()),
+            freeze_reads: AtomicUsize::new(0),
         })
     }
 
@@ -391,6 +395,7 @@ impl Shell {
             Effect::RunAction(request) => self.run_action(request),
             Effect::OpenShell(request) => self.open_shell(request),
             Effect::SaveFreeze(request) => self.save_freeze(request),
+            Effect::LoadFreezes(request) => self.load_freezes(request),
             Effect::Cancel(request) => self.cancel(request.operation.id),
         }
     }
@@ -673,6 +678,13 @@ impl Shell {
         self.changed.notify_one();
     }
 
+    /// How many times the freeze state was read on the way to an update, for tests: two for
+    /// an update that went through (the core's look at the `y`, the shell's before the spawn).
+    #[must_use]
+    pub fn freeze_reads(&self) -> usize {
+        self.freeze_reads.load(Ordering::SeqCst)
+    }
+
     /// The streamed output of updates and builds, for the Log tab.
     #[must_use]
     pub const fn output(&self) -> &Output {
@@ -790,11 +802,12 @@ impl Shell {
         self.tasks.spawn(async move {
             let answer: SaveFreezeAnswer = if let Some(store) = store {
                 store
-                    .set(&op.machine, op.frozen)
+                    .set_with(&op.machine, op.frozen, &op.also_frozen)
                     .await
                     .map_err(|e| e.to_string())
             } else {
                 let mut set = lock(&shell.frozen_in_memory);
+                set.extend(op.also_frozen.iter().cloned());
                 if op.frozen {
                     set.insert(op.machine.clone());
                 } else {
@@ -818,6 +831,48 @@ impl Shell {
         });
     }
 
+    /// The state file as it is now, or why it cannot be read: with no file configured, what this
+    /// run froze in memory.
+    async fn read_freezes(&self) -> LoadFreezesAnswer {
+        self.freeze_reads.fetch_add(1, Ordering::SeqCst);
+        let store = lock(&self.freeze_store).clone();
+        match store {
+            Some(store) => store.load().await.map_err(|e| e.to_string()),
+            None => Ok(lock(&self.frozen_in_memory).clone()),
+        }
+    }
+
+    /// `Effect::LoadFreezes`: the last look at the file before the core requests an update.
+    fn load_freezes(
+        self: &Arc<Self>,
+        mut request: Request<auspex_core::effects::LoadFreezesRequest>,
+    ) {
+        let shell = Arc::clone(self);
+        self.tasks.spawn(async move {
+            let answer = shell.read_freezes().await;
+            shell.resolve(&mut request, answer);
+        });
+    }
+
+    /// The last look before `clan` is started: the file is read once more, and a machine frozen
+    /// in it, or a file that cannot be read, ends the update here, unstarted. The core looked at
+    /// the file at the `y`; this closes the gap between that and the spawn.
+    ///
+    /// # Errors
+    ///
+    /// Why the update must not start: the machine is frozen, or the state cannot be read.
+    pub async fn freeze_gate(&self, machine: &str) -> Result<(), String> {
+        match self.read_freezes().await {
+            Ok(set) if set.contains(machine) => {
+                Err(format!("{machine} is frozen; not updating it"))
+            }
+            Ok(_) => Ok(()),
+            Err(why) => Err(format!(
+                "could not read which machines are frozen ({why}); not updating {machine}"
+            )),
+        }
+    }
+
     fn run_action(self: &Arc<Self>, mut request: Request<auspex_core::effects::ActionRequest>) {
         let op = request.operation.clone();
         let token = self.open(op.id);
@@ -829,10 +884,21 @@ impl Shell {
         let logged = self.log_action(&op);
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {
-            let ran = shell
-                .backend
-                .run_action(&op, &token, &|stream, text| shell.output.push(stream, text))
-                .await;
+            // An update is the one action that can lift nothing a freeze holds: asked again, here.
+            let gate = if op.kind == ActionKind::Update {
+                shell.freeze_gate(&op.machine).await
+            } else {
+                Ok(())
+            };
+            let ran = match gate {
+                Err(reason) => Ok(Err(reason)),
+                Ok(()) => {
+                    shell
+                        .backend
+                        .run_action(&op, &token, &|stream, text| shell.output.push(stream, text))
+                        .await
+                }
+            };
             shell.forget(op.id);
             let end = action_end(&shell.output, &op, ran);
             shell.output.finish(&ended_line(&end));

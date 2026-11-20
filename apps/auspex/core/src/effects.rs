@@ -521,6 +521,10 @@ pub struct SaveFreezeRequest {
     pub machine: String,
     /// `true` to freeze it, `false` to unfreeze.
     pub frozen: bool,
+    /// Machines frozen in this run whose own save failed, so the file does not hold them: the
+    /// adapter freezes them in the same write, so a later save that works also keeps them (see
+    /// `app/freeze.rs`). Never contains `machine`.
+    pub also_frozen: BTreeSet<String>,
 }
 
 /// The machines frozen after the change, or one line on why it could not be kept. Failures are
@@ -529,6 +533,25 @@ pub type SaveFreezeAnswer = Result<BTreeSet<String>, String>;
 
 impl Operation for SaveFreezeRequest {
     type Output = SaveFreezeAnswer;
+}
+
+/// Read the freeze state file again: which machines `f` froze, as the file says now.
+///
+/// Asked at the `y` of an update, as the last decision before it is requested: another running
+/// auspex may have frozen the machine since this one read the file at start-up. The answer is
+/// the whole set, or one line on why the file could not be read; the core refuses the update on
+/// an error, because a machine that may be frozen is not one to deploy to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadFreezesRequest {
+    /// This request.
+    pub id: RequestId,
+}
+
+/// The machines frozen with `f` now, or why the file could not be read.
+pub type LoadFreezesAnswer = Result<BTreeSet<String>, String>;
+
+impl Operation for LoadFreezesRequest {
+    type Output = LoadFreezesAnswer;
 }
 
 /// Stop request `id`: kill its process and drop its `Request`. Fire and forget.
@@ -579,4 +602,6 @@ pub enum Effect {
     OpenShell(ShellRequest),
     /// [`SaveFreezeRequest`]: keep a freeze or an unfreeze in the state file.
     SaveFreeze(SaveFreezeRequest),
+    /// [`LoadFreezesRequest`]: read the state file again, before an update.
+    LoadFreezes(LoadFreezesRequest),
 }

@@ -314,6 +314,10 @@ pub(super) fn request(model: &mut Model, kind: ActionKind) -> Command<Effect, Ev
     if kind == ActionKind::Update && !model.act {
         return model.notice(ACT_MODE_OFF);
     }
+    if model.freeze.rechecking() {
+        return model
+            .notice("still checking which machines are frozen before an update; ask again");
+    }
     if let Some(a) = model.action.as_ref().filter(|a| a.active()) {
         let text = format!("{} of {} is already running", article(a.kind), a.machine);
         return model.notice(text);
@@ -723,7 +727,35 @@ fn confirm_update(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
         });
         return model.notice(note);
     }
-    launch(model, ActionKind::Update, machine)
+    // Everything the core can know says yes. The last look is at the file, which another
+    // running auspex may have changed since this one read it (`freeze.rs`).
+    super::freeze::recheck(model, machine, path)
+}
+
+/// The file was read again and no freeze stopped the update (`freeze::loaded`): every rule is
+/// decided once more, since the world may have moved while it was read, and the update is
+/// requested only if all still hold.
+pub(super) fn launch_after_recheck(
+    model: &mut Model,
+    machine: String,
+    path: &str,
+) -> Command<Effect, Event> {
+    if !model.act {
+        return model.notice(ACT_MODE_OFF);
+    }
+    if model.action_active() {
+        return model.notice("another action is already running");
+    }
+    if model.refresh_running(&machine) {
+        return model.notice(REFRESH_RUNNING);
+    }
+    match check(model, ActionKind::Update, &machine) {
+        Ok(now) if now.path == path => launch(model, ActionKind::Update, machine),
+        Ok(_) => model.notice(format!(
+            "the pending system of {machine} changed while the freeze state was read; ask again"
+        )),
+        Err(why) => model.notice(why),
+    }
 }
 
 /// What the dialog the operator confirmed was about.

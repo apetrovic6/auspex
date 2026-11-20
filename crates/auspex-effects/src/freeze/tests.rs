@@ -471,3 +471,134 @@ fn the_guard_refuses_the_default_location_and_nothing_else() {
     forbid_default_location_in_tests(&d.path().join("elsewhere").join(FILE_NAME), Some(&pretend));
     forbid_default_location_in_tests(&pretend, None);
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn the_fleet_key_is_the_same_for_every_spelling_of_a_plain_local_fleet() {
+    let d = dir();
+    let real = d.path().join("fleet");
+    std::fs::create_dir(&real).unwrap();
+    let canonical = std::fs::canonicalize(&real)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let r = real.display();
+    for spelling in [
+        format!("git+file://{r}"),
+        format!("git+file:{r}"),
+        format!("path:{r}"),
+        r.to_string(),
+        format!("{r}/../fleet"),
+    ] {
+        assert_eq!(fleet_key(&spelling), canonical, "{spelling}");
+    }
+}
+
+#[test]
+fn a_reference_with_a_query_or_a_remote_host_is_not_taken_for_the_plain_path() {
+    let d = dir();
+    let real = d.path().join("fleet");
+    std::fs::create_dir(&real).unwrap();
+    let r = real.display();
+    // `?dir=sub` names another flake than the repository at the path before it.
+    for spelling in [
+        format!("git+file://{r}?dir=sub"),
+        format!("git+file://{r}?ref=main"),
+        format!("path:{r}?dir=sub"),
+        "git+file://otherhost/fleet".to_owned(),
+        "github:me/fleet".to_owned(),
+    ] {
+        assert_eq!(fleet_key(&spelling), spelling, "{spelling}");
+    }
+}
+
+#[test]
+fn a_moved_fleet_is_another_fleet_and_its_freezes_stay_in_the_file() {
+    let d = dir();
+    let old = FreezeStore::new(file_in(d.path()), "/old/place/fleet".to_owned());
+    let new = FreezeStore::new(file_in(d.path()), "/new/place/fleet".to_owned());
+    old.set_blocking("luna", true).unwrap();
+    assert_eq!(
+        new.load_blocking().unwrap(),
+        set(&[]),
+        "not found under the new path"
+    );
+    new.set_blocking("sol", true).unwrap();
+    assert_eq!(old.load_blocking().unwrap(), set(&["luna"]), "and not lost");
+}
+
+#[test]
+fn a_write_can_carry_the_freezes_an_earlier_save_failed_to_keep() {
+    let d = dir();
+    let s = store(d.path());
+    let also = set(&["luna", "terra"]);
+    let got = s.set_with_blocking("sol", true, &also).unwrap();
+    assert_eq!(got, set(&["luna", "sol", "terra"]));
+    assert_eq!(s.load_blocking().unwrap(), got);
+    // An unfreeze carries them too, and removes only its own machine.
+    let got = s.set_with_blocking("sol", false, &set(&["mars"])).unwrap();
+    assert_eq!(got, set(&["luna", "mars", "terra"]));
+}
+
+#[test]
+fn a_name_that_is_not_plain_among_the_carried_ones_refuses_the_whole_write() {
+    let d = dir();
+    let s = store(d.path());
+    s.set_blocking("luna", true).unwrap();
+    let before = read_text(&file_in(d.path()));
+    let e = s
+        .set_with_blocking("sol", true, &set(&["fine", "-rf"]))
+        .unwrap_err();
+    assert!(matches!(e, Error::BadName(n) if n == "-rf"));
+    assert_eq!(read_text(&file_in(d.path())), before, "nothing was written");
+}
+
+// The rules for a file that may be used, as a function of the numbers (as the action log's are),
+// so that each is tested without another user's file.
+
+fn facts(kind: FileType, owner: u32, mode: u32, links: u64) -> Result<()> {
+    check_file_facts("/x/state.toml", kind, owner, 1000, mode, links)
+}
+
+#[test]
+fn a_file_with_no_group_or_other_bit_that_is_ours_and_has_one_name_is_usable() {
+    for mode in [0o600, 0o400, 0o200, 0o100_600] {
+        assert!(
+            facts(FileType::RegularFile, 1000, mode, 1).is_ok(),
+            "{mode:o}"
+        );
+    }
+    // A name that was just replaced under the reader has none left: not a second name.
+    assert!(facts(FileType::RegularFile, 1000, 0o600, 0).is_ok());
+}
+
+#[test]
+fn any_group_or_other_permission_bit_refuses_the_file() {
+    for mode in [
+        0o640, 0o660, 0o604, 0o620, 0o602, 0o601, 0o610, 0o644, 0o666, 0o700_077,
+    ] {
+        let e = facts(FileType::RegularFile, 1000, mode, 1).unwrap_err();
+        assert!(e.to_string().contains("expected 0600"), "{mode:o}: {e}");
+    }
+}
+
+#[test]
+fn another_users_file_is_refused() {
+    let e = facts(FileType::RegularFile, 1001, 0o600, 1).unwrap_err();
+    assert!(e.to_string().contains("owned by uid 1001"), "{e}");
+    let e = facts(FileType::RegularFile, 0, 0o600, 1).unwrap_err();
+    assert!(e.to_string().contains("not by this user"), "{e}");
+}
+
+#[test]
+fn a_symlink_a_directory_and_a_second_name_are_refused() {
+    let e = facts(FileType::Symlink, 1000, 0o600, 1).unwrap_err();
+    assert!(e.to_string().contains("symlink"), "{e}");
+    let e = facts(FileType::Directory, 1000, 0o600, 1).unwrap_err();
+    assert!(e.to_string().contains("not a regular file"), "{e}");
+    let e = facts(FileType::RegularFile, 1000, 0o600, 2).unwrap_err();
+    assert!(e.to_string().contains("2 hard links"), "{e}");
+}

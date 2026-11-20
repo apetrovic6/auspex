@@ -62,8 +62,8 @@ use crate::config::{Config, SavedFreezes};
 use crate::effects::{
     ActionEnd, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest, Effect,
     EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
-    PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer, PrometheusRequest,
-    RequestId, ResolveRequest, SaveFreezeAnswer, ShellEnd,
+    LoadFreezesAnswer, PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer,
+    PrometheusRequest, RequestId, ResolveRequest, SaveFreezeAnswer, ShellEnd,
 };
 use crate::view::{
     FreezeView, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState,
@@ -245,6 +245,14 @@ pub enum Event {
     /// and no question; unfreezing asks "unfreeze luna? y/N". A machine frozen in `config.toml`
     /// cannot be unfrozen here.
     ToggleFreeze,
+    /// [`LoadFreezesRequest`](crate::effects::LoadFreezesRequest) answered: what the state file
+    /// says now, read as the last look before an update is requested. Built by the core.
+    FreezesLoaded {
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: LoadFreezesAnswer,
+    },
     /// The answer to the open question: `true` for `y`, `false` for anything else. For a
     /// question that asks for a typed name ([`crate::ConfirmKind::UpdateTyped`]) `true` is
     /// ignored: only [`Event::ConfirmSubmit`] with the exact name confirms, and `false`
@@ -707,6 +715,7 @@ impl App for Auspex {
             | Event::ActionEnded { .. }) => act::event(model, event),
             Event::ToggleFreeze => freeze::toggle(model),
             Event::FreezeSaved { id, answer } => freeze::saved(model, id, answer),
+            Event::FreezesLoaded { id, answer } => freeze::loaded(model, id, answer),
             view_event => {
                 view_update(model, view_event);
                 render()
@@ -748,13 +757,26 @@ impl App for Auspex {
         // prints: a failed list must not read as a settled, empty fleet. `report.settled`
         // is the domain's ("the scan completed cleanly"); `refresh.settled` below is
         // "nothing more will change", which is what headless mode waits for.
+        // Which machines were frozen with `f` is not known: the report says so in band, because
+        // every `frozen: false` in it is then only what the config declares, and a reader that
+        // updates "every machine whose `frozen` is false" would update the ones the operator froze.
+        let mut errors = model.fleet_errors.clone();
+        if let SavedFreezes::Unknown(why) = model.freeze.saved() {
+            errors.push(FleetError::new(
+                FleetErrorKind::FreezesUnknown,
+                &format!(
+                    "freezes made with f are unknown, so `frozen` is only what the config declares \
+                     and nothing is updated: {why}"
+                ),
+            ));
+        }
         let report = fleet_report(
             machines,
             shared,
             FleetFacts {
                 scan_complete: model.scan_complete(),
                 timed_out: model.timed_out,
-                errors: model.fleet_errors.clone(),
+                errors: errors.clone(),
             },
         );
         let settled = model.fleet_settled();
@@ -796,6 +818,7 @@ impl App for Auspex {
             notice: model.view.notice.clone(),
             freeze: FreezeView {
                 declared: model.freeze.declared().clone(),
+                run_only: model.freeze.run_only().clone(),
                 saved: match model.freeze.saved() {
                     SavedFreezes::Known(s) => s.clone(),
                     SavedFreezes::Unknown(_) => BTreeSet::new(),
@@ -1537,6 +1560,7 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::ShellEnded { .. }
         | Event::ToggleFreeze
         | Event::FreezeSaved { .. }
+        | Event::FreezesLoaded { .. }
         | Event::ActionEnded { .. }
         | Event::Terminate
         | Event::Quit => {}

@@ -142,7 +142,10 @@ fn a_kept_freeze_adopts_the_set_the_file_now_holds() {
     saved(&mut s, &mut r, &["luna", "sol"]);
     assert!(frozen(&s, "luna") && frozen(&s, "sol") && !frozen(&s, "terra"));
     assert!(!s.view().freeze.saving);
-    assert_eq!(s.view().freeze.frozen(), BTreeSet::from(["luna", "sol"]));
+    assert_eq!(
+        s.view().freeze.frozen(),
+        Some(BTreeSet::from(["luna", "sol"]))
+    );
     assert_eq!(notice(&s), "luna frozen");
 }
 
@@ -521,7 +524,7 @@ fn a_build_is_not_refused_when_it_is_unknown_which_machines_are_frozen() {
 fn the_frozen_set_is_in_the_view_for_u_to_skip() {
     let s = settled(config(&["terra"], known(&["luna"])));
     let freeze = s.view().freeze;
-    assert_eq!(freeze.frozen(), BTreeSet::from(["luna", "terra"]));
+    assert_eq!(freeze.frozen(), Some(BTreeSet::from(["luna", "terra"])));
     assert!(freeze.is_frozen("luna") && freeze.is_frozen("terra") && !freeze.is_frozen("sol"));
     assert_eq!(freeze.declared, set(&["terra"]));
     assert_eq!(freeze.saved, set(&["luna"]));
@@ -579,4 +582,294 @@ fn a_yes_to_unfreeze_is_not_obeyed_for_a_machine_the_config_now_freezes() {
         "the config's freeze is not f's to undo"
     );
     assert!(frozen(&s, "luna"));
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1, F1: a freeze that is "for this run only" is kept for the run
+// ---------------------------------------------------------------------------------------
+
+/// luna frozen with a save that failed, so the file does not hold it.
+fn luna_frozen_for_this_run() -> Shell {
+    let mut s = settled(config(&[], known(&[])));
+    s.send(Event::ToggleFreeze);
+    let mut r = s.take_freeze();
+    s.resolve(&mut r, Err("busy".to_owned()));
+    assert!(frozen(&s, "luna"));
+    s
+}
+
+#[test]
+fn a_freeze_for_this_run_only_survives_the_next_successful_save() {
+    let mut s = luna_frozen_for_this_run();
+    select(&mut s, "sol");
+    s.send(Event::ToggleFreeze);
+    let mut r = s.take_freeze();
+    // The file never held luna, so what it says back does not either.
+    saved(&mut s, &mut r, &["sol"]);
+    assert!(
+        frozen(&s, "luna"),
+        "the operator was told luna is frozen for the run"
+    );
+    assert!(has_snowflake(&s, "luna"));
+    assert!(frozen(&s, "sol"));
+    assert!(s.view().freeze.frozen().is_some_and(|f| f.contains("luna")));
+}
+
+#[test]
+fn a_freeze_for_this_run_only_still_refuses_u_after_the_next_save() {
+    let mut s = luna_frozen_for_this_run();
+    act_on(&mut s);
+    select(&mut s, "sol");
+    s.send(Event::ToggleFreeze);
+    let mut r = s.take_freeze();
+    saved(&mut s, &mut r, &["sol"]);
+    select(&mut s, "luna");
+    s.send(Event::UpdateSelected);
+    assert_eq!(notice(&s), "luna is frozen; f to unfreeze");
+    assert!(s.actions.is_empty());
+}
+
+#[test]
+fn the_next_save_asks_the_shell_to_keep_the_run_only_freezes_too() {
+    let mut s = luna_frozen_for_this_run();
+    select(&mut s, "sol");
+    s.send(Event::ToggleFreeze);
+    let r = s.take_freeze();
+    assert_eq!(r.operation.machine, "sol");
+    assert_eq!(
+        r.operation.also_frozen,
+        set(&["luna"]),
+        "a retry for luna rides along"
+    );
+}
+
+#[test]
+fn a_run_only_freeze_the_file_now_holds_is_an_ordinary_one() {
+    let mut s = luna_frozen_for_this_run();
+    select(&mut s, "sol");
+    s.send(Event::ToggleFreeze);
+    let mut r = s.take_freeze();
+    saved(&mut s, &mut r, &["luna", "sol"]);
+    assert!(frozen(&s, "luna"));
+    // The next save has nothing left to carry.
+    select(&mut s, "terra");
+    s.send(Event::ToggleFreeze);
+    assert!(s.take_freeze().operation.also_frozen.is_empty());
+}
+
+#[test]
+fn a_run_only_freeze_is_lifted_only_by_the_operator() {
+    let mut s = luna_frozen_for_this_run();
+    // f on it asks to unfreeze, like any freeze made with f.
+    s.send(Event::ToggleFreeze);
+    assert_eq!(
+        s.view().confirm.expect("a question").kind,
+        ConfirmKind::Unfreeze
+    );
+    s.send(Event::ConfirmAnswer(true));
+    assert!(
+        !frozen(&s, "luna"),
+        "the file never held it, so there is nothing to wait for"
+    );
+    assert!(s.freezes.is_empty(), "and nothing is asked of the shell");
+    assert!(notice(&s).contains("unfroze luna"), "{}", notice(&s));
+}
+
+#[test]
+fn a_run_only_freeze_is_reported_by_the_view() {
+    let s = luna_frozen_for_this_run();
+    let v = s.view();
+    assert_eq!(v.freeze.run_only, set(&["luna"]));
+    assert!(v.freeze.is_frozen("luna"));
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1, F2: the last look is at the file
+// ---------------------------------------------------------------------------------------
+
+/// luna, evaluated, act mode on, the file as the shell would read it now.
+fn ready_to_update(file: &[&str]) -> Shell {
+    let mut s = settled(config(&[], known(&[])));
+    act_on(&mut s);
+    s.freeze_file = Ok(set(file));
+    s
+}
+
+/// `u`, the checks, and the `y`.
+fn ask_and_confirm(s: &mut Shell) {
+    s.send(Event::UpdateSelected);
+    answer_checks(s);
+    assert_eq!(
+        s.view().confirm.expect("the question").kind,
+        ConfirmKind::Update
+    );
+    s.send(Event::ConfirmAnswer(true));
+}
+
+#[test]
+fn a_freeze_made_by_another_auspex_stops_the_update_at_the_y() {
+    // This process read an empty file at start-up; another one froze luna since.
+    let mut s = ready_to_update(&["luna"]);
+    ask_and_confirm(&mut s);
+    assert!(s.actions.is_empty(), "luna is frozen in the file now");
+    assert_eq!(notice(&s), "luna is frozen; f to unfreeze");
+    assert!(frozen(&s, "luna"), "and this process shows it");
+}
+
+#[test]
+fn what_the_file_says_is_taken_in_for_the_other_machines_too() {
+    let mut s = ready_to_update(&["sol"]);
+    ask_and_confirm(&mut s);
+    let a = s.take_action();
+    assert_eq!(a.operation.machine, "luna", "luna was not frozen: it goes");
+    assert!(
+        frozen(&s, "sol"),
+        "sol, frozen elsewhere meanwhile, shows its ❄"
+    );
+}
+
+#[test]
+fn a_file_that_cannot_be_read_at_the_y_refuses_the_update() {
+    let mut s = ready_to_update(&[]);
+    s.freeze_file = Err("the state file is not valid (not TOML)".to_owned());
+    ask_and_confirm(&mut s);
+    assert!(s.actions.is_empty());
+    let n = notice(&s);
+    assert!(
+        n.contains("could not read which machines are frozen")
+            && n.contains("not valid")
+            && n.contains("luna"),
+        "{n}"
+    );
+    // One failed read does not make everything unknown: a later `u` asks again.
+    assert!(s.view().freeze.unknown.is_none());
+}
+
+#[test]
+fn the_update_is_requested_only_once_the_file_has_been_read() {
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s);
+    assert!(s.actions.is_empty(), "the file has not been read yet");
+    assert_eq!(s.loads.len(), 1, "the core asked for it");
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(set(&[])));
+    assert_eq!(s.take_action().operation.machine, "luna");
+}
+
+#[test]
+fn a_freeze_that_arrives_in_the_answer_wins_over_the_yes() {
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s);
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(set(&["luna"])));
+    assert!(s.actions.is_empty());
+    assert_eq!(notice(&s), "luna is frozen; f to unfreeze");
+}
+
+#[test]
+fn quitting_while_the_file_is_read_starts_nothing() {
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s);
+    s.send(Event::Quit);
+    assert!(s.view().quit);
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(set(&[])));
+    assert!(s.actions.is_empty(), "nothing is started on the way out");
+}
+
+#[test]
+fn what_changed_while_the_file_was_read_is_checked_again() {
+    // Act mode turned off.
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s);
+    s.send(Event::ToggleAct);
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(set(&[])));
+    assert!(s.actions.is_empty());
+    assert_eq!(notice(&s), "act mode is off (A)");
+    // The machine frozen here in the meantime.
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s);
+    s.send(Event::ToggleFreeze);
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(set(&[])));
+    assert!(s.actions.is_empty());
+}
+
+#[test]
+fn another_update_cannot_start_while_the_file_is_read() {
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s);
+    s.send(Event::UpdateSelected);
+    assert!(
+        notice(&s).contains("still checking which machines are frozen"),
+        "{}",
+        notice(&s)
+    );
+    assert!(s.view().confirm.is_none(), "no second question");
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1, F4 and F6
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn the_frozen_set_for_u_is_none_while_it_is_not_known_which_machines_are_frozen() {
+    let s = unknown();
+    let freeze = s.view().freeze;
+    assert_eq!(
+        freeze.frozen(),
+        None,
+        "not `{{terra}}`: a U that updated the rest would update what f froze"
+    );
+    assert!(
+        freeze.is_frozen("terra"),
+        "a declaration still reads as frozen"
+    );
+}
+
+#[test]
+fn an_unfreeze_question_answered_while_a_save_is_out_asks_nothing_of_the_shell() {
+    // The question is open, a freeze of sol is saved meanwhile (the core takes the event even
+    // though a shell never sends it behind a question), and then the `y` arrives.
+    let mut s = luna_frozen();
+    s.send(Event::ToggleFreeze);
+    assert_eq!(
+        s.view().confirm.expect("a question").kind,
+        ConfirmKind::Unfreeze
+    );
+    select(&mut s, "sol");
+    s.send(Event::ToggleFreeze);
+    assert!(s.view().freeze.saving);
+    s.send(Event::ConfirmAnswer(true));
+    assert!(notice(&s).contains("still being saved"), "{}", notice(&s));
+    assert_eq!(s.freezes.len(), 1, "only sol's save is out");
+    assert!(frozen(&s, "luna"));
+}
+
+#[test]
+fn unknown_freezes_are_a_fleet_error_in_the_report_and_known_ones_are_not() {
+    use auspex_core::FleetErrorKind;
+    let s = unknown();
+    let errors = s.view().report.errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].kind, FleetErrorKind::FreezesUnknown);
+    assert!(
+        errors[0].reason.contains("the state file is corrupt")
+            && errors[0].reason.contains("config declares"),
+        "{}",
+        errors[0].reason
+    );
+    assert!(
+        !s.view().report.settled,
+        "a report with an error is not a settled one"
+    );
+    let s = settled(config(&["terra"], known(&["luna"])));
+    assert_eq!(s.view().report.errors, []);
 }

@@ -807,10 +807,6 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
                 .unwrap_or_else(|| end.summary.join(" | ")),
         );
     }
-    if view.freeze.unknown.is_some() {
-        // The reason is in the detail panel and the log; here, what it costs.
-        errors.push("freezes unknown: u and f refused".to_owned());
-    }
     if let Some(w) = &ui.warning {
         errors.push(format!("⚠ {w}"));
     }

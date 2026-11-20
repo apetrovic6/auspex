@@ -67,6 +67,9 @@ pub struct FreezeView {
     pub declared: BTreeSet<String>,
     /// Frozen with `f` (the state file), when it could be read; empty when it could not.
     pub saved: BTreeSet<String>,
+    /// Frozen with `f` in this run, but not kept: the save failed, so the file does not hold
+    /// them and a restart forgets them. They count as frozen until the operator unfreezes them.
+    pub run_only: BTreeSet<String>,
     /// Why the freezes made with `f` are unknown (the state file is corrupt or newer, or there
     /// is no state directory), or `None`. While set, `u` and `f` are refused for every machine.
     pub unknown: Option<String>,
@@ -75,20 +78,30 @@ pub struct FreezeView {
 }
 
 impl FreezeView {
-    /// Whether `machine` is frozen, by either source.
+    /// Whether `machine` is known to be frozen, by any source. While [`FreezeView::unknown`] is
+    /// set this says nothing about a machine frozen with `f`: ask [`FreezeView::frozen`], or
+    /// refuse outright.
     #[must_use]
     pub fn is_frozen(&self, machine: &str) -> bool {
-        self.declared.contains(machine) || self.saved.contains(machine)
+        self.declared.contains(machine)
+            || self.saved.contains(machine)
+            || self.run_only.contains(machine)
     }
 
-    /// Every machine known to be frozen: what `U` skips.
+    /// Every machine known to be frozen, which `U` skips, or `None` while it is not known which
+    /// machines were frozen with `f` ([`FreezeView::unknown`]). `None` is not "none are frozen":
+    /// a `U` that updates the rest then would update the machine the operator froze, so it must
+    /// refuse outright, as `u` does (`act::check`).
     #[must_use]
-    pub fn frozen(&self) -> BTreeSet<&str> {
-        self.declared
-            .iter()
-            .chain(&self.saved)
-            .map(String::as_str)
-            .collect()
+    pub fn frozen(&self) -> Option<BTreeSet<&str>> {
+        self.unknown.is_none().then(|| {
+            self.declared
+                .iter()
+                .chain(&self.saved)
+                .chain(&self.run_only)
+                .map(String::as_str)
+                .collect()
+        })
     }
 }
 

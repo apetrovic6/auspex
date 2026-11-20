@@ -154,15 +154,37 @@ fn default_path_from(xdg_state_home: Option<&OsStr>, home: Option<&OsStr>) -> Op
 /// The key a fleet's freezes are filed under: its canonical path.
 ///
 /// `flake` as configured (`--flake`, `CLAN_DIR`, `flake` in the config), with a leading `path:`
-/// dropped; when that names something on this machine it is resolved through symlinks and `.`,
-/// so `.`, `~/clan/fleet` and `/home/me/clan/fleet` are one fleet. Anything else (a flake
-/// reference that is not a local path) is used as written: it names the fleet as well as a path
-/// does, and two different references are two fleets.
+/// or `git+file://` dropped; when that names something on this machine it is resolved through
+/// symlinks and `.`, so `.`, `~/clan/fleet`, `/home/me/clan/fleet`, `path:/home/me/clan/fleet`
+/// and `git+file:///home/me/clan/fleet` are one fleet. Anything else (a flake reference that is
+/// not a plain local path: a remote one, or one with a query) is used as written, and two
+/// different references are two fleets.
+///
+/// **A fleet that is moved or renamed is another fleet:** the key is its path, so the freezes
+/// filed under the old one are not found (and not lost: they are still in the file). The README
+/// says so; there is no migration, because the file cannot tell a moved fleet from a second one.
 #[must_use]
 pub fn fleet_key(flake: &str) -> String {
-    let local = flake.strip_prefix("path:").unwrap_or(flake);
+    let local = local_path(flake).unwrap_or(flake);
     std::fs::canonicalize(local)
         .map_or_else(|_| flake.to_owned(), |p| p.to_string_lossy().into_owned())
+}
+
+/// The directory a reference names on this machine, when it is a plain one: `path:/x`,
+/// `git+file:///x` or `git+file:/x`. A reference with a query (`?dir=sub`, `?ref=…`) is not
+/// one, and needs no rule of its own: the text with the query is no path that exists, so
+/// `canonicalize` fails and the reference is used as written.
+fn local_path(flake: &str) -> Option<&str> {
+    if let Some(rest) = flake.strip_prefix("path:") {
+        return Some(rest);
+    }
+    let rest = flake.strip_prefix("git+file:")?;
+    // `git+file://<host>/<path>`: only an empty host is this machine.
+    match rest.strip_prefix("//") {
+        Some(path) if path.starts_with('/') => Some(path),
+        Some(_) => None,
+        None => Some(rest),
+    }
 }
 
 /// One fleet's freezes in one state file. Cheap to clone; every call opens the file afresh.
@@ -207,9 +229,26 @@ impl FreezeStore {
     /// See [`Error`]. Nothing was written, except that a failure after the temporary file was
     /// created may leave it behind (the next write replaces it).
     pub async fn set(&self, machine: &str, frozen: bool) -> Result<BTreeSet<String>> {
+        self.set_with(machine, frozen, &BTreeSet::new()).await
+    }
+
+    /// [`FreezeStore::set`], and freezes every machine of `also_frozen` in the same write: the
+    /// freezes the operator made whose own save failed, so the first write that works keeps them
+    /// too. Nothing is written if any of the names is not a plain machine name.
+    ///
+    /// # Errors
+    ///
+    /// See [`Error`].
+    pub async fn set_with(
+        &self,
+        machine: &str,
+        frozen: bool,
+        also_frozen: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
         let this = self.clone();
         let machine = machine.to_owned();
-        tokio::task::spawn_blocking(move || this.set_blocking(&machine, frozen))
+        let also = also_frozen.clone();
+        tokio::task::spawn_blocking(move || this.set_with_blocking(&machine, frozen, &also))
             .await
             .map_err(|e| Error::Io(format!("the state file writer stopped: {e}")))?
     }
@@ -235,10 +274,27 @@ impl FreezeStore {
     ///
     /// See [`Error`].
     pub fn set_blocking(&self, machine: &str, frozen: bool) -> Result<BTreeSet<String>> {
+        self.set_with_blocking(machine, frozen, &BTreeSet::new())
+    }
+
+    /// [`FreezeStore::set_with`], on the calling thread.
+    ///
+    /// # Errors
+    ///
+    /// See [`Error`].
+    pub fn set_with_blocking(
+        &self,
+        machine: &str,
+        frozen: bool,
+        also_frozen: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>> {
         #[cfg(test)]
         forbid_default_location_in_tests(&self.path, default_path().as_deref());
-        if !is_plain_name(machine) {
-            return Err(Error::BadName(machine.to_owned()));
+        if let Some(bad) = std::iter::once(machine)
+            .chain(also_frozen.iter().map(String::as_str))
+            .find(|n| !is_plain_name(n))
+        {
+            return Err(Error::BadName(bad.to_owned()));
         }
         let (dir, dir_path) = self.prepare_dir()?;
         let _lock = self.lock(&dir)?;
@@ -248,6 +304,7 @@ impl FreezeStore {
             t
         });
         let mut set = self.frozen_of(Some(&table))?;
+        set.extend(also_frozen.iter().cloned());
         if frozen {
             set.insert(machine.to_owned());
         } else {
@@ -378,43 +435,14 @@ impl FreezeStore {
                 )));
             }
         };
-        match FileType::from_raw_mode(st.st_mode) {
-            FileType::RegularFile => {}
-            FileType::Symlink => {
-                return Err(Error::Unusable(format!(
-                    "the state file {shown} is a symlink; refusing to use it"
-                )));
-            }
-            _ => {
-                return Err(Error::Unusable(format!(
-                    "the state file {shown} is not a regular file; refusing to use it"
-                )));
-            }
-        }
-        let me = rustix::process::getuid().as_raw();
-        if st.st_uid != me {
-            return Err(Error::Unusable(format!(
-                "the state file {shown} is owned by uid {}, not by this user (uid {me}); \
-                 refusing to use it",
-                st.st_uid
-            )));
-        }
-        let mode = st.st_mode & 0o7777;
-        if mode & 0o077 != 0 {
-            return Err(Error::Unusable(format!(
-                "the state file {shown} has mode {mode:04o}, expected 0600; refusing to use it"
-            )));
-        }
-        // More than one name. Not `!= 1`: a writer renaming a new file over this one between our
-        // lookup and the kernel reading its attributes leaves the old inode with no names at all
-        // (0), which is a file that was just replaced, not a second name. The test that reads
-        // while the file is rewritten found it.
-        if st.st_nlink > 1 {
-            return Err(Error::Unusable(format!(
-                "the state file {shown} has {} hard links; refusing to use it",
-                st.st_nlink
-            )));
-        }
+        check_file_facts(
+            &shown.to_string(),
+            FileType::from_raw_mode(st.st_mode),
+            st.st_uid,
+            rustix::process::getuid().as_raw(),
+            st.st_mode,
+            st.st_nlink,
+        )?;
         let mut bytes = Vec::new();
         safe_fs::read_file(dir, name.as_bytes(), MAX_BYTES, &|| false, &mut |chunk| {
             bytes.extend_from_slice(chunk);
@@ -539,6 +567,54 @@ impl FreezeStore {
         fsync(dir).map_err(|e| io("flush the directory of", &e))?;
         Ok(())
     }
+}
+
+/// Whether the file with these facts may be used: a regular file (not a symlink), this user's, with
+/// no group or other permission bit, and at most one name. A function of the numbers, so each
+/// rule is tested without another user's file.
+fn check_file_facts(
+    shown: &str,
+    kind: FileType,
+    owner: u32,
+    me: u32,
+    mode: u32,
+    links: u64,
+) -> Result<()> {
+    match kind {
+        FileType::RegularFile => {}
+        FileType::Symlink => {
+            return Err(Error::Unusable(format!(
+                "the state file {shown} is a symlink; refusing to use it"
+            )));
+        }
+        _ => {
+            return Err(Error::Unusable(format!(
+                "the state file {shown} is not a regular file; refusing to use it"
+            )));
+        }
+    }
+    if owner != me {
+        return Err(Error::Unusable(format!(
+            "the state file {shown} is owned by uid {owner}, not by this user (uid {me}); \
+             refusing to use it"
+        )));
+    }
+    let mode = mode & 0o7777;
+    if mode & 0o077 != 0 {
+        return Err(Error::Unusable(format!(
+            "the state file {shown} has mode {mode:04o}, expected 0600; refusing to use it"
+        )));
+    }
+    // More than one name. Not `!= 1`: a writer renaming a new file over this one between our
+    // lookup and the kernel reading its attributes leaves the old inode with no names at all
+    // (0), which is a file that was just replaced, not a second name. The test that reads
+    // while the file is rewritten found it.
+    if links > 1 {
+        return Err(Error::Unusable(format!(
+            "the state file {shown} has {links} hard links; refusing to use it"
+        )));
+    }
+    Ok(())
 }
 
 fn describe(e: &ReadError) -> String {

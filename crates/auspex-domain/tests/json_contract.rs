@@ -367,6 +367,7 @@ fn fleet_errors_are_reported_and_never_settle() {
         (FleetErrorKind::InventoryFailed, "inventory_failed"),
         (FleetErrorKind::InventoryTimedOut, "inventory_timed_out"),
         (FleetErrorKind::EvaluationFailed, "evaluation_failed"),
+        (FleetErrorKind::FreezesUnknown, "freezes_unknown"),
     ];
     for (kind, spelling) in kinds {
         assert_eq!(serde_json::to_value(kind).unwrap(), spelling);
@@ -605,12 +606,14 @@ fn every_enum_spelling_is_pinned() {
             FleetErrorKind::InventoryFailed => "inventory_failed",
             FleetErrorKind::InventoryTimedOut => "inventory_timed_out",
             FleetErrorKind::EvaluationFailed => "evaluation_failed",
+            FleetErrorKind::FreezesUnknown => "freezes_unknown",
         }
     }
     for k in [
         FleetErrorKind::InventoryFailed,
         FleetErrorKind::InventoryTimedOut,
         FleetErrorKind::EvaluationFailed,
+        FleetErrorKind::FreezesUnknown,
     ] {
         assert_eq!(serde_json::to_value(k).unwrap(), fleet_error(k));
     }

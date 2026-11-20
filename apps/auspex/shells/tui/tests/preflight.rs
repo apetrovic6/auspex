@@ -30,6 +30,14 @@ use common::{
 };
 use crossterm::event::KeyCode;
 
+/// After the confirmation the shell reads the freeze state before the core asks for the update
+/// to run: wait (time is paused, so this is instant) until it has.
+async fn until_action_starts(shell: &std::sync::Arc<auspex_tui::shell::Shell>) {
+    while shell.view().action.is_none() {
+        shell.changed().await;
+    }
+}
+
 fn dirty_and_unpushed() -> PreflightAnswer {
     PreflightAnswer {
         tree: Ok(TreeState {
@@ -164,6 +172,7 @@ async fn warnings_alone_are_shown_with_the_question_and_y_still_confirms() {
     );
     expect_file("snapshots", "preflight_warnings_120.txt", &frame);
     type_keys(&shell, &mut ui, &km, "y");
+    until_action_starts(&shell).await;
     assert!(shell.view().action.is_some(), "a warning does not stop it");
 }
 
@@ -208,6 +217,7 @@ async fn the_public_machine_asks_for_its_name_and_only_the_name_runs_the_update(
     assert!(typing.contains(&format!("> {PUBLIC_MACHINE}")), "{typing}");
     expect_file("snapshots", "preflight_typed_120.txt", &typing);
     type_keys(&shell, &mut ui, &km, "\n");
+    until_action_starts(&shell).await;
     let action = shell.view().action.expect("the update runs");
     assert_eq!(action.machine, PUBLIC_MACHINE);
     assert!(matches!(

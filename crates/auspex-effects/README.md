@@ -83,7 +83,7 @@ Keyed by the fleet flake's canonical path, so two fleets do not share freezes. W
 changing **one machine** under an exclusive lock on the directory, then replacing the file with
 a rename (temporary file 0600, flushed, renamed, directory flushed): a reader sees the old file
 or the new one, two auspex processes do not lose each other's freezes, and keys this build does
-not know are kept. **Unknown is not empty:** a file that is not valid, or written by a newer
+not know are kept. A write can also carry the freezes an earlier save failed to keep (`set_with`), so the first write that works stores them too. The state is read again (`load`) at the `y` of an update and right before `clan` starts, so a freeze made by another running auspex is honoured. **Unknown is not empty:** a file that is not valid, or written by a newer
 auspex (`version` above 1), is refused and never written over, and the caller must treat
 freezes as unknown (the TUI then refuses `u` and `f` for every machine, and says why). A missing
 file is the empty set.
