@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# The C compiler `just cross::check` gives cc-rs for a foreign target (see just/cross.just).
+#
+# `zig cc` is clang plus every target's libc headers, so it compiles ring's and SQLite's C for
+# aarch64-linux-gnu and for macOS with no cross gcc and no Apple SDK. cc-rs passes
+# `--target=<rust triple>`, which zig does not read as its own target, so it is dropped here and
+# `$ZIG_TARGET` (zig's spelling, set by the recipe) stands in. The object files are never
+# linked: `cargo check` stops at metadata.
+set -euo pipefail
+args=()
+for a in "$@"; do
+    case "$a" in
+        --target=*) ;;
+        *) args+=("$a") ;;
+    esac
+done
+exec zig cc -target "${ZIG_TARGET:?set by just cross::check}" "${args[@]}"

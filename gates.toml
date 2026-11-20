@@ -237,3 +237,14 @@ path = ["publish::push"]
 local = false
 ci = ["ci-impure"]
 reason = "a master-only step: it publishes the images a product configured a registry for, and skips with a notice when HARBOR_USERNAME/HARBOR_PASSWORD are unset — the state this repository is in, so it must not be a red build"
+
+# The foreign systems of the flake, type-checked. `just ci` runs it, and the `ci-impure` job runs
+# the same recipe, so a green local gate predicts a green pipeline. A host step rather than a
+# derivation: it fetches the crates of the foreign targets, and a derivation would build another
+# system's closure or a cross C toolchain in the sandbox (just/cross.just says what is and is not
+# covered). It is the only thing between a change that compiles on x86_64 Linux and a package
+# that does not build on the other three declared systems.
+[[gate]]
+path = ["cross::check"]
+local = true
+ci = ["ci-impure"]

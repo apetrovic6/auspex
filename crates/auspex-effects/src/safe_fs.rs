@@ -57,10 +57,20 @@ const DIR: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
+/// `O_PATH` exists on Linux only. Elsewhere (macOS, which the flake also builds for) a name-only
+/// open does not exist, so the directory is opened `O_RDONLY`: it then needs read permission as
+/// well as search, so it can refuse a directory Linux would accept, and never accepts one Linux
+/// would refuse. Without this the crate did not compile on darwin at all (found by
+/// `just cross-check`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const PATH_FLAG: OFlags = OFlags::PATH;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const PATH_FLAG: OFlags = OFlags::RDONLY;
+
 /// A directory opened only to name things in it (`O_PATH`): needs search permission on
 /// the way to it, not read permission on it, as git itself does in `.git` (review of
 /// `ca2cc3f`, F6). `statat` and `openat` relative to it work; listing it does not.
-const PATH_DIR: OFlags = OFlags::PATH
+const PATH_DIR: OFlags = PATH_FLAG
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
@@ -110,7 +120,7 @@ pub fn open_root(path: &Path) -> Result<OwnedFd, ReadError> {
 pub fn open_path_root(path: &Path) -> Result<OwnedFd, ReadError> {
     Ok(rustix::fs::open(
         path,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        PATH_FLAG | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?)
 }

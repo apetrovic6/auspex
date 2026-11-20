@@ -68,6 +68,11 @@ jobs:
       - name: deny
         run: devenv shell -- just deny
 
+      # The flake builds auspex for aarch64-linux and both darwins; ci-pure builds x86_64-linux.
+      # This type-checks the shipped code for the other three without building their
+      # derivations (the cost: no cache, the crates of those targets are fetched here).
+      - name: cross check
+        run: devenv shell -- just cross::check
 
       # Publishing (decision 5). The template never pushes its own images: every push proves the
       # archive parses and carries its contract, which ci-pure does as `<svc>-image-validate`.

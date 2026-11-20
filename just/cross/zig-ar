@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The archiver `just cross::check` gives cc-rs for a foreign target: zig's, because the host
+# `ar` is a GNU ar that need not agree with the object format of the target (Mach-O).
+exec zig ar "$@"

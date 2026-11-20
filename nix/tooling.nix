@@ -31,6 +31,11 @@
     # than skipping for want of the binary. Not in the `ci-pure` sandbox: there is no Nix
     # daemon to evaluate against there, so the test skips itself.
     nix-eval-jobs
+
+    # `just cross::check` type-checks the package for aarch64-linux and darwin, and ring and
+    # SQLite compile C on the way. zig bundles the libc headers of every target, so its `cc`
+    # is the one C compiler that works for all three from a Linux host; see just/cross.just.
+    zig
   ] ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
     # Git's address-space cap must be installed before exec, not raced from the parent.
     pkgs.util-linux
