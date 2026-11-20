@@ -584,3 +584,83 @@ async fn a_timeout_of_zero_is_one_second_not_none() {
     );
     assert!(answer.tree.is_ok(), "{:?}", answer.tree);
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2 (re-review 1): a dialog that cannot show its findings is not "drawn whole"
+// ---------------------------------------------------------------------------------------
+
+/// The re-reviewer's reproduction: one warning, 40 columns. At two heights of a y/N dialog (8 and
+/// 9), one of a typed dialog (14) and two of a refusal (7 and 8) the box used to have no line
+/// left for the warning or for "…and N more", yet counted as drawn, so `y` answered a clean-looking
+/// question. The invariant, at every height: a dialog that counts as drawn shows its findings, or
+/// at least says how many are not shown.
+#[tokio::test(start_paused = true)]
+async fn a_dialog_that_counts_as_drawn_shows_its_findings_or_counts_them_at_every_height() {
+    let shell = settled_demo().await;
+    let cases: [(&str, ConfirmView); 3] = [
+        ("y/N", {
+            let mut c = question(ConfirmKind::Update, false);
+            c.warnings = vec!["the fleet repository has 1 uncommitted change".to_owned()];
+            c
+        }),
+        ("typed", {
+            let mut c = question(ConfirmKind::UpdateTyped, true);
+            c.warnings = vec!["the fleet repository has 1 uncommitted change".to_owned()];
+            c
+        }),
+        ("refused", {
+            let mut c = question(ConfirmKind::Refused, false);
+            c.question = "luna will not be updated.".to_owned();
+            c.refusals = vec!["luna's /nix/store is full".to_owned()];
+            c.warnings = vec!["the fleet repository has 1 uncommitted change".to_owned()];
+            c
+        }),
+    ];
+    for (name, confirm) in cases {
+        let mut counted_at_a_tight_height = false;
+        for height in 4..=26 {
+            let (frame, whole) = drawn(&view_asking(&shell, confirm.clone()), 40, height).await;
+            if !whole {
+                // Not asked at all: no key can answer it (the box says so where it has room).
+                continue;
+            }
+            let shows_findings = frame.contains("warning:") || frame.contains("refused:");
+            let counts_them = frame.contains("…and ");
+            assert!(
+                shows_findings || counts_them,
+                "{name} at {height} counts as drawn but shows no finding and no count:\n{frame}"
+            );
+            counted_at_a_tight_height |= counts_them;
+        }
+        assert!(
+            counted_at_a_tight_height,
+            "{name}: some height is tight enough to need the count line"
+        );
+    }
+}
+
+/// With exactly one spare line the count takes it, and the blank between the parts goes.
+#[tokio::test(start_paused = true)]
+async fn with_one_spare_line_the_count_line_is_drawn_without_the_blank() {
+    let shell = settled_demo().await;
+    let mut confirm = question(ConfirmKind::Update, false);
+    confirm.warnings = vec!["the fleet repository has 1 uncommitted change and more".to_owned()];
+    let mut seen = false;
+    for height in 6..=16 {
+        let (frame, whole) = drawn(&view_asking(&shell, confirm.clone()), 40, height).await;
+        if !whole {
+            continue;
+        }
+        let lines: Vec<&str> = frame.lines().collect();
+        let Some(at) = lines.iter().position(|l| l.contains("…and 1 more warning")) else {
+            continue;
+        };
+        // The line after the count is the question itself, not a blank: no spare line was left
+        // for one.
+        if lines[at + 1].contains("update luna") {
+            assert!(frame.contains("y confirms"), "{frame}");
+            seen = true;
+        }
+    }
+    assert!(seen, "some height leaves exactly one spare line");
+}

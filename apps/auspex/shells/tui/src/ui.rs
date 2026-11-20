@@ -1187,12 +1187,22 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
     let width = area.width.min(78);
     let text_cells = usize::from(width.saturating_sub(4)).max(1);
     let tail = confirm_tail(confirm, text_cells, theme);
-    let whole = width >= MIN_CONFIRM_WIDTH && tail.len() + 2 <= usize::from(area.height);
+    let has_findings = !confirm.refusals.is_empty() || !confirm.warnings.is_empty();
+    // What is left of the pane once the question, the typed name and the hint have theirs. The
+    // question is "whole" only if what the checks found is shown too, or at least counted: a
+    // dialog with findings and no line left for even "…and N more" would read as a clean y/N
+    // question, and `y` would deploy what the warnings were about. So with findings, one spare
+    // line is needed at the very least.
+    let spare = usize::from(area.height).saturating_sub(2 + tail.len());
+    let whole = width >= MIN_CONFIRM_WIDTH
+        && tail.len() + 2 <= usize::from(area.height)
+        && (!has_findings || spare >= 1);
     let lines: Vec<Line> = if whole {
-        // What is left of the pane (less the blank between the two parts) goes to the findings.
-        let room = (usize::from(area.height) - 2 - tail.len()).saturating_sub(1);
+        // The findings get the spare lines, less one for the blank between the two parts; with
+        // exactly one spare line that is the findings' (their count), and the blank goes.
+        let room = if spare >= 2 { spare - 1 } else { spare };
         let mut lines = confirm_found(confirm, text_cells, room, theme);
-        if !lines.is_empty() {
+        if !lines.is_empty() && spare >= 2 {
             lines.push(Line::default());
         }
         lines.extend(tail);
