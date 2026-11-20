@@ -1,21 +1,21 @@
-┌ machines (18) ─────────────────────────────────────┐┌ alfrost ───────────────────────────────────────────────────────┐
-│›✓    alfrost              in s┌ help ────────────────────────────────────────────────┐                               │
-│ ✓    callisto             in s│j down        down (count: 5j)                        │                               │
-│ ✓⚠   cerberus             in s│k up          up (count: 5k)                          │                               │
-│ ↑    cypramundi           upda│ctrl-d        half a page down                        │tory deploy.targetHost)        │
-│ ?    deimos               not │ctrl-u        half a page up                          │er                             │
-│ ✓    europa               in s│gg home       first row (5gg: row 5)                  │                               │
-│ ✓⟳   ganymede             in s│G end         last row (5G: row 5)                    │lfrost-25.11.20261101.6a2f1c0  │
-│ ✓    genetor              in s│/             search names                            │lfrost-25.11.20261101.6a2f1c0  │
-│ ✓    io                   in s│n             next match                              │                               │
-│ ↑◆   luna                 upda│N             previous match                          │                               │
-│ ✗    mars                 unre│enter tab     machine detail (narrow)                 │                               │
-│ ✓    mechanicus-forge-wo… in s│L             log tab: action output (Tab: notes)     │                               │
-│ ✓    phobos               in s│d             package diff (q closes)                 │sed, 128.3 GiB free            │
-│ ↑◆   sol                  upda│A             toggle act mode (asks first)            │                               │
-│ ✓    terra                in s│u             update the machine (act mode)           │eus)                           │
-│ ✓    titan                in s│b             build its pending system here           │ee (prometheus)                │
-│ ✗    triton               unre│s             ssh to the machine (act mode)           │                               │
+┌ machines (18) ────────────────┌ help ────────────────────────────────────────────────┐───────────────────────────────┐
+│›✓    alfrost              in s│j down        down (count: 5j)                        │                               │
+│ ✓    callisto             in s│k up          up (count: 5k)                          │                               │
+│ ✓⚠   cerberus             in s│ctrl-d        half a page down                        │                               │
+│ ↑    cypramundi           upda│ctrl-u        half a page up                          │tory deploy.targetHost)        │
+│ ?    deimos               not │gg home       first row (5gg: row 5)                  │er                             │
+│ ✓    europa               in s│G end         last row (5G: row 5)                    │                               │
+│ ✓⟳   ganymede             in s│/             search names                            │lfrost-25.11.20261101.6a2f1c0  │
+│ ✓    genetor              in s│n             next match                              │lfrost-25.11.20261101.6a2f1c0  │
+│ ✓    io                   in s│N             previous match                          │                               │
+│ ↑◆   luna                 upda│enter tab     machine detail (narrow)                 │                               │
+│ ✗    mars                 unre│L             log tab: action output (Tab: notes)     │                               │
+│ ✓    mechanicus-forge-wo… in s│d             package diff (q closes)                 │                               │
+│ ✓    phobos               in s│A             toggle act mode (asks first)            │sed, 128.3 GiB free            │
+│ ↑◆   sol                  upda│u             update the machine (act mode)           │                               │
+│ ✓    terra                in s│b             build its pending system here           │eus)                           │
+│ ✓    titan                in s│s             ssh to the machine (act mode)           │ee (prometheus)                │
+│ ✗    triton               unre│f             freeze the machine (asks to unfreeze)   │                               │
 │ !    vulcan               eval│r             scan again                              │                               │
 │                               │:             command (:q, :refresh)                  │                               │
 │                               │?             this help                               │                               │

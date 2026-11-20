@@ -39,6 +39,8 @@ pub struct Config {
     /// closure the package preview does), enforced by the shell. `0` is treated as one second
     /// by the shell, never as "no limit".
     pub preflight_timeout_seconds: u64,
+    /// Which machines are frozen: declared in `config.toml` and saved by `f` (see [`FreezeConfig`]).
+    pub freeze: FreezeConfig,
 }
 
 /// Prometheus settings the core decides with. The URL is the adapter's, not the core's.
@@ -67,4 +69,34 @@ pub struct DiffConfig {
     /// `timeouts.diff`: how long one machine's preview may take, from the moment its queries
     /// are requested. Carried on each request, enforced by the shell.
     pub timeout_seconds: u64,
+}
+
+/// What is frozen when the run starts: the config's declarations and the saved freezes.
+///
+/// The shell reads both before [`Event::Start`](crate::Event::Start), so a headless `--json` run
+/// reports `frozen` too. The default is "nothing frozen, nothing unknown" (a core that is not
+/// told anything has no freezes to know about): the shell sets it explicitly in every real run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreezeConfig {
+    /// `machines.<m>.frozen = true` in `config.toml`. Never written, and `f` cannot undo it.
+    pub declared: BTreeSet<String>,
+    /// What `f` saved in an earlier run.
+    pub saved: SavedFreezes,
+}
+
+/// The freezes made with `f`, as the shell found them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedFreezes {
+    /// These machines. An empty set when nothing was saved yet.
+    Known(BTreeSet<String>),
+    /// They could not be read (a corrupt file, one written by a newer auspex, no usable state
+    /// directory); the text says why. **Not** the same as none: the core refuses `u` for every
+    /// machine, and `f`, until it is fixed.
+    Unknown(String),
+}
+
+impl Default for SavedFreezes {
+    fn default() -> Self {
+        Self::Known(BTreeSet::new())
+    }
 }

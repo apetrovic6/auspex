@@ -1,0 +1,24 @@
+┌ cypramundi ──────────────────────────┐
+│badges    ↑ update pending  ❄ frozen  │
+│status    update pending              │
+│reason    pending                     │
+│          nixos-system-cypramundi-25.1│
+│          1.20261101.6a2f1c0          │
+│frozen    yes, in config.toml (f      │
+│          cannot unfreeze it)         │
+│diff      not cached (d)              │
+│host      root@198.51.100.4:2222      │
+│          (config override)           │
+│class     nixos  tags: base, server   │
+│lints     none                        │
+│current   i4payi4p                    │
+│          nixos-system-cypramundi-25.1│
+│          1.20261019.b81e2d4          │
+│pending   8jx7iv6h                    │
+│          nixos-system-cypramundi-25.1│
+│          1.20261101.6a2f1c0          │
+│revision  6a2f1c0e9d                  │
+│systemd   running                     │
+└──────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ settled │ 0 pending │ prom: ok

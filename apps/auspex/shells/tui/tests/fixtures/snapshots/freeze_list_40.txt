@@ -1,0 +1,24 @@
+┌ machines (18) ───────────────────────┐
+│›✓    alfrost         in sync         │
+│ ✓    callisto        in sync         │
+│ ✓⚠   cerberus        in sync         │
+│ ↑❄   cypramundi      update pending  │
+│ ?    deimos          not installed   │
+│ ✓    europa          in sync         │
+│ ✓⟳   ganymede        in sync         │
+│ ✓    genetor         in sync         │
+│ ✓    io              in sync         │
+│ ↑◆❄  luna            update pending  │
+│ ✗    mars            unreachable     │
+│ ✓    mechanicus-for… in sync         │
+│ ✓    phobos          in sync         │
+│ ↑◆   sol             update pending  │
+│ ✓    terra           in sync         │
+│ ✓    titan           in sync         │
+│ ✗    triton          unreachable     │
+│ !    vulcan          eval error      │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ settled │ 0 pending │ prom: ok

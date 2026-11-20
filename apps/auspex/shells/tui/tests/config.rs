@@ -52,6 +52,7 @@ fn the_home_manager_contract_fixture_loads_whole() {
                 prometheus_instance: Some("terra:9100".to_owned()),
                 // The fixture says `true`, the opposite of the default.
                 public: true,
+                frozen: true,
             }
         )])
     );
@@ -89,6 +90,11 @@ fn the_home_manager_contract_fixture_loads_whole() {
     let prom = core.prometheus.unwrap();
     assert_eq!(prom.instances["terra"], "terra:9100");
     assert_eq!(prom.max_age_seconds, 60);
+    // `machines.terra.frozen` reaches the core as a declared freeze, and nothing else does.
+    assert_eq!(
+        core.freeze.declared,
+        std::collections::BTreeSet::from(["terra".to_owned()])
+    );
     assert!(core.binary_cache);
     assert_eq!(
         core.diff, None,
@@ -99,13 +105,13 @@ fn the_home_manager_contract_fixture_loads_whole() {
 #[test]
 fn an_unknown_key_is_a_warning_naming_it() {
     let (s, w) = config::parse(
-        "future_feature = true\n[machines.terra]\nfrozen = true\ntarget = \"root@10.0.0.1\"\n",
+        "future_feature = true\n[machines.terra]\nhue = \"red\"\ntarget = \"root@10.0.0.1\"\n",
     )
     .unwrap();
     assert_eq!(s.machines["terra"].target.as_deref(), Some("root@10.0.0.1"));
     assert_eq!(w.len(), 2, "{w:?}");
     assert!(w.iter().any(|w| w.contains("`future_feature`")));
-    assert!(w.iter().any(|w| w.contains("`machines.terra.frozen`")));
+    assert!(w.iter().any(|w| w.contains("`machines.terra.hue`")));
 }
 
 #[test]

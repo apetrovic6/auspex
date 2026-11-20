@@ -142,6 +142,10 @@ pub struct MachineSettings {
     /// `public`: the machine faces the internet, so updating it asks for its name to be typed
     /// instead of `y` (default `false`).
     pub public: bool,
+    /// `frozen = true`: the machine is frozen, declaratively. `u` refuses it and `U` skips it, and
+    /// `f` cannot undo it (the file is read-only under home-manager, and a key that edited a
+    /// declaration would be undone by the next switch). Default `false`.
+    pub frozen: bool,
 }
 
 /// The longest timeout accepted, in seconds: a day.
@@ -368,6 +372,7 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                                 m.prometheus_instance = Some(w.string(v, &name)?);
                             }
                             "public" => m.public = w.boolean(v, &name)?,
+                            "frozen" => m.frozen = w.boolean(v, &name)?,
                             _ => w.unknown(&name),
                         }
                     }

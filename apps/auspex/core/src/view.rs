@@ -1,5 +1,7 @@
 //! What a shell draws, and the pure view state behind it: selection, search, help, quit.
 
+use std::collections::BTreeSet;
+
 use auspex_domain::report::FleetReport;
 
 use crate::effects::{ActionEnd, ActionKind, Generation};
@@ -51,6 +53,56 @@ pub struct ViewModel {
     /// A one-line refusal or note about the last thing the operator asked for ("act mode is
     /// off (A)"), until their next request.
     pub notice: Option<String>,
+    /// Which machines are frozen, and from where.
+    pub freeze: FreezeView,
+}
+
+/// Which machines are frozen: what the report's `frozen` flags and `f` are drawn from.
+///
+/// The report says *whether* each machine is frozen; this says *why*, for the detail panel, and
+/// whether the answer can be trusted at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreezeView {
+    /// Frozen by `machines.<m>.frozen = true` in `config.toml`: `f` cannot undo it.
+    pub declared: BTreeSet<String>,
+    /// Frozen with `f` (the state file), when it could be read; empty when it could not.
+    pub saved: BTreeSet<String>,
+    /// Frozen with `f` in this run, but not kept: the save failed, so the file does not hold
+    /// them and a restart forgets them. They count as frozen until the operator unfreezes them.
+    pub run_only: BTreeSet<String>,
+    /// Why the freezes made with `f` are unknown (the state file is corrupt or newer, or there
+    /// is no state directory), or `None`. While set, `u` and `f` are refused for every machine.
+    pub unknown: Option<String>,
+    /// A freeze or unfreeze is being saved.
+    pub saving: bool,
+}
+
+impl FreezeView {
+    /// Whether `machine` is known to be frozen, by any source. While [`FreezeView::unknown`] is
+    /// set this says nothing about a machine frozen with `f`: ask [`FreezeView::frozen`], or
+    /// refuse outright.
+    #[must_use]
+    pub fn is_frozen(&self, machine: &str) -> bool {
+        self.declared.contains(machine)
+            || self.saved.contains(machine)
+            || self.run_only.contains(machine)
+    }
+
+    /// Every machine known to be frozen, which `U` skips, or `None` while it is not known which
+    /// machines were frozen with `f` ([`FreezeView::unknown`]). `None` is not "none are frozen":
+    /// a `U` that updates the rest then would update the machine the operator froze, so it must
+    /// refuse outright, as `u` does (`act::check`).
+    #[must_use]
+    pub fn frozen(&self) -> Option<BTreeSet<&str>> {
+        self.unknown.is_none().then(|| {
+            self.declared
+                .iter()
+                .chain(&self.saved)
+                .chain(&self.run_only)
+                .map(String::as_str)
+                .collect()
+        })
+    }
 }
 
 /// Where a refresh is.
@@ -142,6 +194,8 @@ pub enum ConfirmKind {
     Refused,
     /// Quit while an action runs.
     Quit,
+    /// Unfreeze a machine (`f` on a frozen one).
+    Unfreeze,
 }
 
 /// A question the operator has to answer before anything happens.

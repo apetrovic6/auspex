@@ -52,6 +52,7 @@ const fn kind(k: FleetErrorKind) -> &'static str {
         FleetErrorKind::InventoryFailed => "inventory_failed",
         FleetErrorKind::InventoryTimedOut => "inventory_timed_out",
         FleetErrorKind::EvaluationFailed => "evaluation_failed",
+        FleetErrorKind::FreezesUnknown => "freezes_unknown",
     }
 }
 

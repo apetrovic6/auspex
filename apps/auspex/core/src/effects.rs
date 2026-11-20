@@ -22,7 +22,7 @@
 //! their own deadline, `timeouts.diff`, which the shell enforces, and the fleet settles when
 //! they have answered.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 
@@ -502,6 +502,58 @@ impl Operation for ShellRequest {
     type Output = ShellEnd;
 }
 
+/// Keep one freeze (`f`): freeze or unfreeze `machine` in the state file, and answer with every
+/// machine frozen afterwards.
+///
+/// **A write to auspex's own state, never to a machine.** The shell changes only this machine's
+/// entry, under a lock, so two running auspex processes do not lose each other's freezes, and
+/// answers with the whole set as written, which the core adopts. The machine name was validated
+/// against the inventory and the domain's name rule before the request was made; the adapter
+/// checks the rule again.
+///
+/// Unlike an action it is not cancelled by a refresh or by quitting: it is one short write, and
+/// the shell waits for it when it shuts down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveFreezeRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The machine.
+    pub machine: String,
+    /// `true` to freeze it, `false` to unfreeze.
+    pub frozen: bool,
+    /// Machines frozen in this run whose own save failed, so the file does not hold them: the
+    /// adapter freezes them in the same write, so a later save that works also keeps them (see
+    /// `app/freeze.rs`). Never contains `machine`.
+    pub also_frozen: BTreeSet<String>,
+}
+
+/// The machines frozen after the change, or one line on why it could not be kept. Failures are
+/// values: the core says so in a notice, and keeps the machine frozen if it was a freeze.
+pub type SaveFreezeAnswer = Result<BTreeSet<String>, String>;
+
+impl Operation for SaveFreezeRequest {
+    type Output = SaveFreezeAnswer;
+}
+
+/// Read the freeze state file again: which machines `f` froze, as the file says now.
+///
+/// Asked at the `y` of an update, as the last decision before it is requested: another running
+/// auspex may have frozen the machine since this one read the file at start-up. The answer is
+/// the whole set, or one line on why the file could not be read; the core refuses the update on
+/// an error, because a machine that may be frozen is not one to deploy to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadFreezesRequest {
+    /// This request.
+    pub id: RequestId,
+}
+
+/// The machines frozen with `f` now, or why the file could not be read.
+pub type LoadFreezesAnswer = Result<BTreeSet<String>, String>;
+
+impl Operation for LoadFreezesRequest {
+    type Output = LoadFreezesAnswer;
+}
+
 /// Stop request `id`: kill its process and drop its `Request`. Fire and forget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelRequest {
@@ -548,4 +600,8 @@ pub enum Effect {
     RunAction(ActionRequest),
     /// [`ShellRequest`]: the operator's own ssh session, with the terminal.
     OpenShell(ShellRequest),
+    /// [`SaveFreezeRequest`]: keep a freeze or an unfreeze in the state file.
+    SaveFreeze(SaveFreezeRequest),
+    /// [`LoadFreezesRequest`]: read the state file again, before an update.
+    LoadFreezes(LoadFreezesRequest),
 }

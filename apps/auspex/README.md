@@ -49,7 +49,7 @@ reference, so **a machine file that is not tracked yet is not evaluated** (the s
 
 ## Acting on a machine
 
-auspex starts in **observe** mode, always: nothing is persisted, and `--plain` and `--json` can
+auspex starts in **observe** mode, always: act mode is never persisted, and `--plain` and `--json` can
 never leave it. `A` asks `turn on act mode? y/N`; the status bar then shows `ACT` in a warning
 colour, and `A` turns it off again at once. In observe mode `u` and `s` only say `act mode is off (A)`.
 
@@ -58,6 +58,7 @@ colour, and `A` turns it off again at once. In observe mode `u` and `s` only say
 | `u` | Act mode only. Runs the checks below, then asks `update luna to 0a1b2c3d nixos-system-luna-…? y/N` (the pending system as the detail panel shows it, hash prefix first; the machine's name typed, for a public one), then runs exactly `clan machines update --host-key-check strict --flake <fleet> -- luna` with the fleet's pinned `clan` (found from its lock, never from `PATH`). One machine, named, validated against the inventory; one action at a time. |
 | `b` | Builds the machine's pending system here (`nix build --no-link --print-out-paths --no-write-lock-file <fleet>#nixosConfigurations.luna.config.system.build.toplevel`; `darwinConfigurations.<m>.system` for darwin). Changes nothing on any machine, so it needs no act mode. Refused for a machine of another system than this one. |
 | `s` | Act mode only. Suspends the TUI and opens `ssh` to the selected machine (see below); when ssh ends the TUI is back, and the status bar says `ssh to luna exited (code N)`. |
+| `f` | Freezes the machine: `u` refuses it from then on (`luna is frozen; f to unfreeze`) and a later `U` will skip it. Shows `❄` in the list and `frozen` in the detail panel. **Needs no act mode**, because it only prevents changes. On a frozen machine `f` asks `unfreeze luna? updates to it will be possible again. y/N` (answered like every question: only once it could be read). A freeze is kept across restarts, per fleet, in `$XDG_STATE_HOME/auspex/state.toml` (see *Freezing* below), and every freeze and unfreeze is a row in the action log. |
 | `L` | The Log tab: the streamed output of the current and last action, standard error in its own colour, the last 10 000 lines of each, following the tail until you scroll up (`k`, `Ctrl-u`, `gg`; `G` follows again). `Tab` switches to the adapters' notes. |
 
 **`s` is your own ssh, not auspex's.** It runs `ssh -o ControlMaster=no -o ControlPath=<runtime dir>/auspex/%C [-p port] -- user@host` for the machine's target (the same user, host and port the probes use), with the terminal: your agent, your `SSH_ASKPASS` and your prompts (host keys, passwords, passphrases) work, because none of auspex's probe guards (`BatchMode`, no tty, askpass removed) apply to it. **Which connection it uses depends on whether auspex holds a live control master for that host.** If it does, the session is a channel on *that* connection: no second agent approval, but the connection is auspex's, so its settings decide the transport, not your `~/.ssh/config`: a keepalive of 5 s (a network drop of about 15 s ends the session, which your own keepalive settings might have survived), and its `Compression`, `TCPKeepAlive` and `IPQoS`; your `ControlPath` and `ControlMaster` do not apply either. What is per session still follows your config (`ForwardAgent`, `RemoteCommand`, `SendEnv`, the tty). If there is no live master, ssh connects directly under your `~/.ssh/config` entirely, and leaves no master behind (a socket left by a dead master makes ssh print `Control socket connect(...): Connection refused` first). While ssh runs auspex draws nothing and reads no key (its probes and an update's output carry on, and the Log tab has them when you are back), and Ctrl-C, Ctrl-\ and Ctrl-Z go to ssh: Ctrl-Z does not suspend it (auspex has no job control to bring it back, so a stopped ssh is continued at once). Signals: ssh is in auspex's process group, so the terminal's own signals reach auspex as well as ssh and auspex ignores them: that includes a `kill -INT` or `kill -QUIT` aimed at auspex from another terminal while ssh runs (SIGTERM and SIGHUP are obeyed, below). After ssh ends auspex waits 100 ms for a late copy of such a signal and discards it, which is a timing heuristic: on a very loaded machine one that is noticed later still quits auspex. The SIGTSTP handler, installed the first time you press `s`, stays for the rest of the run, so a `kill -TSTP` aimed at auspex itself no longer stops it. ssh may leave your terminal in raw mode (it cannot restore it when it is killed): auspex saves the terminal's modes before ssh and puts them back as soon as it ends, on every path. A panic in auspex while ssh runs does not write anything into your ssh session (it prints the message as plain text; the terminal is not touched). **To get back, leave ssh the way you would anywhere: `exit`, Ctrl-D, or `~.` on a new line.** Whatever its exit code, or if it was killed, the TUI redraws and says how it ended; keys typed to a dead ssh are discarded. If auspex is sent `SIGTERM` or `SIGHUP` while ssh runs, it ends ssh (`SIGTERM`, then `SIGKILL` after 3 s), leaves your terminal as it is (normal screen, cursor shown) and exits with 128 plus the signal. `s` is refused with a reason in observe mode ("act mode is off (A)"), for a machine whose target did not parse, and in `--demo` (nothing real to ssh to); `--plain` and `--json` never have it.
@@ -116,6 +117,57 @@ second `Ctrl-C`) kills the whole process group, waits until it is gone, logs the
 `cancelled` and only then exits; a third `Ctrl-C` stops waiting for that answer (the shell still
 gives the kill up to 5 s to finish). `SIGTERM`, `SIGINT` and
 `SIGHUP` take the same path without the question.
+
+## Freezing
+
+A frozen machine is never updated: `u` refuses it, and `b` (which changes nothing on any machine)
+does not care. There are two ways to freeze one.
+
+- **`f` in the TUI** keeps the freeze in `$XDG_STATE_HOME/auspex/state.toml` (else
+  `~/.local/state/auspex/state.toml`), not in `config.toml`: a home-manager config is a read-only
+  store symlink. The file is keyed by the fleet flake's canonical path, so two fleets do not share
+  freezes, and is private (directory 0700, file 0600) and written atomically. Delete it to forget
+  every freeze.
+- **`machines.<m>.frozen = true` in `config.toml`** (home-manager: `programs.auspex.settings.machines.<m>.frozen`)
+  freezes declaratively. **`f` cannot undo it** (the notice says so): remove the setting and
+  switch.
+
+A freeze is applied the moment `f` is pressed, and saved beside it; if the save fails the machine
+stays frozen for this run and the notice says it was not kept. It stays frozen, whatever a later
+save answers, until you unfreeze it (`f`, then `y`: the file never held it, so nothing has to be
+written), and the next save that works writes it into the file too. An unfreeze is applied only once it
+has been saved (the file is what the next run believes), so a failed unfreeze leaves the machine
+frozen and says so.
+
+**Two terminals on one fleet.** Each auspex reads the file when it starts, and reads it again at
+the `y` of every update and once more right before `clan` is started: a machine frozen from the
+other terminal in the meantime is refused (`luna is frozen; f to unfreeze`) and the ❄ appears here
+too, and an update whose file cannot be read at that point is refused too. The list does not
+redraw other terminals' freezes until then (or until your own next `f`). What a terminal knows
+only grows: a freeze it has seen stays until its own operator unfreezes it, so a machine
+unfrozen in another terminal stays frozen here until you restart or unfreeze it here too (which
+fails safe).
+
+**The key is the fleet's path.** Freezes are filed under the fleet flake's canonical path
+(`path:` and `git+file://` spellings of a plain directory are the same fleet as the directory).
+A fleet that is **moved or renamed is another fleet**: its freezes are not found under the new
+path (they stay in the file, under the old one), so freeze again, or edit the key in
+`state.toml`. A reference with a query (`?dir=`) or a remote host is keyed as written.
+
+**When it is not known which machines are frozen, nothing is updated.** If the state file is
+corrupt, was written by a newer auspex, or there is no usable state directory (neither
+`XDG_STATE_HOME` nor `HOME` is absolute), the freezes made with `f` are *unknown*, not none: the
+status bar says `freezes unknown: u and f refused`, `u` is refused for every machine (a guess
+of "nothing is frozen" would update the machine you froze), and `f` is refused too, so a corrupt
+file is not overwritten nor a newer one downgraded. Fix or delete the file and restart. Freezes in
+`config.toml` still apply, and a build is unaffected.
+
+`--json` carries `frozen` (a boolean) on every machine, and `frozen` among its `badges`, for both
+kinds of freeze. **When the freezes made with `f` are unknown, `frozen` is only what the config
+declares, and the report says so in band**: an entry in `errors` with `kind` `freezes_unknown`
+(and the run exits 1, as for any fleet error). A script that updates "every machine whose `frozen`
+is false" must check `errors` first. The JSON version stays 1: the kind is new, as an unknown
+`kind` is for any reader of version 1.
 
 ## Installing
 
@@ -176,6 +228,8 @@ enabled = true      # false: never query a closure; package_diff stays null
 
 [machines.alfrost]
 public = true       # updating it asks for its name to be typed, not y (default false)
+[machines.luna]
+frozen = true       # freeze it declaratively: `u` refuses it, `f` cannot undo it (see Freezing)
 ```
 
 The config file's `flake` and `CLAN_DIR` take a leading `~/` (your `$HOME`; `~user/` is refused);

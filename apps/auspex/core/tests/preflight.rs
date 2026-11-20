@@ -1693,3 +1693,51 @@ fn n3_a_warning_that_changed_its_content_with_the_same_count_asks_again() {
     );
     assert_ne!(again.serial, confirm.serial);
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2, N3: the rules are decided again on what the re-read of the freeze state meets
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_store_that_filled_up_while_the_freeze_state_was_read_refuses_the_update() {
+    let mut s = ready(config(), FLEET, Some(100));
+    dialog(&mut s, closure(10));
+    s.hold_freeze_loads = true;
+    s.send(Event::ConfirmAnswer(true));
+    assert_eq!(s.loads.len(), 1, "the file is being read");
+    rescan(&mut s, FLEET, 2);
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(std::collections::BTreeSet::new()));
+    nothing_runs(&s);
+    assert!(
+        notice(&s).contains("not updating luna") && notice(&s).contains("/nix/store has"),
+        "{}",
+        notice(&s)
+    );
+}
+
+#[test]
+fn an_address_that_became_shared_while_the_freeze_state_was_read_refuses_the_update() {
+    let mut s = ready(config(), FLEET, Some(100));
+    dialog(&mut s, clean_preflight());
+    s.hold_freeze_loads = true;
+    s.send(Event::ConfirmAnswer(true));
+    rescan(&mut s, SHARED, 100);
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(std::collections::BTreeSet::new()));
+    nothing_runs(&s);
+    assert!(notice(&s).contains("192.168.1.11"), "{}", notice(&s));
+}
+
+#[test]
+fn a_refresh_that_started_while_the_freeze_state_was_read_stops_the_update() {
+    let mut s = ready(config(), FLEET, Some(100));
+    dialog(&mut s, clean_preflight());
+    s.hold_freeze_loads = true;
+    s.send(Event::ConfirmAnswer(true));
+    // The list is being read again: what would be deployed is not settled.
+    s.send(Event::Refresh);
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(std::collections::BTreeSet::new()));
+    nothing_runs(&s);
+}

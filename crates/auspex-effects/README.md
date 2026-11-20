@@ -58,10 +58,35 @@ what the key must tell apart), `tests/cache_hostile.rs` (a fleet repository,
 cache directory or `flake.lock` prepared by someone else), `tests/signals.rs` (auspex itself
 signalled), and `tests/http.rs` (a server on 127.0.0.1, and TLS with an untrusted
 certificate from `tests/fixtures/tls`).
+The freeze state file's tests (`src/freeze/tests.rs`) are unit tests too, each in its own temporary
+directory; a test build panics if one asks for the real state file.
 None contacts a machine or the network beyond loopback. The action log's tests are unit tests
 (`src/deploylog/tests.rs`, which re-run the test binary for the multi-process cases); each opens a
 database in its own temporary directory, and a test build panics if one asks for the real state
 directory.
+
+## The freeze state file
+
+`freeze` keeps the machines the operator froze with `f` in `$XDG_STATE_HOME/auspex/state.toml`
+(else `~/.local/state/auspex/state.toml`; a relative `XDG_STATE_HOME` is ignored), **not** in
+`config.toml`, which home-manager makes a read-only store symlink. The directory is 0700 and the
+file 0600, owned by the user, with one name, never followed through a symlink.
+
+```toml
+version = 1
+
+[fleets."/home/me/clan/fleet"]
+frozen = ["luna", "sol"]
+```
+
+Keyed by the fleet flake's canonical path, so two fleets do not share freezes. Written by
+changing **one machine** under an exclusive lock on the directory, then replacing the file with
+a rename (temporary file 0600, flushed, renamed, directory flushed): a reader sees the old file
+or the new one, two auspex processes do not lose each other's freezes, and keys this build does
+not know are kept. A write can also carry the freezes an earlier save failed to keep (`set_with`), so the first write that works stores them too. The state is read again (`load`) at the `y` of an update and right before `clan` starts, so a freeze made by another running auspex is honoured. **Unknown is not empty:** a file that is not valid, or written by a newer
+auspex (`version` above 1), is refused and never written over, and the caller must treat
+freezes as unknown (the TUI then refuses `u` and `f` for every machine, and says why). A missing
+file is the empty set.
 
 ## The action log
 
@@ -108,7 +133,7 @@ before upgrading one.
 | Column | Type | Meaning |
 |---|---|---|
 | `id` | integer, primary key | Row id; increases with time of insertion. |
-| `kind` | text, not null | `deploy` (`clan machines update`), `build` (build only), `reboot`, `rollback`, `freeze`, `unfreeze`. |
+| `kind` | text, not null | `deploy` (`clan machines update`), `build` (build only), `reboot`, `rollback`, `freeze`, `unfreeze` (written for every `f` that changes a freeze made at the keyboard; `detail` is `frozen`/`unfrozen`, or why the state file could not be written). A freeze declared in `config.toml` is not an action and has no row. |
 | `machine` | text, not null | The machine's name from the inventory, sanitised (no control or format characters), at most 255 bytes. |
 | `fleet_commit` | text | The fleet repository's commit when the action started: lowercase hex, 4 to 64 characters. NULL when unknown. |
 | `fleet_dirty` | integer | 1 if the fleet tree had uncommitted changes, 0 if clean, NULL when unknown. |

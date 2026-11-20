@@ -34,7 +34,7 @@ let
     eval = { workers = 4; max_memory_mb = 4096; };
     prometheus = { url = "http://prometheus.example:9090"; stale_after = 60; };
     cache.url = "https://ncps.example";
-    machines.terra = { target = "root@192.168.1.10"; prometheus_instance = "terra:9100"; public = true; };
+    machines.terra = { target = "root@192.168.1.10"; prometheus_instance = "terra:9100"; public = true; frozen = true; };
     keymap = { quit = [ "q" "esc" ]; down = "j"; };
     theme.file = "~/.config/auspex/theme.toml";
   };

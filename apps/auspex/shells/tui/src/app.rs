@@ -21,9 +21,12 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use auspex_core::{Config, DiffConfig, Event, PrometheusConfig, PrometheusStatus};
+use auspex_core::{
+    Config, DiffConfig, Event, FreezeConfig, PrometheusConfig, PrometheusStatus, SavedFreezes,
+};
 use auspex_effects::Termination;
 use auspex_effects::deploylog::{self, Identity, OpenParams};
+use auspex_effects::freeze::{self, FreezeStore};
 use clap::Parser as _;
 
 use crate::backend::{Backend, Real};
@@ -68,6 +71,16 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
             max_age_seconds: p.stale_after,
         }),
         binary_cache: settings.cache_url.is_some(),
+        // What `f` saved is read where the run is built (it is I/O): see `load_freezes`.
+        freeze: FreezeConfig {
+            declared: settings
+                .machines
+                .iter()
+                .filter(|(_, m)| m.frozen)
+                .map(|(name, _)| name.clone())
+                .collect(),
+            saved: SavedFreezes::default(),
+        },
         diff: settings.diff.enabled.then_some(DiffConfig {
             timeout_seconds: settings.timeouts.diff,
         }),
@@ -93,6 +106,42 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
 pub fn for_mode(mut config: Config, mode: Mode) -> Config {
     config.allow_act &= mode == Mode::Tui;
     config
+}
+
+/// Reads what `f` saved into `config`, and tells `shell` where to keep the next freeze.
+///
+/// `store` is `None` when there is no usable state directory: the freezes are then unknown (see
+/// [`load_freezes`]), which the log says once, since the status bar will say what it costs.
+/// `main` calls this for every real run, and the tests call it too, so the wiring is the one that
+/// ships.
+pub async fn setup_freezes(shell: &Shell, config: &mut Config, store: Option<FreezeStore>) {
+    config.freeze.saved = load_freezes(store.as_ref()).await;
+    if let SavedFreezes::Unknown(why) = &config.freeze.saved {
+        shell.log.line(&format!(
+            "freezes made with f are unknown, so no machine can be updated until this is fixed: {why}"
+        ));
+    }
+    if let Some(store) = store {
+        shell.set_freeze_store(store);
+    }
+}
+
+/// The freezes `f` saved, or why they are unknown.
+///
+/// `None` is no usable state directory (neither `XDG_STATE_HOME` nor `HOME` is absolute). Either
+/// way it is **unknown, not empty**: an empty set would let `u` through on a machine the operator
+/// froze, so the core refuses to update anything until the file can be read.
+pub async fn load_freezes(store: Option<&FreezeStore>) -> SavedFreezes {
+    let Some(store) = store else {
+        return SavedFreezes::Unknown(
+            "no usable state directory (XDG_STATE_HOME or HOME), so freezes cannot be read or kept"
+                .to_owned(),
+        );
+    };
+    match store.load().await {
+        Ok(set) => SavedFreezes::Known(set),
+        Err(e) => SavedFreezes::Unknown(e.to_string()),
+    }
 }
 
 const fn signal_exit(name: &str) -> u8 {
@@ -235,7 +284,7 @@ impl Run {
                 format!("{} (from {})", self.flake, self.source.describe()),
             )
         };
-        let config = for_mode(config, mode);
+        let mut config = for_mode(config, mode);
         let settle = self.settings.timeouts.settle;
         let shell = Shell::new(backend, log, Duration::from_secs(settle));
         if !self.args.demo {
@@ -253,6 +302,13 @@ impl Run {
                     "no usable state directory (XDG_STATE_HOME or HOME), so actions are not logged",
                 );
             }
+        }
+        // What `f` froze in earlier runs. Read for headless runs too: `--json` reports `frozen`.
+        // The demo has no state file (it is not a fleet), so a freeze there lasts for the run.
+        if !self.args.demo {
+            let store = freeze::default_path()
+                .map(|path| FreezeStore::new(path, freeze::fleet_key(&self.flake)));
+            setup_freezes(&shell, &mut config, store).await;
         }
         if let Some(diff) = config.diff {
             shell.set_preview_grace(Duration::from_secs(diff.timeout_seconds));

@@ -327,7 +327,10 @@ Acceptance:
 - **`U` updates every `↑` machine.** Rolling mode per tag: one machine at a time, waiting
   until it probes healthy before the next. For the k8s tags, drain before and uncordon
   after, and refuse if any node is already NotReady.
-- **Freezing:** `f` freezes a machine so `U` skips it; freezes persist in the config.
+- **Freezing:** `f` freezes a machine so `U` skips it. A freeze made with `f` persists in a state
+  file (`$XDG_STATE_HOME/auspex/state.toml`, per fleet), not the config: a home-manager
+  `config.toml` is a read-only store symlink. `machines.<m>.frozen = true` in the config freezes
+  declaratively, and `f` cannot undo it.
 - **Before any update:**
   - warn if the fleet tree is dirty or unpushed, or **changed since it was evaluated** (clan
     deploys the tree as it is at `y`; today only a changed pending store path is caught, by commit

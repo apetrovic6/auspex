@@ -19,6 +19,14 @@ use common::{
     until_asked,
 };
 
+/// Waits (time is paused, so this is instant) until the update has been requested: after the
+/// `y` the shell reads the freeze state before the core asks for it to run.
+async fn until_action_starts(shell: &std::sync::Arc<auspex_tui::shell::Shell>) {
+    while shell.view().action.is_none() {
+        shell.changed().await;
+    }
+}
+
 /// Waits (time is paused, so this is instant) until the action is over.
 async fn until_action_ends(shell: &std::sync::Arc<auspex_tui::shell::Shell>) {
     while shell
@@ -179,6 +187,7 @@ async fn an_update_streams_into_the_log_tab_and_the_status_bar_says_how_it_ended
     type_keys_seen(&shell, &mut ui, &km, "Ay/luna\nu");
     until_asked(&shell, &mut ui, &km).await;
     type_keys_seen(&shell, &mut ui, &km, "y");
+    until_action_starts(&shell).await;
     // Running: the bar names it.
     let running = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 30);
     assert!(
@@ -591,6 +600,7 @@ async fn each_question_seen_then_answered_deploys() {
     // The checks run first; the dialog they open is drawn before `y` counts.
     until_asked(&shell, &mut ui, &km).await;
     type_keys(&shell, &mut ui, &km, "y");
+    until_action_starts(&shell).await;
     let action = shell.view().action.expect("the update started");
     assert_eq!(action.machine, "luna");
     until_action_ends(&shell).await;
@@ -695,6 +705,7 @@ async fn a_habitual_u_y_deploys_nothing_and_the_same_y_a_moment_later_does() {
     );
     common::elapse(QUESTION_DWELL);
     type_keys(&shell, &mut ui, &km, "y");
+    until_action_starts(&shell).await;
     assert_eq!(shell.view().action.expect("started").machine, "luna");
     until_action_ends(&shell).await;
 }
@@ -733,6 +744,7 @@ async fn a_question_that_did_not_fit_is_not_drawn_and_cannot_be_answered() {
     assert!(shell.view().action.is_none(), "not yet read");
     common::elapse(QUESTION_DWELL);
     type_keys(&shell, &mut ui, &km, "y");
+    until_action_starts(&shell).await;
     assert_eq!(shell.view().action.expect("started").machine, "luna");
     until_action_ends(&shell).await;
 }

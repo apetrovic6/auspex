@@ -1,0 +1,30 @@
+┌ machines (18) ─────────────────────────────────────┐┌ luna ──────────────────────────────────────────────────────────┐
+│ ✓    alfrost              in sync                  ││badges    ↑ update pending  ◆ cached  ❄ frozen                  │
+│ ✓    callisto             in sync                  ││status    update pending                                        │
+│ ✓⚠   cerberus             in sync                  ││reason    pending nixos-system-luna-25.11.20261101.6a2f1c0      │
+│ ↑    cypramundi           update pending           ││frozen    yes (f to unfreeze)                                   │
+│ ?    deimos               not installed            ││diff      +3 −2 ~10 packages (d)                                │
+│ ✓    europa               in sync                  ││host      root@192.168.1.11 (inventory deploy.targetHost)       │
+│ ✓⟳   ganymede             in sync                  ││build     localhost                                             │
+│ ✓    genetor              in sync                  ││class     nixos  tags: k8s, k8s-server                          │
+│ ✓    io                   in sync                  ││lints     none                                                  │
+│›↑◆❄  luna                 update pending           ││current   0357acgi nixos-system-luna-25.11.20261019.b81e2d4     │
+│ ✗    mars          ┌ confirm ───────────────────────────────────────────────────────────────────┐0261101.6a2f1c0     │
+│ ✓    mechanicus-for│unfreeze luna? updates to it will be possible again. y/N                    │                    │
+│ ✓    phobos        │                                                                            │                    │
+│ ↑◆   sol           │y confirms; any other key cancels                                           │                    │
+│ ✓    terra         └────────────────────────────────────────────────────────────────────────────┘                    │
+│ ✓    titan                in sync                  ││disk      93.5 GiB of 233.7 GiB used, 128.3 GiB free            │
+│ ✗    triton               unreachable              ││          (prometheus)                                          │
+│ !    vulcan               eval error               ││load      0.40 0.35 0.30 (prometheus)                           │
+│                                                    ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
+│                                                    ││diff      linux 6.12.38 → 6.12.41, +3 −2 ~10                    │
+│                                                    ││critical  linux 6.12.38 → 6.12.41, systemd 256.10 → 257.2, glibc│
+│                                                    ││          2.40-66 → 2.40-77, nix rebuilt                        │
+│                                                    ││counts    3 other major-version changes; +3 −2 ~10  1 rebuilt … │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ settled │ 0 pending │ prom: ok                                                                          ? help

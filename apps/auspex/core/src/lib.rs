@@ -15,6 +15,8 @@
 //! - Acting: [`Event::ToggleAct`], [`Event::UpdateSelected`] and [`Event::BuildSelected`] (with the
 //!   question each asks, and [`Event::ConfirmAnswer`]) end in one [`effects::ActionRequest`]; see
 //!   `app/act.rs` for what the core guarantees before it asks the shell to run anything.
+//! - Freezing: [`Event::ToggleFreeze`] (`f`) keeps a machine out of every update; see
+//!   `app/freeze.rs` for the two sources of a freeze and what "unknown" does.
 //!
 //! No I/O, no async runtime and no clock: a rule that needs "now" receives an age, and the
 //! global deadline arrives as [`Event::DeadlinePassed`].
@@ -30,13 +32,13 @@ pub use app::{
     PROMETHEUS_TIMED_OUT, SYSTEM_CHANGED,
 };
 pub use auspex_domain::report::{FleetError, FleetErrorKind};
-pub use config::{Config, DiffConfig, PrometheusConfig};
+pub use config::{Config, DiffConfig, FreezeConfig, PrometheusConfig, SavedFreezes};
 pub use crux_core::Core;
 pub use effects::{
     ActionEnd, ActionKind, ActionRequest, ActionResult, Effect, Generation, PreflightAnswer,
     PreflightRequest, RequestId, ShellEnd, ShellRequest,
 };
 pub use view::{
-    ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode, Phase, PrometheusStatus, RefreshView,
-    SearchView, TypedView, ViewModel,
+    ActionStatus, ActionView, ConfirmKind, ConfirmView, FreezeView, Mode, Phase, PrometheusStatus,
+    RefreshView, SearchView, TypedView, ViewModel,
 };

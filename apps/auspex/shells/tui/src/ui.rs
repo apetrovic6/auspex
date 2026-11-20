@@ -12,8 +12,8 @@
 use std::time::{Duration, Instant};
 
 use auspex_core::{
-    ActionResult, ActionStatus, ActionView, ConfirmKind, ConfirmView, Event, Mode, Phase,
-    PrometheusStatus, ViewModel,
+    ActionResult, ActionStatus, ActionView, ConfirmKind, ConfirmView, Event, FreezeView, Mode,
+    Phase, PrometheusStatus, ViewModel,
 };
 use auspex_domain::fleet::{Lint, TargetSource};
 use auspex_domain::observe::{HealthSource, StorePath};
@@ -414,6 +414,7 @@ const fn health_source(s: HealthSource) -> &'static str {
 )]
 pub fn detail_lines(
     m: &MachineReport,
+    freeze: &FreezeView,
     cache_configured: bool,
     diff_key: Option<&str>,
     value_cells: usize,
@@ -433,10 +434,31 @@ pub fn detail_lines(
             ),
         ),
     ];
+    // Right under the reason, where a short panel still shows it: whether `u` will refuse this
+    // machine, and who can undo it. Nothing for a machine that is not frozen (unless it is
+    // unknown which are, which is true of every machine).
+    if let Some(why) = &freeze.unknown {
+        out.insert(2, ("frozen", format!("unknown: {why}")));
+    } else if freeze.declared.contains(&m.name) {
+        out.insert(
+            2,
+            (
+                "frozen",
+                "yes, in config.toml (f cannot unfreeze it)".to_owned(),
+            ),
+        );
+    } else if freeze.is_frozen(&m.name) {
+        out.insert(2, ("frozen", "yes (f to unfreeze)".to_owned()));
+    }
     // One row for the preview, right after the reason: health comes before the full block below,
     // which a short panel cuts, so this is what says a preview exists.
     if let Some(row) = packages::summary_row(m, diff_key, value_cells) {
-        out.insert(2, row);
+        let at = if out.get(2).is_some_and(|(label, _)| *label == "frozen") {
+            3
+        } else {
+            2
+        };
+        out.insert(at, row);
     }
     if let Some(e) = &m.target_error {
         out.push(("refused", e.clone()));
@@ -596,7 +618,13 @@ fn draw_detail(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'_
     lines.push(Line::from(badges));
     let room = usize::from(inner.height);
     let diff_key = ctx.keymap.keys_for(Action::Diff).into_iter().next();
-    for (label, value) in detail_lines(m, view.binary_cache, diff_key.as_deref(), value_cells) {
+    for (label, value) in detail_lines(
+        m,
+        &view.freeze,
+        view.binary_cache,
+        diff_key.as_deref(),
+        value_cells,
+    ) {
         if lines.len() >= room {
             break; // nothing below the panel is drawn, so nothing below it is wrapped
         }
@@ -763,10 +791,22 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         parts.push(format!("count {c}"));
     }
     let mut errors: Vec<String> = Vec::new();
-    match view.report.errors.as_slice() {
+    // Not the unknown freezes: that error is written for `--json` readers, and is long. The bar
+    // says what it costs, below.
+    let fleet: Vec<_> = view
+        .report
+        .errors
+        .iter()
+        .filter(|e| e.kind != auspex_core::FleetErrorKind::FreezesUnknown)
+        .collect();
+    match fleet.as_slice() {
         [] => {}
         [one] => errors.push(format!("fleet error: {}", one.reason)),
         many => errors.push(format!("{} fleet errors: {}", many.len(), many[0].reason)),
+    }
+    if view.freeze.unknown.is_some() {
+        // The reason is in the detail panel and the log; here, what it costs.
+        errors.push("freezes unknown: u and f refused".to_owned());
     }
     if let Some(a) = &view.action
         && let ActionStatus::Ended(end) = &a.status

@@ -56,7 +56,11 @@ pub struct FleetReport {
     /// (the machine list could not be read or parsed, so `machines` is empty or partial),
     /// `"inventory_timed_out"` (reading it took longer than its timeout) and
     /// `"evaluation_failed"` (the evaluator itself could not run, so no machine has an
-    /// evaluation). `reason` is one line. Always present; `[]` when there are none.
+    /// evaluation) and `"freezes_unknown"` (the freezes made with `f` could not be read: a
+    /// corrupt or newer state file, or no state directory; every machine's `frozen` is then
+    /// only what `config.toml` declares, so **a reader must not treat `frozen: false` as "may
+    /// be updated"**; added to version 1, which readers of version 1 ignore, as they do an
+    /// unknown `kind`). `reason` is one line. Always present; `[]` when there are none.
     pub errors: Vec<FleetError>,
     /// One entry per inventory machine, sorted by name.
     pub machines: Vec<MachineReport>,
@@ -78,6 +82,9 @@ pub enum FleetErrorKind {
     /// The evaluator could not run at all (not one machine's eval error: those stay on
     /// that machine's row).
     EvaluationFailed,
+    /// Which machines were frozen with `f` is not known (the state file could not be read), so
+    /// `frozen` says only what the config declares. See [`MachineReport::frozen`].
+    FreezesUnknown,
 }
 
 /// One fleet-level failure.
@@ -196,7 +203,13 @@ pub struct MachineReport {
     /// Homelab-safety warnings: `{"kind": "hostname_target", "host"}` and `{"kind":
     /// "shared_ip", "ip", "with": [machines]}`.
     pub lints: Vec<Lint>,
-    /// Frozen in the config, so `U` skips it.
+    /// Frozen, so `u` refuses it and `U` skips it: by `machines.<m>.frozen = true` in `config.toml`,
+    /// or with `f` in the TUI (kept in auspex's state file, per fleet). `false` when neither says
+    /// so, and **also when it is not known which machines `f` froze** (the state file could not
+    /// be read): then it is only what the config declares, and the report carries a
+    /// `"freezes_unknown"` entry in `errors` (see [`FleetReport::errors`]), which a reader must
+    /// check before treating `false` as "may be updated". Always present: added to version 1 as
+    /// a field, which readers of version 1 ignore.
     pub frozen: bool,
 }
 

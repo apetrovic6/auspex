@@ -99,6 +99,8 @@ pub(super) enum Confirm {
         /// a review with no refusals: there is nothing to confirm otherwise.
         typed: Option<Typed>,
     },
+    /// Unfreeze `machine` (`f` on a machine frozen with `f`).
+    Unfreeze { machine: String },
     /// Quit while an action runs.
     Quit,
 }
@@ -141,7 +143,7 @@ impl Model {
         self.action.as_ref().is_some_and(Action::active)
     }
 
-    const fn fresh_id(&mut self) -> RequestId {
+    pub(super) const fn fresh_id(&mut self) -> RequestId {
         let id = RequestId(self.next_id);
         self.next_id += 1;
         id
@@ -156,12 +158,12 @@ impl Model {
     }
 
     /// Opens `confirm` as a new question: a shell must draw it before it may be answered.
-    fn ask(&mut self, confirm: Confirm) {
+    pub(super) fn ask(&mut self, confirm: Confirm) {
         self.confirm_serial += 1;
         self.confirm = Some(confirm);
     }
 
-    fn notice(&mut self, text: impl Into<String>) -> Command<Effect, Event> {
+    pub(super) fn notice(&mut self, text: impl Into<String>) -> Command<Effect, Event> {
         self.view.notice = Some(text.into());
         render()
     }
@@ -188,6 +190,7 @@ fn confirm_view(model: &Model, confirm: &Confirm) -> ConfirmView {
         Confirm::Act => (ConfirmKind::Act, Vec::new(), Vec::new(), None),
         Confirm::Checking { .. } => (ConfirmKind::Checking, Vec::new(), Vec::new(), None),
         Confirm::Quit => (ConfirmKind::Quit, Vec::new(), Vec::new(), None),
+        Confirm::Unfreeze { .. } => (ConfirmKind::Unfreeze, Vec::new(), Vec::new(), None),
         Confirm::Update {
             machine,
             review,
@@ -246,6 +249,9 @@ fn question(model: &Model, confirm: &Confirm) -> String {
             } else {
                 format!("update {machine} to {to}? y/N")
             }
+        }
+        Confirm::Unfreeze { machine } => {
+            format!("unfreeze {machine}? updates to it will be possible again. y/N")
         }
         Confirm::Quit => {
             let what = model.action.as_ref().map_or_else(
@@ -308,6 +314,10 @@ pub(super) fn request(model: &mut Model, kind: ActionKind) -> Command<Effect, Ev
     if kind == ActionKind::Update && !model.act {
         return model.notice(ACT_MODE_OFF);
     }
+    if model.freeze.rechecking() {
+        return model
+            .notice("still checking which machines are frozen before an update; ask again");
+    }
     if let Some(a) = model.action.as_ref().filter(|a| a.active()) {
         let text = format!("{} of {} is already running", article(a.kind), a.machine);
         return model.notice(text);
@@ -365,6 +375,13 @@ fn check(model: &Model, kind: ActionKind, machine: &str) -> Result<Shown, String
             "{machine} is not in the inventory; not touching it"
         ));
     };
+    // A frozen machine is never updated, and neither is any machine while it is unknown which
+    // are frozen (`freeze.rs`): the question is asked here, so it is asked again at the `y`.
+    if kind == ActionKind::Update
+        && let Some(why) = model.freeze.refusal(machine)
+    {
+        return Err(why);
+    }
     let Some(EvalOutcome::Success(eval)) = &row.eval else {
         return Err(format!(
             "{machine} has no evaluated system (still evaluating, or it failed): nothing to {}",
@@ -644,7 +661,17 @@ fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effec
 /// may have moved while the dialog was open: act mode turned off, an action started, the list
 /// refreshed, an address changed. Everything is decided again, with the checks' answer the
 /// dialog was showing.
-fn confirm_update(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
+/// Whether the file of freezes was read again since the `y`: the first time through, an update that
+/// passes every rule asks for that read ([`super::freeze::recheck`]); the second, it is requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stage {
+    /// Straight from the operator's `y` (or typed name).
+    Confirmed,
+    /// The file has been read again, and merged into what the core knows.
+    FreezesRead,
+}
+
+fn confirm_update(model: &mut Model, asked: Asked, stage: Stage) -> Command<Effect, Event> {
     let Asked {
         machine,
         to,
@@ -710,14 +737,38 @@ fn confirm_update(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
         });
         return model.notice(note);
     }
-    launch(model, ActionKind::Update, machine)
+    if stage == Stage::FreezesRead {
+        return launch(model, ActionKind::Update, machine);
+    }
+    // Everything the core can know says yes. The last look is at the file, which another
+    // running auspex may have changed since this one read it (`freeze.rs`); every rule above is
+    // decided once more on what the core knows when the answer is in.
+    super::freeze::recheck(
+        model,
+        Asked {
+            machine,
+            to,
+            path,
+            answer,
+            review: shown,
+            typed_given,
+        },
+    )
+}
+
+/// The file was read again and merged: the update is decided as at the `y`, on what the core
+/// knows now (the disk and address rules, the refresh and act-mode guards, the pending system,
+/// the freeze, the typed name), and requested only if every rule still says yes.
+pub(super) fn confirm_update_after_read(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
+    confirm_update(model, asked, Stage::FreezesRead)
 }
 
 /// What the dialog the operator confirmed was about.
-struct Asked {
-    machine: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Asked {
+    pub(super) machine: String,
     to: String,
-    path: String,
+    pub(super) path: String,
     answer: PreflightAnswer,
     /// What the checks decided when the dialog was drawn.
     review: Preflight,
@@ -854,7 +905,9 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
                 review,
                 typed_given: false,
             },
+            Stage::Confirmed,
         ),
+        Confirm::Unfreeze { machine } => super::freeze::unfreeze_confirmed(model, machine),
         Confirm::Quit => stop_and_quit(model),
     }
 }
@@ -914,7 +967,7 @@ pub(super) fn typed_submit(model: &mut Model) -> Command<Effect, Event> {
         typed_given: true,
     };
     model.confirm = None;
-    confirm_update(model, asked)
+    confirm_update(model, asked, Stage::Confirmed)
 }
 
 /// The operator's request to quit (`q`, Esc, Ctrl-C, `:q`).
