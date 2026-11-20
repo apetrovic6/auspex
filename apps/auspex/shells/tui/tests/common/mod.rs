@@ -2,8 +2,9 @@
 //! text, snapshot files, fake programs, and running the built binary in an environment of
 //! its own.
 //!
-//! Every run of the binary gets fresh `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME` and
-//! `XDG_RUNTIME_DIR`, so no test reads the real config, the real eval cache or `~/.ssh`.
+//! Every run of the binary gets fresh `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` and
+//! `XDG_RUNTIME_DIR`, so no test reads the real config, eval cache, state (freezes, action log)
+//! or `~/.ssh`.
 //! Fake programs are POSIX `sh` scripts with the absolute path of the `sh` on `PATH` as
 //! their interpreter (copied from `crates/auspex-effects/tests/common`, as is `alive`). Tests
 //! signal and kill only processes they spawned, by pid.
@@ -51,6 +52,20 @@ pub async fn settled_demo() -> Arc<Shell> {
 pub async fn settled_demo_with(demo: Demo) -> Arc<Shell> {
     let shell = Shell::new(Backend::Demo(demo), Log::memory(), Duration::from_secs(120));
     shell.send(Event::Start(demo::config()));
+    while !shell.view().refresh.settled {
+        shell.changed().await;
+    }
+    shell
+}
+
+/// [`settled_demo`] with `config` (the demo's, changed): freezes, say.
+pub async fn settled_demo_config(config: auspex_core::Config) -> Arc<Shell> {
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    shell.send(Event::Start(config));
     while !shell.view().refresh.settled {
         shell.changed().await;
     }
@@ -304,7 +319,7 @@ pub fn tempdir() -> tempfile::TempDir {
 /// runtime directories, and `CLAN_DIR` unset.
 pub fn auspex(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_auspex-tui"));
-    for d in ["home", "config", "cache", "run"] {
+    for d in ["home", "config", "cache", "run", "state"] {
         let p = home.join(d);
         fs::create_dir_all(&p).unwrap();
         if d == "run" {
@@ -314,6 +329,9 @@ pub fn auspex(home: &Path) -> Command {
     cmd.env("HOME", home.join("home"))
         .env("XDG_CONFIG_HOME", home.join("config"))
         .env("XDG_CACHE_HOME", home.join("cache"))
+        // The state directory too: the freeze file and the action log live there, and the
+        // developer's own environment may already point it at the real one.
+        .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_RUNTIME_DIR", home.join("run"))
         .env_remove("CLAN_DIR")
         .env_remove("AUSPEX_SSH")

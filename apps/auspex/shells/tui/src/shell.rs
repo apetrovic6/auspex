@@ -32,13 +32,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use auspex_core::effects::{EvalAnswer, Generation, RequestId, ShellEnd, ShellRequest};
+use auspex_core::effects::{
+    EvalAnswer, Generation, RequestId, SaveFreezeAnswer, ShellEnd, ShellRequest,
+};
 use auspex_core::{ActionEnd, ActionKind, ActionResult, Auspex, Core, Effect, Event, ViewModel};
 use auspex_effects::clan::{ClanRun, RunEnd};
 use auspex_effects::deploylog::{
     ActionKind as LoggedKind, ActionLog, ActionResult as LoggedResult, NewAction, OpenParams,
     Outcome,
 };
+use auspex_effects::freeze::FreezeStore;
 use auspex_effects::nix::EvalItem;
 use auspex_effects::{CancellationToken, Cancelled};
 use crux_core::Request;
@@ -121,6 +124,11 @@ pub struct Shell {
     /// Where `s` asks the TUI loop for the terminal. `None` in every run that has no loop to
     /// give it: headless, and tests of the core's effects.
     handoff: Mutex<Option<UnboundedSender<Handoff>>>,
+    /// Where `f` keeps a freeze, when a state file is configured.
+    freeze_store: Mutex<Option<FreezeStore>>,
+    /// What `f` froze in a run with no state file (the demo, most tests): kept for the run, so
+    /// that freezing and unfreezing work as they do with a file.
+    frozen_in_memory: Mutex<BTreeSet<String>>,
 }
 
 impl Shell {
@@ -148,6 +156,8 @@ impl Shell {
             action_log: OnceCell::new(),
             warning: Mutex::new(None),
             handoff: Mutex::new(None),
+            freeze_store: Mutex::new(None),
+            frozen_in_memory: Mutex::new(BTreeSet::new()),
         })
     }
 
@@ -380,6 +390,7 @@ impl Shell {
             }
             Effect::RunAction(request) => self.run_action(request),
             Effect::OpenShell(request) => self.open_shell(request),
+            Effect::SaveFreeze(request) => self.save_freeze(request),
             Effect::Cancel(request) => self.cancel(request.operation.id),
         }
     }
@@ -705,9 +716,7 @@ impl Shell {
         self: &Arc<Self>,
         op: &auspex_core::effects::ActionRequest,
     ) -> oneshot::Sender<Outcome> {
-        let (done, outcome) = oneshot::channel();
-        let shell = Arc::clone(self);
-        let new = NewAction {
+        self.log_row(NewAction {
             kind: match op.kind {
                 ActionKind::Update => LoggedKind::Deploy,
                 ActionKind::Build => LoggedKind::Build,
@@ -715,7 +724,15 @@ impl Shell {
             machine: op.machine.clone(),
             fleet_commit: None,
             fleet_dirty: None,
-        };
+        })
+    }
+
+    /// The row for `new`, written beside whatever it records: see [`Shell::log_action`], whose
+    /// rules every caller follows (a task of its own, a failure is a warning, never the
+    /// action's result, tracked so a quit waits for it).
+    fn log_row(self: &Arc<Self>, new: NewAction) -> oneshot::Sender<Outcome> {
+        let (done, outcome) = oneshot::channel();
+        let shell = Arc::clone(self);
         self.tasks.spawn(async move {
             let Some(log) = shell.action_log().await else {
                 return;
@@ -739,6 +756,66 @@ impl Shell {
             }
         });
         done
+    }
+
+    /// Where `f` keeps freezes: call before the first one. Without it a freeze lasts for the run
+    /// (the demo, most tests).
+    pub fn set_freeze_store(&self, store: FreezeStore) {
+        *lock(&self.freeze_store) = Some(store);
+    }
+
+    /// `Effect::SaveFreeze`: one machine's freeze or unfreeze, kept in the state file, and a row
+    /// in the action log beside it (kind `freeze` or `unfreeze`).
+    ///
+    /// The row follows the log's rules (see [`Shell::log_action`]): written by a task of its own,
+    /// a failure of the log is a warning and never the freeze's result, and the freeze never
+    /// waits for it. The save itself is tracked, so a quit waits for it.
+    fn save_freeze(
+        self: &Arc<Self>,
+        mut request: Request<auspex_core::effects::SaveFreezeRequest>,
+    ) {
+        let op = request.operation.clone();
+        let logged = self.log_row(NewAction {
+            kind: if op.frozen {
+                LoggedKind::Freeze
+            } else {
+                LoggedKind::Unfreeze
+            },
+            machine: op.machine.clone(),
+            fleet_commit: None,
+            fleet_dirty: None,
+        });
+        let store = lock(&self.freeze_store).clone();
+        let shell = Arc::clone(self);
+        self.tasks.spawn(async move {
+            let answer: SaveFreezeAnswer = if let Some(store) = store {
+                store
+                    .set(&op.machine, op.frozen)
+                    .await
+                    .map_err(|e| e.to_string())
+            } else {
+                let mut set = lock(&shell.frozen_in_memory);
+                if op.frozen {
+                    set.insert(op.machine.clone());
+                } else {
+                    set.remove(&op.machine);
+                }
+                Ok(set.clone())
+            };
+            let _ = logged.send(match &answer {
+                Ok(_) => Outcome {
+                    result: LoggedResult::Succeeded,
+                    exit_code: None,
+                    detail: Some(if op.frozen { "frozen" } else { "unfrozen" }.to_owned()),
+                },
+                Err(why) => Outcome {
+                    result: LoggedResult::Failed,
+                    exit_code: None,
+                    detail: Some(why.clone()),
+                },
+            });
+            shell.resolve(&mut request, answer);
+        });
     }
 
     fn run_action(self: &Arc<Self>, mut request: Request<auspex_core::effects::ActionRequest>) {

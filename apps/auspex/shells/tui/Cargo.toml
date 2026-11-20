@@ -54,6 +54,9 @@ rustix = { version = "1", default-features = false, features = ["std", "fs", "pr
 
 [dev-dependencies]
 tempfile = "3"
+# Holding the action log's write lock from a second connection, to show that a freeze never waits
+# for the log (`tests/freeze.rs`). The version `auspex-effects` has; already in the graph.
+rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "signal", "test-util"] }
 # Checking that a fake child is gone, by pid, without `unsafe`; `pty` and `termios` for the
 # terminal the `s` tests give the binary (`tests/common/pty.rs`). Already in the graph.

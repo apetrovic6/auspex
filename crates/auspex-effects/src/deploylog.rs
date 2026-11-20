@@ -13,6 +13,9 @@
 //! it back for the timeline. The TUI shell calls it for every `u` (kind `deploy`) and `b` (kind
 //! `build`): it opens the log on the first action, writes the row from a task of its own beside
 //! the action, and shows a failure as a warning in the status bar (`shell.rs`, `log_action`).
+//! It writes a `freeze` or `unfreeze` row, the same way, for every `f` that changes a freeze
+//! (`save_freeze`): `detail` is `frozen`/`unfrozen`, or why the state file could not be written
+//! (`result` `failed`). A freeze the config declares is not an action and has no row.
 //!
 //! **The log is a record of the action, never part of it.** A caller must not await a log
 //! call on a deploy's critical path (start the deploy, and write the row beside it, for

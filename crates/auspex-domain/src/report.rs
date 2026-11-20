@@ -196,7 +196,11 @@ pub struct MachineReport {
     /// Homelab-safety warnings: `{"kind": "hostname_target", "host"}` and `{"kind":
     /// "shared_ip", "ip", "with": [machines]}`.
     pub lints: Vec<Lint>,
-    /// Frozen in the config, so `U` skips it.
+    /// Frozen, so `u` refuses it and `U` skips it: by `machines.<m>.frozen = true` in `config.toml`,
+    /// or with `f` in the TUI (kept in auspex's state file, per fleet). `false` when neither says
+    /// so, and when it is not known which machines `f` froze (the state file could not be read:
+    /// the stderr note says so, and nothing can be updated then). Always present: added to
+    /// version 1 as a field, which readers of version 1 ignore.
     pub frozen: bool,
 }
 

@@ -21,7 +21,7 @@ use auspex_core::effects::{
     PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer, PrometheusRequest,
     ResolveRequest,
 };
-use auspex_core::{Config, DiffConfig, PrometheusConfig};
+use auspex_core::{Config, DiffConfig, FreezeConfig, PrometheusConfig};
 use auspex_domain::closure::ClosurePaths;
 use auspex_domain::eval::{EvalFailure, EvalOutcome, EvalSuccess};
 use auspex_domain::fleet::parse_inventory;
@@ -69,6 +69,7 @@ pub fn config() -> Config {
         // The demo has one machine whose update asks for its name typed.
         public_machines: std::collections::BTreeSet::from([PUBLIC_MACHINE.to_owned()]),
         preflight_timeout_seconds: 5,
+        freeze: FreezeConfig::default(),
     }
 }
 

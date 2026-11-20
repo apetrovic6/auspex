@@ -12,10 +12,11 @@ use std::collections::BTreeMap;
 use auspex_core::effects::{
     ActionRequest, CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest, InventoryRequest,
     PendingClosureRequest, PreflightRequest, ProbeRequest, PrometheusRequest, ResolveRequest,
-    ShellRequest,
+    SaveFreezeRequest, ShellRequest,
 };
 use auspex_core::{
-    Auspex, Config, Core, DiffConfig, Effect, Event, PrometheusConfig, RequestId, ViewModel,
+    Auspex, Config, Core, DiffConfig, Effect, Event, FreezeConfig, PrometheusConfig, RequestId,
+    ViewModel,
 };
 use auspex_domain::eval::{EvalFailure, EvalOutcome, EvalSuccess};
 use auspex_domain::fleet::{Machine, parse_inventory};
@@ -120,6 +121,7 @@ pub fn full_config() -> Config {
         local_system: String::new(),
         public_machines: std::collections::BTreeSet::new(),
         preflight_timeout_seconds: 90,
+        freeze: FreezeConfig::default(),
     }
 }
 
@@ -158,6 +160,8 @@ pub struct Shell {
     pub preflights: Vec<Request<PreflightRequest>>,
     /// `s` requests: the terminal lent to ssh, until the test answers.
     pub shells: Vec<Request<ShellRequest>>,
+    /// Freeze and unfreeze saves, which the test answers as the shell would.
+    pub freezes: Vec<Request<SaveFreezeRequest>>,
     /// Every cancel the core has emitted, in order.
     pub cancels: Vec<RequestId>,
     /// Every request id the core has issued, in order.
@@ -185,6 +189,7 @@ impl Shell {
             actions: Vec::new(),
             preflights: Vec::new(),
             shells: Vec::new(),
+            freezes: Vec::new(),
             cancels: Vec::new(),
             issued: Vec::new(),
         }
@@ -243,6 +248,10 @@ impl Shell {
                 Effect::RunAction(r) => {
                     self.issued.push(r.operation.id);
                     self.actions.push(r);
+                }
+                Effect::SaveFreeze(r) => {
+                    self.issued.push(r.operation.id);
+                    self.freezes.push(r);
                 }
                 Effect::OpenShell(r) => {
                     self.issued.push(r.operation.id);
@@ -437,4 +446,11 @@ pub fn sized(bytes: u64) -> Result<Vec<(StorePath, u64)>, String> {
         StorePath::new(path('s', "closure-payload")).unwrap(),
         bytes,
     )])
+}
+impl Shell {
+    /// The one freeze or unfreeze save outstanding.
+    pub fn take_freeze(&mut self) -> Request<SaveFreezeRequest> {
+        assert_eq!(self.freezes.len(), 1, "one freeze save outstanding");
+        self.freezes.remove(0)
+    }
 }

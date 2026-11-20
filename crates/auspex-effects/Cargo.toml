@@ -36,6 +36,10 @@ rustix = { version = "1", default-features = false, features = ["std", "process"
 # build (`cc`, `libsqlite3-sys`), which the Nix sandbox's stdenv already supplies. Default
 # features are off: nothing beyond the bundled library.
 rusqlite = { version = "0.43", default-features = false, features = ["bundled"] }
+# The freeze state file (`freeze`): read as a table and written back with the keys this build
+# does not know left alone. The version `auspex-tui` reads `config.toml` with, so nothing new
+# enters Cargo.lock.
+toml = "0.9"
 
 # --- HTTP (Prometheus and narinfo) ---
 #

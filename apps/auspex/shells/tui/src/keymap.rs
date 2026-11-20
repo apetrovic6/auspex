@@ -63,13 +63,16 @@ pub enum Action {
     Build,
     /// ssh to the selected machine, with the terminal (act mode only).
     Shell,
+    /// Freeze the selected machine, or (asking first) unfreeze it. Works in observe mode: it
+    /// only prevents changes.
+    Freeze,
     /// Quit.
     Quit,
 }
 
 impl Action {
     /// Every action, in the order the help overlay lists them.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Down,
         Self::Up,
         Self::HalfPageDown,
@@ -86,6 +89,7 @@ impl Action {
         Self::Update,
         Self::Build,
         Self::Shell,
+        Self::Freeze,
         Self::Refresh,
         Self::Command,
         Self::Help,
@@ -115,6 +119,7 @@ impl Action {
             Self::Update => "update",
             Self::Build => "build",
             Self::Shell => "shell",
+            Self::Freeze => "freeze",
             Self::Quit => "quit",
         }
     }
@@ -142,6 +147,7 @@ impl Action {
             Self::Update => "update the machine (act mode)",
             Self::Build => "build its pending system here",
             Self::Shell => "ssh to the machine (act mode)",
+            Self::Freeze => "freeze the machine (asks to unfreeze)",
             Self::Quit => "quit",
         }
     }
@@ -169,6 +175,7 @@ impl Action {
             Self::Update => &["u"],
             Self::Build => &["b"],
             Self::Shell => &["s"],
+            Self::Freeze => &["f"],
             Self::Quit => &["q", "esc", "ctrl-c"],
         }
     }

@@ -99,6 +99,8 @@ pub(super) enum Confirm {
         /// a review with no refusals: there is nothing to confirm otherwise.
         typed: Option<Typed>,
     },
+    /// Unfreeze `machine` (`f` on a machine frozen with `f`).
+    Unfreeze { machine: String },
     /// Quit while an action runs.
     Quit,
 }
@@ -141,7 +143,7 @@ impl Model {
         self.action.as_ref().is_some_and(Action::active)
     }
 
-    const fn fresh_id(&mut self) -> RequestId {
+    pub(super) const fn fresh_id(&mut self) -> RequestId {
         let id = RequestId(self.next_id);
         self.next_id += 1;
         id
@@ -156,12 +158,12 @@ impl Model {
     }
 
     /// Opens `confirm` as a new question: a shell must draw it before it may be answered.
-    fn ask(&mut self, confirm: Confirm) {
+    pub(super) fn ask(&mut self, confirm: Confirm) {
         self.confirm_serial += 1;
         self.confirm = Some(confirm);
     }
 
-    fn notice(&mut self, text: impl Into<String>) -> Command<Effect, Event> {
+    pub(super) fn notice(&mut self, text: impl Into<String>) -> Command<Effect, Event> {
         self.view.notice = Some(text.into());
         render()
     }
@@ -188,6 +190,7 @@ fn confirm_view(model: &Model, confirm: &Confirm) -> ConfirmView {
         Confirm::Act => (ConfirmKind::Act, Vec::new(), Vec::new(), None),
         Confirm::Checking { .. } => (ConfirmKind::Checking, Vec::new(), Vec::new(), None),
         Confirm::Quit => (ConfirmKind::Quit, Vec::new(), Vec::new(), None),
+        Confirm::Unfreeze { .. } => (ConfirmKind::Unfreeze, Vec::new(), Vec::new(), None),
         Confirm::Update {
             machine,
             review,
@@ -246,6 +249,9 @@ fn question(model: &Model, confirm: &Confirm) -> String {
             } else {
                 format!("update {machine} to {to}? y/N")
             }
+        }
+        Confirm::Unfreeze { machine } => {
+            format!("unfreeze {machine}? updates to it will be possible again. y/N")
         }
         Confirm::Quit => {
             let what = model.action.as_ref().map_or_else(
@@ -365,6 +371,13 @@ fn check(model: &Model, kind: ActionKind, machine: &str) -> Result<Shown, String
             "{machine} is not in the inventory; not touching it"
         ));
     };
+    // A frozen machine is never updated, and neither is any machine while it is unknown which
+    // are frozen (`freeze.rs`): the question is asked here, so it is asked again at the `y`.
+    if kind == ActionKind::Update
+        && let Some(why) = model.freeze.refusal(machine)
+    {
+        return Err(why);
+    }
     let Some(EvalOutcome::Success(eval)) = &row.eval else {
         return Err(format!(
             "{machine} has no evaluated system (still evaluating, or it failed): nothing to {}",
@@ -855,6 +868,7 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
                 typed_given: false,
             },
         ),
+        Confirm::Unfreeze { machine } => super::freeze::unfreeze_confirmed(model, machine),
         Confirm::Quit => stop_and_quit(model),
     }
 }

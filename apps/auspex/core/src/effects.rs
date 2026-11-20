@@ -22,7 +22,7 @@
 //! their own deadline, `timeouts.diff`, which the shell enforces, and the fleet settles when
 //! they have answered.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 
@@ -502,6 +502,35 @@ impl Operation for ShellRequest {
     type Output = ShellEnd;
 }
 
+/// Keep one freeze (`f`): freeze or unfreeze `machine` in the state file, and answer with every
+/// machine frozen afterwards.
+///
+/// **A write to auspex's own state, never to a machine.** The shell changes only this machine's
+/// entry, under a lock, so two running auspex processes do not lose each other's freezes, and
+/// answers with the whole set as written, which the core adopts. The machine name was validated
+/// against the inventory and the domain's name rule before the request was made; the adapter
+/// checks the rule again.
+///
+/// Unlike an action it is not cancelled by a refresh or by quitting: it is one short write, and
+/// the shell waits for it when it shuts down.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveFreezeRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The machine.
+    pub machine: String,
+    /// `true` to freeze it, `false` to unfreeze.
+    pub frozen: bool,
+}
+
+/// The machines frozen after the change, or one line on why it could not be kept. Failures are
+/// values: the core says so in a notice, and keeps the machine frozen if it was a freeze.
+pub type SaveFreezeAnswer = Result<BTreeSet<String>, String>;
+
+impl Operation for SaveFreezeRequest {
+    type Output = SaveFreezeAnswer;
+}
+
 /// Stop request `id`: kill its process and drop its `Request`. Fire and forget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelRequest {
@@ -548,4 +577,6 @@ pub enum Effect {
     RunAction(ActionRequest),
     /// [`ShellRequest`]: the operator's own ssh session, with the terminal.
     OpenShell(ShellRequest),
+    /// [`SaveFreezeRequest`]: keep a freeze or an unfreeze in the state file.
+    SaveFreeze(SaveFreezeRequest),
 }

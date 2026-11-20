@@ -260,6 +260,7 @@ impl Input {
             Action::Update => vec![Event::UpdateSelected],
             Action::Build => vec![Event::BuildSelected],
             Action::Shell => vec![Event::ShellSelected],
+            Action::Freeze => vec![Event::ToggleFreeze],
             Action::Down => vec![Event::MoveDown(n)],
             Action::Up => vec![Event::MoveUp(n)],
             // Counted: `n` half pages as one move of `n * max(page / 2, 1)` rows (the core's
@@ -340,7 +341,8 @@ impl Input {
             | Action::Act
             | Action::Update
             | Action::Build
-            | Action::Shell => {}
+            | Action::Shell
+            | Action::Freeze => {}
         }
         Vec::new()
     }
@@ -397,7 +399,8 @@ impl Input {
             | Action::Act
             | Action::Update
             | Action::Build
-            | Action::Shell => {}
+            | Action::Shell
+            | Action::Freeze => {}
         }
         Vec::new()
     }

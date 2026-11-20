@@ -29,6 +29,7 @@ url = "https://ncps.example"
 target = "root@192.168.1.10"
 prometheus_instance = "terra:9100"
 public = true
+frozen = true
 
 [keymap]
 quit = ["q", "esc"]

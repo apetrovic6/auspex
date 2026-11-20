@@ -43,6 +43,7 @@
 //! settles even if an adapter task never answers. Headless worst case: `settle + diff`.
 
 mod act;
+mod freeze;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -57,14 +58,16 @@ use auspex_domain::status::{Badge, MachineFacts, NarCache, Outstanding, machine_
 use crux_core::render::render;
 use crux_core::{App, Command};
 
-use crate::config::Config;
+use crate::config::{Config, SavedFreezes};
 use crate::effects::{
     ActionEnd, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest, Effect,
     EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
     PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer, PrometheusRequest,
-    RequestId, ResolveRequest, ShellEnd,
+    RequestId, ResolveRequest, SaveFreezeAnswer, ShellEnd,
 };
-use crate::view::{Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState};
+use crate::view::{
+    FreezeView, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState,
+};
 
 /// The reason a probe still out at the global deadline is shown with.
 pub const PROBE_TIMED_OUT: &str = "timed out: no answer from the probe before the global deadline";
@@ -238,6 +241,10 @@ pub enum Event {
     /// Open the operator's own ssh session to the selected machine (`s`). Act mode only; the
     /// shell suspends its UI for as long as ssh runs, and answers with [`Event::ShellEnded`].
     ShellSelected,
+    /// Freeze the selected machine, or ask about unfreezing it (`f`). Freezing needs no act mode
+    /// and no question; unfreezing asks "unfreeze luna? y/N". A machine frozen in `config.toml`
+    /// cannot be unfrozen here.
+    ToggleFreeze,
     /// The answer to the open question: `true` for `y`, `false` for anything else. For a
     /// question that asks for a typed name ([`crate::ConfirmKind::UpdateTyped`]) `true` is
     /// ignored: only [`Event::ConfirmSubmit`] with the exact name confirms, and `false`
@@ -282,6 +289,16 @@ pub enum Event {
         id: RequestId,
         /// How it ended.
         end: ShellEnd,
+    },
+
+    // --- the freeze's answer (built by the core) ----------------------------------------
+    /// [`SaveFreezeRequest`](crate::effects::SaveFreezeRequest) answered: the machines frozen
+    /// now, or why the change was not kept.
+    FreezeSaved {
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: SaveFreezeAnswer,
     },
 }
 
@@ -371,6 +388,7 @@ impl Row {
             probe: self.probe.as_ref(),
             eval: self.eval.as_ref(),
             cache: self.cache,
+            // `view` sets it: whether a machine is frozen is the model's, not the row's.
             frozen: false,
             alerts_firing: 0,
             outstanding: Outstanding {
@@ -436,6 +454,9 @@ pub struct Model {
     /// answered. An update is refused while that is the current refresh (see `app/act.rs`); the
     /// next refresh is another generation, so it starts afresh (nothing resets it).
     resolution_timed_out: Option<Generation>,
+    /// Which machines are frozen: the config's and the saved ones (`app/freeze.rs`). Set by
+    /// [`Event::Start`]; kept across refreshes.
+    freeze: freeze::Freezes,
 }
 
 impl Model {
@@ -593,6 +614,7 @@ impl App for Auspex {
     fn update(&self, event: Event, model: &mut Model) -> Command<Effect, Event> {
         match event {
             Event::Start(config) => {
+                model.freeze = freeze::Freezes::new(&config.freeze);
                 model.config = Some(config);
                 refresh(model)
             }
@@ -683,6 +705,8 @@ impl App for Auspex {
             | Event::PreflightAnswered { .. }
             | Event::ShellEnded { .. }
             | Event::ActionEnded { .. }) => act::event(model, event),
+            Event::ToggleFreeze => freeze::toggle(model),
+            Event::FreezeSaved { id, answer } => freeze::saved(model, id, answer),
             view_event => {
                 view_update(model, view_event);
                 render()
@@ -703,7 +727,10 @@ impl App for Auspex {
                 let mut report = machine_report(
                     &r.machine,
                     &r.target,
-                    &r.facts(prometheus_out),
+                    &MachineFacts {
+                        frozen: model.freeze.is_frozen(&r.machine.name),
+                        ..r.facts(prometheus_out)
+                    },
                     model.health(r),
                     &shared,
                 );
@@ -767,6 +794,18 @@ impl App for Auspex {
             action,
             confirm,
             notice: model.view.notice.clone(),
+            freeze: FreezeView {
+                declared: model.freeze.declared().clone(),
+                saved: match model.freeze.saved() {
+                    SavedFreezes::Known(s) => s.clone(),
+                    SavedFreezes::Unknown(_) => BTreeSet::new(),
+                },
+                unknown: match model.freeze.saved() {
+                    SavedFreezes::Unknown(why) => Some(why.clone()),
+                    SavedFreezes::Known(_) => None,
+                },
+                saving: model.freeze.saving(),
+            },
         }
     }
 }
@@ -1496,6 +1535,8 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::ConfirmSubmit
         | Event::PreflightAnswered { .. }
         | Event::ShellEnded { .. }
+        | Event::ToggleFreeze
+        | Event::FreezeSaved { .. }
         | Event::ActionEnded { .. }
         | Event::Terminate
         | Event::Quit => {}

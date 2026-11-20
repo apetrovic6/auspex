@@ -248,6 +248,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "url",
  "webpki-roots",
 ]
@@ -264,6 +265,7 @@ dependencies = [
  "crux_core",
  "i18n",
  "ratatui",
+ "rusqlite",
  "rustix",
  "serde_json",
  "tempfile",

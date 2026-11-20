@@ -1,5 +1,7 @@
 //! What a shell draws, and the pure view state behind it: selection, search, help, quit.
 
+use std::collections::BTreeSet;
+
 use auspex_domain::report::FleetReport;
 
 use crate::effects::{ActionEnd, ActionKind, Generation};
@@ -51,6 +53,43 @@ pub struct ViewModel {
     /// A one-line refusal or note about the last thing the operator asked for ("act mode is
     /// off (A)"), until their next request.
     pub notice: Option<String>,
+    /// Which machines are frozen, and from where.
+    pub freeze: FreezeView,
+}
+
+/// Which machines are frozen: what the report's `frozen` flags and `f` are drawn from.
+///
+/// The report says *whether* each machine is frozen; this says *why*, for the detail panel, and
+/// whether the answer can be trusted at all.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreezeView {
+    /// Frozen by `machines.<m>.frozen = true` in `config.toml`: `f` cannot undo it.
+    pub declared: BTreeSet<String>,
+    /// Frozen with `f` (the state file), when it could be read; empty when it could not.
+    pub saved: BTreeSet<String>,
+    /// Why the freezes made with `f` are unknown (the state file is corrupt or newer, or there
+    /// is no state directory), or `None`. While set, `u` and `f` are refused for every machine.
+    pub unknown: Option<String>,
+    /// A freeze or unfreeze is being saved.
+    pub saving: bool,
+}
+
+impl FreezeView {
+    /// Whether `machine` is frozen, by either source.
+    #[must_use]
+    pub fn is_frozen(&self, machine: &str) -> bool {
+        self.declared.contains(machine) || self.saved.contains(machine)
+    }
+
+    /// Every machine known to be frozen: what `U` skips.
+    #[must_use]
+    pub fn frozen(&self) -> BTreeSet<&str> {
+        self.declared
+            .iter()
+            .chain(&self.saved)
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// Where a refresh is.
@@ -142,6 +181,8 @@ pub enum ConfirmKind {
     Refused,
     /// Quit while an action runs.
     Quit,
+    /// Unfreeze a machine (`f` on a frozen one).
+    Unfreeze,
 }
 
 /// A question the operator has to answer before anything happens.

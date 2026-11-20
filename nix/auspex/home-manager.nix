@@ -86,6 +86,7 @@ in {
             target = optional types.str "SSH target overriding inventory deploy.targetHost.";
             prometheus_instance = optional types.str "Prometheus instance label; defaults to <name>:9100.";
             public = optional types.bool "Whether the machine faces the internet (default false). Updating a public machine asks for its name to be typed instead of y.";
+            frozen = optional types.bool "Freeze the machine (default false): `u` refuses it and `U` skips it. Declarative: `f` in the TUI cannot unfreeze it, so remove it here (and switch) to let the machine be updated again. Freezes made with `f` are not kept in this file but in auspex's state file.";
           });
         };
         keymap = mkOption {
