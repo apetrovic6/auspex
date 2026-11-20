@@ -646,8 +646,13 @@ fn ctrl_backslash_during_ssh_reaches_ssh_and_does_not_quit_auspex() {
 #[test]
 fn keys_typed_to_an_ssh_that_never_read_them_are_not_read_by_auspex_afterwards() {
     // ssh ignores its input and exits; what was typed meanwhile is for a dead ssh. Read by
-    // auspex it would be commands: `b` is a build, `s` is ssh again. Any key clears the status
-    // bar's note in the core, so the note is still there only if no key was read.
+    // auspex it would be a command, and the key here is `q`, which has an effect nothing can
+    // overwrite: it quits auspex. (This test used to type `b`, whose only effect was to clear the
+    // status note, and the note is replaced by "ssh to luna exited" a moment later whether or not
+    // `b` was read, so it passed with the `tcflush` in `enter_terminal` removed: review of PR
+    // #30, R1. The long-burst test below caught that mutation alone.) The line is typed whole,
+    // so it is waiting in the terminal's input queue and becomes readable when auspex puts the
+    // terminal in raw mode again, which is what `tcflush` is for.
     let session = "touch '@dir@/ssh.ready'\n@sleep@ 1\nexit 4";
     let Some(mut run) = Run::start("", INVENTORY, session) else {
         return;
@@ -655,15 +660,20 @@ fn keys_typed_to_an_ssh_that_never_read_them_are_not_read_by_auspex_afterwards()
     run.act();
     run.pty.send(b"s");
     run.wait_for_login();
-    run.pty.send(b"b\n");
+    run.pty.send(b"q\n");
     run.pty.wait_for_text("ssh to luna exited (code 4)");
     std::thread::sleep(Duration::from_millis(600));
     assert!(
-        run.pty.text().contains("ssh to luna exited (code 4)"),
-        "a key typed to the dead ssh was read by auspex:\n{}",
+        run.pty.running(),
+        "a q typed to the dead ssh was read by auspex, which quit:\n{}",
         run.pty.text()
     );
-    assert!(run.pty.running());
+    assert!(
+        run.pty.text().contains("ssh to luna exited (code 4)"),
+        "the screen after ssh:\n{}",
+        run.pty.text()
+    );
+    run.assert_tui_has_the_terminal("after ssh");
 }
 
 #[test]

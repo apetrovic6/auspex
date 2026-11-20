@@ -980,22 +980,23 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
 /// - **No `ConnectTimeout`, `ServerAliveInterval` or `ControlPersist`**: those are auspex's
 ///   settings for a probe nobody is watching. For a connection this ssh makes itself, the
 ///   operator's `~/.ssh/config` decides, and Ctrl-C ends a connect that hangs.
-/// - **`ControlMaster=no` with the probes' `ControlPath`**: reuse the master auspex keeps for
-///   this destination if one is live (no second agent approval, no second login), and never
-///   start one. `auto` would make this ssh the master, and when the operator logged out ssh
-///   would fork into the background to keep it for `ControlPersist` seconds, a process the
-///   operator did not ask for. Both are `%C`, so the same destination and port give the same
-///   socket as [`SshOperation::Probe`].
+/// - **`ControlMaster=no` with the probes' `ControlPath`**, first on the command line, so the
+///   operator's own `ControlPath` and `ControlMaster` never apply, with a live master or
+///   without one: reuse the master auspex keeps for this destination if one is live (no second
+///   agent approval, no second login), and never start one. `auto` would make this ssh the
+///   master, and when the operator logged out ssh would fork into the background to keep it for
+///   `ControlPersist` seconds, a process the operator did not ask for. Both are `%C`, so the
+///   same destination and port give the same socket as [`SshOperation::Probe`].
 ///
 /// **With a live master, the connection is auspex's, not the operator's.** The session is a
 /// channel on the master's transport, so what governs that transport is what auspex opened it
-/// with: `ServerAliveInterval=5` (a network drop of about 15 s ends the session, which a direct
-/// ssh under the operator's own keepalive settings might have survived), and the master's
-/// `Compression`, `TCPKeepAlive` and `IPQoS`. The operator's own `ControlPath` and `ControlMaster`
-/// do not apply (auspex's come first). What is per session still follows their config: the tty,
-/// `ForwardAgent`, `RemoteCommand`, `SendEnv`. Without a live master ssh connects directly, with
-/// the operator's config and none of that; a socket left by a dead master makes ssh print
-/// `Control socket connect(...): Connection refused` before it does.
+/// with: `ServerAliveInterval=5` (a network drop of about 15 s ends the session: 5 s times
+/// `ServerAliveCountMax`, which is 3 unless the target's options set it, 1 to 5, so 5 to 25 s; a
+/// direct ssh under the operator's own keepalive settings might have survived it), and the
+/// master's `Compression`, `TCPKeepAlive` and `IPQoS`. What is per session still follows their
+/// config: the tty, `ForwardAgent`, `RemoteCommand`, `SendEnv`. Without a live master ssh
+/// connects directly, with the operator's config and none of that; a socket left by a dead
+/// master makes ssh print `Control socket connect(...): Connection refused` before it does.
 ///
 /// The target's own options and port are passed as for a probe: they are the machine's, not a
 /// probe's.

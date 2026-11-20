@@ -5,6 +5,7 @@ mod proto 'just/proto.just'
 mod i18n 'just/i18n.just'
 mod rust 'just/rust.just'
 mod publish 'just/publish.just'
+mod cross 'just/cross.just'
 
 default: dev
 
@@ -77,7 +78,7 @@ dev: fmt check build test
 # network, and it can start failing without anything here changing, which is a reason to
 # report it on a schedule rather than to block the change under review (see the supply-chain
 # job's own comment). `gates.toml` records that split.
-ci: check-repo check build test typos
+ci: check-repo check build test typos cross-check
 
 # --------------------------------------------------------------------------
 # Repository health
@@ -175,3 +176,11 @@ rust-test:
 clean: (_each "clean")
     cargo clean
     rm -rf target
+
+# type-check the shipped code for the flake's other systems (aarch64-linux, both darwins)
+#
+# A recipe of its own rather than a dependency written `cross::check` in `ci`, because the gate
+# graph (`cargo xtask check`) follows a module's recipe only through an invocation in a recipe
+# body, as `check-repo` does for `proto::check`. What it covers and does not is in just/cross.just.
+cross-check:
+    @just cross::check

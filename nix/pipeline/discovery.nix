@@ -191,11 +191,15 @@ let
   # a different toolchain and a full rebuild of the frozen dependency layers. This is
   # master's order (wasm32 first, then Android in android.nix's own list order).
   #
-  # Apple triples are deliberately ABSENT. Master's dev shell never contributed them (no
-  # module added `languages.rust.targets` for Apple), so including them would change the
-  # toolchain derivation and rebuild depsL0/depsL1. Apple projects build on macOS only, and
-  # the `nix` runners are not macOS; reintroducing the three Apple triples is a separate
-  # decision, not this restructuring.
+  # Apple triples for an Apple PROJECT are deliberately absent: master's dev shell never
+  # contributed them, Xcode projects build on macOS only, and the `nix` runners are not macOS.
+  #
+  # The last three are not that. They are the foreign systems of auspex's own flake
+  # (aarch64-linux, aarch64-darwin, x86_64-darwin), here only so `just cross::check` can
+  # `cargo check --target` them from the dev shell (just/cross.just). The cost is one rebuild
+  # of the derivations that use this toolchain, once. The frozen bottom layer (`depsL0`) is
+  # built with `hostOnly`, which drops every target, so `nix/deps-base` and that layer are
+  # unchanged by it.
   rustTargets = lib.unique (
     lib.optionals (wasmCrates != [ ]) [ "wasm32-unknown-unknown" ]
     ++ lib.optionals (androidApps != [ ]) [
@@ -204,6 +208,7 @@ let
       "x86_64-linux-android"
       "i686-linux-android"
     ]
+    ++ [ "aarch64-unknown-linux-gnu" "aarch64-apple-darwin" "x86_64-apple-darwin" ]
   );
 in
 {

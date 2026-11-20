@@ -49,7 +49,10 @@
 //! - **A pid that is no longer ssh's.** Signals go through [`signal_ssh`], which refuses once the
 //!   waiter has marked ssh reaped, and the waiter marks it before it reaps.
 //! - **A panic while suspended** must not write escape sequences into ssh's session, so the TUI's
-//!   panic hooks are set aside until the terminal is taken back ([`suspend_panic_hook`]).
+//!   panic hooks are set aside until the terminal is taken back ([`suspend_panic_hook`]). The
+//!   plain message it prints instead does go to the terminal ssh is drawing on (stderr), as text
+//!   only. They are put back by [`enter_terminal`], or by [`run`] when it ends because auspex was
+//!   told to terminate, a path that never enters the terminal again.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -396,6 +399,12 @@ pub async fn run(program: &Path, args: &[String], term: &mut Termination) -> Ses
                 };
                 // ssh is gone, killed or not: its modes are not ours to keep.
                 modes.restore();
+                // The caller exits without `enter_terminal`, which is what puts the hooks back,
+                // and `shell.terminate()` still runs: a panic there would otherwise be reported
+                // as "while ssh has the terminal" and lose the default hook's backtrace. The
+                // TUI's hooks on a cooked terminal and the main screen restore what is already
+                // restored.
+                resume_panic_hook();
                 return Session {
                     end: end.unwrap_or_else(|e| ShellEnd::NotStarted {
                         reason: format!("waiting for ssh failed: {e}"),
@@ -462,9 +471,53 @@ fn reap(pid: Pid) -> ShellEnd {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// What a child test process prints when its body ran to the end. A filter that matches
+    /// nothing makes libtest run no test and exit 0, which would read as a pass.
+    const CHILD_DONE: &str = "handoff child test body completed";
+
+    /// The variable that makes [`in_a_process_of_its_own`] run the body instead of spawning.
+    const CHILD_ENV: &str = "AUSPEX_HANDOFF_TEST_CHILD";
+
+    /// Runs `body` in a new process (this test binary, running only `test`), and fails when it
+    /// fails. In the parent it returns what the child printed on stderr; in the child, `None`, so a check on that
+    /// output (which only the parent has) is written `if let Some(stderr) = …`.
+    ///
+    /// For tests of process-global state: the panic hook and the signal handlers. libtest runs
+    /// the tests of one binary on parallel threads of one process, so a test that swaps the hook
+    /// takes the failure message of any test that fails meanwhile, and a failed assertion leaves
+    /// its hook installed for every later test. nextest runs a process per test, `cargo test`
+    /// does not, and the tests must not depend on which. A child process also keeps the minimal
+    /// hook's output out of the run's (libtest does not capture stderr writes made with
+    /// `writeln!(std::io::stderr())`).
+    fn in_a_process_of_its_own(test: &str, body: impl FnOnce()) -> Option<String> {
+        if std::env::var(CHILD_ENV).is_ok_and(|name| name == test) {
+            body();
+            println!("{CHILD_DONE}");
+            return None;
+        }
+        let path = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, rest)| rest);
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("{path}::{test}"), "--nocapture"])
+            .args(["--test-threads=1"])
+            .env(CHILD_ENV, test)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success() && stdout.contains(CHILD_DONE),
+            "the test body failed in its own process ({}):\n{stdout}\n{stderr}",
+            out.status
+        );
+        Some(stderr)
+    }
 
     /// Nothing is signalled once ssh is marked reaped (its pid may be someone else's by then),
     /// and it is while it is not. The race itself cannot be staged; the rule that closes it can.
@@ -487,27 +540,124 @@ mod tests {
         assert!(!child.wait().unwrap().success(), "an unreaped one was not");
     }
 
+    /// The waiter marks ssh reaped *before* it reaps it, which is the order that stops a signal
+    /// from reaching a pid that has been handed to someone else. The race cannot be staged, but
+    /// the order can: this test holds the flag's lock, so a waiter that marks first is stuck on it
+    /// with ssh still unreaped, and one that reaps first has already finished reaping.
+    #[test]
+    fn the_waiter_marks_ssh_reaped_before_it_reaps_it() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_child(&child);
+        let reaped: Reaped = Arc::new(Mutex::new(false));
+        let held = reaped.lock().unwrap();
+        let waiter = std::thread::spawn({
+            let reaped = Arc::clone(&reaped);
+            move || wait_for(pid, &reaped)
+        });
+        // Long enough for the shell to have exited and the waiter to have noticed.
+        std::thread::sleep(Duration::from_millis(400));
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOWAIT | WaitIdOptions::NOHANG;
+        assert!(
+            matches!(waitid(WaitId::Pid(pid), options), Ok(Some(_))),
+            "ssh was reaped while the flag was still not set"
+        );
+        assert!(
+            !waiter.is_finished(),
+            "the waiter did not wait for the flag"
+        );
+        drop(held);
+        assert_eq!(waiter.join().unwrap(), ShellEnd::Exited { code: 3 });
+        assert!(*reaped.lock().unwrap(), "and it is marked afterwards");
+        drop(child);
+    }
+
     /// A panic while the terminal is lent to ssh runs none of the TUI's hooks (they write escape
     /// sequences into the operator's session); one after it is taken back runs them again.
     #[test]
     fn a_panic_while_suspended_does_not_run_the_tuis_hooks() {
-        static RAN: AtomicUsize = AtomicUsize::new(0);
-        let before = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {
-            RAN.fetch_add(1, Ordering::SeqCst);
-        }));
-        suspend_panic_hook();
-        // Twice: the second must not set aside the minimal hook in the first one's place.
-        suspend_panic_hook();
-        let _ = std::panic::catch_unwind(|| panic!("while suspended"));
-        assert_eq!(
-            RAN.load(Ordering::SeqCst),
-            0,
-            "the TUI's hook ran in ssh's session"
+        in_a_process_of_its_own(
+            "a_panic_while_suspended_does_not_run_the_tuis_hooks",
+            || {
+                static RAN: AtomicUsize = AtomicUsize::new(0);
+                std::panic::set_hook(Box::new(|_| {
+                    RAN.fetch_add(1, Ordering::SeqCst);
+                }));
+                suspend_panic_hook();
+                // Twice: the second must not set aside the minimal hook in the first one's place.
+                suspend_panic_hook();
+                let _ = std::panic::catch_unwind(|| panic!("while suspended"));
+                assert_eq!(
+                    RAN.load(Ordering::SeqCst),
+                    0,
+                    "the TUI's hook ran in ssh's session"
+                );
+                resume_panic_hook();
+                let _ = std::panic::catch_unwind(|| panic!("after"));
+                assert_eq!(RAN.load(Ordering::SeqCst), 1, "the TUI's hook is back");
+            },
         );
-        resume_panic_hook();
-        let _ = std::panic::catch_unwind(|| panic!("after"));
-        assert_eq!(RAN.load(Ordering::SeqCst), 1, "the TUI's hook is back");
-        std::panic::set_hook(before);
+    }
+
+    /// `leave_terminal`, which is what `s` calls, sets the hooks aside: the helper being right
+    /// (the test above) is not the hand-off using it.
+    #[test]
+    fn leaving_the_terminal_sets_the_tuis_hooks_aside() {
+        let stderr =
+            in_a_process_of_its_own("leaving_the_terminal_sets_the_tuis_hooks_aside", || {
+                static RAN: AtomicUsize = AtomicUsize::new(0);
+                std::panic::set_hook(Box::new(|_| {
+                    RAN.fetch_add(1, Ordering::SeqCst);
+                }));
+                leave_terminal();
+                let _ = std::panic::catch_unwind(|| panic!("while ssh has the terminal"));
+                assert_eq!(
+                    RAN.load(Ordering::SeqCst),
+                    0,
+                    "the TUI's hook ran after leave_terminal"
+                );
+            });
+        if let Some(stderr) = stderr {
+            assert!(
+                stderr.contains("auspex panicked while ssh has the terminal: "),
+                "and the plain message is what said so:\n{stderr}"
+            );
+        }
+    }
+
+    /// When auspex is told to terminate while ssh runs, it exits without taking the terminal back,
+    /// so nothing else would put the hooks back: `run` does, before it returns, and a panic while
+    /// auspex winds down gets its own hook, not the "while ssh has the terminal" one.
+    #[test]
+    fn terminating_during_ssh_puts_the_tuis_hooks_back() {
+        in_a_process_of_its_own("terminating_during_ssh_puts_the_tuis_hooks_back", || {
+            static RAN: AtomicUsize = AtomicUsize::new(0);
+            std::panic::set_hook(Box::new(|_| {
+                RAN.fetch_add(1, Ordering::SeqCst);
+            }));
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let session = runtime.block_on(async {
+                let mut term = Termination::new().unwrap();
+                leave_terminal();
+                tokio::spawn(async {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let _ = kill_process(rustix::process::getpid(), Signal::TERM);
+                });
+                let args = ["30".to_owned()];
+                run(Path::new("sleep"), &args, &mut term).await
+            });
+            assert_eq!(session.stopped_by, Some("SIGTERM"));
+            let _ = std::panic::catch_unwind(|| panic!("while winding down"));
+            assert_eq!(
+                RAN.load(Ordering::SeqCst),
+                1,
+                "the TUI's hook is not back after SIGTERM"
+            );
+        });
     }
 }
