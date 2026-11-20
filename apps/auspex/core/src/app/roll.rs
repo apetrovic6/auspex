@@ -6,45 +6,54 @@
 //!   leaves out the frozen ones (and refuses outright while it is unknown which are frozen,
 //!   exactly as `u` does: [`FreezeView::frozen`](crate::view::FreezeView::frozen) is `None`),
 //!   splits the rest by the configured rolling tags ([`auspex_domain::roll::plan`]) and asks one
-//!   question that lists the order, what runs in parallel and what is skipped, each with its
-//!   reason. Nothing runs before the `y`.
-//! - **Machines that share a rolling tag never update at the same time.** A rolling group is one
+//!   question that lists the order, what runs at once, what is skipped and the warnings of the
+//!   fleet repository (dirty, unpushed), each with its reason, and which cluster (context and
+//!   API server) the Kubernetes groups will talk to. Nothing runs before the `y`.
+//! - **One auspex updates a fleet at a time.** The `y` takes the fleet's update lock
+//!   ([`FleetLockRequest`]); a second `U` or `u` from another auspex is refused while it is held.
+//!   It is held for the whole roll.
+//! - **Machines that share a rolling tag never update at the same time**, and neither do any two
+//!   machines of the groups that use the cluster (one kubeconfig, one etcd). A group is one
 //!   machine after another, in name order; machines with no rolling tag update a few at a time
-//!   (`update.parallel`). Groups run beside each other.
+//!   (`update.parallel`).
 //! - **Each machine is checked at its turn, as `u` checks it.** The checks of PR #26 run for it
-//!   when its turn comes (the fleet tree as it is then, the closure's size, the free disk, the
-//!   duplicate-address rule), and the freeze is looked at again, in the core and by the shell
-//!   right before the process starts. A refusal **skips that machine and the roll goes on**; a
-//!   failure of a started update, a failed drain, or a machine that does not become healthy
-//!   **stops its rolling group** (the rest of it is skipped) and the other groups carry on.
-//!   Warnings of the checks do not stop a machine: they are written to its part of the Log tab.
-//!   A machine whose name has to be typed (`public`) is skipped: that confirmation is for `u`.
-//! - **Kubernetes.** A group with a `kubernetes = true` tag is refused up front if any node of the
-//!   cluster is `NotReady` or cordoned, or a machine is no node of it (it is listed as skipped,
-//!   with the reason). Between its machines the roll waits until the updated one runs the new
-//!   system, its probe is healthy and its node is `Ready` ([`AwaitRequest`]). With `drain = true`
-//!   the node is drained before its update and uncordoned after; **a node auspex cordoned is
-//!   never left cordoned by auspex**: after a failed drain, a failed update, a machine that never
-//!   became healthy, and a quit, the uncordon is asked for before the machine ends (and if it
-//!   fails, the machine is failed and the log says to uncordon by hand).
+//!   when its turn comes, and the freeze is looked at again, in the core and by the shell right
+//!   before the process starts. A refusal **skips that machine and the roll goes on**; a failure
+//!   of a started update, a failed drain, a cluster that is no longer healthy, or a machine that
+//!   does not become healthy **stops its rolling group** (the rest is skipped) and the others carry
+//!   on. A warning about the fleet repository that was not in the confirmed plan (someone edited
+//!   the tree after the `y`) refuses the machine. A machine whose name has to be typed
+//!   (`public`) is skipped: that confirmation is for `u`.
+//! - **Kubernetes.** The cluster is read again before every machine that uses it (and so right
+//!   after the `y` for the first of each group): any node that is `NotReady` or cordoned stops
+//!   the group, and a node is drained only when it is schedulable at that moment, which is what
+//!   makes it auspex's to uncordon. Every call is pinned to the context the plan showed. Between
+//!   machines the roll waits ([`AwaitRequest`]) until the updated one runs the deployed system,
+//!   has no failed unit it did not already have when its turn began, and its node is `Ready` with
+//!   a heartbeat newer than the end of the update.
+//! - **A node is put back where it is safe to.** After a failed drain, or a quit before the update
+//!   started, the node is uncordoned. After an update or a wait that failed the node **stays
+//!   cordoned**: the machine may be broken, and workloads must not return to it unasked. That is
+//!   said in the log, the status bar, the action log and on stderr at exit, with the command.
 //! - **Quit asks, and stops cleanly.** `q` during a roll asks; on `y` nothing new starts, the
 //!   running `clan` processes are cancelled ([`ActionRequest`] is answered when the process
 //!   group is gone), a drain in progress is cancelled and its node uncordoned, and
 //!   [`ViewModel::quit`](crate::ViewModel::quit) becomes true only when every machine has ended.
-//!   A second quit forces.
+//!   A second quit forces (the shell then uncordons what it still can, within a bound).
 //! - **While it runs, nothing else changes the world under it**: `u`, `b`, `r` (refresh) and `A`
 //!   say that a roll is running, and `U` says so again.
 //!
 //! The log: the roll has a run of its own in the Log tab (the plan first, one line per machine as
 //! it ends, the totals), and each machine has one (its checks' warnings, the drain, `clan`'s
-//! output, the wait, the uncordon). Each machine that is started is one action-log row (the
-//! shell writes it, as for `u`); a machine that was refused or skipped was never tried and has
-//! none.
+//! output, the wait, the uncordon). A machine that was drained or started has one action-log row
+//! (the shell writes it, and its detail says the node was drained and how the machine ended); a
+//! machine that was refused or skipped before that was never tried and has none.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 
-use auspex_domain::roll::{self, Candidate, Group, Member, Node};
+use auspex_domain::preflight::TreeState;
+use auspex_domain::roll::{self, Candidate, ClusterId, Group, Member, Node};
 use crux_core::Command;
 use crux_core::render::render;
 
@@ -52,8 +61,8 @@ use super::act::{ACT_MODE_OFF, Confirm, article, check, not_yet, review};
 use super::{Event, Model, Pending};
 use crate::effects::{
     ActionEnd, ActionKind, ActionResult, AwaitAnswer, AwaitRequest, CancelRequest, Effect,
-    KubeAnswer, KubeOp, KubeReply, KubeRequest, LogOp, LogRequest, PreflightAnswer,
-    PreflightRequest, RequestId,
+    EndResult, FleetLockRequest, FleetUnlockRequest, KubeAnswer, KubeOp, KubeReply, KubeRequest,
+    LogOp, LogRequest, PreflightAnswer, PreflightRequest, ProbeRequest, RequestId, TreeRequest,
 };
 use crate::view::{RollMachineView, RollState, RollStatus, RollView};
 
@@ -87,6 +96,16 @@ impl Outcome {
             Self::Cancelled => RollState::Cancelled,
         }
     }
+
+    const fn result(&self) -> EndResult {
+        match self {
+            Self::Done => EndResult::Done,
+            Self::Refused(_) => EndResult::Refused,
+            Self::Failed(_) => EndResult::Failed,
+            Self::Skipped(_) => EndResult::Skipped,
+            Self::Cancelled => EndResult::Cancelled,
+        }
+    }
 }
 
 /// Where one machine is in its turn.
@@ -95,6 +114,10 @@ enum Step {
     Queued,
     /// The checks before an update are running in the shell.
     Checking,
+    /// A fresh probe, for the failed units the machine has before anything is done to it.
+    Baseline,
+    /// The cluster's nodes are being read before the machine's node goes out of service.
+    Reading,
     /// `kubectl drain` is running. `cancelling`: the operator quit; the answer will say the
     /// process is gone, and the node is then uncordoned.
     Draining {
@@ -120,8 +143,12 @@ struct Entry {
     step: Step,
     /// The pending system the checks were asked about, and what the update deploys.
     path: Option<String>,
+    /// The failed units it had when its turn began.
+    baseline: Vec<String>,
     /// auspex cordoned its node (the drain starts with a cordon) and has not uncordoned it.
     cordoned: bool,
+    /// Its node was drained: said in its log and its action-log row.
+    drained: bool,
 }
 
 /// A rolling group while it runs.
@@ -133,6 +160,8 @@ struct GroupRun {
     busy: Option<String>,
     /// A machine of it failed: nothing more of it starts.
     stopped: bool,
+    /// Its machines use the cluster: at most one of all such groups at a time.
+    cluster: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +184,15 @@ pub(super) struct Roll {
     free: VecDeque<String>,
     parallel: usize,
     ready_timeout_seconds: u64,
+    /// The cluster the plan named; every call after it is pinned to its context.
+    context: Option<String>,
+    /// The fleet repository's warnings in the confirmed plan: a machine's turn may show these and
+    /// no others.
+    tree_warnings: Vec<String>,
+    /// The fleet lock, released when the roll is over.
+    lock: RequestId,
+    /// Nodes left cordoned on purpose, with the command that gives them back.
+    left_cordoned: Vec<String>,
     /// Which machine each request of this roll belongs to.
     ids: BTreeMap<RequestId, String>,
 }
@@ -181,6 +219,13 @@ impl Roll {
             .count()
     }
 
+    /// A machine that uses the cluster is in its turn: no other such machine may start.
+    fn cluster_busy(&self) -> bool {
+        self.entries
+            .values()
+            .any(|e| e.member.uses_cluster() && !matches!(e.step, Step::Queued | Step::Ended(_)))
+    }
+
     fn counts(&self) -> String {
         let mut done = 0;
         let (mut refused, mut failed, mut skipped, mut cancelled) = (0, 0, 0, 0);
@@ -201,6 +246,15 @@ impl Roll {
         )
     }
 
+    /// The `kubectl` words that name the cluster the roll works in, for the command that gives a
+    /// node back.
+    fn kubectl_prefix(&self) -> String {
+        self.context.as_ref().map_or_else(
+            || "kubectl".to_owned(),
+            |c| format!("kubectl --context {c}"),
+        )
+    }
+
     pub(super) fn view(&self) -> RollView {
         RollView {
             status: match self.status {
@@ -216,7 +270,7 @@ impl Roll {
                     name: name.clone(),
                     state: match &e.step {
                         Step::Queued => RollState::Queued,
-                        Step::Checking => RollState::Checking,
+                        Step::Checking | Step::Baseline | Step::Reading => RollState::Checking,
                         Step::Draining { .. } => RollState::Draining,
                         Step::Updating => RollState::Updating,
                         Step::Waiting => RollState::Waiting,
@@ -225,6 +279,7 @@ impl Roll {
                     },
                 })
                 .collect(),
+            left_cordoned: self.left_cordoned.clone(),
         }
     }
 
@@ -254,7 +309,7 @@ pub(super) struct PlannedGroup {
     group: Group,
 }
 
-/// What `U` is about to ask, after the cluster was looked at.
+/// What `U` is about to ask, after the cluster and the fleet repository were looked at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Planned {
     groups: Vec<PlannedGroup>,
@@ -263,6 +318,10 @@ pub(super) struct Planned {
     skipped: Vec<(String, String)>,
     parallel: usize,
     ready_timeout_seconds: u64,
+    /// The cluster the groups that use it will talk to, when any does.
+    cluster: Option<ClusterId>,
+    /// What the fleet repository's state warns about, once, for the whole roll.
+    tree_warnings: Vec<String>,
 }
 
 impl Planned {
@@ -274,13 +333,19 @@ impl Planned {
             + self.free.len()
     }
 
-    /// The question's body: the order, what runs in parallel, what is skipped.
+    /// The question's body: the order, what runs at once, what is skipped, the warnings.
     pub(super) fn lines(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "update {} machine{}:",
             self.machines(),
             if self.machines() == 1 { "" } else { "s" }
         )];
+        if let Some(c) = &self.cluster {
+            lines.push(format!(
+                "cluster: context {} ({}); every kubectl call is pinned to it",
+                c.context, c.server
+            ));
+        }
         for g in &self.groups {
             let group = &g.group;
             let order = group
@@ -314,48 +379,100 @@ impl Planned {
                 self.free.join(", ")
             ));
         }
+        lines.push(self.concurrency());
         for (name, why) in &self.skipped {
             lines.push(format!("skipped {name}: {why}"));
         }
+        for w in &self.tree_warnings {
+            lines.push(format!("warning: {w}"));
+        }
         lines.push(
             "each machine is checked at its turn: a refusal skips it, a failure stops its \
-             rolling group"
+             rolling group, and a new warning about the fleet repository refuses it"
                 .to_owned(),
         );
         lines
     }
+
+    /// What can be out of service at the same moment, said plainly.
+    fn concurrency(&self) -> String {
+        let cluster = self
+            .groups
+            .iter()
+            .filter(|g| g.group.uses_cluster())
+            .count();
+        let others: Vec<String> = self
+            .groups
+            .iter()
+            .filter(|g| !g.group.uses_cluster())
+            .map(|g| format!("one of {}", g.group.label()))
+            .collect();
+        let free = self.parallel.min(self.free.len());
+        let mut parts = others;
+        if cluster > 0 {
+            parts.push(if cluster == 1 {
+                "one of the cluster's group".to_owned()
+            } else {
+                format!("one of the {cluster} cluster groups together (they share one cluster)")
+            });
+        }
+        if free > 0 {
+            parts.push(format!("{free} of the machines in parallel"));
+        }
+        let at_once = parts.len() + free.saturating_sub(1);
+        format!(
+            "at most {at_once} machine{} updating at once: {}",
+            if at_once == 1 { "" } else { "s" },
+            parts.join(" + ")
+        )
+    }
 }
 
-/// `U` before the cluster has been looked at.
+/// Which look the question is waiting for: the cluster, then its nodes, then the repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stage {
+    Context,
+    Nodes,
+    Tree,
+}
+
+/// `U` before everything it needs to ask has been answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Draft {
     plan: roll::Plan,
-    members: BTreeMap<String, Member>,
     skipped: Vec<(String, String)>,
     parallel: usize,
     ready_timeout_seconds: u64,
+    cluster: Option<Result<ClusterId, String>>,
+    nodes: Option<Result<Vec<Node>, String>>,
+    tree: Option<Result<TreeState, String>>,
 }
 
 impl Draft {
-    /// Applies what the cluster said (or why it could not be asked) to every Kubernetes group:
-    /// a group the cluster refuses is not rolled, and its machines are listed as skipped.
-    fn finish(
-        mut self,
-        cluster: Option<&Result<Vec<Node>, String>>,
-        unavailable: Option<&str>,
-    ) -> Planned {
+    fn context(&self) -> Option<String> {
+        match &self.cluster {
+            Some(Ok(c)) => Some(c.context.clone()),
+            _ => None,
+        }
+    }
+
+    /// Applies what was found to every group that uses the cluster: one the cluster refuses is not
+    /// rolled, and its machines are listed as skipped.
+    fn finish(mut self, unavailable: Option<&str>) -> Planned {
         let mut groups = Vec::new();
         for group in std::mem::take(&mut self.plan.groups) {
-            if group.kubernetes() {
-                let why = match (unavailable, cluster) {
-                    (Some(why), _) => Some(format!("kubernetes is not usable here: {why}")),
-                    (None, None) => Some("the cluster was not asked".to_owned()),
-                    (None, Some(Err(why))) => Some(format!("cannot read the cluster: {why}")),
-                    (None, Some(Ok(nodes))) => {
+            if group.uses_cluster() {
+                let why = match (unavailable, &self.cluster, &self.nodes) {
+                    (Some(why), _, _) => Some(format!("kubernetes is not usable here: {why}")),
+                    (None, Some(Err(why)), _) | (None, _, Some(Err(why))) => {
+                        Some(format!("cannot read the cluster: {why}"))
+                    }
+                    (None, Some(Ok(_)), Some(Ok(nodes))) => {
                         let members: Vec<&Member> = group.members.iter().collect();
                         let why = roll::cluster_refusals(nodes, &members);
                         (!why.is_empty()).then(|| why.join("; "))
                     }
+                    _ => Some("the cluster was not asked".to_owned()),
                 };
                 if let Some(why) = why {
                     for m in &group.members {
@@ -370,12 +487,27 @@ impl Draft {
             groups.push(PlannedGroup { group });
         }
         self.skipped.sort();
+        let cluster = groups
+            .iter()
+            .any(|g| g.group.uses_cluster())
+            .then(|| match &self.cluster {
+                Some(Ok(c)) => Some(c.clone()),
+                _ => None,
+            })
+            .flatten();
+        let tree_warnings = auspex_domain::preflight::tree_warnings(match &self.tree {
+            Some(Ok(t)) => Ok(t),
+            Some(Err(why)) => Err(why.as_str()),
+            None => Err("the fleet repository was not looked at"),
+        });
         Planned {
             groups,
             free: self.plan.free,
             skipped: self.skipped,
             parallel: self.parallel,
             ready_timeout_seconds: self.ready_timeout_seconds,
+            cluster,
+            tree_warnings,
         }
     }
 }
@@ -405,7 +537,7 @@ pub(super) fn request(model: &mut Model) -> Command<Effect, Event> {
     if !model.act {
         return model.notice(ACT_MODE_OFF);
     }
-    if model.roll_active() {
+    if model.roll_active() || model.lock_wait.is_some() {
         return model.notice("an update of all machines is already running");
     }
     if let Some(a) = model.action.as_ref().filter(|a| a.active()) {
@@ -436,7 +568,6 @@ pub(super) fn request(model: &mut Model) -> Command<Effect, Event> {
 
     let mut candidates = Vec::new();
     let mut skipped = Vec::new();
-    let mut members = BTreeMap::new();
     for row in model.rows.iter().filter(|r| update_pending(r)) {
         let name = row.machine.name.as_str();
         if frozen.contains(name) {
@@ -464,42 +595,62 @@ pub(super) fn request(model: &mut Model) -> Command<Effect, Event> {
         return model.notice(text);
     }
     let plan = roll::plan(&candidates, &config.rolling.rules);
-    for g in &plan.groups {
-        for m in &g.members {
-            members.insert(m.name.clone(), m.clone());
-        }
-    }
     let draft = Draft {
         plan,
-        members,
         skipped,
         parallel: config.rolling.parallel.max(1),
         ready_timeout_seconds: config.rolling.ready_timeout_seconds,
+        cluster: None,
+        nodes: None,
+        tree: None,
     };
 
     let mut commands = super::act::drop_confirm(model);
-    let kube = draft.plan.groups.iter().any(Group::kubernetes);
-    if kube && config.rolling.kubernetes_unavailable.is_none() {
-        // One look at the cluster for every Kubernetes group: they share the kubeconfig.
-        let id = model.fresh_id();
-        model.ask(Confirm::CheckingCluster {
-            id,
-            draft: Box::new(draft),
-        });
-        commands.push(
-            Command::request_from_shell(KubeRequest {
-                id,
-                log: None,
-                op: KubeOp::Nodes,
-            })
-            .then_send(move |answer| Event::KubeAnswered { id, answer }),
-        );
-        commands.push(render());
-        return Command::all(commands);
-    }
-    let planned = draft.finish(None, config.rolling.kubernetes_unavailable.as_deref());
-    commands.push(open_question(model, planned));
+    let cluster = draft.plan.groups.iter().any(Group::uses_cluster)
+        && config.rolling.kubernetes_unavailable.is_none();
+    // Which cluster, then its nodes, then the repository: each look is its own request, and the
+    // question opens when the last is in.
+    commands.push(ask_stage(
+        model,
+        draft,
+        if cluster { Stage::Context } else { Stage::Tree },
+    ));
     Command::all(commands)
+}
+
+/// Opens the checking dialog for `stage` and asks the shell for what it needs.
+fn ask_stage(model: &mut Model, draft: Draft, stage: Stage) -> Command<Effect, Event> {
+    let id = model.fresh_id();
+    let context = draft.context();
+    let (flake, timeout_seconds) = model.config.as_ref().map_or_else(
+        || (String::new(), 0),
+        |c| (c.flake.clone(), c.preflight_timeout_seconds),
+    );
+    model.ask(Confirm::CheckingCluster {
+        id,
+        draft: Box::new(draft),
+        stage,
+    });
+    let asked = match stage {
+        Stage::Context | Stage::Nodes => Command::request_from_shell(KubeRequest {
+            id,
+            log: None,
+            context,
+            op: if stage == Stage::Context {
+                KubeOp::Context
+            } else {
+                KubeOp::Nodes
+            },
+        })
+        .then_send(move |answer| Event::KubeAnswered { id, answer }),
+        Stage::Tree => Command::request_from_shell(TreeRequest {
+            id,
+            flake,
+            timeout_seconds,
+        })
+        .then_send(move |answer| Event::TreeChecked { id, answer }),
+    };
+    Command::all([asked, render()])
 }
 
 /// Opens the question, or says there is nothing to roll.
@@ -516,33 +667,147 @@ fn open_question(model: &mut Model, planned: Planned) -> Command<Effect, Event> 
     render()
 }
 
-/// The cluster's answer, for the plan: from [`Confirm::CheckingCluster`].
-fn cluster_answered(
+/// What a look at the world answered, for [`stage_answered`].
+enum Found<'a> {
+    Kube(&'a KubeAnswer),
+    Tree(&'a Result<TreeState, String>),
+}
+
+/// An answer to the plan's own questions. `None`: it is not the one the dialog waits for.
+fn stage_answered(
     model: &mut Model,
     id: RequestId,
-    answer: &KubeAnswer,
+    found: &Found<'_>,
 ) -> Option<Command<Effect, Event>> {
-    let Some(Confirm::CheckingCluster { id: waiting, .. }) = &model.confirm else {
+    let Some(Confirm::CheckingCluster {
+        id: waiting, stage, ..
+    }) = &model.confirm
+    else {
         return None;
     };
     if *waiting != id {
         return None;
     }
-    let Some(Confirm::CheckingCluster { draft, .. }) = model.confirm.take() else {
+    let stage = *stage;
+    let Some(Confirm::CheckingCluster { mut draft, .. }) = model.confirm.take() else {
         return None;
     };
     let unavailable = model
         .config
         .as_ref()
         .and_then(|c| c.rolling.kubernetes_unavailable.clone());
-    let nodes = match answer {
-        Ok(KubeReply::Nodes(nodes)) => Ok(nodes.clone()),
-        Ok(KubeReply::Cancelled) => Err("the request was cancelled".to_owned()),
-        Ok(KubeReply::Done) => Err("the shell answered a node list with nothing".to_owned()),
-        Err(why) => Err(why.clone()),
+    match (stage, found) {
+        (Stage::Context, Found::Kube(answer)) => {
+            let cluster = match answer {
+                Ok(KubeReply::Cluster(c)) => Ok(c.clone()),
+                Ok(_) => Err(
+                    "the shell answered the question which cluster with something else".to_owned(),
+                ),
+                Err(why) => Err(why.clone()),
+            };
+            let next = if cluster.is_ok() {
+                Stage::Nodes
+            } else {
+                Stage::Tree
+            };
+            draft.cluster = Some(cluster);
+            Some(ask_stage(model, *draft, next))
+        }
+        (Stage::Nodes, Found::Kube(answer)) => {
+            draft.nodes = Some(match answer {
+                Ok(KubeReply::Nodes(nodes)) => Ok(nodes.clone()),
+                Ok(KubeReply::Cancelled) => Err("the request was cancelled".to_owned()),
+                Ok(_) => Err("the shell answered a node list with something else".to_owned()),
+                Err(why) => Err(why.clone()),
+            });
+            Some(ask_stage(model, *draft, Stage::Tree))
+        }
+        (Stage::Tree, Found::Tree(tree)) => {
+            draft.tree = Some((*tree).clone());
+            let planned = draft.finish(unavailable.as_deref());
+            Some(open_question(model, planned))
+        }
+        // The shell answered something that was not asked at this stage: leave the dialog as
+        // it was (it is cancelled by any key).
+        _ => None,
+    }
+}
+
+/// The fleet repository's answer, for the plan.
+pub(super) fn tree_checked(
+    model: &mut Model,
+    id: RequestId,
+    answer: &Result<TreeState, String>,
+) -> Option<Command<Effect, Event>> {
+    stage_answered(model, id, &Found::Tree(answer))
+}
+
+// ---------------------------------------------------------------------------------------
+// The lock
+// ---------------------------------------------------------------------------------------
+
+/// What is waiting for the fleet's update lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LockWait {
+    /// A `u` of this machine, confirmed.
+    Update { id: RequestId, machine: String },
+    /// A `U`, confirmed.
+    Roll {
+        id: RequestId,
+        planned: Box<Planned>,
+    },
+}
+
+impl LockWait {
+    const fn id(&self) -> RequestId {
+        match self {
+            Self::Update { id, .. } | Self::Roll { id, .. } => *id,
+        }
+    }
+}
+
+fn lock_command(id: RequestId, what: String) -> Command<Effect, Event> {
+    Command::request_from_shell(FleetLockRequest { id, what })
+        .then_send(move |answer| Event::FleetLockAnswered { id, answer })
+}
+
+/// A `u` has passed every rule and the last look at the freeze file: take the fleet's lock, then
+/// launch.
+pub(super) fn lock_for_update(model: &mut Model, machine: String) -> Command<Effect, Event> {
+    let id = model.fresh_id();
+    let what = format!("update {machine}");
+    model.lock_wait = Some(LockWait::Update { id, machine });
+    Command::all([lock_command(id, what), render()])
+}
+
+/// The shell's answer about the lock.
+pub(super) fn lock_answered(
+    model: &mut Model,
+    id: RequestId,
+    answer: &Result<(), String>,
+) -> Command<Effect, Event> {
+    let Some(wait) = model.lock_wait.take_if(|w| w.id() == id) else {
+        return Command::done();
     };
-    let planned = draft.finish(Some(&nodes), unavailable.as_deref());
-    Some(open_question(model, planned))
+    if let Err(why) = answer {
+        return model.notice(format!("not updating: {why}"));
+    }
+    let unlock =
+        || -> Command<Effect, Event> { Command::notify_shell(FleetUnlockRequest { id }).into() };
+    // Quit while the lock was being taken: nothing is started on the way out.
+    if model.view.quit || !model.act {
+        return Command::all([unlock(), render()]);
+    }
+    match wait {
+        LockWait::Update { machine, .. } => {
+            // The world may have moved while the lock was taken: decided again.
+            if let Err(why) = check(model, ActionKind::Update, &machine) {
+                return Command::all([unlock(), model.notice(why)]);
+            }
+            super::act::launch_locked(model, machine, id)
+        }
+        LockWait::Roll { planned, .. } => start(model, &planned, id),
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -557,13 +822,15 @@ fn say(run: RequestId, text: impl Into<String>) -> Command<Effect, Event> {
     log(run, LogOp::Line { text: text.into() })
 }
 
-/// The operator confirmed the plan: the roll starts. The world may have moved while the question
-/// was open, so the guards are decided again; each machine is decided again at its turn anyway.
+/// The operator confirmed the plan: the fleet's lock is taken, and then the roll starts. The
+/// world may have moved while the question was open, so the guards are decided again; each
+/// machine is decided again at its turn anyway.
 pub(super) fn confirmed(model: &mut Model, planned: &Planned) -> Command<Effect, Event> {
     if !model.act {
         return model.notice(ACT_MODE_OFF);
     }
     if model.roll_active()
+        || model.lock_wait.is_some()
         || model
             .action
             .as_ref()
@@ -575,10 +842,30 @@ pub(super) fn confirmed(model: &mut Model, planned: &Planned) -> Command<Effect,
         return model
             .notice("still checking which machines are frozen before an update; ask again");
     }
+    let id = model.fresh_id();
+    model.lock_wait = Some(LockWait::Roll {
+        id,
+        planned: Box::new(planned.clone()),
+    });
+    Command::all([lock_command(id, "update all".to_owned()), render()])
+}
+
+/// The lock is held: the roll starts.
+fn start(model: &mut Model, planned: &Planned, lock: RequestId) -> Command<Effect, Event> {
     let run = model.fresh_id();
     let mut entries = BTreeMap::new();
     let mut order = Vec::new();
     let mut groups = Vec::new();
+    let entry = |member: Member, group: Option<usize>| Entry {
+        member,
+        group,
+        log: None,
+        step: Step::Queued,
+        path: None,
+        baseline: Vec::new(),
+        cordoned: false,
+        drained: false,
+    };
     for (index, planned_group) in planned.groups.iter().enumerate() {
         let group = &planned_group.group;
         groups.push(GroupRun {
@@ -586,38 +873,25 @@ pub(super) fn confirmed(model: &mut Model, planned: &Planned) -> Command<Effect,
             queue: group.members.iter().map(|m| m.name.clone()).collect(),
             busy: None,
             stopped: false,
+            cluster: group.uses_cluster(),
         });
         for m in &group.members {
             order.push(m.name.clone());
-            entries.insert(
-                m.name.clone(),
-                Entry {
-                    member: m.clone(),
-                    group: Some(index),
-                    log: None,
-                    step: Step::Queued,
-                    path: None,
-                    cordoned: false,
-                },
-            );
+            entries.insert(m.name.clone(), entry(m.clone(), Some(index)));
         }
     }
     for name in &planned.free {
         order.push(name.clone());
         entries.insert(
             name.clone(),
-            Entry {
-                member: Member {
+            entry(
+                Member {
                     name: name.clone(),
                     kubernetes: false,
                     drain: None,
                 },
-                group: None,
-                log: None,
-                step: Step::Queued,
-                path: None,
-                cordoned: false,
-            },
+                None,
+            ),
         );
     }
     let mut roll = Roll {
@@ -629,6 +903,10 @@ pub(super) fn confirmed(model: &mut Model, planned: &Planned) -> Command<Effect,
         free: planned.free.iter().cloned().collect(),
         parallel: planned.parallel,
         ready_timeout_seconds: planned.ready_timeout_seconds,
+        context: planned.cluster.as_ref().map(|c| c.context.clone()),
+        tree_warnings: planned.tree_warnings.clone(),
+        lock,
+        left_cordoned: Vec::new(),
         ids: BTreeMap::new(),
     };
     let mut out = vec![log(
@@ -654,6 +932,10 @@ fn advance(model: &mut Model, roll: &mut Roll, out: &mut Vec<Command<Effect, Eve
         if roll.status == Status::Running {
             for g in 0..roll.groups.len() {
                 if roll.groups[g].stopped || roll.groups[g].busy.is_some() {
+                    continue;
+                }
+                // The groups that use the cluster share it: one machine of all of them at a time.
+                if roll.groups[g].cluster && roll.cluster_busy() {
                     continue;
                 }
                 if let Some(next) = roll.groups[g].queue.pop_front() {
@@ -683,16 +965,22 @@ fn finish(model: &mut Model, roll: &mut Roll, out: &mut Vec<Command<Effect, Even
     let quit = matches!(roll.status, Status::Stopping { quit: true });
     roll.status = Status::Ended;
     let totals = roll.counts();
+    let mut text = format!("update all over: {totals}");
+    if !roll.left_cordoned.is_empty() {
+        let _ = write!(text, "; LEFT CORDONED: {}", roll.left_cordoned.join(", "));
+    }
     out.push(log(
         roll.log,
         LogOp::End {
-            text: format!("update all over: {totals}"),
+            text: text.clone(),
+            result: EndResult::Done,
         },
     ));
+    out.push(Command::notify_shell(FleetUnlockRequest { id: roll.lock }).into());
     if quit {
         model.view.quit = true;
     } else {
-        model.view.notice = Some(format!("update of all machines over: {totals}"));
+        model.view.notice = Some(text);
     }
 }
 
@@ -717,7 +1005,7 @@ fn begin(model: &mut Model, roll: &mut Roll, name: &str, out: &mut Vec<Command<E
     let shown = match shown {
         Ok(s) => s,
         Err(why) => {
-            end_member(model, roll, name, Outcome::Refused(why), out);
+            end_member(model, roll, name, Outcome::Refused(why), false, out);
             return;
         }
     };
@@ -763,7 +1051,7 @@ pub(super) fn preflight_answered(
         // The world may have moved while the shell looked: decided again, as `u` does at its `y`.
         let now = match check(model, ActionKind::Update, &name) {
             Ok(now) => now,
-            Err(why) => return end_member(model, roll, &name, Outcome::Refused(why), out),
+            Err(why) => return end_member(model, roll, &name, Outcome::Refused(why), false, out),
         };
         if asked.as_deref() != Some(now.path.as_str()) {
             return end_member(
@@ -773,6 +1061,7 @@ pub(super) fn preflight_answered(
                 Outcome::Refused(
                     "its pending system changed while it was being checked".to_owned(),
                 ),
+                false,
                 out,
             );
         }
@@ -783,6 +1072,7 @@ pub(super) fn preflight_answered(
                 roll,
                 &name,
                 Outcome::Refused(review.refusals.join("; ")),
+                false,
                 out,
             );
         }
@@ -792,18 +1082,158 @@ pub(super) fn preflight_answered(
                 roll,
                 &name,
                 Outcome::Refused("its name has to be typed to update it: use u on it".to_owned()),
+                false,
                 out,
             );
         }
-        for w in &review.warnings {
+        // The warnings about the fleet repository were shown in the plan the operator confirmed.
+        // One that is not among them is news: someone changed the tree (or its upstream) since,
+        // and `clan` deploys the tree as it is now. That machine is not updated on it.
+        let tree =
+            auspex_domain::preflight::tree_warnings(answer.tree.as_ref().map_err(String::as_str));
+        if let Some(new) = tree.iter().find(|w| !roll.tree_warnings.contains(w)) {
+            return end_member(
+                model,
+                roll,
+                &name,
+                Outcome::Refused(format!(
+                    "the fleet repository is not as the confirmed plan found it: {new}"
+                )),
+                false,
+                out,
+            );
+        }
+        for w in review.warnings.iter().filter(|w| !tree.contains(w)) {
             out.push(say(run, format!("warning: {w}")));
         }
-        let drain = roll.entries.get(&name).and_then(|e| e.member.drain);
-        match drain {
-            Some(timeout_seconds) => start_drain(model, roll, &name, timeout_seconds, out),
-            None => start_update(model, roll, &name, out),
+        start_baseline(model, roll, &name, out);
+    })
+}
+
+/// A fresh probe, before anything is done to the machine: which units are already failed.
+fn start_baseline(
+    model: &mut Model,
+    roll: &mut Roll,
+    name: &str,
+    out: &mut Vec<Command<Effect, Event>>,
+) {
+    let machine = model.rows.iter().find(|r| r.machine.name == name);
+    let target = machine
+        .and_then(|r| r.target.as_ref().ok())
+        .map(|t| t.target.clone());
+    let class = machine.map(|r| r.machine.class);
+    let (Some(target), Some(class)) = (target, class) else {
+        return end_member(
+            model,
+            roll,
+            name,
+            Outcome::Refused("it has no usable ssh target".to_owned()),
+            false,
+            out,
+        );
+    };
+    let id = model.fresh_id();
+    let generation = model.generation;
+    roll.ids.insert(id, name.to_owned());
+    if let Some(e) = roll.entries.get_mut(name) {
+        e.step = Step::Baseline;
+    }
+    out.push(
+        Command::request_from_shell(ProbeRequest {
+            id,
+            generation,
+            machine: name.to_owned(),
+            class,
+            target,
+        })
+        .then_send(move |outcome| Event::ProbeAnswered {
+            generation,
+            id,
+            outcome,
+        }),
+    );
+}
+
+/// The baseline probe of a machine of the roll is in. `None`: `id` is not the roll's.
+pub(super) fn probed(
+    model: &mut Model,
+    id: RequestId,
+    outcome: &auspex_domain::observe::ProbeOutcome,
+) -> Option<Command<Effect, Event>> {
+    with_roll(model, id, |model, roll, name, out| {
+        if roll.entries.get(&name).map(|e| &e.step) != Some(&Step::Baseline) || roll.stopping() {
+            return;
+        }
+        let run = roll.entries.get(&name).and_then(|e| e.log);
+        // A machine that does not answer now is not one to start on: its health afterwards could
+        // not be told from its health before.
+        if !matches!(outcome, auspex_domain::observe::ProbeOutcome::Observed(_)) {
+            let why = match outcome {
+                auspex_domain::observe::ProbeOutcome::Unreachable { reason }
+                | auspex_domain::observe::ProbeOutcome::Failed { reason } => reason.clone(),
+                auspex_domain::observe::ProbeOutcome::Observed(_) => String::new(),
+            };
+            return end_member(
+                model,
+                roll,
+                &name,
+                Outcome::Refused(format!("it does not answer a probe at its turn: {why}")),
+                false,
+                out,
+            );
+        }
+        let baseline = roll::failed_units(outcome).unwrap_or_default();
+        if let (Some(run), false) = (run, baseline.is_empty()) {
+            out.push(say(
+                run,
+                format!("already failed before the update: {}", baseline.join(", ")),
+            ));
+        }
+        if let Some(e) = roll.entries.get_mut(&name) {
+            e.baseline = baseline;
+        }
+        if roll
+            .entries
+            .get(&name)
+            .is_some_and(|e| e.member.uses_cluster())
+        {
+            start_reading(model, roll, &name, out);
+        } else {
+            proceed(model, roll, &name, out);
         }
     })
+}
+
+/// The cluster's nodes, read again right before this machine's node may go out of service.
+fn start_reading(
+    model: &mut Model,
+    roll: &mut Roll,
+    name: &str,
+    out: &mut Vec<Command<Effect, Event>>,
+) {
+    let id = model.fresh_id();
+    roll.ids.insert(id, name.to_owned());
+    let run = roll.entries.get(name).and_then(|e| e.log);
+    if let Some(e) = roll.entries.get_mut(name) {
+        e.step = Step::Reading;
+    }
+    out.push(
+        Command::request_from_shell(KubeRequest {
+            id,
+            log: run,
+            context: roll.context.clone(),
+            op: KubeOp::Nodes,
+        })
+        .then_send(move |answer| Event::KubeAnswered { id, answer }),
+    );
+}
+
+/// The drain, or the update itself.
+fn proceed(model: &mut Model, roll: &mut Roll, name: &str, out: &mut Vec<Command<Effect, Event>>) {
+    match roll.entries.get(name).and_then(|e| e.member.drain) {
+        Some(timeout_seconds) => start_drain(model, roll, name, timeout_seconds, out),
+        None => start_update(model, roll, name, out),
+    }
 }
 
 fn start_drain(
@@ -815,12 +1245,14 @@ fn start_drain(
 ) {
     let id = model.fresh_id();
     roll.ids.insert(id, name.to_owned());
+    let context = roll.context.clone();
     let Some(entry) = roll.entries.get_mut(name) else {
         return;
     };
     // `kubectl drain` cordons first and leaves the node cordoned if it fails: from here on the
-    // node is ours to uncordon, however this ends.
+    // node is ours (it was schedulable a moment ago: the cluster was just read).
     entry.cordoned = true;
+    entry.drained = true;
     entry.step = Step::Draining { cancelling: false };
     let run = entry.log;
     if let Some(run) = run {
@@ -833,6 +1265,7 @@ fn start_drain(
         Command::request_from_shell(KubeRequest {
             id,
             log: run,
+            context,
             op: KubeOp::Drain {
                 node: name.to_owned(),
                 timeout_seconds,
@@ -852,7 +1285,7 @@ fn start_update(
     let log = roll.entries.get(name).and_then(|e| e.log);
     let request = match super::act::action_request(model, ActionKind::Update, name, id, log) {
         Ok(r) => r,
-        Err(why) => return end_member(model, roll, name, Outcome::Refused(why), out),
+        Err(why) => return end_member(model, roll, name, Outcome::Refused(why), false, out),
     };
     roll.ids.insert(id, name.to_owned());
     if let Some(e) = roll.entries.get_mut(name) {
@@ -893,25 +1326,27 @@ pub(super) fn action_ended(
                 out.extend(super::act::refresh_machine(model, &name));
                 start_wait(model, roll, &name, out);
             }
+            // Nothing was started, so a drained node is given back.
             ActionResult::Refused => {
                 let why = end.summary.last().cloned().unwrap_or_else(describe);
-                end_member(model, roll, &name, Outcome::Refused(why), out);
+                end_member(model, roll, &name, Outcome::Refused(why), false, out);
             }
+            // A failed deploy may have switched anyway: the row is refreshed, as for `u`, and a
+            // drained node stays cordoned.
             ActionResult::Failed | ActionResult::TimedOut => {
-                // A failed deploy may have switched anyway; the row is refreshed, as for `u`.
                 out.extend(super::act::refresh_machine(model, &name));
-                end_member(model, roll, &name, Outcome::Failed(describe()), out);
+                end_member(model, roll, &name, Outcome::Failed(describe()), true, out);
             }
             ActionResult::Cancelled => {
                 out.extend(super::act::refresh_machine(model, &name));
-                end_member(model, roll, &name, Outcome::Cancelled, out);
+                end_member(model, roll, &name, Outcome::Cancelled, true, out);
             }
         }
     })
 }
 
-/// The update is over: wait for the machine to run the new system, be healthy and (Kubernetes)
-/// have its node `Ready`.
+/// The update is over: wait for the machine to run the new system, have no new failed unit and
+/// (Kubernetes) have its node `Ready` with a heartbeat newer than the update.
 fn start_wait(
     model: &mut Model,
     roll: &mut Roll,
@@ -923,6 +1358,7 @@ fn start_wait(
     };
     let run = entry.log;
     let node = entry.member.kubernetes.then(|| name.to_owned());
+    let baseline = entry.baseline.clone();
     let expect = entry
         .path
         .as_deref()
@@ -938,11 +1374,13 @@ fn start_wait(
             roll,
             name,
             Outcome::Failed("updated, but there is nothing to check its health against".to_owned()),
+            true,
             out,
         );
     };
     let id = model.fresh_id();
     roll.ids.insert(id, name.to_owned());
+    let context = roll.context.clone();
     if let Some(e) = roll.entries.get_mut(name) {
         e.step = Step::Waiting;
     }
@@ -952,7 +1390,7 @@ fn start_wait(
             format!(
                 "updated; waiting for {name} to be healthy{} (up to {}s)",
                 if node.is_some() {
-                    " and its node Ready"
+                    " and its node Ready, with a heartbeat after the update"
                 } else {
                     ""
                 },
@@ -969,6 +1407,8 @@ fn start_wait(
             target,
             expect,
             node,
+            context,
+            baseline,
             timeout_seconds: roll.ready_timeout_seconds,
         })
         .then_send(move |answer| Event::AwaitAnswered { id, answer }),
@@ -985,21 +1425,32 @@ pub(super) fn awaited(
         if roll.entries.get(&name).map(|e| &e.step) != Some(&Step::Waiting) {
             return;
         }
-        let outcome = match answer {
-            Ok(()) => Outcome::Done,
-            Err(why) => Outcome::Failed(format!("not healthy after the update: {why}")),
-        };
-        end_member(model, roll, &name, outcome, out);
+        match answer {
+            Ok(()) => end_member(model, roll, &name, Outcome::Done, false, out),
+            // The machine took the update and is not well: its node is not put back in service.
+            Err(why) => end_member(
+                model,
+                roll,
+                &name,
+                Outcome::Failed(format!("not healthy after the update: {why}")),
+                true,
+                out,
+            ),
+        }
     })
 }
 
-/// A call to the cluster ended: the plan's look at it, or a drain or uncordon of the roll.
+/// A call to the cluster ended: the plan's looks at it, or a read, drain or uncordon of the roll.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one arm per step a call to the cluster can answer for; split, it stops reading as the machine's turn"
+)]
 pub(super) fn kube_answered(
     model: &mut Model,
     id: RequestId,
     answer: &KubeAnswer,
 ) -> Option<Command<Effect, Event>> {
-    if let Some(command) = cluster_answered(model, id, answer) {
+    if let Some(command) = stage_answered(model, id, &Found::Kube(answer)) {
         return Some(command);
     }
     with_roll(model, id, |model, roll, name, out| {
@@ -1007,6 +1458,54 @@ pub(super) fn kube_answered(
             return;
         };
         match step {
+            Step::Reading => {
+                if roll.stopping() {
+                    return;
+                }
+                let nodes = match answer {
+                    Ok(KubeReply::Nodes(nodes)) => nodes,
+                    Ok(_) => {
+                        return end_member(
+                            model,
+                            roll,
+                            &name,
+                            Outcome::Failed("the cluster could not be read before it".to_owned()),
+                            false,
+                            out,
+                        );
+                    }
+                    Err(why) => {
+                        return end_member(
+                            model,
+                            roll,
+                            &name,
+                            Outcome::Failed(format!(
+                                "the cluster could not be read before it: {why}"
+                            )),
+                            false,
+                            out,
+                        );
+                    }
+                };
+                let mut why = roll::cluster_unhealthy(nodes);
+                if !nodes.iter().any(|n| n.name == name) {
+                    why.push(format!("{name} is not a node of the cluster"));
+                }
+                if why.is_empty() {
+                    proceed(model, roll, &name, out);
+                } else {
+                    // A cluster that is already short of a node is not the moment to take
+                    // another out: not this machine's refusal but the group's stop.
+                    end_member(
+                        model,
+                        roll,
+                        &name,
+                        Outcome::Failed(format!("the cluster is not healthy: {}", why.join("; "))),
+                        false,
+                        out,
+                    );
+                }
+            }
             Step::Draining { cancelling } => match answer {
                 Ok(KubeReply::Done) if !cancelling && !roll.stopping() => {
                     if let Some(run) = roll.entries.get(&name).and_then(|e| e.log) {
@@ -1014,16 +1513,19 @@ pub(super) fn kube_answered(
                     }
                     start_update(model, roll, &name, out);
                 }
-                // A quit raced the drain's end: the node is drained and cordoned, nothing
-                // updates, and the node is given back.
+                // A quit raced the drain's end: the update has not started, so the node is given
+                // back.
                 Ok(KubeReply::Done | KubeReply::Cancelled) => {
-                    end_member(model, roll, &name, Outcome::Cancelled, out);
+                    end_member(model, roll, &name, Outcome::Cancelled, false, out);
                 }
-                Ok(KubeReply::Nodes(_)) => end_member(
+                Ok(_) => end_member(
                     model,
                     roll,
                     &name,
-                    Outcome::Failed("drain failed: kubectl answered with a node list".to_owned()),
+                    Outcome::Failed(
+                        "drain failed: kubectl answered with something else".to_owned(),
+                    ),
+                    false,
                     out,
                 ),
                 Err(why) => end_member(
@@ -1031,6 +1533,7 @@ pub(super) fn kube_answered(
                     roll,
                     &name,
                     Outcome::Failed(format!("drain failed: {why}")),
+                    false,
                     out,
                 ),
             },
@@ -1049,9 +1552,11 @@ pub(super) fn kube_answered(
                     Err(why) => why.clone(),
                     _ => "the request was cancelled".to_owned(),
                 };
+                let by_hand = format!("{} uncordon {name}", roll.kubectl_prefix());
+                roll.left_cordoned.push(name.clone());
                 let note = format!(
                     "node {name} may still be cordoned: could not uncordon it ({why}); uncordon \
-                     it by hand (kubectl uncordon {name})"
+                     it by hand ({by_hand})"
                 );
                 let outcome = match then {
                     Outcome::Done => Outcome::Failed(format!("updated, but {note}")),
@@ -1066,21 +1571,36 @@ pub(super) fn kube_answered(
     })
 }
 
-/// Ends machine `name` as `outcome`; a node auspex cordoned is uncordoned first.
+/// Ends machine `name` as `outcome`. A node auspex cordoned is uncordoned first, unless `keep`:
+/// the update or the wait failed, the machine may be broken, and it stays cordoned, said in the
+/// outcome with the command that gives it back.
 fn end_member(
     model: &mut Model,
     roll: &mut Roll,
     name: &str,
     outcome: Outcome,
+    keep: bool,
     out: &mut Vec<Command<Effect, Event>>,
 ) {
     let cordoned = roll.entries.get(name).is_some_and(|e| e.cordoned);
     if !cordoned {
         return finalize(roll, name, outcome, out);
     }
+    if keep {
+        let by_hand = format!("{} uncordon {name}", roll.kubectl_prefix());
+        let note = format!("node {name} is left cordoned (the machine may be broken): {by_hand}");
+        roll.left_cordoned.push(name.to_owned());
+        let outcome = match outcome {
+            Outcome::Failed(f) => Outcome::Failed(format!("{f}; {note}")),
+            Outcome::Cancelled => Outcome::Failed(format!("cancelled; {note}")),
+            other => other,
+        };
+        return finalize(roll, name, outcome, out);
+    }
     let id = model.fresh_id();
     roll.ids.insert(id, name.to_owned());
     let run = roll.entries.get(name).and_then(|e| e.log);
+    let context = roll.context.clone();
     if let Some(e) = roll.entries.get_mut(name) {
         e.step = Step::Uncordoning { then: outcome };
     }
@@ -1091,6 +1611,7 @@ fn end_member(
         Command::request_from_shell(KubeRequest {
             id,
             log: run,
+            context,
             op: KubeOp::Uncordon {
                 node: name.to_owned(),
             },
@@ -1105,17 +1626,25 @@ fn finalize(roll: &mut Roll, name: &str, outcome: Outcome, out: &mut Vec<Command
     let Some(entry) = roll.entries.get_mut(name) else {
         return;
     };
-    let line = outcome.line();
+    let mut line = outcome.line();
+    if entry.drained {
+        line.push_str(" [node drained first]");
+    }
+    let result = outcome.result();
     let stops_group = matches!(outcome, Outcome::Failed(_) | Outcome::Cancelled);
     entry.step = Step::Ended(outcome);
     let (group, run) = (entry.group, entry.log);
     roll.ids.retain(|_, n| n != name);
     out.push(say(roll.log, format!("{name}: {line}")));
     if let Some(run) = run {
-        out.push(log(run, LogOp::End { text: line }));
+        out.push(log(run, LogOp::End { text: line, result }));
     }
     let Some(g) = group else { return };
-    roll.groups[g].busy = None;
+    // Only the machine whose turn it is frees the group: another member may still be running
+    // (a quit ends the queued ones while one is being stopped).
+    if roll.groups[g].busy.as_deref() == Some(name) {
+        roll.groups[g].busy = None;
+    }
     if stops_group && !roll.groups[g].stopped {
         roll.groups[g].stopped = true;
         let rest: Vec<String> = roll.groups[g].queue.drain(..).collect();
@@ -1159,8 +1688,9 @@ pub(super) fn quit_question(roll: &Roll) -> String {
     };
     format!(
         "an update of all machines is running ({} of {} over; now: {doing}); quit and stop it? \
-         Nothing new starts, running updates are cancelled and a node auspex cordoned is \
-         uncordoned (an activation already under way on a machine may complete) y/N",
+         Nothing new starts and running updates are cancelled; a node drained but not yet \
+         updated is uncordoned, a node whose update was stopped stays cordoned and is named \
+         (an activation already under way on a machine may complete) y/N",
         roll.entries
             .values()
             .filter(|e| matches!(e.step, Step::Ended(_)))
@@ -1169,9 +1699,10 @@ pub(super) fn quit_question(roll: &Roll) -> String {
     )
 }
 
-/// Stops the roll: nothing new starts, running work is cancelled, and a node auspex cordoned is
-/// uncordoned before its machine ends. With `quit`, [`ViewModel::quit`](crate::ViewModel::quit)
-/// becomes true when the last machine has ended.
+/// Stops the roll: nothing new starts and running work is cancelled. A node drained but not yet
+/// updated is uncordoned before its machine ends; one whose update was under way stays cordoned,
+/// said in the log. With `quit`, [`ViewModel::quit`](crate::ViewModel::quit) becomes true when the
+/// last machine has ended.
 pub(super) fn stop(model: &mut Model, quit: bool) -> Vec<Command<Effect, Event>> {
     let Some(mut roll) = model.roll.take() else {
         return Vec::new();
@@ -1202,14 +1733,17 @@ pub(super) fn stop(model: &mut Model, quit: bool) -> Vec<Command<Effect, Event>>
                         &mut out,
                     );
                 }
-                // Only the checks and the wait are dropped by the shell without an answer:
-                // nothing is left to wait for, so the machine ends here.
-                Step::Checking | Step::Waiting => {
+                // These are dropped by the shell without an answer (or answered after the
+                // machine has ended, which is then ignored): nothing is left to wait for. Only
+                // the wait follows an update, so only there is a node already ours and the
+                // machine already changed: it stays cordoned.
+                Step::Checking | Step::Baseline | Step::Reading | Step::Waiting => {
                     for id in ids {
                         out.push(Command::notify_shell(CancelRequest { id }).into());
                         roll.ids.remove(&id);
                     }
-                    end_member(model, &mut roll, &name, Outcome::Cancelled, &mut out);
+                    let keep = step == Step::Waiting;
+                    end_member(model, &mut roll, &name, Outcome::Cancelled, keep, &mut out);
                 }
                 // These two answer a cancellation: the machine ends when they do.
                 Step::Draining { .. } => {
@@ -1235,7 +1769,8 @@ pub(super) fn stop(model: &mut Model, quit: bool) -> Vec<Command<Effect, Event>>
 }
 
 /// A second quit while the first is still stopping the roll: leave now, cancelling even the
-/// uncordons.
+/// uncordons. The shell then uncordons what is still registered as cordoned by auspex, within a
+/// bound, and says which nodes it could not.
 pub(super) fn force(model: &mut Model) -> Vec<Command<Effect, Event>> {
     let Some(roll) = model.roll.as_mut() else {
         return Vec::new();

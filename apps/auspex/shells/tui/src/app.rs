@@ -377,6 +377,10 @@ async fn headless(
     ExitCode::from(headless::exit_status(&view))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the whole interactive run, in the order it happens: setup, the loop, the way out"
+)]
 async fn tui(
     shell: &Arc<Shell>,
     config: Config,
@@ -395,6 +399,18 @@ async fn tui(
         }
     };
     enter_bracketed_paste();
+    // A panic must not leave a node cordoned either: the hook says so after the panic message, and
+    // uncordons what was cordoned for an update that had not started.
+    {
+        let cordons = shell.cordons();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            previous(info);
+            for line in cordons.last_resort(Duration::from_secs(10)) {
+                say(&line);
+            }
+        }));
+    }
     // Where `s` asks for the terminal; before the first key, so a request always has an answer.
     let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel();
     shell.set_handoff(handoff_tx);
@@ -487,13 +503,23 @@ async fn tui(
     // Cancel and reap first, then give the terminal back.
     // Stop whatever an action runs (its process group killed and reaped, its row logged
     // `cancelled`) and cancel the rest, then give the terminal back.
-    shell.terminate().await;
+    // A second signal ends the wait for the roll to stop, but not the uncordon after it.
+    shell
+        .terminate_with(async {
+            let _ = term.recv().await;
+        })
+        .await;
     leave_bracketed_paste();
     if !terminal_left {
         ratatui::restore();
     }
     if let Some(f) = failure {
         say(&f);
+    }
+    // Nodes auspex cordoned and could not give back, or left cordoned on purpose: after the terminal
+    // is back, where it is read, with the command for each.
+    for line in shell.exit_report() {
+        say(&line);
     }
     code
 }

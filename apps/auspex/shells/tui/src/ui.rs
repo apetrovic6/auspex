@@ -826,6 +826,15 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
                 .unwrap_or_else(|| end.summary.join(" | ")),
         );
     }
+    // Nodes auspex cordoned and did not give back: where it can not be missed, with the way out.
+    if let Some(r) = &view.roll
+        && !r.left_cordoned.is_empty()
+    {
+        errors.push(format!(
+            "LEFT CORDONED: {} (kubectl uncordon <node>; the Log tab has the command)",
+            r.left_cordoned.join(", ")
+        ));
+    }
     if let Some(w) = &ui.warning {
         errors.push(format!("⚠ {w}"));
     }

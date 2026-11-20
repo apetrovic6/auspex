@@ -6,10 +6,29 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use auspex_core::{ConfirmKind, Mode, RollState, RollStatus};
 use auspex_tui::keymap::Keymap;
+use auspex_tui::shell::Shell;
 use auspex_tui::ui::Ui;
-use common::{expect_file, render, render_with, settled_demo, type_keys_seen, until_asked};
+use common::{elapse, expect_file, frame, render, render_with, settled_demo, type_keys_seen};
+
+/// Waits (time is paused, so this is instant) until the plan is the open question: first the
+/// shell looks at the fleet repository (and the cluster, when a group uses one), then the question
+/// opens; then a frame draws it and the dwell passes, so a key counts for it.
+async fn until_plan(shell: &Arc<Shell>, ui: &mut Ui, km: &Keymap) {
+    while shell
+        .view()
+        .confirm
+        .as_ref()
+        .is_none_or(|c| c.kind != ConfirmKind::UpdateAll)
+    {
+        shell.changed().await;
+    }
+    frame(shell, ui, km);
+    elapse(auspex_tui::ui::QUESTION_DWELL);
+}
 
 #[tokio::test(start_paused = true)]
 async fn in_observe_mode_u_says_act_mode_is_off() {
@@ -30,7 +49,7 @@ async fn the_plan_at_120_and_40_columns() {
     type_keys_seen(&shell, &mut ui, &km, "Ay");
     assert_eq!(shell.view().mode, Mode::Act);
     type_keys_seen(&shell, &mut ui, &km, "U");
-    until_asked(&shell, &mut ui, &km).await;
+    until_plan(&shell, &mut ui, &km).await;
     let confirm = shell.view().confirm.expect("the plan");
     assert_eq!(confirm.kind, ConfirmKind::UpdateAll);
     assert_eq!(confirm.question, "update 2 machines as listed above? y/N");
@@ -64,7 +83,7 @@ async fn a_plan_that_does_not_fit_is_not_asked() {
     let km = Keymap::defaults();
     type_keys_seen(&shell, &mut ui, &km, "Ay");
     type_keys_seen(&shell, &mut ui, &km, "U");
-    until_asked(&shell, &mut ui, &km).await;
+    until_plan(&shell, &mut ui, &km).await;
     let view = shell.view();
     let mut small = Ui::default();
     let frame = render_with(&view, &mut small, &km, &[], shell.output(), 40, 12);
@@ -83,8 +102,12 @@ async fn the_status_bar_and_the_log_follow_a_roll() {
     let km = Keymap::defaults();
     type_keys_seen(&shell, &mut ui, &km, "Ay");
     type_keys_seen(&shell, &mut ui, &km, "U");
-    until_asked(&shell, &mut ui, &km).await;
+    until_plan(&shell, &mut ui, &km).await;
     type_keys_seen(&shell, &mut ui, &km, "y");
+    // The `y` takes the fleet's lock first (a task of the shell), and then the roll begins.
+    while shell.view().roll.is_none() {
+        shell.changed().await;
+    }
     // Running: the bar names who is doing what.
     let running = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 140, 30);
     let status = running.lines().last().unwrap();

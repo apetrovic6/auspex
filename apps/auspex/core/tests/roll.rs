@@ -10,14 +10,14 @@ mod support;
 use std::collections::BTreeSet;
 
 use auspex_core::effects::{
-    ActionEnd, ActionRequest, ActionResult, AwaitRequest, EvalAnswer, KubeOp, KubeReply,
+    ActionEnd, ActionRequest, ActionResult, AwaitRequest, EndResult, EvalAnswer, KubeOp, KubeReply,
     KubeRequest, LogOp, PreflightRequest,
 };
 use auspex_core::{
     Config, ConfirmKind, Event, FreezeConfig, Mode, Phase, RollState, RollStatus, RollingConfig,
     SavedFreezes,
 };
-use auspex_domain::roll::{Node, RollRule};
+use auspex_domain::roll::{ClusterId, Node, RollRule};
 use auspex_domain::status::Badge;
 use crux_core::Request;
 use support::{Shell, clean_preflight, evaluated, observed, path};
@@ -101,6 +101,14 @@ fn node(name: &str, ready: bool, cordoned: bool) -> Node {
         name: name.to_owned(),
         ready,
         cordoned,
+        heartbeat: None,
+    }
+}
+
+fn cluster() -> ClusterId {
+    ClusterId {
+        context: "rke2".to_owned(),
+        server: "https://10.0.0.1:6443".to_owned(),
     }
 }
 
@@ -119,9 +127,18 @@ fn take_kube(s: &mut Shell) -> Request<KubeRequest> {
     s.kubes.remove(0)
 }
 
+/// The plan asks which cluster this is, then for its nodes: answers both.
 fn answer_nodes(s: &mut Shell, nodes: Vec<Node>) {
     let mut k = take_kube(s);
+    assert_eq!(k.operation.op, KubeOp::Context);
+    assert_eq!(
+        k.operation.context, None,
+        "the question that names the context has none"
+    );
+    s.resolve(&mut k, Ok(KubeReply::Cluster(cluster())));
+    let mut k = take_kube(s);
     assert_eq!(k.operation.op, KubeOp::Nodes);
+    assert_eq!(k.operation.context.as_deref(), Some("rke2"));
     s.resolve(&mut k, Ok(KubeReply::Nodes(nodes)));
 }
 
@@ -202,10 +219,18 @@ fn start(s: &mut Shell, nodes: Vec<Node>) {
     assert!(s.view().roll.is_some());
 }
 
-/// Answers the checks of `machine` cleanly.
+/// Answers the checks of `machine` cleanly, then its baseline probe, then (a machine of the cluster)
+/// the read of the cluster that comes before it goes out of service.
 fn pass_checks(s: &mut Shell, machine: &str) {
     let mut p = take_preflight(s, machine);
     s.resolve(&mut p, clean_preflight());
+    s.probe(machine, observed(&old(machine), ""));
+    if CLUSTER.contains(&machine)
+        && let Some(i) = s.kubes.iter().position(|k| k.operation.op == KubeOp::Nodes)
+    {
+        let mut k = s.kubes.remove(i);
+        s.resolve(&mut k, Ok(KubeReply::Nodes(healthy_cluster())));
+    }
 }
 
 /// A whole machine, start to finish, with nothing special: checks, update, healthy.
@@ -257,13 +282,15 @@ fn the_plan_is_one_question_listing_the_order_the_parallelism_and_what_is_skippe
         q.lines,
         [
             "update 4 machines:",
+            "cluster: context rke2 (https://10.0.0.1:6443); every kubectl call is pinned to it",
             "rolling taghmata (one at a time; each node must be Ready before the next; drains \
              and uncordons luna (600s), mars (600s), sol (600s), terra (600s)): \
              luna → mars → sol → terra",
+            "at most 1 machine updating at once: one of the cluster's group",
             "skipped alfrost: marked public: its name has to be typed, so update it with u",
             "skipped cerberus: frozen",
             "each machine is checked at its turn: a refusal skips it, a failure stops its \
-             rolling group",
+             rolling group, and a new warning about the fleet repository refuses it",
         ]
     );
     assert_eq!(q.question, "update 4 machines as listed above? y/N");
@@ -281,13 +308,18 @@ fn free_machines_are_listed_with_their_parallel_limit() {
     answer_nodes(&mut s, healthy_cluster());
     let lines = s.view().confirm.unwrap().lines;
     assert_eq!(
-        lines[1],
+        lines[2],
         "rolling taghmata (one at a time; each node must be Ready before the next): \
          luna → mars → sol → terra"
     );
     assert_eq!(
-        lines[2],
+        lines[3],
         "in parallel, at most 2 at a time: alfrost, cerberus"
+    );
+    assert_eq!(
+        lines[4],
+        "at most 3 machines updating at once: one of the cluster's group + 2 of the machines in \
+         parallel"
     );
 }
 
@@ -628,7 +660,7 @@ fn an_uncordon_that_fails_is_a_failure_that_says_to_do_it_by_hand() {
                 "{why}"
             );
             assert!(
-                why.contains("uncordon it by hand (kubectl uncordon luna)"),
+                why.contains("uncordon it by hand (kubectl --context rke2 uncordon luna)"),
                 "{why}"
             );
         }
@@ -636,10 +668,11 @@ fn an_uncordon_that_fails_is_a_failure_that_says_to_do_it_by_hand() {
     }
 }
 
-/// A drained node is not left cordoned by a failed update either, nor by a machine that never
-/// becomes healthy.
+/// After a failed update or a machine that never became healthy the node **stays cordoned**: the
+/// machine may be broken, and workloads must not return to it unasked. It is said everywhere an
+/// operator looks, with the command that gives it back.
 #[test]
-fn a_drained_node_is_uncordoned_after_a_failed_update_and_after_a_failed_wait() {
+fn a_drained_node_stays_cordoned_after_a_failed_update_and_after_a_failed_wait_and_says_so() {
     for failing in ["update", "wait"] {
         let mut s = settled(config_with(draining(), 2));
         start(&mut s, healthy_cluster());
@@ -654,23 +687,41 @@ fn a_drained_node_is_uncordoned_after_a_failed_update_and_after_a_failed_wait() 
             let mut w = take_await(&mut s, "luna");
             s.resolve(&mut w, Err("systemd is degraded".to_owned()));
         }
-        let mut un = take_kube(&mut s);
-        assert_eq!(
-            un.operation.op,
-            KubeOp::Uncordon {
-                node: "luna".to_owned()
-            },
-            "{failing}"
-        );
-        s.resolve(&mut un, Ok(KubeReply::Done));
-        assert!(
-            matches!(state(&s, "luna"), RollState::Failed(_)),
-            "{failing}"
-        );
+        assert!(s.kubes.is_empty(), "{failing}: no uncordon is asked for");
+        let by_hand = "kubectl --context rke2 uncordon luna";
+        match state(&s, "luna") {
+            RollState::Failed(why) => assert!(
+                why.contains("node luna is left cordoned") && why.contains(by_hand),
+                "{failing}: {why}"
+            ),
+            other => panic!("{failing}: {other:?}"),
+        }
         assert!(
             matches!(state(&s, "mars"), RollState::Skipped(_)),
             "{failing}"
         );
+        assert_eq!(s.view().roll.unwrap().left_cordoned, ["luna"], "{failing}");
+        assert!(
+            log_lines(&s)
+                .iter()
+                .any(|l| l.starts_with("luna: failed:") && l.contains(by_hand)),
+            "{failing}: the roll's own run says it"
+        );
+        // The row of the action log is closed with the same words (the shell writes it from this).
+        let end = s.logs.iter().find_map(|l| match &l.op {
+            LogOp::End { text, result } if text.starts_with("failed:") => Some((text, *result)),
+            _ => None,
+        });
+        let (text, result) = end.expect("luna's run is closed");
+        assert!(
+            text.contains(by_hand) && text.ends_with("[node drained first]"),
+            "{text}"
+        );
+        assert_eq!(result, EndResult::Failed);
+        // Everything else of the roll ends, and the notice at the end names the node.
+        finish_machine(&mut s, "alfrost");
+        finish_machine(&mut s, "cerberus");
+        assert!(notice(&s).contains("LEFT CORDONED: luna"), "{}", notice(&s));
     }
 }
 
@@ -743,7 +794,8 @@ fn a_refusal_by_the_checks_skips_that_machine_and_the_roll_goes_on() {
     });
     start(&mut s, healthy_cluster());
     finish_machine(&mut s, "luna");
-    pass_checks(&mut s, "mars");
+    let mut p = take_preflight(&mut s, "mars");
+    s.resolve(&mut p, clean_preflight());
     match state(&s, "mars") {
         RollState::Refused(why) => assert!(why.contains("/nix/store has"), "{why}"),
         other => panic!("{other:?}"),
@@ -767,20 +819,26 @@ fn a_refusal_by_the_checks_skips_that_machine_and_the_roll_goes_on() {
     assert_eq!(state(&s, "terra"), RollState::Done);
 }
 
-/// Warnings of the checks do not stop a machine: they are written into its part of the log.
+/// A warning about the size of a closure or a disk that is not known belongs to one machine and
+/// cannot be in the plan: it is written into the machine's part of the log and does not stop it.
 #[test]
-fn a_warning_of_the_checks_is_logged_and_does_not_stop_the_machine() {
+fn a_warning_of_the_checks_about_the_machine_is_logged_and_does_not_stop_it() {
     let mut s = settled(config_with(k8s(), 2));
     start(&mut s, healthy_cluster());
     let mut p = take_preflight(&mut s, "luna");
     let mut answer = clean_preflight();
-    answer.tree = Err("not a git repository".to_owned());
+    answer.closure = Err("nix could not size it".to_owned());
     s.resolve(&mut p, answer);
-    let a = take_action(&mut s, "luna");
+    s.probe("luna", observed(&old("luna"), ""));
+    let a = {
+        let mut k = s.kubes.remove(0);
+        s.resolve(&mut k, Ok(KubeReply::Nodes(healthy_cluster())));
+        take_action(&mut s, "luna")
+    };
     assert!(
         log_lines(&s)
             .iter()
-            .any(|l| l.starts_with("warning: could not check the fleet repository")),
+            .any(|l| l.starts_with("warning: the size of the pending closure")),
         "{:?}",
         log_lines(&s)
     );
@@ -788,6 +846,72 @@ fn a_warning_of_the_checks_is_logged_and_does_not_stop_the_machine() {
         a.operation.log.is_some(),
         "the update writes into luna's run"
     );
+}
+
+/// The fleet repository's warnings are run once, before the question, and shown in the plan; the
+/// machines are then held to them: a warning that was not in the plan refuses the machine.
+#[test]
+fn the_plans_warnings_about_the_fleet_repository_are_shown_and_a_new_one_refuses_the_machine() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.tree_answer = Err("not a git repository".to_owned());
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    let lines = s.view().confirm.unwrap().lines;
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("warning: could not check the fleet repository")),
+        "{lines:?}"
+    );
+    s.send(Event::ConfirmAnswer(true));
+    // The same warning at luna's turn is the one that was confirmed: it goes on.
+    let mut p = take_preflight(&mut s, "luna");
+    let mut same = clean_preflight();
+    same.tree = Err("not a git repository".to_owned());
+    s.resolve(&mut p, same);
+    assert_eq!(state(&s, "luna"), RollState::Checking);
+    assert!(
+        s.probes.iter().any(|p| p.operation.machine == "luna"),
+        "its baseline is next"
+    );
+    // A different one at alfrost's turn (the tree is dirty now) is news.
+    let mut p = take_preflight(&mut s, "alfrost");
+    let mut dirty = clean_preflight();
+    dirty.tree = Err("a different failure".to_owned());
+    s.resolve(&mut p, dirty);
+    match state(&s, "alfrost") {
+        RollState::Refused(why) => {
+            assert!(why.contains("not as the confirmed plan found it"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A tree that was clean when the plan was confirmed and is dirty at a machine's turn: that machine
+/// is refused, and the roll goes on.
+#[test]
+fn a_tree_edited_after_the_y_refuses_the_machine_it_reaches() {
+    let mut s = settled(config_with(k8s(), 2));
+    start(&mut s, healthy_cluster());
+    let mut p = take_preflight(&mut s, "luna");
+    let mut dirty = clean_preflight();
+    dirty.tree = Ok(auspex_domain::preflight::TreeState {
+        changed_files: 3,
+        upstream: auspex_domain::preflight::Upstream::None,
+    });
+    s.resolve(&mut p, dirty);
+    match state(&s, "luna") {
+        RollState::Refused(why) => assert!(
+            why.contains("uncommitted changes to 3 tracked files"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        s.actions.iter().all(|a| a.operation.machine != "luna"),
+        "never updated"
+    );
+    assert!(preflights(&s).contains("mars"), "the group goes on");
 }
 
 /// The shell's own last look at the freeze file refuses: a refusal, not a failure.
@@ -1009,10 +1133,11 @@ fn the_log_has_the_plan_first_a_line_per_machine_and_a_run_for_each_machine() {
 // Quitting
 // ---------------------------------------------------------------------------------------
 
-/// `q` asks; on `y` nothing new starts, the running updates are cancelled, a node auspex
-/// cordoned is uncordoned, and quit comes only when every machine has ended.
+/// `q` asks; on `y` nothing new starts, the running updates are cancelled, and quit comes only when
+/// every machine has ended. A node whose update was under way stays cordoned (it is named); one
+/// drained and not yet updated is given back (the next test).
 #[test]
-fn quitting_asks_cancels_the_updates_never_starts_the_next_and_uncordons() {
+fn quitting_asks_cancels_the_updates_never_starts_the_next_and_names_the_cordon() {
     let mut s = settled(config_with(draining(), 1));
     start(&mut s, healthy_cluster());
     // luna: drained and updating. alfrost: updating. cerberus: queued behind alfrost.
@@ -1068,17 +1193,18 @@ fn quitting_asks_cancels_the_updates_never_starts_the_next_and_uncordons() {
     assert!(!s.view().quit, "luna is still stopping");
     let mut a = take_action(&mut s, "luna");
     s.resolve(&mut a, ended(ActionResult::Cancelled));
-    // luna's node was cordoned by auspex: it is given back before quitting.
-    let mut un = take_kube(&mut s);
-    assert_eq!(
-        un.operation.op,
-        KubeOp::Uncordon {
-            node: "luna".to_owned()
-        }
-    );
-    assert!(!s.view().quit, "the uncordon is not over");
-    s.resolve(&mut un, Ok(KubeReply::Done));
-    assert_eq!(state(&s, "luna"), RollState::Cancelled);
+    // luna's update was under way when it was stopped: it may be half done, so its node stays
+    // cordoned, and the operator is told with the command.
+    assert!(s.kubes.is_empty(), "no uncordon is asked for");
+    match state(&s, "luna") {
+        RollState::Failed(why) => assert!(
+            why.starts_with("cancelled; node luna is left cordoned")
+                && why.contains("kubectl --context rke2 uncordon luna"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.view().roll.as_ref().unwrap().left_cordoned, ["luna"]);
     assert!(s.view().quit, "now every machine has ended");
     assert_eq!(s.view().roll.unwrap().status, RollStatus::Ended);
     // Nothing was started on the way out.
@@ -1119,9 +1245,10 @@ fn quitting_during_a_drain_uncordons_after_the_drain_is_gone() {
 }
 
 /// A quit while a machine is being checked or waited for ends it at once (those requests are
-/// dropped by the shell, so nothing is left to wait for), uncordoning a drained node.
+/// dropped by the shell, so nothing is left to wait for). A machine that was updated and is being
+/// waited for keeps its cordon: nobody knows it is well.
 #[test]
-fn quitting_while_waiting_for_health_uncordons_and_quits() {
+fn quitting_while_waiting_for_health_keeps_the_cordon_and_quits() {
     let mut s = settled(config_with(draining(), 1));
     start(&mut s, healthy_cluster());
     pass_checks(&mut s, "luna");
@@ -1141,15 +1268,8 @@ fn quitting_while_waiting_for_health_uncordons_and_quits() {
     s.send(Event::Quit);
     s.send(Event::ConfirmAnswer(true));
     assert!(s.cancels.contains(&wait_id) && s.cancels.contains(&check_id));
-    assert!(!s.view().quit, "luna's node is still cordoned");
-    let mut un = take_kube(&mut s);
-    assert_eq!(
-        un.operation.op,
-        KubeOp::Uncordon {
-            node: "luna".to_owned()
-        }
-    );
-    s.resolve(&mut un, Ok(KubeReply::Done));
+    assert!(s.kubes.is_empty(), "no uncordon is asked for");
+    assert_eq!(s.view().roll.as_ref().unwrap().left_cordoned, ["luna"]);
     assert!(s.view().quit);
 }
 
@@ -1202,4 +1322,382 @@ fn quitting_while_the_cluster_is_being_read_cancels_that() {
     s.send(Event::Quit);
     assert!(s.cancels.contains(&id));
     assert!(s.view().quit);
+}
+
+// ---------------------------------------------------------------------------------------
+// Review round 1
+// ---------------------------------------------------------------------------------------
+
+/// A whole machine of a draining group: checks, baseline, the read of the cluster, the drain, the
+/// update, the wait, the uncordon.
+fn finish_drained(s: &mut Shell, machine: &str) {
+    pass_checks(s, machine);
+    let mut drain = take_kube(s);
+    s.resolve(&mut drain, Ok(KubeReply::Done));
+    let mut a = take_action(s, machine);
+    s.resolve(&mut a, ended(ActionResult::Succeeded));
+    let mut w = take_await(s, machine);
+    s.resolve(&mut w, Ok(()));
+    let mut un = take_kube(s);
+    s.resolve(&mut un, Ok(KubeReply::Done));
+}
+
+/// F3. The cluster is read again before every machine that uses it, not only for the plan: mars
+/// has gone `NotReady` (it was not in the roll, it had nothing pending) and someone cordoned sol.
+/// The next machine is not drained, the group stops, and a node auspex did not cordon is never
+/// uncordoned by it.
+#[test]
+fn a_cluster_that_got_sick_during_the_roll_stops_the_group_before_the_next_drain() {
+    let mut s = settled(config_with(draining(), 2));
+    start(&mut s, healthy_cluster());
+    finish_drained(&mut s, "luna");
+    // mars's turn: checks, baseline, and then the read, which now says the cluster is short.
+    let mut p = take_preflight(&mut s, "mars");
+    s.resolve(&mut p, clean_preflight());
+    s.probe("mars", observed(&old("mars"), ""));
+    let mut read = take_kube(&mut s);
+    assert_eq!(read.operation.op, KubeOp::Nodes);
+    assert_eq!(read.operation.context.as_deref(), Some("rke2"));
+    let sick = vec![
+        node("luna", true, false),
+        node("mars", true, false),
+        node("sol", true, true),
+        node("terra", false, false),
+    ];
+    s.resolve(&mut read, Ok(KubeReply::Nodes(sick)));
+    match state(&s, "mars") {
+        RollState::Failed(why) => assert_eq!(
+            why,
+            "the cluster is not healthy: node sol is cordoned; node terra is NotReady"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(state(&s, "sol"), RollState::Skipped(_)));
+    assert!(matches!(state(&s, "terra"), RollState::Skipped(_)));
+    assert!(
+        s.kubes.is_empty(),
+        "nothing is drained, and sol's cordon is not auspex's to lift"
+    );
+    assert!(s.actions.iter().all(|a| a.operation.machine != "mars"));
+    assert_eq!(s.view().roll.unwrap().left_cordoned.len(), 0);
+}
+
+/// F3. A cluster that cannot be read before a machine stops the group too: not knowing is not
+/// permission.
+#[test]
+fn a_cluster_that_cannot_be_read_before_a_machine_stops_the_group() {
+    let mut s = settled(config_with(draining(), 2));
+    start(&mut s, healthy_cluster());
+    pass_checks_without_read(&mut s, "luna");
+    let mut read = take_kube(&mut s);
+    s.resolve(&mut read, Err("Unable to connect to the server".to_owned()));
+    match state(&s, "luna") {
+        RollState::Failed(why) => assert!(
+            why.starts_with("the cluster could not be read before it: Unable to connect"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(state(&s, "mars"), RollState::Skipped(_)));
+    assert!(s.kubes.is_empty());
+}
+
+/// Checks and baseline, leaving the read of the cluster outstanding.
+fn pass_checks_without_read(s: &mut Shell, machine: &str) {
+    let mut p = take_preflight(s, machine);
+    s.resolve(&mut p, clean_preflight());
+    s.probe(machine, observed(&old(machine), ""));
+}
+
+/// F8. Every call after the plan names the context the plan showed: the reads, the drain, the
+/// uncordon and the wait.
+#[test]
+fn every_call_after_the_plan_is_pinned_to_the_context_the_plan_showed() {
+    let mut s = settled(config_with(draining(), 2));
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    let lines = s.view().confirm.unwrap().lines;
+    assert!(
+        lines[1].starts_with("cluster: context rke2 (https://10.0.0.1:6443)"),
+        "{lines:?}"
+    );
+    s.send(Event::ConfirmAnswer(true));
+    pass_checks_without_read(&mut s, "luna");
+    let mut contexts = Vec::new();
+    let mut read = take_kube(&mut s);
+    contexts.push(read.operation.context.clone());
+    s.resolve(&mut read, Ok(KubeReply::Nodes(healthy_cluster())));
+    let mut drain = take_kube(&mut s);
+    contexts.push(drain.operation.context.clone());
+    s.resolve(&mut drain, Ok(KubeReply::Done));
+    let mut a = take_action(&mut s, "luna");
+    s.resolve(&mut a, ended(ActionResult::Succeeded));
+    let mut w = take_await(&mut s, "luna");
+    contexts.push(w.operation.context.clone());
+    s.resolve(&mut w, Ok(()));
+    let un = take_kube(&mut s);
+    contexts.push(un.operation.context);
+    assert!(
+        contexts.iter().all(|c| c.as_deref() == Some("rke2")),
+        "{contexts:?}"
+    );
+}
+
+/// F6. The units that were failed when the machine's turn began are its baseline, handed to the
+/// wait: a unit that was already failed is not the update's failure. A machine that does not
+/// answer a probe at its turn is refused: its health afterwards could not be told from before.
+#[test]
+fn the_failed_units_at_the_turn_are_the_baseline_and_a_silent_machine_is_refused() {
+    let mut s = settled(config_with(k8s(), 2));
+    start(&mut s, healthy_cluster());
+    let mut checks = take_preflight(&mut s, "luna");
+    s.resolve(&mut checks, clean_preflight());
+    s.probe(
+        "luna",
+        support::observed_failed_unit(&old("luna"), "old.service"),
+    );
+    let mut read = take_kube(&mut s);
+    s.resolve(&mut read, Ok(KubeReply::Nodes(healthy_cluster())));
+    let mut update = take_action(&mut s, "luna");
+    s.resolve(&mut update, ended(ActionResult::Succeeded));
+    let wait = take_await(&mut s, "luna");
+    assert_eq!(wait.operation.baseline, ["old.service"]);
+    assert!(
+        log_lines(&s)
+            .iter()
+            .any(|l| l.contains("already failed before the update: old.service")),
+        "{:?}",
+        log_lines(&s)
+    );
+    // mars: the probe at its turn gets no answer.
+    drop(wait);
+    let mut checks = take_preflight(&mut s, "alfrost");
+    s.resolve(&mut checks, clean_preflight());
+    s.probe("alfrost", support::unreachable("no route to host"));
+    match state(&s, "alfrost") {
+        RollState::Refused(why) => assert_eq!(
+            why,
+            "it does not answer a probe at its turn: no route to host"
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// F4. The `y` takes the fleet's lock before anything starts, and a refusal (another auspex holds
+/// it) starts nothing and says so.
+#[test]
+fn the_y_takes_the_fleets_lock_and_a_refusal_starts_nothing() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.lock_answer =
+        Err("another auspex is updating this fleet (/fleet): pid 9: update all".to_owned());
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    s.send(Event::ConfirmAnswer(true));
+    assert_eq!(s.lock_requests.len(), 1);
+    assert_eq!(s.lock_requests[0].what, "update all");
+    assert_eq!(
+        notice(&s),
+        "not updating: another auspex is updating this fleet (/fleet): pid 9: update all"
+    );
+    assert!(s.view().roll.is_none());
+    assert!(s.preflights.is_empty() && s.kubes.is_empty() && s.actions.is_empty());
+    // Nothing is held by this one, so nothing is let go either.
+    assert_eq!(s.unlocks.len(), 0);
+    // And the keys work again: it can be asked again.
+    s.lock_answer = Ok(());
+    s.send(Event::UpdateAll);
+    assert!(s.view().confirm.is_some());
+}
+
+/// F4. The lock is held for the whole roll and let go when it is over.
+#[test]
+fn the_lock_is_held_for_the_whole_roll_and_let_go_when_it_ends() {
+    let mut s = settled(config_with(k8s(), 2));
+    start(&mut s, healthy_cluster());
+    let lock = s.lock_requests[0].id;
+    for m in CLUSTER {
+        finish_machine(&mut s, m);
+        assert!(s.unlocks.is_empty(), "{m}: still held");
+    }
+    finish_machine(&mut s, "alfrost");
+    finish_machine(&mut s, "cerberus");
+    assert_eq!(s.view().roll.unwrap().status, RollStatus::Ended);
+    assert_eq!(s.unlocks, [lock]);
+}
+
+/// F4. A quit while the lock is being taken starts nothing and lets it go.
+#[test]
+fn a_roll_stopped_before_it_started_lets_the_lock_go() {
+    let mut s = settled(config_with(k8s(), 2));
+    start(&mut s, healthy_cluster());
+    let lock = s.lock_requests[0].id;
+    s.send(Event::Quit);
+    s.send(Event::ConfirmAnswer(true));
+    // luna's checks and alfrost's are dropped, the rest skipped: all over at once.
+    assert!(s.view().quit);
+    assert_eq!(s.unlocks, [lock]);
+}
+
+/// F5. The repository is looked at before the question, and the question waits for it; any key
+/// cancels the look.
+#[test]
+fn the_plan_waits_for_the_look_at_the_repository_and_a_key_cancels_it() {
+    let mut s = settled(config_with(RollRule::default(), 2));
+    s.hold_tree = true;
+    s.send(Event::UpdateAll);
+    assert_eq!(s.view().confirm.unwrap().kind, ConfirmKind::CheckingCluster);
+    assert_eq!(s.trees.len(), 1);
+    let id = s.trees[0].operation.id;
+    s.send(Event::ConfirmAnswer(true));
+    assert!(
+        s.view().confirm.is_none(),
+        "a y is not a yes to a question nobody has seen"
+    );
+    assert!(s.cancels.contains(&id));
+    // The late answer is nobody\'s.
+    let mut late = s.trees.remove(0);
+    s.resolve(&mut late, clean_preflight().tree);
+    assert!(s.view().confirm.is_none());
+}
+
+/// F11. Two groups that both use the cluster share it: never a machine of each at once. The plan
+/// says what runs at once.
+#[test]
+fn groups_that_use_the_cluster_share_it_and_the_plan_says_what_runs_at_once() {
+    let fleet = r#"{
+      "alfrost": {"deploy": {"targetHost": "root@192.168.1.1"}},
+      "luna":    {"tags": ["a"], "deploy": {"targetHost": "root@192.168.1.11"}},
+      "mars":    {"tags": ["a"], "deploy": {"targetHost": "root@192.168.1.12"}},
+      "sol":     {"tags": ["b"], "deploy": {"targetHost": "root@192.168.1.13"}},
+      "terra":   {"tags": ["b"], "deploy": {"targetHost": "root@192.168.1.14"}}
+    }"#;
+    let mut config = config_with(k8s(), 2);
+    config.rolling.rules = [("a".to_owned(), k8s()), ("b".to_owned(), k8s())].into();
+    let mut s = Shell::new();
+    s.start_with(config, fleet);
+    let mut eval = s.take_eval();
+    let names = ["alfrost", "luna", "mars", "sol", "terra"];
+    for m in names {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    for m in names {
+        s.probe(m, observed(&old(m), ""));
+    }
+    s.send(Event::ToggleAct);
+    s.send(Event::ConfirmAnswer(true));
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    let lines = s.view().confirm.unwrap().lines;
+    assert!(
+        lines.contains(
+            &"at most 2 machines updating at once: one of the 2 cluster groups together (they \
+              share one cluster) + 1 of the machines in parallel"
+                .to_owned()
+        ),
+        "{lines:?}"
+    );
+    s.send(Event::ConfirmAnswer(true));
+    let busy = |s: &Shell| {
+        ["luna", "mars", "sol", "terra"]
+            .iter()
+            .filter(|m| {
+                !matches!(
+                    state(s, m),
+                    RollState::Queued
+                        | RollState::Done
+                        | RollState::Refused(_)
+                        | RollState::Failed(_)
+                        | RollState::Skipped(_)
+                        | RollState::Cancelled
+                )
+            })
+            .count()
+    };
+    let mut turns = 0;
+    while s
+        .view()
+        .roll
+        .as_ref()
+        .is_some_and(|r| r.status == RollStatus::Running)
+    {
+        assert!(
+            busy(&s) <= 1,
+            "two machines of the cluster at once: {:?}",
+            s.view().roll
+        );
+        if let Some(m) = s.awaits.first().map(|r| r.operation.machine.clone()) {
+            let mut w = take_await(&mut s, &m);
+            s.resolve(&mut w, Ok(()));
+        } else if let Some(m) = s.actions.first().map(|r| r.operation.machine.clone()) {
+            let mut a = take_action(&mut s, &m);
+            s.resolve(&mut a, ended(ActionResult::Succeeded));
+        } else if let Some(m) = s.preflights.first().map(|r| r.operation.machine.clone()) {
+            pass_checks(&mut s, &m);
+        } else {
+            panic!("stuck: {:?}", s.view().roll);
+        }
+        turns += 1;
+        assert!(turns < 100);
+    }
+    let roll = s.view().roll.unwrap();
+    assert!(
+        roll.machines.iter().all(|m| m.state == RollState::Done),
+        "{roll:?}"
+    );
+}
+
+/// M06. `U` is refused while a refresh is running (the list may be about to change).
+#[test]
+fn u_is_refused_while_a_refresh_is_running() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.send(Event::Refresh);
+    s.send(Event::UpdateAll);
+    assert_eq!(
+        notice(&s),
+        "a refresh is running; ask again when it has finished"
+    );
+    assert!(s.view().confirm.is_none() && s.kubes.is_empty());
+}
+
+/// M19. An uncordon that was cancelled did not uncordon: the machine is failed and says the node
+/// may still be cordoned, with the command.
+#[test]
+fn a_cancelled_uncordon_is_not_an_uncordon() {
+    let mut s = settled(config_with(draining(), 1));
+    start(&mut s, healthy_cluster());
+    pass_checks(&mut s, "luna");
+    let mut drain = take_kube(&mut s);
+    s.send(Event::Quit);
+    s.send(Event::ConfirmAnswer(true));
+    s.resolve(&mut drain, Ok(KubeReply::Cancelled));
+    let mut un = take_kube(&mut s);
+    s.resolve(&mut un, Ok(KubeReply::Cancelled));
+    match state(&s, "luna") {
+        RollState::Failed(why) => assert!(
+            why.contains(
+                "may still be cordoned: could not uncordon it (the request was cancelled)"
+            ) && why.contains("kubectl --context rke2 uncordon luna"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(s.view().roll.unwrap().left_cordoned, ["luna"]);
+}
+
+/// M06 (the other half). The list is in but the evaluation is still running: what is pending is
+/// not settled, so `U` waits too.
+#[test]
+fn u_is_refused_while_the_evaluation_is_still_running() {
+    let mut s = Shell::new();
+    s.start_with(config_with(k8s(), 2), FLEET);
+    // The list has loaded (the evaluator is out), and nothing has answered yet.
+    s.send(Event::ToggleAct);
+    s.send(Event::ConfirmAnswer(true));
+    s.send(Event::UpdateAll);
+    assert_eq!(
+        notice(&s),
+        "a refresh is running; ask again when it has finished"
+    );
+    assert!(s.view().confirm.is_none() && s.kubes.is_empty());
 }

@@ -199,6 +199,15 @@ let
       && rejected { kubernetes = 1; } && rejected { drain = "yes"; }
       && rejected { drain_timeout = 0; } && rejected { drain_timeout = 86401; }
       && rejected { drain_timeout = "ten"; };
+  # A rolling tag that says nothing is still a rolling tag: it reaches config.toml as an empty
+  # table, which auspex reads as the rule with its defaults.
+  emptyTag = (evaluate {
+    programs.auspex.settings.rolling = {
+      taghmata = { };
+      fabricator = { kubernetes = false; };
+      nulls = { kubernetes = null; drain = null; };
+    };
+  }).config.xdg.configFile."auspex/config.toml".source;
   withKubeconfig = kubeconfig: (evaluate {
     programs.auspex.settings.kubernetes = { inherit kubeconfig; };
   }).config;
@@ -268,6 +277,9 @@ in {
     && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeFlake pathFlake ]);
   auspex-diff-types = check "diff-types" diffEnabledOK;
   auspex-public-type = check "public-type" publicOK;
+  auspex-rolling-empty-tag = compareToml "rolling-empty-tag" emptyTag {
+    rolling = { taghmata = { }; fabricator = { kubernetes = false; }; nulls = { }; };
+  };
   auspex-kubeconfig-path = pkgs.linkFarm "auspex-kubeconfig-path" [
     {
       name = "tilde";

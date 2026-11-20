@@ -318,6 +318,22 @@ pub enum Event {
         /// What it answered.
         answer: AwaitAnswer,
     },
+    /// [`TreeRequest`](crate::effects::TreeRequest) answered: the state of the fleet repository, for the
+    /// plan of an update of all. Built by the core.
+    TreeChecked {
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: Result<auspex_domain::preflight::TreeState, String>,
+    },
+    /// [`FleetLockRequest`](crate::effects::FleetLockRequest) answered: the update lock is held, or
+    /// why not. Built by the core.
+    FleetLockAnswered {
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: Result<(), String>,
+    },
 
     // --- the freeze's answer (built by the core) ----------------------------------------
     /// [`SaveFreezeRequest`](crate::effects::SaveFreezeRequest) answered: the machines frozen
@@ -474,6 +490,8 @@ pub struct Model {
     /// `outstanding` either: a refresh must not cancel them (and a refresh is refused while it
     /// runs).
     roll: Option<roll::Roll>,
+    /// A `u` or a `U` that is waiting for the fleet's update lock (`app/roll.rs`).
+    lock_wait: Option<roll::LockWait>,
     /// The ssh session open now: the shell has the terminal until it answers. Not in
     /// `outstanding`: nothing may cancel it (see [`ShellRequest`](crate::effects::ShellRequest)).
     shell: Option<(RequestId, String)>,
@@ -676,7 +694,8 @@ impl App for Auspex {
                 outcome,
             } => match model.accept(generation, id, |p| matches!(p, Pending::Probe(_))) {
                 Some(Pending::Probe(name)) => probe_answered(model, &name, outcome),
-                _ => Command::done(),
+                // The baseline probe of a machine of an update of all is not in `outstanding`.
+                _ => roll::probed(model, id, &outcome).unwrap_or_else(Command::done),
             },
             Event::EvalAnswered {
                 generation,
@@ -738,6 +757,8 @@ impl App for Auspex {
             | Event::UpdateAll
             | Event::KubeAnswered { .. }
             | Event::AwaitAnswered { .. }
+            | Event::TreeChecked { .. }
+            | Event::FleetLockAnswered { .. }
             | Event::BuildSelected
             | Event::ShellSelected
             | Event::ConfirmAnswer(_)
@@ -1592,6 +1613,8 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::UpdateAll
         | Event::KubeAnswered { .. }
         | Event::AwaitAnswered { .. }
+        | Event::TreeChecked { .. }
+        | Event::FleetLockAnswered { .. }
         | Event::UpdateSelected
         | Event::BuildSelected
         | Event::ShellSelected

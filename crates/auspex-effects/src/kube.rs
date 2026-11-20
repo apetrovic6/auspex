@@ -38,7 +38,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use auspex_domain::fleet::is_plain_name;
-use auspex_domain::roll::{Node, parse_nodes};
+use auspex_domain::roll::{
+    ClusterId, Node, merge_leases, parse_cluster_id, parse_leases, parse_nodes,
+};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -62,6 +64,11 @@ pub struct KubeParams<'a> {
     pub kubectl: &'a OsStr,
     /// The kubeconfig, an absolute path.
     pub kubeconfig: &'a Path,
+    /// The kubeconfig context every call is pinned to (`--context=<name>`), resolved once for the
+    /// plan: without it each call follows the kubeconfig's *current* context at that moment, which
+    /// a `kubectl config use-context` in another terminal can change mid-roll. `None` only for the
+    /// call that asks which context that is ([`cluster_id`]).
+    pub context: Option<&'a str>,
     /// The budget of a short call (nodes, cordon, uncordon).
     pub timeout: Duration,
     /// [`DRAIN_GRACE`], a field so a test can shorten it.
@@ -75,6 +82,7 @@ impl<'a> KubeParams<'a> {
         Self {
             kubectl,
             kubeconfig,
+            context: None,
             timeout: Duration::from_secs(30),
             drain_grace: DRAIN_GRACE,
         }
@@ -87,10 +95,15 @@ impl<'a> KubeParams<'a> {
                 self.kubeconfig.display()
             ));
         }
-        Ok(vec![
+        let mut head = vec![
             OsString::from("--kubeconfig"),
             self.kubeconfig.as_os_str().to_owned(),
-        ])
+        ];
+        if let Some(context) = self.context {
+            // One argument, `--context=<name>`: a name that starts with `-` is still its value.
+            head.push(OsString::from(format!("--context={context}")));
+        }
+        Ok(head)
     }
 }
 
@@ -112,6 +125,30 @@ fn node_arg(node: &str) -> Result<OsString, String> {
 pub fn nodes_argv(params: &KubeParams<'_>) -> Result<Vec<OsString>, String> {
     let mut argv = params.head()?;
     argv.extend(["get", "nodes", "-o", "json"].map(OsString::from));
+    Ok(argv)
+}
+
+/// The argv (after the program) of the node leases: each kubelet renews its lease every ten
+/// seconds, which is the sign of life [`auspex_domain::roll::node_state`] waits for.
+///
+/// # Errors
+///
+/// The kubeconfig is not absolute.
+pub fn leases_argv(params: &KubeParams<'_>) -> Result<Vec<OsString>, String> {
+    let mut argv = params.head()?;
+    argv.extend(["get", "leases", "-n", "kube-node-lease", "-o", "json"].map(OsString::from));
+    Ok(argv)
+}
+
+/// The argv (after the program) of the question "which cluster is this": the kubeconfig's
+/// current context and its API server.
+///
+/// # Errors
+///
+/// The kubeconfig is not absolute.
+pub fn cluster_id_argv(params: &KubeParams<'_>) -> Result<Vec<OsString>, String> {
+    let mut argv = params.head()?;
+    argv.extend(["config", "view", "--minify", "-o", "json"].map(OsString::from));
     Ok(argv)
 }
 
@@ -186,7 +223,11 @@ async fn text(
     }
 }
 
-/// The cluster's nodes.
+/// The cluster's nodes, each with its newest heartbeat (the `Ready` condition's, or its lease's
+/// when that is later).
+///
+/// The leases are a second call, and a failure of it is not a failure of this one: the nodes
+/// are then without lease heartbeats, and a caller that waits for one says it is stale.
 ///
 /// # Errors
 ///
@@ -200,9 +241,39 @@ pub async fn nodes(
         Ok(a) => a,
         Err(why) => return Ok(Err(why)),
     };
-    Ok(text(params, argv, "kubectl get nodes", cancel)
+    let mut nodes = match text(params, argv, "kubectl get nodes", cancel).await? {
+        Ok(out) => match parse_nodes(&out) {
+            Ok(n) => n,
+            Err(why) => return Ok(Err(why)),
+        },
+        Err(why) => return Ok(Err(why)),
+    };
+    if let Ok(argv) = leases_argv(params)
+        && let Ok(out) = text(params, argv, "kubectl get leases", cancel).await?
+        && let Ok(leases) = parse_leases(&out)
+    {
+        merge_leases(&mut nodes, &leases);
+    }
+    Ok(Ok(nodes))
+}
+
+/// Which cluster `params`' kubeconfig is pointed at: its current context and API server.
+///
+/// # Errors
+///
+/// [`Cancelled`] as [`nodes`]; a kubectl that failed, or a kubeconfig with no current context, is
+/// the inner line.
+pub async fn cluster_id(
+    params: &KubeParams<'_>,
+    cancel: &CancellationToken,
+) -> Result<Result<ClusterId, String>, Cancelled> {
+    let argv = match cluster_id_argv(params) {
+        Ok(a) => a,
+        Err(why) => return Ok(Err(why)),
+    };
+    Ok(text(params, argv, "kubectl config view", cancel)
         .await?
-        .and_then(|out| parse_nodes(&out)))
+        .and_then(|out| parse_cluster_id(&out)))
 }
 
 /// Cordons (`cordon`) or uncordons `node`.
@@ -328,6 +399,61 @@ mod tests {
                 "600s"
             ]
         );
+    }
+
+    #[test]
+    fn every_call_after_the_plan_is_pinned_to_the_context_and_the_plan_asks_which_it_is() {
+        let mut p = params("/k/config");
+        assert_eq!(
+            strings(&cluster_id_argv(&p).unwrap()),
+            [
+                "--kubeconfig",
+                "/k/config",
+                "config",
+                "view",
+                "--minify",
+                "-o",
+                "json"
+            ]
+        );
+        assert_eq!(
+            strings(&leases_argv(&p).unwrap()),
+            [
+                "--kubeconfig",
+                "/k/config",
+                "get",
+                "leases",
+                "-n",
+                "kube-node-lease",
+                "-o",
+                "json"
+            ]
+        );
+        p.context = Some("rke2");
+        let pinned = "--context=rke2";
+        assert_eq!(
+            strings(&nodes_argv(&p).unwrap()),
+            [
+                "--kubeconfig",
+                "/k/config",
+                pinned,
+                "get",
+                "nodes",
+                "-o",
+                "json"
+            ]
+        );
+        assert_eq!(
+            strings(&cordon_argv(&p, "luna", false).unwrap()),
+            ["--kubeconfig", "/k/config", pinned, "uncordon", "luna"]
+        );
+        assert_eq!(
+            strings(&drain_argv(&p, "luna", 5).unwrap())[..3],
+            ["--kubeconfig", "/k/config", pinned]
+        );
+        // A context that looks like an option is still one argument, the flag's value.
+        p.context = Some("--all");
+        assert_eq!(strings(&nodes_argv(&p).unwrap())[2], "--context=--all");
     }
 
     #[test]

@@ -726,3 +726,32 @@ impl Demo {
         }
     }
 }
+
+impl Demo {
+    /// `Effect::Tree`: a clean, pushed tree (or what `preflight_answer` says), as for the checks.
+    pub(crate) async fn tree(
+        &self,
+        op: &auspex_core::effects::TreeRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Result<TreeState, String>, Cancelled> {
+        if self.real_preflight
+            && let Some(real) = &self.real_actions
+        {
+            return real.tree(op, cancel).await;
+        }
+        after(100, cancel).await?;
+        Ok(self.preflight_answer.clone().map_or_else(
+            || {
+                Ok(TreeState {
+                    changed_files: 0,
+                    upstream: Upstream::Tracking {
+                        name: "origin/main".to_owned(),
+                        ahead: 0,
+                        behind: 0,
+                    },
+                })
+            },
+            |a| a.tree,
+        ))
+    }
+}

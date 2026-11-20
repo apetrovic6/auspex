@@ -203,6 +203,12 @@ impl FreezeStore {
         Self { path, fleet }
     }
 
+    /// The fleet this store is for ([`fleet_key`]): the key the update lock is filed under too.
+    #[must_use]
+    pub fn fleet(&self) -> &str {
+        &self.fleet
+    }
+
     /// The state file.
     #[must_use]
     pub fn path(&self) -> &Path {

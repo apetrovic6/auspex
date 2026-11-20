@@ -580,6 +580,9 @@ pub struct KubeRequest {
     pub id: RequestId,
     /// The Log tab run the call's output (a drain's) is added to; see [`ActionRequest::log`].
     pub log: Option<RequestId>,
+    /// The kubeconfig context to pin the call to (`--context`), resolved once for the plan. `None`
+    /// only for the plan's own questions, before it is known.
+    pub context: Option<String>,
     /// What to do.
     pub op: KubeOp,
 }
@@ -587,6 +590,8 @@ pub struct KubeRequest {
 /// What a [`KubeRequest`] asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KubeOp {
+    /// `kubectl config view --minify -o json`: which cluster the kubeconfig points at.
+    Context,
     /// `kubectl get nodes -o json`.
     Nodes,
     /// `kubectl uncordon <node>`.
@@ -607,6 +612,8 @@ pub enum KubeOp {
 /// What a successful [`KubeRequest`] came back with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KubeReply {
+    /// The kubeconfig's current context and API server.
+    Cluster(auspex_domain::roll::ClusterId),
     /// The cluster's nodes.
     Nodes(Vec<auspex_domain::roll::Node>),
     /// The node was drained or uncordoned.
@@ -646,6 +653,11 @@ pub struct AwaitRequest {
     pub expect: StorePath,
     /// The Kubernetes node to wait for, when the machine's rolling group asks for it.
     pub node: Option<String>,
+    /// The kubeconfig context the node is read in (`--context`).
+    pub context: Option<String>,
+    /// The machine's failed units when its turn began: what was already wrong is not the update's
+    /// doing ([`auspex_domain::roll::healthy`]).
+    pub baseline: Vec<String>,
     /// How long to wait before giving up.
     pub timeout_seconds: u64,
 }
@@ -687,15 +699,80 @@ pub enum LogOp {
         /// The text; the shell sanitises it.
         text: String,
     },
-    /// Closes the run, with this under it.
+    /// Closes the run, with this under it. The result is how the machine ended, for the action
+    /// log row that was kept open for it (a drained machine has one before `clan` starts).
     End {
         /// The text.
         text: String,
+        /// How it ended.
+        result: EndResult,
     },
+}
+
+/// How a machine of an update of all ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndResult {
+    /// Updated, healthy, node given back.
+    Done,
+    /// Refused before anything was done to it.
+    Refused,
+    /// Started and failed.
+    Failed,
+    /// Not started.
+    Skipped,
+    /// Stopped by the operator.
+    Cancelled,
 }
 
 impl Operation for LogRequest {
     type Output = ();
+}
+
+/// Take the fleet's update lock: one auspex updates a fleet at a time.
+///
+/// An exclusive `flock` in the state directory, asked for at the `y` of a `u` and of a `U`; the
+/// answer is `Ok` or why not (and who holds it). Held until [`FleetUnlockRequest`], or until the
+/// process ends.
+///
+/// A run with no state directory (the demo, most tests) is granted at once: without one the
+/// freezes are unknown, so a real run could not update anything anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetLockRequest {
+    /// This request; it also names the lock for [`FleetUnlockRequest`].
+    pub id: RequestId,
+    /// What will be done with it, for the refusal another auspex gets ("update all").
+    pub what: String,
+}
+
+impl Operation for FleetLockRequest {
+    type Output = Result<(), String>;
+}
+
+/// Let go of the lock [`FleetLockRequest`] `id` took. Fire and forget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FleetUnlockRequest {
+    /// The lock request.
+    pub id: RequestId,
+}
+
+impl Operation for FleetUnlockRequest {
+    type Output = ();
+}
+
+/// Read the state of the fleet repository, once, for the plan of an update of all: the tree part
+/// of the checks of [`PreflightRequest`], without a closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The fleet flake, as configured.
+    pub flake: String,
+    /// `timeouts.diff`.
+    pub timeout_seconds: u64,
+}
+
+impl Operation for TreeRequest {
+    type Output = Result<TreeState, String>;
 }
 
 /// Stop request `id`: kill its process and drop its `Request`. Fire and forget.
@@ -754,4 +831,10 @@ pub enum Effect {
     Await(AwaitRequest),
     /// [`LogRequest`]: words for the Log tab.
     Log(LogRequest),
+    /// [`FleetLockRequest`]: take the update lock of the fleet.
+    FleetLock(FleetLockRequest),
+    /// [`FleetUnlockRequest`]: let it go.
+    FleetUnlock(FleetUnlockRequest),
+    /// [`TreeRequest`]: the state of the fleet repository, for the plan.
+    Tree(TreeRequest),
 }

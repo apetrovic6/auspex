@@ -276,6 +276,10 @@ pub struct RollView {
     /// Every machine of the plan, in the order the plan lists them (rolling groups first, each in
     /// its own order, then the free machines), with where it is.
     pub machines: Vec<RollMachineView>,
+    /// Nodes auspex cordoned and did not uncordon: a machine whose update or wait failed (the node
+    /// may be broken, so it is not put back in service) or a quit that left it. Each needs a
+    /// `kubectl uncordon`, which the log and the action log say.
+    pub left_cordoned: Vec<String>,
 }
 
 impl RollView {

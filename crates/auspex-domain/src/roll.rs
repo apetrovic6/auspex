@@ -78,6 +78,15 @@ pub struct Member {
     pub drain: Option<u64>,
 }
 
+impl Member {
+    /// The machine's node is asked about and put out of service by auspex: it waits for the node
+    /// (`kubernetes`) or drains it.
+    #[must_use]
+    pub const fn uses_cluster(&self) -> bool {
+        self.kubernetes || self.drain.is_some()
+    }
+}
+
 /// Machines that never update at the same time, in the order they update.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
@@ -92,6 +101,14 @@ impl Group {
     #[must_use]
     pub fn kubernetes(&self) -> bool {
         self.members.iter().any(|m| m.kubernetes)
+    }
+
+    /// A machine of the group is waited for or drained in the cluster, so the group is one of the
+    /// cluster's: at most one machine of all such groups is out of service at a time, because they
+    /// share one kubeconfig.
+    #[must_use]
+    pub fn uses_cluster(&self) -> bool {
+        self.members.iter().any(Member::uses_cluster)
     }
 
     /// The group as the operator reads it: `taghmata+fabricator`.
@@ -202,10 +219,14 @@ pub fn plan<'a>(candidates: &[Candidate<'a>], rules: &RollRules) -> Plan {
 pub struct Node {
     /// `metadata.name`, sanitised.
     pub name: String,
-    /// The `Ready` condition is `True`.
+    /// The `Ready` condition is `True` (not `False`, not `Unknown`, not absent).
     pub ready: bool,
     /// `spec.unschedulable`: cordoned.
     pub cordoned: bool,
+    /// The newest sign of life the cluster has from the node's kubelet, in seconds since the
+    /// epoch: the `Ready` condition's `lastHeartbeatTime`, or its lease's `renewTime` when that is
+    /// later ([`merge_leases`]). `None` when the cluster said neither.
+    pub heartbeat: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -240,11 +261,57 @@ struct RawCondition {
     #[serde(rename = "type")]
     kind: Option<String>,
     status: Option<String>,
+    #[serde(rename = "lastHeartbeatTime")]
+    heartbeat: Option<String>,
+}
+
+/// Seconds since the epoch of an RFC 3339 UTC time as Kubernetes writes it
+/// (`2026-11-20T15:04:05Z`, or with a fraction as a lease's `renewTime` has).
+///
+/// Only the `Z` form is read: a time with an offset is `None`, never a guess, and so is anything
+/// that is not a plausible date.
+#[must_use]
+pub fn parse_rfc3339(text: &str) -> Option<i64> {
+    let text = text.strip_suffix('Z')?;
+    let (date, time) = text.split_once('T')?;
+    let mut ymd = date.split('-');
+    let (year, month, day): (i64, i64, i64) = (
+        ymd.next()?.parse().ok()?,
+        ymd.next()?.parse().ok()?,
+        ymd.next()?.parse().ok()?,
+    );
+    if ymd.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let time = time.split('.').next()?;
+    let mut clock = time.split(':');
+    let (hour, minute, second): (i64, i64, i64) = (
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+        clock.next()?.parse().ok()?,
+    );
+    if clock.next().is_some()
+        || !(0..24).contains(&hour)
+        || !(0..60).contains(&minute)
+        || !(0..61).contains(&second)
+    {
+        return None;
+    }
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
 }
 
 /// Parses `kubectl get nodes -o json`.
 ///
-/// A node with no `Ready` condition is not ready: absence of a report is not health.
+/// A node with no `Ready` condition is not ready: absence of a report is not health. `Unknown`
+/// (what a node gets when its kubelet stops reporting) is not ready either.
 ///
 /// # Errors
 ///
@@ -264,28 +331,123 @@ pub fn parse_nodes(json: &str) -> Result<Vec<Node>, String> {
                 .map(|n| sanitize_line(&n))
                 .filter(|n| !n.is_empty())
                 .ok_or_else(|| "kubectl's node list has a node with no name".to_owned())?;
-            let ready = n.status.and_then(|s| s.conditions).is_some_and(|cs| {
-                cs.iter().any(|c| {
-                    c.kind.as_deref() == Some("Ready") && c.status.as_deref() == Some("True")
-                })
-            });
+            let conditions = n.status.and_then(|s| s.conditions).unwrap_or_default();
+            let ready_condition = conditions
+                .iter()
+                .find(|c| c.kind.as_deref() == Some("Ready"));
+            let ready = ready_condition.is_some_and(|c| c.status.as_deref() == Some("True"));
+            let heartbeat = ready_condition
+                .and_then(|c| c.heartbeat.as_deref())
+                .and_then(parse_rfc3339);
             let cordoned = n.spec.and_then(|s| s.unschedulable).unwrap_or(false);
             Ok(Node {
                 name,
                 ready,
                 cordoned,
+                heartbeat,
             })
         })
         .collect()
 }
 
-/// Why a roll of `members` may not start in this cluster, one sentence each; empty when it may.
+#[derive(Deserialize)]
+struct RawLeases {
+    items: Option<Vec<RawLease>>,
+}
+
+#[derive(Deserialize)]
+struct RawLease {
+    metadata: Option<RawMeta>,
+    spec: Option<RawLeaseSpec>,
+}
+
+#[derive(Deserialize)]
+struct RawLeaseSpec {
+    #[serde(rename = "renewTime")]
+    renew_time: Option<String>,
+}
+
+/// Parses `kubectl get leases -n kube-node-lease -o json` into each node's last `renewTime`.
 ///
-/// Any node of the cluster that is `NotReady` or cordoned refuses it (not only the members:
-/// a roll takes one more node out of service for a while, and a cluster already short of one is
-/// not the moment), and so does a member that is no node at all.
+/// A node's kubelet renews its lease every ten seconds, while the `Ready` condition's own
+/// heartbeat is only rewritten when the status changes or every few minutes: the lease is the
+/// real sign of life, so it decides when it is there.
+///
+/// # Errors
+///
+/// Not the JSON of a lease list.
+pub fn parse_leases(json: &str) -> Result<BTreeMap<String, i64>, String> {
+    let list: RawLeases = serde_json::from_str(json)
+        .map_err(|e| format!("kubectl's lease list is not the expected JSON: {e}"))?;
+    Ok(list
+        .items
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|l| {
+            let name = sanitize_line(&l.metadata?.name?);
+            let at = parse_rfc3339(&l.spec?.renew_time?)?;
+            Some((name, at))
+        })
+        .collect())
+}
+
+/// Gives each node of `nodes` its lease's `renewTime` as its heartbeat when that is later than
+/// the condition's.
+pub fn merge_leases(nodes: &mut [Node], leases: &BTreeMap<String, i64>) {
+    for n in nodes {
+        if let Some(&renewed) = leases.get(&n.name) {
+            n.heartbeat = Some(n.heartbeat.map_or(renewed, |h| h.max(renewed)));
+        }
+    }
+}
+
+/// The cluster `kubectl` is pointed at: what the plan names, and every later call is pinned to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterId {
+    /// The kubeconfig's current context, sanitised.
+    pub context: String,
+    /// That context's cluster's API server, sanitised, or `"unknown"`.
+    pub server: String,
+}
+
+/// Parses `kubectl config view --minify -o json`.
+///
+/// # Errors
+///
+/// Not the JSON of a kubeconfig, or it has no current context.
+pub fn parse_cluster_id(json: &str) -> Result<ClusterId, String> {
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| format!("kubectl's config view is not the expected JSON: {e}"))?;
+    let context = v
+        .get("current-context")
+        .and_then(serde_json::Value::as_str)
+        .map(sanitize_line)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| "the kubeconfig has no current context".to_owned())?;
+    let cluster_name = v
+        .get("contexts")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|cs| {
+            cs.iter()
+                .find(|c| c.get("name").and_then(serde_json::Value::as_str) == Some(&context))
+        })
+        .and_then(|c| c.get("context")?.get("cluster")?.as_str());
+    let server = cluster_name
+        .and_then(|name| {
+            v.get("clusters")?.as_array()?.iter().find_map(|c| {
+                (c.get("name")?.as_str()? == name)
+                    .then(|| c.get("cluster")?.get("server")?.as_str().map(sanitize_line))
+                    .flatten()
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+    Ok(ClusterId { context, server })
+}
+
+/// Why the cluster is not fit for the next node to go out of service, one sentence each; empty
+/// when every node is `Ready` and schedulable.
 #[must_use]
-pub fn cluster_refusals(nodes: &[Node], members: &[&Member]) -> Vec<String> {
+pub fn cluster_unhealthy(nodes: &[Node]) -> Vec<String> {
     let mut why = Vec::new();
     for node in nodes {
         if !node.ready {
@@ -295,7 +457,18 @@ pub fn cluster_refusals(nodes: &[Node], members: &[&Member]) -> Vec<String> {
             why.push(format!("node {} is cordoned", node.name));
         }
     }
-    for m in members.iter().filter(|m| m.kubernetes) {
+    why
+}
+
+/// Why a roll of `members` may not start in this cluster, one sentence each; empty when it may.
+///
+/// Any node of the cluster that is `NotReady` or cordoned refuses it (not only the members:
+/// a roll takes one more node out of service for a while, and a cluster already short of one is
+/// not the moment), and so does a member that is no node at all.
+#[must_use]
+pub fn cluster_refusals(nodes: &[Node], members: &[&Member]) -> Vec<String> {
+    let mut why = cluster_unhealthy(nodes);
+    for m in members.iter().filter(|m| m.uses_cluster()) {
         if !nodes.iter().any(|n| n.name == m.name) {
             why.push(format!(
                 "{} is not a node of the cluster (a node is named like its machine)",
@@ -309,34 +482,63 @@ pub fn cluster_refusals(nodes: &[Node], members: &[&Member]) -> Vec<String> {
 /// A node, as the wait between machines sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeState {
-    /// Its `Ready` condition is `True`.
+    /// Its `Ready` condition is `True`, and (when asked) its kubelet has been heard from since.
     Ready,
     /// It is in the cluster and not ready.
     NotReady,
+    /// `Ready`, but nothing has been heard from its kubelet since the update ended: the
+    /// condition may be left over from before the switch.
+    Stale,
     /// No node of that name.
     Missing,
 }
 
 /// The state of node `name`.
+///
+/// With `since` (seconds since the epoch), a `Ready` node counts only if its heartbeat is at or
+/// after it: `Ready=True` stays true for the node controller's grace
+/// period (about 40 s) after the kubelet's last report, so a node restarted for less than that
+/// would otherwise pass on the condition it had before the switch.
 #[must_use]
-pub fn node_state(nodes: &[Node], name: &str) -> NodeState {
+pub fn node_state(nodes: &[Node], name: &str, since: Option<i64>) -> NodeState {
     match nodes.iter().find(|n| n.name == name) {
-        Some(n) if n.ready => NodeState::Ready,
+        Some(n) if n.ready => match (since, n.heartbeat) {
+            (None, _) => NodeState::Ready,
+            (Some(s), Some(h)) if h >= s => NodeState::Ready,
+            _ => NodeState::Stale,
+        },
         Some(_) => NodeState::NotReady,
         None => NodeState::Missing,
     }
 }
 
+/// The names of the failed units of a probe, when it observed the machine and could read them.
+#[must_use]
+pub fn failed_units(probe: &ProbeOutcome) -> Option<Vec<String>> {
+    match probe {
+        ProbeOutcome::Observed(o) => o.failed_units.clone(),
+        _ => None,
+    }
+}
+
 /// Whether `probe` shows a machine that took the update and is up: reachable, running exactly
-/// `expect`, and with systemd past starting up without failed units.
+/// `expect`, systemd past starting up, and **no failed unit that `baseline` does not already
+/// hold**.
 ///
-/// `starting` and `degraded` are both "not yet": a machine just switched is often still starting,
-/// so the caller asks again until its deadline. What it reports then is the last reason.
+/// `baseline` is the machine's failed units when its turn began. A unit that was already failed
+/// is not the update's doing (and would otherwise fail the machine on every roll, for as long as
+/// someone leaves it failed); a unit that is newly failed is, and stops the group. `degraded` is
+/// accepted only when every failed unit is in the baseline, and never when the list could not be
+/// read. `starting` and an unreadable systemd state on a NixOS machine are "not yet".
 ///
 /// # Errors
 ///
 /// Why the machine is not (yet) healthy, one line.
-pub fn healthy(probe: &ProbeOutcome, expect: &StorePath) -> Result<(), String> {
+pub fn healthy(
+    probe: &ProbeOutcome,
+    expect: &StorePath,
+    baseline: &[String],
+) -> Result<(), String> {
     let o = match probe {
         ProbeOutcome::Observed(o) => o,
         ProbeOutcome::Unreachable { reason } => return Err(format!("unreachable: {reason}")),
@@ -355,13 +557,27 @@ pub fn healthy(probe: &ProbeOutcome, expect: &StorePath) -> Result<(), String> {
         }
         None => return Err("it reports no current system".to_owned()),
     }
-    if o.has_failed_units() {
-        let units = o.failed_units.as_deref().unwrap_or_default().join(", ");
-        return Err(format!("failed units: {units}"));
+    let new: Vec<&str> = o
+        .failed_units
+        .iter()
+        .flatten()
+        .filter(|u| !baseline.contains(u))
+        .map(String::as_str)
+        .collect();
+    if !new.is_empty() {
+        return Err(format!("new failed units: {}", new.join(", ")));
     }
+    let darwin = o.class == Some(crate::fleet::MachineClass::Darwin);
     match o.system_state.as_deref() {
-        None | Some("running") => Ok(()),
+        Some("running") => Ok(()),
+        // Failed units that are all in the baseline were failed before: nothing new is wrong.
+        Some("degraded") if o.failed_units.is_some() => Ok(()),
+        Some("degraded") => {
+            Err("systemd is degraded and its failed units could not be read".to_owned())
+        }
         Some(state) => Err(format!("systemd is {state}")),
+        None if darwin => Ok(()),
+        None => Err("systemd's state was not reported".to_owned()),
     }
 }
 
@@ -528,9 +744,9 @@ mod tests {
             ],
             "no Ready condition is not ready"
         );
-        assert_eq!(node_state(&nodes, "luna"), NodeState::Ready);
-        assert_eq!(node_state(&nodes, "sol"), NodeState::NotReady);
-        assert_eq!(node_state(&nodes, "nobody"), NodeState::Missing);
+        assert_eq!(node_state(&nodes, "luna", None), NodeState::Ready);
+        assert_eq!(node_state(&nodes, "sol", None), NodeState::NotReady);
+        assert_eq!(node_state(&nodes, "nobody", None), NodeState::Missing);
     }
 
     #[test]
@@ -614,21 +830,18 @@ mod tests {
     #[test]
     fn healthy_means_up_on_the_deployed_system_and_not_degraded() {
         let expect = StorePath::new(SYS).unwrap();
+        let none: &[String] = &[];
         assert_eq!(
             healthy(
                 &probe(SYS, "system_state=running\nfailed_units=[]\n"),
-                &expect
+                &expect,
+                none
             ),
             Ok(())
         );
-        assert_eq!(
-            healthy(&probe(SYS, ""), &expect),
-            Ok(()),
-            "no systemd report (darwin)"
-        );
-        let old = healthy(&probe(OTHER, "system_state=running\n"), &expect).unwrap_err();
+        let old = healthy(&probe(OTHER, "system_state=running\n"), &expect, none).unwrap_err();
         assert!(old.contains("not the"), "{old}");
-        let starting = healthy(&probe(SYS, "system_state=starting\n"), &expect).unwrap_err();
+        let starting = healthy(&probe(SYS, "system_state=starting\n"), &expect, none).unwrap_err();
         assert_eq!(starting, "systemd is starting");
         let failed = healthy(
             &probe(
@@ -636,14 +849,16 @@ mod tests {
                 "system_state=degraded\nfailed_units=[{\"unit\":\"rke2-server.service\"}]\n",
             ),
             &expect,
+            none,
         )
         .unwrap_err();
-        assert_eq!(failed, "failed units: rke2-server.service");
+        assert_eq!(failed, "new failed units: rke2-server.service");
         let down = healthy(
             &ProbeOutcome::Unreachable {
                 reason: "Connection refused".to_owned(),
             },
             &expect,
+            none,
         )
         .unwrap_err();
         assert_eq!(down, "unreachable: Connection refused");
@@ -652,9 +867,143 @@ mod tests {
                 &ProbeOutcome::Failed {
                     reason: "cut off".to_owned()
                 },
-                &expect
+                &expect,
+                none
             )
             .is_err()
         );
+    }
+
+    /// A machine with a unit that was failed before the update (the operator's terra has one) is
+    /// healthy after it; a unit that fails because of it is not, and `degraded` with an unreadable
+    /// list never is.
+    #[test]
+    fn a_unit_that_was_failed_before_the_update_is_not_the_updates_failure() {
+        let expect = StorePath::new(SYS).unwrap();
+        let before = vec!["old.service".to_owned()];
+        let degraded = "system_state=degraded\nfailed_units=[{\"unit\":\"old.service\"}]\n";
+        assert_eq!(healthy(&probe(SYS, degraded), &expect, &before), Ok(()));
+        // The update fixed it, or never touched it: running is running.
+        assert_eq!(
+            healthy(
+                &probe(SYS, "system_state=running\nfailed_units=[]\n"),
+                &expect,
+                &before
+            ),
+            Ok(())
+        );
+        // A second unit failed: that one is new.
+        let two = "system_state=degraded\nfailed_units=[{\"unit\":\"old.service\"},{\"unit\":\"new.service\"}]\n";
+        assert_eq!(
+            healthy(&probe(SYS, two), &expect, &before).unwrap_err(),
+            "new failed units: new.service"
+        );
+        // Degraded and no readable list: nothing says what failed.
+        let unreadable =
+            healthy(&probe(SYS, "system_state=degraded\n"), &expect, &before).unwrap_err();
+        assert!(unreadable.contains("could not be read"), "{unreadable}");
+        // No systemd report on NixOS is "not yet"; on darwin there is none to give.
+        assert!(healthy(&probe(SYS, ""), &expect, &before).is_err());
+        let darwin = parse_probe(
+            &format!("auspex_probe=1\nprobe=darwin\ncurrent_system={SYS}\nauspex_end=1\n"),
+            "",
+            ProbeExit::Code(0),
+        );
+        assert_eq!(healthy(&darwin, &expect, &before), Ok(()));
+        assert_eq!(failed_units(&probe(SYS, degraded)), Some(before));
+        assert_eq!(failed_units(&probe(SYS, "")), None);
+    }
+
+    #[test]
+    fn rfc3339_times_are_read_as_utc_seconds_and_nothing_else_is() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_rfc3339("2026-11-20T15:04:05Z"), Some(1_795_187_045));
+        assert_eq!(
+            parse_rfc3339("2026-11-20T15:04:05.123456Z"),
+            Some(1_795_187_045),
+            "a lease's renewTime has a fraction"
+        );
+        assert_eq!(parse_rfc3339("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+        for bad in [
+            "",
+            "2026-11-20T15:04:05",
+            "2026-11-20T15:04:05+01:00",
+            "2026-13-20T15:04:05Z",
+            "2026-11-20 15:04:05Z",
+            "yesterday",
+            "2026-11-20T25:04:05Z",
+        ] {
+            assert_eq!(parse_rfc3339(bad), None, "{bad:?}");
+        }
+    }
+
+    const LUNA_READY_AT: &str = r#"{"items":[
+      {"metadata":{"name":"luna"},"status":{"conditions":[
+        {"type":"Ready","status":"True","lastHeartbeatTime":"2026-11-20T15:00:00Z"}]}},
+      {"metadata":{"name":"sol"},"status":{"conditions":[
+        {"type":"Ready","status":"Unknown","lastHeartbeatTime":"2026-11-20T15:00:00Z"}]}}]}"#;
+
+    /// `Ready` from before the switch is not `Ready` after it: the wait wants a heartbeat that is
+    /// newer than the end of the update, from the condition or (newer, every ten seconds) the node's
+    /// lease. `Unknown`, which a node gets when its kubelet stops reporting, is not ready.
+    #[test]
+    fn a_ready_that_is_older_than_the_update_does_not_count() {
+        let mut nodes = parse_nodes(LUNA_READY_AT).unwrap();
+        let before = parse_rfc3339("2026-11-20T15:00:00Z").unwrap();
+        assert_eq!(nodes[0].heartbeat, Some(before));
+        assert_eq!(node_state(&nodes, "luna", None), NodeState::Ready);
+        assert_eq!(node_state(&nodes, "luna", Some(before)), NodeState::Ready);
+        assert_eq!(
+            node_state(&nodes, "luna", Some(before + 1)),
+            NodeState::Stale
+        );
+        assert_eq!(
+            node_state(&nodes, "sol", None),
+            NodeState::NotReady,
+            "Ready=Unknown is not Ready"
+        );
+        // Its lease says the kubelet is alive after the update ended.
+        let leases = parse_leases(
+            r#"{"items":[{"metadata":{"name":"luna"},"spec":{"renewTime":"2026-11-20T15:00:30.5Z"}},
+                         {"metadata":{"name":"gone"},"spec":{"renewTime":"2026-11-20T15:00:30Z"}},
+                         {"metadata":{"name":"bad"},"spec":{"renewTime":"never"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(leases.len(), 2, "an unreadable time is no time");
+        merge_leases(&mut nodes, &leases);
+        assert_eq!(nodes[0].heartbeat, Some(before + 30));
+        assert_eq!(
+            node_state(&nodes, "luna", Some(before + 20)),
+            NodeState::Ready
+        );
+        // A node with no heartbeat at all is stale when asked, never Ready by default.
+        let silent = parse_nodes(
+            r#"{"items":[{"metadata":{"name":"luna"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(node_state(&silent, "luna", Some(1)), NodeState::Stale);
+        assert_eq!(node_state(&nodes, "nobody", Some(1)), NodeState::Missing);
+        assert!(parse_leases("[]").is_err());
+    }
+
+    #[test]
+    fn the_cluster_is_named_by_its_context_and_server() {
+        let id = parse_cluster_id(
+            r#"{"current-context":"rke2","contexts":[{"name":"rke2","context":{"cluster":"c1","user":"u"}}],
+                "clusters":[{"name":"c1","cluster":{"server":"https://10.0.0.1:6443"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            id,
+            ClusterId {
+                context: "rke2".to_owned(),
+                server: "https://10.0.0.1:6443".to_owned()
+            }
+        );
+        let no_server = parse_cluster_id(r#"{"current-context":"x"}"#).unwrap();
+        assert_eq!(no_server.server, "unknown");
+        assert!(parse_cluster_id(r#"{"contexts":[]}"#).is_err());
+        assert!(parse_cluster_id(r#"{"current-context":""}"#).is_err());
+        assert!(parse_cluster_id("nope").is_err());
     }
 }

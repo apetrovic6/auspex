@@ -57,7 +57,8 @@ use super::roll::{self, Draft, Planned};
 use super::{Event, Model, Pending};
 use crate::effects::{
     ActionEnd, ActionKind, ActionRequest, CancelRequest, Effect, EvalMachine, EvalRequest,
-    PreflightAnswer, PreflightRequest, ProbeRequest, RequestId, ShellEnd, ShellRequest,
+    FleetUnlockRequest, PreflightAnswer, PreflightRequest, ProbeRequest, RequestId, ShellEnd,
+    ShellRequest,
 };
 use crate::view::{ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode, TypedView};
 
@@ -104,7 +105,11 @@ pub(super) enum Confirm {
     Unfreeze { machine: String },
     /// The cluster is being read (request `id`) before an update of all is planned. Any key
     /// cancels it.
-    CheckingCluster { id: RequestId, draft: Box<Draft> },
+    CheckingCluster {
+        id: RequestId,
+        draft: Box<Draft>,
+        stage: roll::Stage,
+    },
     /// Update everything the plan lists (`U`): one question for the whole roll.
     UpdateAll(Box<Planned>),
     /// Quit while an action runs.
@@ -136,6 +141,8 @@ pub(super) struct Action {
     phase: Phase,
     /// The operator chose to quit: when the shell answers that the process is over, quit.
     quit_when_ended: bool,
+    /// The fleet lock this action holds (a `u`), let go when it ends.
+    lock: Option<RequestId>,
 }
 
 impl Action {
@@ -146,7 +153,9 @@ impl Action {
 
 impl Model {
     fn action_active(&self) -> bool {
-        self.action.as_ref().is_some_and(Action::active) || self.roll_active()
+        self.action.as_ref().is_some_and(Action::active)
+            || self.roll_active()
+            || self.lock_wait.is_some()
     }
 
     pub(super) const fn fresh_id(&mut self) -> RequestId {
@@ -268,7 +277,7 @@ fn question(model: &Model, confirm: &Confirm) -> String {
             format!("unfreeze {machine}? updates to it will be possible again. y/N")
         }
         Confirm::CheckingCluster { .. } => {
-            "reading the cluster before the update of all is planned… any key cancels".to_owned()
+            "looking at the cluster and the fleet repository before the update of all is planned… any key cancels".to_owned()
         }
         Confirm::UpdateAll(planned) => {
             let n = planned.machines();
@@ -681,10 +690,31 @@ pub(super) fn action_request(
 /// Issues the request. Called only after [`check`] and, for an update, the operator's
 /// confirmation.
 fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effect, Event> {
+    launch_with(model, kind, machine, None)
+}
+
+/// [`launch`] of an update that holds the fleet's lock `lock`, which it lets go of when it ends.
+pub(super) fn launch_locked(
+    model: &mut Model,
+    machine: String,
+    lock: RequestId,
+) -> Command<Effect, Event> {
+    launch_with(model, ActionKind::Update, machine, Some(lock))
+}
+
+fn launch_with(
+    model: &mut Model,
+    kind: ActionKind,
+    machine: String,
+    lock: Option<RequestId>,
+) -> Command<Effect, Event> {
     let id = model.fresh_id();
     let request = match action_request(model, kind, &machine, id, None) {
         Ok(r) => r,
-        Err(why) => return model.notice(why),
+        Err(why) => {
+            let release = lock.map(|id| Command::notify_shell(FleetUnlockRequest { id }).into());
+            return Command::all(release.into_iter().chain([model.notice(why)]));
+        }
     };
     model.action = Some(Action {
         id,
@@ -692,6 +722,7 @@ fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effec
         machine,
         phase: Phase::Running,
         quit_when_ended: false,
+        lock,
     });
     Command::all([
         Command::request_from_shell(request).then_send(move |end| Event::ActionEnded { id, end }),
@@ -780,7 +811,9 @@ fn confirm_update(model: &mut Model, asked: Asked, stage: Stage) -> Command<Effe
         return model.notice(note);
     }
     if stage == Stage::FreezesRead {
-        return launch(model, ActionKind::Update, machine);
+        // The last rule: one auspex updates a fleet at a time. The update is launched when the lock
+        // is held (`roll::lock_answered`).
+        return roll::lock_for_update(model, machine);
     }
     // Everything the core can know says yes. The last look is at the file, which another
     // running auspex may have changed since this one read it (`freeze.rs`); every rule above is
@@ -1113,12 +1146,17 @@ pub(super) fn ended(model: &mut Model, id: RequestId, end: ActionEnd) -> Command
         return Command::done();
     };
     let (kind, machine, quitting) = (action.kind, action.machine.clone(), action.quit_when_ended);
+    let lock = action.lock.take();
     action.phase = Phase::Ended(end);
+    let mut commands: Vec<Command<Effect, Event>> = lock
+        .map(|id| Command::notify_shell(FleetUnlockRequest { id }).into())
+        .into_iter()
+        .collect();
     if quitting {
         model.view.quit = true;
-        return render();
+        commands.push(render());
+        return Command::all(commands);
     }
-    let mut commands = Vec::new();
     if kind == ActionKind::Update {
         commands.extend(refresh_machine(model, &machine));
     }
@@ -1220,6 +1258,10 @@ pub(super) fn event(model: &mut Model, event: Event) -> Command<Effect, Event> {
         Event::AwaitAnswered { id, answer } => {
             roll::awaited(model, id, &answer).unwrap_or_else(Command::done)
         }
+        Event::TreeChecked { id, answer } => {
+            roll::tree_checked(model, id, &answer).unwrap_or_else(Command::done)
+        }
+        Event::FleetLockAnswered { id, answer } => roll::lock_answered(model, id, &answer),
         Event::BuildSelected => request(model, ActionKind::Build),
         Event::ShellSelected => open_shell(model),
         Event::ShellEnded { id, end } => shell_ended(model, id, &end),

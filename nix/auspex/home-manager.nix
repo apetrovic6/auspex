@@ -30,7 +30,13 @@ let
   prune = value: if builtins.isAttrs value then
     lib.filterAttrs (_: v: v != null && v != { }) (lib.mapAttrs (_: prune) value)
     else value;
-  pruned = prune cfg.settings;
+  # Except inside `rolling`: a tag with no keys is the rule "these machines update one at a time",
+  # with the defaults, and pruning it away (as an empty section is) silently made its machines
+  # free, updated `update.parallel` at a time. It is written as `[rolling.<tag>]`.
+  pruned = prune cfg.settings
+    // lib.optionalAttrs (cfg.settings.rolling != { }) {
+      rolling = lib.mapAttrs (_: prune) cfg.settings.rolling;
+    };
   # A path value is written as its string, never copied into the store: `toString`, not
   # interpolation of the path. `~/` is the home directory, as for `theme.file`.
   flakePath = toString pruned.flake;

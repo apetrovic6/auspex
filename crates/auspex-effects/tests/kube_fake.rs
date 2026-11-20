@@ -46,13 +46,23 @@ fn argv_log(dir: &Path) -> Vec<Vec<String>> {
         .collect()
 }
 
+const LEASES: &str = r#"{"items":[{"metadata":{"name":"luna"},"spec":{"renewTime":"2026-11-20T15:00:30.000000Z"}}]}"#;
+
 const LIST: &str = r#"{"items":[{"metadata":{"name":"luna"},"status":{"conditions":[{"type":"Ready","status":"True"}]}},{"metadata":{"name":"sol"},"spec":{"unschedulable":true},"status":{"conditions":[{"type":"Ready","status":"False"}]}}]}"#;
 
 #[tokio::test]
 async fn the_node_list_is_asked_with_the_exact_argv_and_parsed() {
     let Some(t) = tools(&["cat"]) else { return };
     let dir = tempdir();
-    let program = fake(&t, dir.path(), &format!("cat <<'EOF'\n{LIST}\nEOF"));
+    let program = fake(
+        &t,
+        dir.path(),
+        &format!(
+            "case \" $* \" in\n\
+             *\" get leases \"*) cat <<'EOF'\n{LEASES}\nEOF\n;;\n\
+             *) cat <<'EOF'\n{LIST}\nEOF\n;;\nesac"
+        ),
+    );
     let nodes = nodes(
         &params(&program, Duration::from_secs(10)),
         &CancellationToken::new(),
@@ -62,8 +72,23 @@ async fn the_node_list_is_asked_with_the_exact_argv_and_parsed() {
     .unwrap();
     assert_eq!(
         argv_log(dir.path()),
-        [["--kubeconfig", KUBECONFIG, "get", "nodes", "-o", "json"]]
+        [
+            vec!["--kubeconfig", KUBECONFIG, "get", "nodes", "-o", "json"],
+            vec![
+                "--kubeconfig",
+                KUBECONFIG,
+                "get",
+                "leases",
+                "-n",
+                "kube-node-lease",
+                "-o",
+                "json"
+            ],
+        ]
     );
+    // luna has a lease renewed at 15:00:30; sol has none.
+    assert_eq!(nodes[0].heartbeat, Some(1_795_186_830));
+    assert_eq!(nodes[1].heartbeat, None);
     let seen: Vec<(&str, bool, bool)> = nodes
         .iter()
         .map(|n| (n.name.as_str(), n.ready, n.cordoned))
@@ -248,6 +273,13 @@ async fn a_drain_that_hangs_is_killed_after_its_timeout_and_the_grace() {
     .unwrap_err();
     assert!(why.contains("did not finish within 1s"), "{why}");
     assert!(started.elapsed() < Duration::from_secs(10));
+    // The backstop is kubectl's own timeout plus the grace (300 ms here), not the timeout alone:
+    // kubectl enforces its own, and is given the time to say so.
+    assert!(
+        started.elapsed() >= Duration::from_millis(1250),
+        "killed before the grace: {:?}",
+        started.elapsed()
+    );
     let gone = still_alive_after_wait(&wait_for_pids(&pids, 2));
     assert_eq!(gone, Vec::<i32>::new(), "left running after the timeout");
 }
@@ -310,4 +342,75 @@ async fn a_relative_kubeconfig_runs_nothing() {
         .unwrap_err();
     assert!(why.contains("not an absolute path"), "{why}");
     assert!(argv_log(dir.path()).is_empty(), "nothing was run");
+}
+
+/// A cluster whose leases cannot be read still has its nodes: the lease is an extra sign of life,
+/// and a caller that waits for one says the node is stale, instead of the whole call failing.
+#[tokio::test]
+async fn a_lease_list_that_fails_leaves_the_nodes_without_lease_heartbeats() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let program = fake(
+        &t,
+        dir.path(),
+        &format!(
+            "case \" $* \" in\n\
+             *\" get leases \"*) echo 'forbidden' >&2; exit 1;;\n\
+             *) cat <<'EOF'\n{LIST}\nEOF\n;;\nesac"
+        ),
+    );
+    let nodes = nodes(
+        &params(&program, Duration::from_secs(10)),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[0].heartbeat, None);
+}
+
+#[tokio::test]
+async fn the_cluster_is_asked_which_it_is_and_every_pinned_call_carries_the_context() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let view = r#"{"current-context":"rke2","contexts":[{"name":"rke2","context":{"cluster":"c1"}}],"clusters":[{"name":"c1","cluster":{"server":"https://10.0.0.1:6443"}}]}"#;
+    let program = fake(&t, dir.path(), &format!("cat <<'EOF'\n{view}\nEOF"));
+    let mut p = params(&program, Duration::from_secs(10));
+    let id = auspex_effects::kube::cluster_id(&p, &CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (id.context.as_str(), id.server.as_str()),
+        ("rke2", "https://10.0.0.1:6443")
+    );
+    p.context = Some("rke2");
+    set_cordon(&p, "luna", false, &CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap();
+    let log = argv_log(dir.path());
+    assert_eq!(
+        log[0],
+        [
+            "--kubeconfig",
+            KUBECONFIG,
+            "config",
+            "view",
+            "--minify",
+            "-o",
+            "json"
+        ]
+    );
+    assert_eq!(
+        log[1],
+        [
+            "--kubeconfig",
+            KUBECONFIG,
+            "--context=rke2",
+            "uncordon",
+            "luna"
+        ]
+    );
 }

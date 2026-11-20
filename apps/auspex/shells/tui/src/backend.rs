@@ -13,10 +13,11 @@ use auspex_core::effects::{
     ActionKind, ActionRequest, AwaitAnswer, AwaitRequest, CacheRequest, ClosureAnswer,
     DeployedClosureRequest, EvalRequest, InventoryAnswer, InventoryRequest, KubeAnswer, KubeOp,
     KubeReply, KubeRequest, PendingClosureRequest, PreflightAnswer, PreflightRequest, ProbeRequest,
-    PrometheusAnswer, PrometheusRequest, ResolveRequest, ShellRequest,
+    PrometheusAnswer, PrometheusRequest, ResolveRequest, ShellRequest, TreeRequest,
 };
 use auspex_domain::fleet::ConnectTimeout;
 use auspex_domain::observe::ProbeOutcome;
+use auspex_domain::preflight::TreeState;
 use auspex_domain::status::NarCache;
 use auspex_effects::cache::{self, CacheParams, GitParams};
 use auspex_effects::clan::{self, ClanLine, ClanLocator, ClanRun, ResolveParams, RunParams};
@@ -231,6 +232,32 @@ impl Backend {
         match self {
             Self::Real(r) => r.preflight(op, cancel).await,
             Self::Demo(d) => d.preflight(op, cancel).await,
+        }
+    }
+
+    /// `Effect::Tree`: the state of the fleet repository, for the plan of an update of all.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn tree(
+        &self,
+        op: &TreeRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Result<TreeState, String>, Cancelled> {
+        match self {
+            Self::Real(r) => r.tree(op, cancel).await,
+            Self::Demo(d) => d.tree(op, cancel).await,
+        }
+    }
+
+    /// The `kubectl` and kubeconfig this run talks to the cluster with, when it has any: what the
+    /// shell's record of cordoned nodes needs to uncordon one at exit.
+    #[must_use]
+    pub fn kubectl_target(&self) -> Option<(OsString, PathBuf)> {
+        match self {
+            Self::Real(r) => r.kubectl_target(),
+            Self::Demo(d) => d.real_actions.as_ref().and_then(|r| r.kubectl_target()),
         }
     }
 
@@ -505,6 +532,13 @@ impl Real {
         self
     }
 
+    fn kubectl_target(&self) -> Option<(OsString, PathBuf)> {
+        self.kubeconfig
+            .as_ref()
+            .ok()
+            .map(|p| (self.kubectl.clone(), p.clone()))
+    }
+
     /// These adapters with `kubectl` and the kubeconfig as given: for the shell's own tests, which
     /// run `U` against a fake `kubectl`.
     #[must_use]
@@ -699,6 +733,41 @@ impl Real {
         closure::pending(&op.store_path, &params, cancel).await
     }
 
+    /// The fleet repository's state (one `git status`), bounded by `timeout`.
+    async fn tree_of(
+        &self,
+        flake: &str,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Result<TreeState, String>, Cancelled> {
+        let flake_ref = match FlakeRef::new(flake) {
+            Ok(f) => f,
+            Err(e) => return Ok(Err(self.fleet_error(flake, &e.0))),
+        };
+        let mut git = GitParams::new();
+        git.program = &self.git;
+        git.timeout = timeout;
+        preflight::fleet_tree(&git, &flake_ref, cancel).await
+    }
+
+    /// `Effect::Tree` with the real `git`.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired: the process group has been killed and reaped.
+    pub async fn tree(
+        &self,
+        op: &TreeRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Result<TreeState, String>, Cancelled> {
+        self.tree_of(
+            &op.flake,
+            Duration::from_secs(op.timeout_seconds.max(1)),
+            cancel,
+        )
+        .await
+    }
+
     /// `Effect::Preflight` with the real adapters: `git` and `nix`, both bounded by
     /// `op.timeout_seconds` (at least a second).
     ///
@@ -712,16 +781,7 @@ impl Real {
     ) -> Result<PreflightAnswer, Cancelled> {
         // The same bound for both; never "none". Each adapter enforces it on its own children.
         let timeout = Duration::from_secs(op.timeout_seconds.max(1));
-        let tree = async {
-            let flake = match FlakeRef::new(&op.flake) {
-                Ok(f) => f,
-                Err(e) => return Ok(Err(self.fleet_error(&op.flake, &e.0))),
-            };
-            let mut git = GitParams::new();
-            git.program = &self.git;
-            git.timeout = timeout;
-            preflight::fleet_tree(&git, &flake, cancel).await
-        };
+        let tree = self.tree_of(&op.flake, timeout, cancel);
         let size = async {
             let params = PendingParams {
                 nix: &self.nix,
@@ -749,6 +809,13 @@ impl Real {
         probe: bool,
     ) -> Result<AwaitAnswer, Cancelled> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(op.timeout_seconds);
+        // The update has just ended: a node counts as back only for a heartbeat from now on. (The
+        // clock is this machine's; the kubelets' are NTP's: a skew of seconds would only make the
+        // wait a little longer.)
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok());
         loop {
             let machine = if probe {
                 let request = ProbeRequest {
@@ -759,7 +826,7 @@ impl Real {
                     target: op.target.clone(),
                 };
                 let outcome = self.probe(&request, cancel, &|_| {}).await?;
-                auspex_domain::roll::healthy(&outcome, &op.expect)
+                auspex_domain::roll::healthy(&outcome, &op.expect, &op.baseline)
             } else {
                 Ok(())
             };
@@ -770,14 +837,19 @@ impl Real {
                     let ask = KubeRequest {
                         id: op.id,
                         log: op.log,
+                        context: op.context.clone(),
                         op: KubeOp::Nodes,
                     };
                     match self.kube(&ask, cancel, sink).await? {
                         Ok(KubeReply::Nodes(nodes)) => {
                             use auspex_domain::roll::NodeState;
-                            match auspex_domain::roll::node_state(&nodes, node) {
+                            match auspex_domain::roll::node_state(&nodes, node, since) {
                                 NodeState::Ready => return Ok(Ok(())),
                                 NodeState::NotReady => format!("node {node} is NotReady"),
+                                NodeState::Stale => format!(
+                                    "node {node} is Ready, but its kubelet has not been heard from \
+                                     since the update"
+                                ),
                                 NodeState::Missing => format!("node {node} is not in the cluster"),
                             }
                         }
@@ -813,8 +885,12 @@ impl Real {
             Ok(p) => p,
             Err(why) => return Ok(Err(format!("no kubeconfig: {why}"))),
         };
-        let params = KubeParams::new(&self.kubectl, kubeconfig);
+        let mut params = KubeParams::new(&self.kubectl, kubeconfig);
+        params.context = op.context.as_deref();
         Ok(match &op.op {
+            KubeOp::Context => kube::cluster_id(&params, cancel)
+                .await?
+                .map(KubeReply::Cluster),
             KubeOp::Nodes => kube::nodes(&params, cancel).await?.map(KubeReply::Nodes),
             KubeOp::Uncordon { node } => {
                 sink(Stream::Note, &format!("kubectl uncordon {node}"));
