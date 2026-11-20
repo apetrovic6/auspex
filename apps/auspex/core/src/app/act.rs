@@ -1,5 +1,7 @@
 //! Act mode, the two actions (`u` update, `b` build), the questions asked before them, and
-//! quitting while one runs.
+//! quitting while one runs. Also `s`, the operator's own ssh session ([`open_shell`]), which is
+//! not an action: it has no process auspex runs, no output and no log row, only the terminal
+//! lent to ssh until it answers.
 //!
 //! # What the core guarantees
 //!
@@ -54,7 +56,7 @@ use crux_core::render::render;
 use super::{Event, Model, Pending};
 use crate::effects::{
     ActionEnd, ActionKind, ActionRequest, CancelRequest, Effect, EvalMachine, EvalRequest,
-    PreflightAnswer, PreflightRequest, ProbeRequest, RequestId,
+    PreflightAnswer, PreflightRequest, ProbeRequest, RequestId, ShellEnd, ShellRequest,
 };
 use crate::view::{ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode, TypedView};
 
@@ -724,6 +726,89 @@ struct Asked {
     typed_given: bool,
 }
 
+/// `s` on the selected machine: the operator's own ssh session, with the terminal.
+///
+/// Act mode only, like `u`: it is a login to a machine as whatever user the target names, so it
+/// belongs behind the same deliberate switch (and a headless run, which cannot be in act mode,
+/// never gets here: the first check says so rather than relying on the second). Refused for a
+/// machine with no usable target: a target that did not parse is never fallen back from, as for
+/// every other use of it. Nothing about the machine's health, its evaluation or an action in
+/// progress matters: ssh is for the machine that is broken, or being updated, as much as for the
+/// one that is fine.
+pub(super) fn open_shell(model: &mut Model) -> Command<Effect, Event> {
+    model.view.notice = None;
+    if !model.config.as_ref().is_some_and(|c| c.allow_act) {
+        return model.notice("act mode is not available in this run");
+    }
+    if !model.act {
+        return model.notice(ACT_MODE_OFF);
+    }
+    if let Some((_, machine)) = &model.shell {
+        let text = format!("ssh to {machine} is already open");
+        return model.notice(text);
+    }
+    let names = model.names();
+    let Some(machine) = model
+        .view
+        .index(&names)
+        .and_then(|i| names.get(i))
+        .map(|n| (*n).to_owned())
+    else {
+        return model.notice("no machine selected");
+    };
+    if !is_plain_name(&machine) {
+        return model.notice(format!(
+            "{machine:?} is not a plain machine name; not touching it"
+        ));
+    }
+    let target = match model.rows.iter().find(|r| r.machine.name == machine) {
+        None => {
+            return model.notice(format!(
+                "{machine} is not in the inventory; not touching it"
+            ));
+        }
+        Some(row) => match &row.target {
+            Ok(resolved) => resolved.target.clone(),
+            Err(why) => {
+                return model.notice(format!(
+                    "{machine} has no usable ssh target ({why}): not opening ssh"
+                ));
+            }
+        },
+    };
+    let id = model.fresh_id();
+    model.shell = Some((id, machine.clone()));
+    Command::all([
+        Command::request_from_shell(ShellRequest {
+            id,
+            machine,
+            target,
+        })
+        .then_send(move |end| Event::ShellEnded { id, end }),
+        render(),
+    ])
+}
+
+/// The shell's answer: ssh is over and the terminal is back. Said in the status bar in the
+/// words the operator would use for any program: `ssh to luna exited (code 255)`.
+pub(super) fn shell_ended(
+    model: &mut Model,
+    id: RequestId,
+    end: &ShellEnd,
+) -> Command<Effect, Event> {
+    let Some((_, machine)) = model.shell.take_if(|(open, _)| *open == id) else {
+        return Command::done();
+    };
+    let text = match end {
+        ShellEnd::Exited { code } => format!("ssh to {machine} exited (code {code})"),
+        ShellEnd::Signaled { signal } => {
+            format!("ssh to {machine} exited (killed by signal {signal})")
+        }
+        ShellEnd::NotStarted { reason } => format!("ssh to {machine} did not start: {reason}"),
+    };
+    model.notice(text)
+}
+
 /// `y` or anything else, to the open question.
 pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
     model.view.notice = None;
@@ -1002,6 +1087,8 @@ pub(super) fn event(model: &mut Model, event: Event) -> Command<Effect, Event> {
         Event::ToggleAct => toggle_act(model),
         Event::UpdateSelected => request(model, ActionKind::Update),
         Event::BuildSelected => request(model, ActionKind::Build),
+        Event::ShellSelected => open_shell(model),
+        Event::ShellEnded { id, end } => shell_ended(model, id, &end),
         Event::ConfirmAnswer(yes) => answer(model, yes),
         Event::ConfirmChar(c) => typed_char(model, c),
         Event::ConfirmBackspace => typed_backspace(model),

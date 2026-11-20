@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use auspex_core::effects::{
     ActionRequest, CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest, InventoryRequest,
     PendingClosureRequest, PreflightRequest, ProbeRequest, PrometheusRequest, ResolveRequest,
+    ShellRequest,
 };
 use auspex_core::{
     Auspex, Config, Core, DiffConfig, Effect, Event, PrometheusConfig, RequestId, ViewModel,
@@ -155,6 +156,8 @@ pub struct Shell {
     pub actions: Vec<Request<ActionRequest>>,
     /// The checks before an update, which the test answers as the shell would.
     pub preflights: Vec<Request<PreflightRequest>>,
+    /// `s` requests: the terminal lent to ssh, until the test answers.
+    pub shells: Vec<Request<ShellRequest>>,
     /// Every cancel the core has emitted, in order.
     pub cancels: Vec<RequestId>,
     /// Every request id the core has issued, in order.
@@ -181,6 +184,7 @@ impl Shell {
             pending_closures: Vec::new(),
             actions: Vec::new(),
             preflights: Vec::new(),
+            shells: Vec::new(),
             cancels: Vec::new(),
             issued: Vec::new(),
         }
@@ -239,6 +243,10 @@ impl Shell {
                 Effect::RunAction(r) => {
                     self.issued.push(r.operation.id);
                     self.actions.push(r);
+                }
+                Effect::OpenShell(r) => {
+                    self.issued.push(r.operation.id);
+                    self.shells.push(r);
                 }
                 Effect::Cancel(r) => self.cancels.push(r.operation.id),
             }

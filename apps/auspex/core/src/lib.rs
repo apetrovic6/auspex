@@ -34,7 +34,7 @@ pub use config::{Config, DiffConfig, PrometheusConfig};
 pub use crux_core::Core;
 pub use effects::{
     ActionEnd, ActionKind, ActionRequest, ActionResult, Effect, Generation, PreflightAnswer,
-    PreflightRequest, RequestId,
+    PreflightRequest, RequestId, ShellEnd, ShellRequest,
 };
 pub use view::{
     ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode, Phase, PrometheusStatus, RefreshView,

@@ -69,7 +69,9 @@ Native shells use `CoreFfi.resolve(id, bytes)`; Rust shells use `Core::resolve(&
 
 The tui is the one that looks surprising, and the reason is its loop. It follows ratatui's
 own async example (`examples/apps/async-github`): a `tokio::select!` over a frame timer and
-a `crossterm::EventStream`. Because the timer repaints whether or not anything changed, an
+the terminal's events. (auspex reads those on a thread of its own, `handoff::TerminalEvents`,
+not `crossterm::EventStream`: `s` must stop reading the keyboard while ssh has it, and the
+stream's reader cannot be stopped safely, which froze the loop about one `s` in two.) Because the timer repaints whether or not anything changed, an
 answer no longer has to be carried back to the thread that owns the terminal — `Core` is
 `Sync`, so the task resolves it, spawns whatever further effects that produces, and the next
 frame shows the result. That is what let the channel this shell used to need disappear.

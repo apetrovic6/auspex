@@ -10,6 +10,8 @@
 
 #![allow(dead_code, reason = "each test file uses a different subset")]
 
+pub mod pty;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};

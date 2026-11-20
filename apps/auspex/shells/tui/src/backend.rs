@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime};
 use auspex_core::effects::{
     ActionKind, ActionRequest, CacheRequest, ClosureAnswer, DeployedClosureRequest, EvalRequest,
     InventoryAnswer, InventoryRequest, PendingClosureRequest, PreflightAnswer, PreflightRequest,
-    ProbeRequest, PrometheusAnswer, PrometheusRequest, ResolveRequest,
+    ProbeRequest, PrometheusAnswer, PrometheusRequest, ResolveRequest, ShellRequest,
 };
 use auspex_domain::fleet::ConnectTimeout;
 use auspex_domain::observe::ProbeOutcome;
@@ -246,6 +246,24 @@ impl Backend {
             Self::Demo(d) => d.run_action(op, cancel, sink).await,
         }
     }
+
+    /// `Effect::OpenShell`: the program and argv of the operator's own ssh session, or why there
+    /// is none. Only says what to run (the TUI loop runs it, with the terminal): nothing here
+    /// starts a process.
+    ///
+    /// # Errors
+    ///
+    /// The demo has no machines; the real backend's ssh cannot be found or has no control
+    /// directory.
+    pub fn shell_command(&self, op: &ShellRequest) -> Result<(PathBuf, Vec<String>), String> {
+        match self {
+            Self::Real(r) => r.shell_command(op),
+            Self::Demo(_) => Err(
+                "this is the demo: its machines are scripted, there is nothing to ssh to"
+                    .to_owned(),
+            ),
+        }
+    }
 }
 
 /// An absolute path to `name` on an absolute `PATH` entry, as `auspex-effects` would find
@@ -381,6 +399,19 @@ impl Real {
         let mut resolve = ResolveParams::new();
         resolve.config_path = self.clan_path.as_deref();
         resolve
+    }
+
+    /// `s`: ssh as the operator would run it by hand, to the machine's target. The program is
+    /// `AUSPEX_SSH` or `ssh` (the same one the probes use, so a test's fake serves both), and
+    /// the argv is the domain's [`SshOperation::Interactive`](auspex_domain::fleet::SshOperation).
+    /// No control directory means no way to name the probes' socket, so no login: the same
+    /// refusal every probe shows, rather than a login that silently skips the master.
+    fn shell_command(&self, op: &ShellRequest) -> Result<(PathBuf, Vec<String>), String> {
+        let dir = self
+            .control_dir
+            .as_ref()
+            .map_err(|why| format!("ssh cannot be used: {why}"))?;
+        ssh::interactive_command(&self.ssh, &op.target, dir)
     }
 
     /// Adapters that can run actions and nothing else: for the shell's own tests, which run
