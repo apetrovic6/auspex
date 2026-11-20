@@ -420,7 +420,7 @@ pub struct Model {
     confirm_serial: u64,
     /// The refresh whose address resolution was cut off at its settle deadline: it never
     /// answered. An update is refused while that is the current refresh (see `app/act.rs`); the
-    /// next refresh is another generation, so it starts afresh.
+    /// next refresh is another generation, so it starts afresh (nothing resets it).
     resolution_timed_out: Option<Generation>,
 }
 
@@ -765,7 +765,6 @@ fn refresh(model: &mut Model) -> Command<Effect, Event> {
     model.rows.clear();
     model.samples.clear();
     model.addresses.clear();
-    model.resolution_timed_out = None;
     model.fleet_errors.clear();
     model.deadline_passed = false;
     model.started.clear();
