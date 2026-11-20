@@ -1006,9 +1006,14 @@ printf 'auspex_probe=1\nprobe=nixos\ncurrent_system={}\nsystem_state=running\nfa
 // ---------------------------------------------------------------------------------------
 
 /// Machines `m00`..`m17` (18, so previews alone could hold more than the 32 shared permits),
-/// all update pending and cached. Every closure query takes 5 s; `m17`'s probe takes 2 s, so
-/// its cache lookup comes after every other machine's previews have started.
-fn crowd_fakes(t: &Tools, dir: &Path, machines: usize) -> [std::path::PathBuf; 3] {
+/// all update pending and cached. Each closure query sleeps for `query_seconds`; `m17`'s
+/// probe takes 2 s, so its cache lookup comes after the other machines' previews start.
+fn crowd_fakes(
+    t: &Tools,
+    dir: &Path,
+    machines: usize,
+    query_seconds: u64,
+) -> [std::path::PathBuf; 3] {
     let name = |i: usize| format!("m{i:02}");
     let inventory = format!(
         "{{{}}}",
@@ -1035,7 +1040,7 @@ fn crowd_fakes(t: &Tools, dir: &Path, machines: usize) -> [std::path::PathBuf; 3
   path-info)
     for last; do :; done
     echo + >> '@dir@/conc.log'
-    @sleep@ 5
+    @sleep@ {query_seconds}
     echo - >> '@dir@/conc.log'
     printf '%s\n' '{GLIBC_NEW}' '{RIPGREP}' "$last";;
   *) exit 64;;
@@ -1068,7 +1073,7 @@ script=$(@cat@)
 case "$script" in
   *'nix-store --query --requisites'*)
     echo + >> '@dir@/conc.log'
-    @sleep@ 5
+    @sleep@ {query_seconds}
     echo - >> '@dir@/conc.log'
     {}
     ;;
@@ -1085,23 +1090,23 @@ esac"#,
 
 #[test]
 fn many_previews_never_starve_a_late_machines_cache_lookup() {
-    crowd(4, 40);
+    crowd(4, 40, 5);
 }
 
 /// Re-review N2: previews queued for a slot do not spend their `timeouts.diff`. Each query
-/// takes 5 s and `diff` is 8 s, so a budget that counted the wait would cut every wave after
-/// the first; the clock starts when a query holds its slot, so all 18 machines compute.
+/// takes 10 s with a 40 s budget: 30 s of scheduling margin per query, but five waves take
+/// at least 50 s. Counting the queue wait must still cut off the later waves.
 #[test]
 fn previews_waiting_for_a_slot_do_not_spend_their_timeout() {
-    crowd(30, 8);
+    crowd(120, 40, 10);
 }
 
-fn crowd(settle: u64, diff: u64) {
+fn crowd(settle: u64, diff: u64, query_seconds: u64) {
     let Some(t) = tools(&["cat", "sleep"]) else {
         return;
     };
     let dir = tempdir();
-    let [nix, eval, ssh] = crowd_fakes(&t, dir.path(), 18);
+    let [nix, eval, ssh] = crowd_fakes(&t, dir.path(), 18, query_seconds);
     let nix_store = t.script(
         dir.path(),
         "nix-store",
@@ -1119,7 +1124,7 @@ fn crowd(settle: u64, diff: u64) {
         .arg(flake_dir(dir.path()))
         .env("AUSPEX_NIX_STORE", &nix_store);
     with_fakes(&mut cmd, &nix, &eval, &ssh);
-    let out = run_within(&mut cmd, LIMIT);
+    let out = run_within(&mut cmd, Duration::from_secs(settle + diff + 30));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
         out.status.code(),

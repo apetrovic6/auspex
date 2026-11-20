@@ -476,7 +476,9 @@ async fn key_and_top(
         let paths = index_paths(&index).map_err(Stop::NoCache)?;
         let mut guard = Sha256::new_with_prefix(b"auspex run guard v1\0");
         let lock = read_lock(&flake_dir, &stop, &mut guard)?;
-        let digest = worktree_digest(&tree_top, &rel, &index, &paths, &stop, &mut guard)?;
+        let digest = worktree_digest::<MAX_WORKTREE_BYTES>(
+            &tree_top, &rel, &index, &paths, &stop, &mut guard,
+        )?;
         git_dir_stamps(&git_dir, &head_ref, &stop, &mut guard)?;
         Ok::<_, Stop>((lock, digest, Guard(guard.finalize().to_vec())))
     });
@@ -709,7 +711,7 @@ fn field(h: &mut Sha256, tag: u8, bytes: &[u8]) {
 /// goes to the guard `g`: the opened file's own, a symlink's or other entry's from the
 /// `lstat` that classified it, or, when nothing is there, the deepest directory reached
 /// (it changes when the name is created in it).
-fn worktree_digest(
+fn worktree_digest<const MAX_BYTES: u64>(
     top: &Path,
     rel: &Path,
     index: &[u8],
@@ -730,7 +732,7 @@ fn worktree_digest(
     // (N2b).
     field(&mut h, b'r', rel.as_os_str().as_bytes());
     field(&mut h, b'i', &Sha256::digest(index));
-    let mut left = MAX_WORKTREE_BYTES;
+    let mut left = MAX_BYTES;
     for p in paths {
         if stop() {
             return Err(Stop::Stopped);
@@ -774,7 +776,7 @@ fn worktree_digest(
                     Err(ReadError::TooBig) => {
                         return Err(Stop::NoCache(format!(
                             "the tracked files are larger than {} MiB",
-                            MAX_WORKTREE_BYTES >> 20
+                            MAX_BYTES >> 20
                         )));
                     }
                     Err(ReadError::Stopped) => return Err(Stop::Stopped),
@@ -1159,6 +1161,35 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// R03/R28: each file fits, but their total does not. Inject the cap into the same
+    /// digest used in production instead of hashing a gigabyte under a wall-clock deadline.
+    #[test]
+    fn the_worktree_cap_is_a_total() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.bin", "b.bin"] {
+            std::fs::File::create(dir.path().join(name))
+                .unwrap()
+                .set_len(600 << 10)
+                .unwrap();
+        }
+        let digest = |paths: &[&[u8]]| {
+            worktree_digest::<{ 1 << 20 }>(
+                dir.path(),
+                Path::new(""),
+                b"",
+                paths,
+                &|| false,
+                &mut Sha256::new(),
+            )
+        };
+        assert!(digest(&[b"a.bin"]).is_ok());
+        assert!(digest(&[b"b.bin"]).is_ok());
+        let Stop::NoCache(why) = digest(&[b"a.bin", b"b.bin"]).unwrap_err() else {
+            panic!("the digest stopped without checking the cap");
+        };
+        assert_eq!(why, "the tracked files are larger than 1 MiB");
+    }
 
     /// An executable `sh` script in `dir`, written by a separate process (as the
     /// integration tests' helper does), so no thread's fork can inherit a write descriptor

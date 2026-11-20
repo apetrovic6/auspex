@@ -1005,7 +1005,7 @@ async fn join_all<T>(
 /// approved) and "approved <dest>" when it is. `@dir@/overlap` gets a line if a second
 /// prompt ever showed while one was showing: the agent's own invariant, checked with a
 /// `running` marker made with `mkdir`, so the fake cannot quietly stop being one-at-a-time.
-fn serial_agent(t: &common::Tools, dir: &Path, delay: &str) -> std::path::PathBuf {
+fn serial_agent(t: &common::Tools, dir: &Path, hosts: usize, delay: &str) -> std::path::PathBuf {
     t.script(
         dir,
         "ssh-agent",
@@ -1024,11 +1024,18 @@ case "$mode" in
   check) [ -f "@dir@/master-$dest" ]; exit $?;;
   connect)
     echo "start $dest" >> '@dir@/events'
+    : > "@dir@/started-$dest"
+    # Do not approve until every connect phase is observably under way.
+    n=1
+    while [ "$n" -le {hosts} ]; do
+      while [ ! -f "@dir@/started-root@h$n" ]; do @sleep@ 0.2; done
+      n=$((n + 1))
+    done
     # The agent: one prompt at a time.
     n=0
     until mkdir '@dir@/agent' 2>/dev/null; do
-      n=$((n + 1)); [ $n -gt 600 ] && exit 98
-      @sleep@ 0.05
+      n=$((n + 1)); [ $n -gt 1000 ] && exit 98
+      @sleep@ 0.2
     done
     mkdir '@dir@/running' 2>/dev/null || echo "$dest" >> '@dir@/overlap'
     @sleep@ {delay}
@@ -1049,11 +1056,14 @@ printf '{}'"#,
 async fn nine_hosts_behind_a_one_at_a_time_agent_all_connect_within_their_own_windows() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
-    let program = serial_agent(&t, dir.path(), "2");
+    let program = serial_agent(&t, dir.path(), 9, "4");
     let cd = control(dir.path());
     let mut params = ProbeParams::new(&cd);
     params.ssh_program = program.as_os_str();
-    params.approval_deadline = Duration::from_secs(5);
+    // Each approval has 22 s of scheduling margin, but the fleet takes at least 36 s:
+    // fixed windows from connect start must still fail. The fake gates on all starts,
+    // rather than assuming every child was scheduled before the first sleep finished.
+    params.approval_deadline = Duration::from_secs(26);
     let targets: Vec<Target> = (1..=9)
         .map(|n| Target::parse(&format!("root@h{n}")).unwrap())
         .collect();
@@ -1080,8 +1090,8 @@ async fn nine_hosts_behind_a_one_at_a_time_agent_all_connect_within_their_own_wi
         "{} of 9 failed: {failed:?}",
         failed.len()
     );
-    // One at a time at the agent: nine 2 s approvals back to back.
-    assert!(elapsed >= Duration::from_secs(18), "{elapsed:?}");
+    // One at a time at the agent: nine 4 s approvals back to back.
+    assert!(elapsed >= Duration::from_secs(36), "{elapsed:?}");
     assert!(
         !dir.path().join("overlap").exists(),
         "the fake agent showed two prompts at once"
