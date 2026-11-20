@@ -59,6 +59,8 @@ pub enum Action {
     Act,
     /// Update the selected machine (act mode only).
     Update,
+    /// Update every machine with an update pending, rolling per tag (act mode only).
+    UpdateAll,
     /// Build the selected machine's pending system here (changes nothing on any machine).
     Build,
     /// ssh to the selected machine, with the terminal (act mode only).
@@ -72,7 +74,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the help overlay lists them.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Down,
         Self::Up,
         Self::HalfPageDown,
@@ -87,6 +89,7 @@ impl Action {
         Self::Diff,
         Self::Act,
         Self::Update,
+        Self::UpdateAll,
         Self::Build,
         Self::Shell,
         Self::Freeze,
@@ -117,6 +120,7 @@ impl Action {
             Self::Diff => "diff",
             Self::Act => "act",
             Self::Update => "update",
+            Self::UpdateAll => "update_all",
             Self::Build => "build",
             Self::Shell => "shell",
             Self::Freeze => "freeze",
@@ -145,6 +149,7 @@ impl Action {
             Self::Diff => "package diff (q closes)",
             Self::Act => "toggle act mode (asks first)",
             Self::Update => "update the machine (act mode)",
+            Self::UpdateAll => "update all that are pending (act mode)",
             Self::Build => "build its pending system here",
             Self::Shell => "ssh to the machine (act mode)",
             Self::Freeze => "freeze the machine (asks to unfreeze)",
@@ -173,6 +178,7 @@ impl Action {
             Self::Diff => &["d"],
             Self::Act => &["A"],
             Self::Update => &["u"],
+            Self::UpdateAll => &["U"],
             Self::Build => &["b"],
             Self::Shell => &["s"],
             Self::Freeze => &["f"],

@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use auspex_core::effects::{
-    EvalAnswer, Generation, LoadFreezesAnswer, RequestId, SaveFreezeAnswer, ShellEnd, ShellRequest,
+    EvalAnswer, Generation, KubeReply, KubeRequest, LoadFreezesAnswer, LogOp, LogRequest,
+    RequestId, SaveFreezeAnswer, ShellEnd, ShellRequest,
 };
 use auspex_core::{ActionEnd, ActionKind, ActionResult, Auspex, Core, Effect, Event, ViewModel};
 use auspex_effects::clan::{ClanRun, RunEnd};
@@ -294,6 +295,10 @@ impl Shell {
     }
 
     /// The mapping, exhaustively.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per effect: the exhaustive match is the point"
+    )]
     fn fulfil(self: &Arc<Self>, effect: Effect) {
         match effect {
             // The TUI's frame timer repaints; headless mode waits on `changed`.
@@ -396,6 +401,22 @@ impl Shell {
             Effect::OpenShell(request) => self.open_shell(request),
             Effect::SaveFreeze(request) => self.save_freeze(request),
             Effect::LoadFreezes(request) => self.load_freezes(request),
+            Effect::Kube(request) => self.kube(request),
+            Effect::Await(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                let key = op.log.map(|k| k.0);
+                self.one_shot(op.id, request, async move {
+                    shell
+                        .backend
+                        .await_healthy(&op, &token, &|stream, text| {
+                            shell.output.push_to(key, stream, text);
+                        })
+                        .await
+                });
+            }
+            Effect::Log(request) => self.log_run(request.operation),
             Effect::Cancel(request) => self.cancel(request.operation.id),
         }
     }
@@ -873,6 +894,44 @@ impl Shell {
         }
     }
 
+    /// A call to the cluster. **Answered on cancellation too**, with [`KubeReply::Cancelled`],
+    /// after `kubectl` has been killed and reaped: the core uncordons a node a cancelled drain
+    /// cordoned only once it knows the drain is over.
+    fn kube(self: &Arc<Self>, mut request: Request<KubeRequest>) {
+        let op = request.operation.clone();
+        let token = self.open(op.id);
+        let shell = Arc::clone(self);
+        let key = op.log.map(|k| k.0);
+        self.tasks.spawn(async move {
+            let answer = shell
+                .backend
+                .kube(&op, &token, &|stream, text| {
+                    shell.output.push_to(key, stream, text);
+                })
+                .await
+                .unwrap_or(Ok(KubeReply::Cancelled));
+            shell.forget(op.id);
+            shell.resolve(&mut request, answer);
+        });
+    }
+
+    /// The core's words for the Log tab. Sanitised here: they carry machine names, tags and what
+    /// `kubectl` said.
+    fn log_run(&self, op: LogRequest) {
+        use auspex_domain::text::sanitize_line;
+        let key = Some(op.run.0);
+        match op.op {
+            LogOp::Begin { title, group } => {
+                self.output.begin_run(key, &sanitize_line(&title), group);
+            }
+            LogOp::Line { text } => self
+                .output
+                .push_to(key, Stream::Note, &sanitize_line(&text)),
+            LogOp::End { text } => self.output.finish_run(key, &sanitize_line(&text)),
+        }
+        self.changed.notify_one();
+    }
+
     fn run_action(self: &Arc<Self>, mut request: Request<auspex_core::effects::ActionRequest>) {
         let op = request.operation.clone();
         // Answered on cancellation too: quitting waits for this.
@@ -888,11 +947,16 @@ impl Shell {
         answer: impl FnOnce(&Arc<Self>, ActionEnd) + Send + 'static,
     ) {
         let token = self.open(op.id);
-        self.output
-            .begin(&format!("{} {}", op.kind.label(), op.machine));
+        // A machine of an update of all writes into the run the core began for it; a lone `u` or
+        // `b` begins (and ends) its own.
+        let key = op.log.map(|k| k.0);
+        if key.is_none() {
+            self.output
+                .begin(&format!("{} {}", op.kind.label(), op.machine));
+        }
         // The action's first line, before clan's: where it builds. Auspex's own words (Note),
         // not clan's output.
-        self.output.push(Stream::Note, &op.start_note());
+        self.output.push_to(key, Stream::Note, &op.start_note());
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {
             // An update is the one action that can lift nothing a freeze holds: asked again, here.
@@ -903,26 +967,33 @@ impl Shell {
             };
             // The row is written only for an action that starts: a refused one is not a deploy
             // that was tried.
+            let gate_refused = gate.is_err();
             let (logged, ran) = if let Err(reason) = gate {
                 (None, Ok(Err(reason)))
             } else {
                 let logged = shell.log_action(&op);
                 let ran = shell
                     .backend
-                    .run_action(&op, &token, &|stream, text| shell.output.push(stream, text))
+                    .run_action(&op, &token, &|stream, text| {
+                        shell.output.push_to(key, stream, text);
+                    })
                     .await;
                 (Some(logged), ran)
             };
             shell.forget(op.id);
-            let end = action_end(&shell.output, &op, ran);
-            shell.output.finish(&ended_line(&end));
+            let end = action_end(&shell.output, key, &op, gate_refused, ran);
+            if key.is_none() {
+                shell.output.finish(&ended_line(&end));
+            }
             // The result is the action's. The row is a record of it: a closed receiver (the
             // log task gave up) is not an error here.
             if let Some(logged) = logged {
                 let _ = logged.send(Outcome {
                     result: match end.result {
                         ActionResult::Succeeded => LoggedResult::Succeeded,
-                        ActionResult::Failed => LoggedResult::Failed,
+                        // A refused action is never logged (it has no row); `Failed` is only
+                        // what this match needs to say.
+                        ActionResult::Failed | ActionResult::Refused => LoggedResult::Failed,
                         ActionResult::TimedOut => LoggedResult::TimedOut,
                         ActionResult::Cancelled => LoggedResult::Cancelled,
                     },
@@ -941,16 +1012,29 @@ impl Shell {
 /// failed update also gets the plain words for an ssh failure when its output shows one.
 fn action_end(
     output: &Output,
+    key: Option<u64>,
     op: &auspex_core::effects::ActionRequest,
+    refused: bool,
     ran: Result<Result<ClanRun, String>, Cancelled>,
 ) -> ActionEnd {
     let summary = || {
         auspex_domain::act::summary_lines(
-            &output.tail(Stream::Stderr, 8),
-            &output.tail(Stream::Stdout, 8),
+            &output.tail_of(key, Stream::Stderr, 8),
+            &output.tail_of(key, Stream::Stdout, 8),
         )
     };
     match ran {
+        // The freeze file's last look said no: nothing was started, which is a refusal and
+        // not a failure of the machine (an update of all skips it and goes on).
+        Ok(Err(reason)) if refused => {
+            output.push_to(key, Stream::Note, &reason);
+            ActionEnd {
+                result: ActionResult::Refused,
+                exit_code: None,
+                summary: vec![reason],
+                explanation: None,
+            }
+        }
         Err(Cancelled) => ActionEnd {
             result: ActionResult::Cancelled,
             exit_code: None,
@@ -958,7 +1042,7 @@ fn action_end(
             explanation: None,
         },
         Ok(Err(reason)) => {
-            output.push(Stream::Note, &reason);
+            output.push_to(key, Stream::Note, &reason);
             ActionEnd {
                 result: ActionResult::Failed,
                 exit_code: None,
@@ -980,7 +1064,7 @@ fn action_end(
                 // prints, and the action log holds summaries, never output. The Log tab has the
                 // lines.
                 summary: if ok {
-                    let n = output.printed_lines();
+                    let n = output.printed_lines_of(key);
                     vec![format!(
                         "exit 0, {n} {}",
                         if n == 1 { "line" } else { "lines" }
@@ -989,7 +1073,7 @@ fn action_end(
                     summary()
                 },
                 explanation: (!ok && op.kind == ActionKind::Update)
-                    .then(|| output.last_lines(EXPLAIN_LINES))
+                    .then(|| output.last_lines_of(key, EXPLAIN_LINES))
                     .and_then(|lines| auspex_domain::act::explain_ssh_failure(&lines))
                     .map(|e| e.line()),
             }

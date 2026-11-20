@@ -1,0 +1,34 @@
+┌ machines (18) ───────────────────────┐
+│›✓    alfrost         in sync         │
+│ ✓    callisto        in sync         │
+│ ✓⚠   cerberus        in sync         │
+│ ↑    cypramundi      update pending  │
+│ ?    deimos          not installed   │
+│ ✓    europa          in sync         │
+│ ✓⟳   ganymede        in sync         │
+┌ confirm ─────────────────────────────┐
+│update 2 machines:                    │
+│in parallel, at most 2 at a time:     │
+│  luna, sol                           │
+│skipped cypramundi: marked public:    │
+│  its name has to be typed, so update │
+│  it with u                           │
+│each machine is checked at its turn:  │
+│  a refusal skips it, a failure stops │
+│  its rolling group                   │
+│                                      │
+│update 2 machines as listed above?    │
+│y/N                                   │
+│                                      │
+│y confirms; any other key cancels     │
+└──────────────────────────────────────┘
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+│                                      │
+└──────────────────────────────────────┘
+log: eval results stored in the cache: …
+ACT │ settled │ 0 pending │ prom: ok

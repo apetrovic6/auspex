@@ -35,6 +35,12 @@ let
     prometheus = { url = "http://prometheus.example:9090"; stale_after = 60; };
     cache.url = "https://ncps.example";
     machines.terra = { target = "root@192.168.1.10"; prometheus_instance = "terra:9100"; public = true; frozen = true; };
+    rolling = {
+      taghmata = { kubernetes = true; drain = true; drain_timeout = 900; };
+      skitarii = { kubernetes = false; drain = false; };
+    };
+    update = { parallel = 3; ready_timeout = 300; };
+    kubernetes.kubeconfig = "/home/me/.kube/fleet";
     keymap = { quit = [ "q" "esc" ]; down = "j"; };
     theme.file = "~/.config/auspex/theme.toml";
   };
@@ -178,6 +184,32 @@ let
       }).config.programs.auspex.settings.machines.terra;
     in (machine true).public == true && (machine false).public == false
       && rejected 1 && rejected "yes" && unset.public == null;
+  # `rolling.<tag>` is typed like every other section: a number or a string where a boolean
+  # belongs is refused at evaluation, a drain timeout is between 1 s and a day, and a tag that
+  # says nothing is pruned (so the file says nothing the operator did not).
+  rollingOK =
+    let
+      tag = value: (evaluate {
+        programs.auspex.settings.rolling.taghmata = value;
+      }).config.programs.auspex.settings.rolling.taghmata;
+      rejected = value: !(builtins.tryEval (builtins.deepSeq (tag value) true)).success;
+    in (tag { kubernetes = true; }).kubernetes == true
+      && (tag { drain = false; }).drain == false
+      && (tag { drain_timeout = 86400; }).drain_timeout == 86400
+      && rejected { kubernetes = 1; } && rejected { drain = "yes"; }
+      && rejected { drain_timeout = 0; } && rejected { drain_timeout = 86401; }
+      && rejected { drain_timeout = "ten"; };
+  withKubeconfig = kubeconfig: (evaluate {
+    programs.auspex.settings.kubernetes = { inherit kubeconfig; };
+  }).config;
+  tildeKubeconfig = withKubeconfig "~/.kube/fleet";
+  # A Nix path value must be written as its string, as for `flake`.
+  pathKubeconfig = withKubeconfig /home/me/.kube/fleet;
+  # What a relative `./kubeconfig` becomes in a flake: a path in the store.
+  storeKubeconfig = withKubeconfig "${pkgs.hello}/kubeconfig";
+  storeKubeconfigRejected =
+    !(builtins.tryEval (builtins.deepSeq (checked storeKubeconfig).assertions true)).success
+    && builtins.any (a: !a.assertion && lib.hasInfix "store" a.message) storeKubeconfig.assertions;
 in {
   auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;
@@ -187,7 +219,10 @@ in {
     && builtins.all (numberOK true null) positivePaths
     && builtins.all (numberOK true 86400) timeoutPaths
     && boundedOK 60 3600 [ "ssh" "control_persist" ]
-    && boundedOK 5 600 [ "timeouts" "ssh_approval" ]);
+    && boundedOK 5 600 [ "timeouts" "ssh_approval" ]
+    && boundedOK 1 16 [ "update" "parallel" ]
+    && numberOK true 86400 [ "update" "ready_timeout" ]
+    && rollingOK);
   auspex-stylix = compareToml "stylix" [
     stylix.xdg.configFile."auspex/theme.toml".source
     prefixed.xdg.configFile."auspex/theme.toml".source
@@ -233,6 +268,20 @@ in {
     && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeFlake pathFlake ]);
   auspex-diff-types = check "diff-types" diffEnabledOK;
   auspex-public-type = check "public-type" publicOK;
+  auspex-kubeconfig-path = pkgs.linkFarm "auspex-kubeconfig-path" [
+    {
+      name = "tilde";
+      path = compareToml "kubeconfig-tilde" tildeKubeconfig.xdg.configFile."auspex/config.toml".source
+        { kubernetes.kubeconfig = "/home/test/.kube/fleet"; };
+    }
+    {
+      name = "path-value";
+      path = compareToml "kubeconfig-path" pathKubeconfig.xdg.configFile."auspex/config.toml".source
+        { kubernetes.kubeconfig = "/home/me/.kube/fleet"; };
+    }
+  ];
+  auspex-kubeconfig-store-path = check "kubeconfig-store-path" (storeKubeconfigRejected
+    && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeKubeconfig pathKubeconfig ]);
   auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision

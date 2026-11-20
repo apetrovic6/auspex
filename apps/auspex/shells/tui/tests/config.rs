@@ -63,6 +63,31 @@ fn the_home_manager_contract_fixture_loads_whole() {
             ("down".to_owned(), vec!["j".to_owned()]),
         ])
     );
+    // `U`: the rolling rules, how many machines at once, and the kubeconfig, each the opposite of
+    // what it would be if the key were never read.
+    assert_eq!(
+        s.rolling,
+        auspex_domain::roll::RollRules::from([
+            (
+                "taghmata".to_owned(),
+                auspex_domain::roll::RollRule {
+                    kubernetes: true,
+                    drain: true,
+                    drain_timeout_seconds: 900,
+                }
+            ),
+            (
+                "skitarii".to_owned(),
+                auspex_domain::roll::RollRule {
+                    kubernetes: false,
+                    drain: false,
+                    drain_timeout_seconds: auspex_domain::roll::DEFAULT_DRAIN_TIMEOUT_SECONDS,
+                }
+            ),
+        ])
+    );
+    assert_eq!((s.update.parallel, s.update.ready_timeout), (3, 300));
+    assert_eq!(s.kubeconfig.as_deref(), Some("/home/me/.kube/fleet"));
     // `~/` is expanded against HOME; only the tail is fixed.
     assert!(
         s.theme_file
@@ -236,6 +261,8 @@ fn every_number_in_the_fixture_is_read_not_defaulted() {
     assert_eq!(s.timeouts.ssh_approval, 61);
     assert_eq!(s.timeouts.diff, 121);
     assert_eq!(s.prometheus.unwrap().stale_after, 61);
+    assert_eq!(s.rolling["taghmata"].drain_timeout_seconds, 901);
+    assert_eq!((s.update.parallel, s.update.ready_timeout), (4, 301));
 }
 
 /// Review finding 2: a huge timeout overflowed `Instant + Duration` inside an adapter and
@@ -447,4 +474,40 @@ fn machines_public_reaches_the_core_and_defaults_to_false() {
     // No machines at all: none is public.
     let (s, _) = config::parse("").unwrap();
     assert!(core_config(&s, ".".to_owned()).public_machines.is_empty());
+}
+
+/// What `[update]`, `[rolling.*]` and `[kubernetes]` say reaches the core's configuration: a
+/// value read by the loader and dropped on the way would roll with the defaults.
+#[test]
+fn the_rolling_settings_reach_the_cores_configuration() {
+    let (s, _) = config::parse(
+        "[rolling.taghmata]\nkubernetes = true\ndrain = true\ndrain_timeout = 77\n\
+         [update]\nparallel = 5\nready_timeout = 321\n\
+         [kubernetes]\nkubeconfig = \"/k/config\"\n",
+    )
+    .unwrap();
+    let core = auspex_tui::app::core_config(&s, "/fleet".to_owned());
+    assert_eq!(core.rolling.parallel, 5);
+    assert_eq!(core.rolling.ready_timeout_seconds, 321);
+    assert_eq!(
+        core.rolling.rules["taghmata"],
+        auspex_domain::roll::RollRule {
+            kubernetes: true,
+            drain: true,
+            drain_timeout_seconds: 77
+        }
+    );
+    assert_eq!(
+        core.rolling.kubernetes_unavailable, None,
+        "a kubeconfig was set"
+    );
+}
+
+/// `kubernetes.kubeconfig` starts with `~/` like `flake`, and that is the home directory.
+#[test]
+fn a_tilde_slash_kubeconfig_is_the_home_directory() {
+    let home = std::env::var("HOME").unwrap();
+    assert!(std::path::Path::new(&home).is_absolute(), "{home}");
+    let (s, _) = config::parse("[kubernetes]\nkubeconfig = \"~/.kube/fleet\"\n").unwrap();
+    assert_eq!(s.kubeconfig, Some(format!("{home}/.kube/fleet")));
 }

@@ -1430,6 +1430,7 @@ async fn the_shell_never_starts_clan_for_a_machine_frozen_in_the_file() {
         flake: fleet.path().to_str().unwrap().to_owned(),
         build_host: None,
         target: None,
+        log: None,
     };
 
     // Control: nothing frozen, so it goes through.
@@ -1441,7 +1442,7 @@ async fn the_shell_never_starts_clan_for_a_machine_frozen_in_the_file() {
     // Frozen in the file: refused here, `clan` not started.
     store.set("alfrost", true).await.unwrap();
     let end = run_op(&shell, op(2)).await;
-    assert_eq!(end.result, ActionResult::Failed);
+    assert_eq!(end.result, ActionResult::Refused);
     assert!(
         end.summary.iter().any(|l| l.contains("alfrost is frozen")),
         "{end:?}"
@@ -1451,7 +1452,7 @@ async fn the_shell_never_starts_clan_for_a_machine_frozen_in_the_file() {
     // A file that cannot be read: refused too.
     damage(&state, b"garbage {\n");
     let end = run_op(&shell, op(3)).await;
-    assert_eq!(end.result, ActionResult::Failed);
+    assert_eq!(end.result, ActionResult::Refused);
     assert!(
         end.summary
             .iter()

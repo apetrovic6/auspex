@@ -32,13 +32,15 @@ pub use app::{
     PROMETHEUS_TIMED_OUT, SYSTEM_CHANGED,
 };
 pub use auspex_domain::report::{FleetError, FleetErrorKind};
-pub use config::{Config, DiffConfig, FreezeConfig, PrometheusConfig, SavedFreezes};
+pub use config::{Config, DiffConfig, FreezeConfig, PrometheusConfig, RollingConfig, SavedFreezes};
 pub use crux_core::Core;
 pub use effects::{
-    ActionEnd, ActionKind, ActionRequest, ActionResult, Effect, Generation, PreflightAnswer,
+    ActionEnd, ActionKind, ActionRequest, ActionResult, AwaitAnswer, AwaitRequest, Effect,
+    Generation, KubeAnswer, KubeOp, KubeReply, KubeRequest, LogOp, LogRequest, PreflightAnswer,
     PreflightRequest, RequestId, ShellEnd, ShellRequest,
 };
 pub use view::{
     ActionStatus, ActionView, ConfirmKind, ConfirmView, FreezeView, Mode, Phase, PrometheusStatus,
-    RefreshView, SearchView, TypedView, ViewModel,
+    RefreshView, RollMachineView, RollState, RollStatus, RollView, SearchView, TypedView,
+    ViewModel,
 };

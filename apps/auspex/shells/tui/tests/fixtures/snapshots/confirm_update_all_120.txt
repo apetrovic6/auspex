@@ -1,0 +1,30 @@
+┌ machines (18) ─────────────────────────────────────┐┌ alfrost ───────────────────────────────────────────────────────┐
+│›✓    alfrost              in sync                  ││badges    ✓ in sync                                             │
+│ ✓    callisto             in sync                  ││status    in sync                                               │
+│ ✓⚠   cerberus             in sync                  ││reason    —                                                     │
+│ ↑    cypramundi           update pending           ││host      root@203.0.113.7 (inventory deploy.targetHost)        │
+│ ?    deimos               not installed            ││class     nixos  tags: base, server                             │
+│ ✓    europa               in sync                  ││lints     none                                                  │
+│ ✓⟳   ganymede             in sync                  ││current   27bglqx1 nixos-system-alfrost-25.11.20261101.6a2f1c0  │
+│ ✓    genetor       ┌ confirm ───────────────────────────────────────────────────────────────────┐1.20261101.6a2f1c0  │
+│ ✓    io            │update 2 machines:                                                          │                    │
+│ ↑◆   luna          │in parallel, at most 2 at a time: luna, sol                                 │                    │
+│ ✗    mars          │skipped cypramundi: marked public: its name has to be typed, so update it   │                    │
+│ ✓    mechanicus-for│  with u                                                                    │                    │
+│ ✓    phobos        │each machine is checked at its turn: a refusal skips it, a failure stops    │GiB free            │
+│ ↑◆   sol           │  its rolling group                                                         │                    │
+│ ✓    terra         │                                                                            │                    │
+│ ✓    titan         │update 2 machines as listed above? y/N                                      │eus)                │
+│ ✗    triton        │                                                                            │                    │
+│ !    vulcan        │y confirms; any other key cancels                                           │                    │
+│                    └────────────────────────────────────────────────────────────────────────────┘                    │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+log: eval results stored in the cache: cypramundi, deimos, luna
+ACT │ settled │ 0 pending │ prom: ok                                                                              ? help

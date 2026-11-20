@@ -13,16 +13,16 @@
 │ ✓    mechanicus-forge-wo… in s│d             package diff (q closes)                 │                               │
 │ ✓    phobos               in s│A             toggle act mode (asks first)            │sed, 128.3 GiB free            │
 │ ↑◆   sol                  upda│u             update the machine (act mode)           │                               │
-│ ✓    terra                in s│b             build its pending system here           │eus)                           │
-│ ✓    titan                in s│s             ssh to the machine (act mode)           │ee (prometheus)                │
-│ ✗    triton               unre│f             freeze the machine (asks to unfreeze)   │                               │
-│ !    vulcan               eval│r             scan again                              │                               │
+│ ✓    terra                in s│U             update all that are pending (act mode)  │eus)                           │
+│ ✓    titan                in s│b             build its pending system here           │ee (prometheus)                │
+│ ✗    triton               unre│s             ssh to the machine (act mode)           │                               │
+│ !    vulcan               eval│f             freeze the machine (asks to unfreeze)   │                               │
+│                               │r             scan again                              │                               │
 │                               │:             command (:q, :refresh)                  │                               │
 │                               │?             this help                               │                               │
 │                               │q esc ctrl-c  quit                                    │                               │
 │                               │:q            quit                                    │                               │
 │                               │:refresh      scan again                              │                               │
-│                               │                                                      │                               │
 │                               │⠋ checking                                            │                               │
 │                               │⠋ evaluating                                          │                               │
 │                               │✓ in sync                                             │                               │

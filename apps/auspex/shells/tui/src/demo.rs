@@ -70,6 +70,7 @@ pub fn config() -> Config {
         public_machines: std::collections::BTreeSet::from([PUBLIC_MACHINE.to_owned()]),
         preflight_timeout_seconds: 5,
         freeze: FreezeConfig::default(),
+        rolling: auspex_core::RollingConfig::default(),
     }
 }
 
@@ -690,5 +691,38 @@ impl Demo {
             lines_dropped: 0,
             long_lines: 0,
         }))
+    }
+}
+
+impl Demo {
+    /// `Effect::Kube`: the demo has no cluster (and none of its machines has a rolling tag, so
+    /// `U` never asks); a call that arrives anyway says so. A run with real adapters (a test with
+    /// a fake `kubectl`) asks them.
+    pub(crate) async fn kube(
+        &self,
+        op: &auspex_core::effects::KubeRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<auspex_core::effects::KubeAnswer, Cancelled> {
+        if let Some(real) = &self.real_actions {
+            return real.kube(op, cancel, sink).await;
+        }
+        after(100, cancel).await?;
+        Ok(Err("the demo has no cluster".to_owned()))
+    }
+
+    /// `Effect::Await`: a scripted machine is healthy a moment after its (scripted) update. With
+    /// real adapters and a node to wait for, the node is waited for with the real `kubectl`.
+    pub(crate) async fn await_healthy(
+        &self,
+        op: &auspex_core::effects::AwaitRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<auspex_core::effects::AwaitAnswer, Cancelled> {
+        after(300, cancel).await?;
+        match &self.real_actions {
+            Some(real) if op.node.is_some() => real.await_loop(op, cancel, sink, false).await,
+            _ => Ok(Ok(())),
+        }
     }
 }

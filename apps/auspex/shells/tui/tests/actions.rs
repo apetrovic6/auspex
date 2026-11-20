@@ -371,6 +371,7 @@ fn request(kind: ActionKind, machine: &str, system: Option<&str>, flake: &str) -
         flake: flake.to_owned(),
         build_host: None,
         target: None,
+        log: None,
     }
 }
 

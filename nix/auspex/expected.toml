@@ -31,6 +31,22 @@ prometheus_instance = "terra:9100"
 public = true
 frozen = true
 
+[rolling.taghmata]
+kubernetes = true
+drain = true
+drain_timeout = 900
+
+[rolling.skitarii]
+kubernetes = false
+drain = false
+
+[update]
+parallel = 3
+ready_timeout = 300
+
+[kubernetes]
+kubeconfig = "/home/me/.kube/fleet"
+
 [keymap]
 quit = ["q", "esc"]
 down = "j"
