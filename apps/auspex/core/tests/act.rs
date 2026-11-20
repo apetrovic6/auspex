@@ -39,8 +39,13 @@ fn new(m: &str) -> String {
 /// luna, sol and terra, scanned to the end: each runs `old` and evaluates to `new`. luna is
 /// selected.
 fn settled(config: Config) -> Shell {
+    settled_with(config, THREE)
+}
+
+/// [`settled`] over another inventory of the same three machines.
+fn settled_with(config: Config, json: &str) -> Shell {
     let mut s = Shell::new();
-    s.start_with(config, THREE);
+    s.start_with(config, json);
     let mut eval = s.take_eval();
     for m in ["luna", "sol", "terra"] {
         s.eval_item(&mut eval, m, evaluated(m, &new(m)));
@@ -799,4 +804,68 @@ fn a_yes_while_the_evaluation_is_still_streaming_is_refused_though_the_machine_h
     s.eval_item(&mut eval, "terra", evaluated("terra", &new("terra")));
     s.resolve(&mut eval, EvalAnswer::Finished { error: None });
     assert_eq!(update(&mut s).operation.machine, "luna");
+}
+
+// ---------------------------------------------------------------------------------------
+// Where an update builds, said on the action's first Log line
+// ---------------------------------------------------------------------------------------
+
+/// The first line of luna's update, with luna's `deploy` as given.
+fn start_note_of_update(deploy: &str) -> String {
+    let json = format!(
+        r#"{{"luna": {{"deploy": {deploy}}},
+            "sol": {{"deploy": {{"targetHost": "root@192.168.1.12"}}}},
+            "terra": {{"deploy": {{"targetHost": "root@192.168.1.10"}}}}}}"#
+    );
+    let mut s = settled_with(config(), &json);
+    act_on(&mut s);
+    update(&mut s).operation.start_note()
+}
+
+#[test]
+fn an_update_built_on_localhost_says_this_machine_builds_and_copies() {
+    assert_eq!(
+        start_note_of_update(r#"{"targetHost": "root@192.168.1.138", "buildHost": "localhost"}"#),
+        "building on this machine (deploy.buildHost = localhost), then copying to root@192.168.1.138"
+    );
+}
+
+#[test]
+fn an_update_with_no_build_host_says_the_target_builds() {
+    assert_eq!(
+        start_note_of_update(r#"{"targetHost": "root@192.168.1.138"}"#),
+        "building on the target itself (no deploy.buildHost set)"
+    );
+}
+
+#[test]
+fn an_update_with_another_build_host_names_it() {
+    assert_eq!(
+        start_note_of_update(r#"{"targetHost": "root@192.168.1.138", "buildHost": "builder"}"#),
+        "building on builder (deploy.buildHost)"
+    );
+}
+
+#[test]
+fn a_hostile_build_host_is_sanitised_in_the_line() {
+    let note = start_note_of_update(
+        r#"{"targetHost": "root@192.168.1.138", "buildHost": "bu\u001b[31mil\u202eder\n"}"#,
+    );
+    assert_eq!(note, "building on builder (deploy.buildHost)");
+    // And the request itself, built by hand with raw text (the second defence).
+    let mut s = settled(config());
+    act_on(&mut s);
+    let mut op = update(&mut s).operation;
+    op.build_host = Some("x\u{1b}[31m\u{202e}y".to_owned());
+    assert_eq!(op.start_note(), "building on xy (deploy.buildHost)");
+}
+
+#[test]
+fn a_build_always_says_this_machine() {
+    let mut s = settled(config());
+    s.send(Event::BuildSelected);
+    assert_eq!(
+        s.take_action().operation.start_note(),
+        "building on this machine"
+    );
 }

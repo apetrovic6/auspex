@@ -225,6 +225,12 @@ async fn an_update_streams_into_the_log_tab_and_the_status_bar_says_how_it_ended
     );
     assert!(wide.contains("── update luna ──"), "{wide}");
     assert!(
+        wide.contains(
+            "building on this machine (deploy.buildHost = localhost), then copying to root@192.168.1.11"
+        ),
+        "{wide}"
+    );
+    assert!(
         wide.contains("activating the new configuration..."),
         "{wide}"
     );
@@ -729,4 +735,23 @@ async fn a_question_that_did_not_fit_is_not_drawn_and_cannot_be_answered() {
     type_keys(&shell, &mut ui, &km, "y");
     assert_eq!(shell.view().action.expect("started").machine, "luna");
     until_action_ends(&shell).await;
+}
+
+// ---------------------------------------------------------------------------------------
+// The Log tab says where the action builds
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn the_first_log_line_is_auspexs_own_and_looks_unlike_clans_output() {
+    let shell = settled_demo().await;
+    let mut ui = Ui::default();
+    let km = Keymap::defaults();
+    type_keys_seen(&shell, &mut ui, &km, "/luna\nb");
+    until_action_ends(&shell).await;
+    let first = shell.output().window(1, 1);
+    assert_eq!(first[0].stream, Stream::Note, "{first:?}");
+    assert_eq!(first[0].text, "building on this machine");
+    let theme = Theme::Ansi;
+    assert_ne!(theme.style(Role::Dim), theme.style(Role::Text));
+    assert_ne!(theme.style(Role::Dim), theme.style(Role::Stderr));
 }

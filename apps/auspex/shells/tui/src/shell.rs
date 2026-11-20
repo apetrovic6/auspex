@@ -693,6 +693,9 @@ impl Shell {
         let token = self.open(op.id);
         self.output
             .begin(&format!("{} {}", op.kind.label(), op.machine));
+        // The action's first line, before clan's: where it builds. Auspex's own words (Note),
+        // not clan's output.
+        self.output.push(Stream::Note, &op.start_note());
         let logged = self.log_action(&op);
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {

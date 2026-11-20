@@ -1,6 +1,7 @@
 ┌ machines (18) ───────────────────────┐
 │┌ log ───────────────────────────────┐│
 ││── update luna ──                   ││
+││building on this machine (deploy.bu…││
 ││demo: nothing is run; update luna i…││
 ││building the system configuration...││
 ││copying closure to the target host.…││
@@ -8,7 +9,6 @@
 ││activating the new configuration... ││
 ││done                                ││
 ││── succeeded, exit 0 ──             ││
-││                                    ││
 ││                                    ││
 ││                                    ││
 ││                                    ││

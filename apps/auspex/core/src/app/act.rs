@@ -591,7 +591,7 @@ fn preflight_answered(
 /// Issues the request. Called only after [`check`] and, for an update, the operator's
 /// confirmation.
 fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effect, Event> {
-    let (class, system) = {
+    let (class, system, build_host, target) = {
         let Some(row) = model.rows.iter().find(|r| r.machine.name == machine) else {
             return model.notice(format!(
                 "{machine} is not in the inventory; not touching it"
@@ -601,7 +601,13 @@ fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effec
             Some(EvalOutcome::Success(e)) => e.system.clone(),
             _ => None,
         };
-        (row.machine.class, system)
+        let target = row.target.as_ref().ok().map(|t| t.target.to_string());
+        (
+            row.machine.class,
+            system,
+            row.machine.build_host.clone(),
+            target,
+        )
     };
     let flake = model
         .config
@@ -624,6 +630,8 @@ fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effec
             class,
             system,
             flake,
+            build_host,
+            target,
         })
         .then_send(move |end| Event::ActionEnded { id, end }),
         render(),

@@ -1,6 +1,7 @@
 ┌ machines (18) ─────────────────────────────────────┐┌ luna ──────────────────────────────────────────────────────────┐
 │┌ log ───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
 ││── update luna ──                                                                                                   ││
+││building on this machine (deploy.buildHost = localhost), then copying to root@192.168.1.11                          ││
 ││demo: nothing is run; update luna is scripted                                                                       ││
 ││building the system configuration...                                                                                ││
 ││copying closure to the target host...                                                                               ││
@@ -8,7 +9,6 @@
 ││activating the new configuration...                                                                                 ││
 ││done                                                                                                                ││
 ││── succeeded, exit 0 ──                                                                                             ││
-││                                                                                                                    ││
 ││                                                                                                                    ││
 ││                                                                                                                    ││
 ││                                                                                                                    ││
