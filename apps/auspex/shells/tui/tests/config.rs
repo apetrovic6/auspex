@@ -50,6 +50,8 @@ fn the_home_manager_contract_fixture_loads_whole() {
             MachineSettings {
                 target: Some("root@192.168.1.10".to_owned()),
                 prometheus_instance: Some("terra:9100".to_owned()),
+                // The fixture says `true`, the opposite of the default.
+                public: true,
             }
         )])
     );
@@ -77,6 +79,13 @@ fn the_home_manager_contract_fixture_loads_whole() {
     assert_eq!(km.keys_for(Action::Down), ["j"]);
     let core = core_config(&s, "/fleet".to_owned());
     assert_eq!(core.target_overrides["terra"], "root@192.168.1.10");
+    // `machines.terra.public = true` reaches the core, which is where typed confirmation is decided;
+    // and the checks before an update share `timeouts.diff`.
+    assert_eq!(
+        core.public_machines,
+        std::collections::BTreeSet::from(["terra".to_owned()])
+    );
+    assert_eq!(core.preflight_timeout_seconds, 120);
     let prom = core.prometheus.unwrap();
     assert_eq!(prom.instances["terra"], "terra:9100");
     assert_eq!(prom.max_age_seconds, 60);
@@ -107,6 +116,11 @@ fn a_wrong_type_is_an_error_naming_the_key() {
         ("timeouts = 5\n", "`timeouts`"),
         ("[prometheus]\nurl = [\"a\"]\n", "`prometheus.url`"),
         ("[machines]\nterra = \"x\"\n", "`machines.terra`"),
+        (
+            "[machines.terra]\npublic = \"yes\"\n",
+            "`machines.terra.public`",
+        ),
+        ("[machines.terra]\npublic = 1\n", "`machines.terra.public`"),
         ("[keymap]\nquit = 1\n", "`keymap.quit`"),
         ("[keymap]\nquit = [\"q\", 2]\n", "`keymap.quit`"),
         ("[theme]\nfile = false\n", "`theme.file`"),
@@ -403,4 +417,28 @@ fn a_settle_shorter_than_the_probe_is_one_warning_not_two() {
     let (_, warnings) = config::parse("[timeouts]\nprobe = 30\nsettle = 20\n").unwrap();
     assert_eq!(warnings.len(), 1, "{warnings:?}");
     assert!(warnings[0].contains("timeouts.probe"), "{warnings:?}");
+}
+
+/// `machines.<m>.public`, end to end: the file, the loader, the core's config. Only the
+/// machines that say `true` are public, a machine the file does not mention is not, and the
+/// default is `false`.
+#[test]
+fn machines_public_reaches_the_core_and_defaults_to_false() {
+    let (s, w) = config::parse(
+        "[machines.luna]\npublic = true\n[machines.sol]\npublic = false\n\
+         [machines.terra]\ntarget = \"root@10.0.0.1\"\n",
+    )
+    .unwrap();
+    assert!(w.is_empty(), "{w:?}");
+    assert!(s.machines["luna"].public);
+    assert!(!s.machines["sol"].public);
+    assert!(!s.machines["terra"].public, "the default is false");
+    let core = core_config(&s, ".".to_owned());
+    assert_eq!(
+        core.public_machines,
+        std::collections::BTreeSet::from(["luna".to_owned()])
+    );
+    // No machines at all: none is public.
+    let (s, _) = config::parse("").unwrap();
+    assert!(core_config(&s, ".".to_owned()).public_machines.is_empty());
 }

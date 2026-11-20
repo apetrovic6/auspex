@@ -131,8 +131,15 @@ pub enum Mode {
 pub enum ConfirmKind {
     /// Turn act mode on.
     Act,
-    /// Update a machine.
+    /// The checks before an update are running (the shell is reading the fleet repository and
+    /// sizing the closure). Any key cancels them; nothing is decided yet.
+    Checking,
+    /// Update a machine: `y` confirms.
     Update,
+    /// Update a machine marked public: the machine's name has to be typed, then Enter.
+    UpdateTyped,
+    /// The checks refused the update. There is no way to proceed; any key closes the dialog.
+    Refused,
     /// Quit while an action runs.
     Quit,
 }
@@ -142,11 +149,29 @@ pub enum ConfirmKind {
 pub struct ConfirmView {
     /// What is being asked.
     pub kind: ConfirmKind,
-    /// The whole question, ending in `y/N`.
+    /// The whole question. Ends in `y/N` for the questions that `y` answers.
     pub question: String,
     /// Which question this is: every question asked gets a new number, so a shell can tell
     /// that the one it drew is the one it is answering.
     pub serial: u64,
+    /// What the checks before an update refused, each a full sentence: the update cannot
+    /// proceed while any is here. Shown first.
+    pub refusals: Vec<String>,
+    /// What the checks before an update found that the operator should read before confirming.
+    pub warnings: Vec<String>,
+    /// The typed confirmation, when the question asks for one ([`ConfirmKind::UpdateTyped`]).
+    pub typed: Option<TypedView>,
+}
+
+/// A name the operator has to type to confirm an update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypedView {
+    /// What has to be typed: the machine's name, exactly.
+    pub expected: String,
+    /// What has been typed so far.
+    pub text: String,
+    /// The last Enter did not match `expected`.
+    pub mismatch: bool,
 }
 
 /// The action in progress, or the last one to end.

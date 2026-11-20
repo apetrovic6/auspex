@@ -291,14 +291,26 @@ fn out_of_memory(stderr: &str, status: std::process::ExitStatus) -> bool {
         || matches!(status.signal(), Some(6 | 7 | 11))
 }
 
-async fn git(
+pub(crate) async fn git(
     params: &GitParams<'_>,
     dir: &Path,
     args: &[&str],
     cap: usize,
     cancel: &CancellationToken,
 ) -> Result<Result<Vec<u8>, String>, Cancelled> {
-    let what = format!("git {}", args.first().copied().unwrap_or_default());
+    // The subcommand, for messages: the first argument that is not a global option or the
+    // value of `-c` (the tree check passes `--no-optional-locks -c k=v status …`).
+    let mut rest = args.iter();
+    let mut subcommand = "";
+    while let Some(a) = rest.next() {
+        if *a == "-c" {
+            rest.next();
+        } else if !a.starts_with('-') {
+            subcommand = a;
+            break;
+        }
+    }
+    let what = format!("git {subcommand}");
     let mut cmd = match command(params.program) {
         Ok(c) => c,
         Err(e) => return Ok(Err(spawn_error(&what, params.program, &e))),

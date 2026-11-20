@@ -85,6 +85,7 @@ in {
           type = types.attrsOf (table {
             target = optional types.str "SSH target overriding inventory deploy.targetHost.";
             prometheus_instance = optional types.str "Prometheus instance label; defaults to <name>:9100.";
+            public = optional types.bool "Whether the machine faces the internet (default false). Updating a public machine asks for its name to be typed instead of y.";
           });
         };
         keymap = mkOption {

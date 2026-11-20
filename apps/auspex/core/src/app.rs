@@ -61,8 +61,8 @@ use crate::config::Config;
 use crate::effects::{
     ActionEnd, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest, Effect,
     EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
-    PendingClosureRequest, ProbeRequest, PrometheusAnswer, PrometheusRequest, RequestId,
-    ResolveRequest,
+    PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer, PrometheusRequest,
+    RequestId, ResolveRequest,
 };
 use crate::view::{Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState};
 
@@ -235,8 +235,27 @@ pub enum Event {
     /// Build the selected machine's pending system here (`b`). Changes nothing on any machine,
     /// so it needs no act mode; refused for another system's machine.
     BuildSelected,
-    /// The answer to the open question: `true` for `y`, `false` for anything else.
+    /// The answer to the open question: `true` for `y`, `false` for anything else. For a
+    /// question that asks for a typed name ([`crate::ConfirmKind::UpdateTyped`]) `true` is
+    /// ignored: only [`Event::ConfirmSubmit`] with the exact name confirms, and `false`
+    /// cancels. For a refusal either answer just closes it.
     ConfirmAnswer(bool),
+    /// A character typed into a typed confirmation. Ignored unless one is open, and for
+    /// anything a machine name cannot contain.
+    ConfirmChar(char),
+    /// Backspace in a typed confirmation.
+    ConfirmBackspace,
+    /// Enter in a typed confirmation: confirms only when the text is the machine's name,
+    /// exactly.
+    ConfirmSubmit,
+    /// [`PreflightRequest`](crate::effects::PreflightRequest) answered: the checks before an
+    /// update have what they need from the shell. Built by the core; a shell never sends it.
+    PreflightAnswered {
+        /// The request.
+        id: RequestId,
+        /// What it found.
+        answer: PreflightAnswer,
+    },
     /// The operator wants to quit. Cancels everything outstanding and sets
     /// [`ViewModel::quit`], except while an action is running: then it asks, and quits once
     /// the action has been stopped, killed and reaped. A second quit while it is stopping
@@ -328,6 +347,9 @@ struct Row {
     eval: Option<EvalOutcome>,
     cache: NarCache,
     diff: DiffSlot,
+    /// The machine's own closure (what the package preview fetched), kept when it is consistent
+    /// with what the probe saw: the disk check counts only the pending paths not in it.
+    deployed_paths: Option<BTreeSet<StorePath>>,
 }
 
 impl Row {
@@ -396,6 +418,10 @@ pub struct Model {
     /// Counts the questions asked, so a shell can tell one question from the next (it may only
     /// accept an answer to a question it has drawn).
     confirm_serial: u64,
+    /// The refresh whose address resolution was cut off at its settle deadline: it never
+    /// answered. An update is refused while that is the current refresh (see `app/act.rs`); the
+    /// next refresh is another generation, so it starts afresh (nothing resets it).
+    resolution_timed_out: Option<Generation>,
 }
 
 impl Model {
@@ -636,6 +662,10 @@ impl App for Auspex {
             | Event::UpdateSelected
             | Event::BuildSelected
             | Event::ConfirmAnswer(_)
+            | Event::ConfirmChar(_)
+            | Event::ConfirmBackspace
+            | Event::ConfirmSubmit
+            | Event::PreflightAnswered { .. }
             | Event::ActionEnded { .. }) => act::event(model, event),
             view_event => {
                 view_update(model, view_event);
@@ -808,6 +838,7 @@ fn inventory_answered(model: &mut Model, answer: InventoryAnswer) -> Command<Eff
                 eval: None,
                 cache: NarCache::NotApplicable,
                 diff: DiffSlot::Idle,
+                deployed_paths: None,
             }
         })
         .collect();
@@ -1186,6 +1217,10 @@ fn closure_answered(
             return Command::all(commands);
         }
     };
+    // The machine's own closure, for the disk check: only if it is the closure of the system
+    // the probe saw (a machine that changed system in between is not the one that was asked).
+    let own =
+        (side == Side::Deployed).then(|| paths.paths.iter().cloned().collect::<BTreeSet<_>>());
     match side {
         Side::Deployed => *deployed = Some(paths),
         Side::Pending => *pending = Some(paths),
@@ -1200,6 +1235,13 @@ fn closure_answered(
             pending,
         );
         row.diff = DiffSlot::Done(diff);
+    }
+    if let Some(own) = own {
+        let consistent = matches!(
+            &row.probe,
+            Some(ProbeOutcome::Observed(o)) if o.current_system.as_ref().is_some_and(|c| own.contains(c))
+        );
+        row.deployed_paths = consistent.then_some(own);
     }
     render()
 }
@@ -1370,8 +1412,10 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
             //
             // The previews' queries are not here: filtered out above, they keep their own
             // deadline.
-            Pending::Resolve(_)
-            | Pending::Probe(_)
+            // ... but not for the update's checks: "the lookup never answered" is not "this name
+            // does not resolve", so it is remembered.
+            Pending::Resolve(_) => model.resolution_timed_out = Some(model.generation),
+            Pending::Probe(_)
             | Pending::Eval
             | Pending::EvalOne(_)
             | Pending::Deployed(_)
@@ -1430,6 +1474,10 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::UpdateSelected
         | Event::BuildSelected
         | Event::ConfirmAnswer(_)
+        | Event::ConfirmChar(_)
+        | Event::ConfirmBackspace
+        | Event::ConfirmSubmit
+        | Event::PreflightAnswered { .. }
         | Event::ActionEnded { .. }
         | Event::Terminate
         | Event::Quit => {}

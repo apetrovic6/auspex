@@ -1,0 +1,16 @@
+┌ confirm ─────────────────────────────┐
+│warning: warning number 1 says        │
+│  something that is long enough to    │
+│  wrap onto lines                     │
+│warning: warning number 2 says        │
+│  something that is long enough to    │
+│  wrap onto lines                     │
+│…and 2 more warnings                  │
+│                                      │
+│update luna to g1j4m7qa               │
+│nixos-system-luna-25.11? y/N          │
+│                                      │
+│y confirms; any other key cancels     │
+└──────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ settled │ 0 pending │ prom: ok

@@ -1,0 +1,30 @@
+┌ machines (18) ─────────────────────────────────────┐┌ europa ────────────────────────────────────────────────────────┐
+│ ✓    alfrost              in sync                  ││badges    ✓ in sync                                             │
+│ ✓    callisto             in sync                  ││status    in sync                                               │
+│ ✓⚠   cerberus             in sync                  ││reason    —                                                     │
+│ ↑    cypramundi           update pending           ││host      root@europa.lab.example (inventory deploy.targetHost) │
+│ ?    deimos               not installed            ││class     nixos  tags: base, dev                                │
+│›✓    europa               in sync                  ││lint      hostname target europa.lab.example (prefer an IP)     │
+│ ✓⟳   ganymede             in sync                  ││lint      192.168.1.30 is also io, vulcan: deploys refused      │
+│ ✓    genetor       ┌ confirm ───────────────────────────────────────────────────────────────────┐.20261101.6a2f1c0   │
+│ ✓    io            │refused: europa's target resolves to 192.168.1.30, which io and vulcan      │.20261101.6a2f1c0   │
+│ ↑◆   luna          │  also resolve to: an update could land on the wrong machine                │                    │
+│ ✗    mars          │warning: the fleet repository has uncommitted changes to 2 tracked files:   │                    │
+│ ✓    mechanicus-for│  the update deploys them, and no commit says what was deployed             │                    │
+│ ✓    phobos        │warning: the fleet repository's HEAD is 1 commit ahead of origin/main:      │                    │
+│ ↑◆   sol           │  what is deployed has not been pushed                                      │GiB free            │
+│ ✓    terra         │                                                                            │                    │
+│ ✓    titan         │europa will not be updated.                                                 │                    │
+│ ✗    triton        │                                                                            │eus)                │
+│ !    vulcan        │any key closes                                                              │                    │
+│                    └────────────────────────────────────────────────────────────────────────────┘                    │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+│                                                    ││                                                                │
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+log: eval results stored in the cache: cypramundi, deimos, luna
+ACT │ settled │ 0 pending │ prom: ok                                                                              ? help

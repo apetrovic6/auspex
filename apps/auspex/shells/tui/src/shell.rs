@@ -365,6 +365,14 @@ impl Shell {
                     .await
                 });
             }
+            Effect::Preflight(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                self.one_shot(op.id, request, async move {
+                    shell.backend.preflight(&op, &token).await
+                });
+            }
             Effect::RunAction(request) => self.run_action(request),
             Effect::Cancel(request) => self.cancel(request.operation.id),
         }

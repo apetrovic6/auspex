@@ -42,11 +42,12 @@ pub fn started_demo() -> Arc<Shell> {
 
 /// The demo, run to its settled end. Call from a test with paused time.
 pub async fn settled_demo() -> Arc<Shell> {
-    let shell = Shell::new(
-        Backend::Demo(Demo::default()),
-        Log::memory(),
-        Duration::from_secs(120),
-    );
+    settled_demo_with(Demo::default()).await
+}
+
+/// [`settled_demo`] with a script of its own (what the checks before an update find, say).
+pub async fn settled_demo_with(demo: Demo) -> Arc<Shell> {
+    let shell = Shell::new(Backend::Demo(demo), Log::memory(), Duration::from_secs(120));
     shell.send(Event::Start(demo::config()));
     while !shell.view().refresh.settled {
         shell.changed().await;
@@ -406,4 +407,26 @@ pub fn still_alive_after_wait(pids: &[i32]) -> Vec<i32> {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Waits (time is paused, so this is instant) until the checks before an update are over and
+/// their dialog is open (or closed by a refusal's notice).
+pub async fn until_checked(shell: &Arc<Shell>) {
+    while shell
+        .view()
+        .confirm
+        .as_ref()
+        .is_some_and(|c| c.kind == auspex_core::ConfirmKind::Checking)
+    {
+        shell.changed().await;
+    }
+}
+
+/// [`until_checked`], then one frame: the dialog the checks opened is a question of its own,
+/// and a key counts for it only once a frame has drawn it.
+pub async fn until_asked(shell: &Arc<Shell>, ui: &mut Ui, keymap: &Keymap) {
+    until_checked(shell).await;
+    frame(shell, ui, keymap);
+    // ... and a question counts only once it has been on screen for the dwell.
+    elapse(auspex_tui::ui::QUESTION_DWELL);
 }

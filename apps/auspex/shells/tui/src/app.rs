@@ -75,6 +75,13 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
         // Clamped to the TUI where the run is built: a headless run never acts.
         allow_act: true,
         local_system: auspex_effects::clan::current_system(),
+        public_machines: settings
+            .machines
+            .iter()
+            .filter(|(_, m)| m.public)
+            .map(|(name, _)| name.clone())
+            .collect(),
+        preflight_timeout_seconds: settings.timeouts.diff,
     }
 }
 

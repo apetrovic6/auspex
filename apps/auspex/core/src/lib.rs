@@ -33,9 +33,10 @@ pub use auspex_domain::report::{FleetError, FleetErrorKind};
 pub use config::{Config, DiffConfig, PrometheusConfig};
 pub use crux_core::Core;
 pub use effects::{
-    ActionEnd, ActionKind, ActionRequest, ActionResult, Effect, Generation, RequestId,
+    ActionEnd, ActionKind, ActionRequest, ActionResult, Effect, Generation, PreflightAnswer,
+    PreflightRequest, RequestId,
 };
 pub use view::{
     ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode, Phase, PrometheusStatus, RefreshView,
-    SearchView, ViewModel,
+    SearchView, TypedView, ViewModel,
 };

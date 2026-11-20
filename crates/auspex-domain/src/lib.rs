@@ -19,6 +19,8 @@
 //! - [`fleet`]: machines, the inventory parser, ssh targets, their resolution and the
 //!   ssh argument vector, and the homelab-safety lints.
 //! - [`observe`]: the probe scripts, their parser, and merging Prometheus samples.
+//! - [`preflight`]: the checks before an update (fleet tree, free disk, duplicate address) and
+//!   the rule for typed confirmation.
 //! - [`eval`]: `nix-eval-jobs` lines, the eval cache key and the cache entry.
 //! - [`closure`]: the two closure queries' script and output parser.
 //! - [`diff`]: bounded package previews from two runtime closures.
@@ -32,6 +34,7 @@ pub mod diff;
 pub mod eval;
 pub mod fleet;
 pub mod observe;
+pub mod preflight;
 pub mod report;
 pub mod status;
 pub mod text;

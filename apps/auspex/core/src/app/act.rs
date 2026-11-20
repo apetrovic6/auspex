@@ -6,9 +6,22 @@
 //! - **Observe is the default and nothing persists it.** [`Model::act`] starts `false`, is
 //!   never read from a config, and can only become `true` when [`Config::allow_act`] is set:
 //!   headless runs do not set it, so they cannot be put in act mode.
-//! - **An update is asked about, by name.** `u` opens "update luna to nixos-system-luna-…?
-//!   y/N". Nothing runs until the operator answers `y`, and the request is re-checked at that
-//!   moment (the list may have been refreshed while the question was open).
+//! - **An update is checked, then asked about, by name.** `u` first asks the shell for what
+//!   the checks need (the fleet repository's state, the pending closure's size:
+//!   [`PreflightRequest`]), then shows **one dialog** with everything the checks found:
+//!   refusals first (no way to proceed: any key closes it), then warnings, then the question
+//!   ("update luna to 0a1b2c3d nixos-system-luna-…? y/N", or for a machine marked public,
+//!   "type luna"). Nothing runs until the operator confirms, and everything is re-checked at
+//!   that moment (the list may have been refreshed while the dialog was open). If the refresh
+//!   changed the pending system, nothing is deployed and the checks run again for the new one.
+//! - **A question is answered only after it was drawn.** Every question the core opens
+//!   ([`Model::ask`]) has a new serial, and a shell accepts an answer only to the one it drew.
+//!   The checking dialog, the refusal or warning dialog that follows it and the typed
+//!   confirmation are each a question of their own: keys typed while the checks ran count for
+//!   none of them.
+//! - **The rules are the domain's** ([`auspex_domain::preflight`]); this file only gathers
+//!   their inputs from what the core holds (the probe's free space on `/nix/store`, the
+//!   machines' addresses, the config's `public` flag) and from the shell's answer.
 //! - **One machine, validated.** The machine of an [`ActionRequest`] is the selected row's name,
 //!   checked against the domain's machine-name rule and against the inventory (a row exists).
 //!   An empty, unknown or malformed name is refused here, before any effect is asked for. The
@@ -16,7 +29,8 @@
 //!   fleet, so neither layer trusts the other.
 //! - **One action at a time.** A second `u` or `b` while one runs says so and asks for nothing.
 //! - **A build is local and same-system.** `b` needs no act mode (it changes nothing on any
-//!   machine) but is refused for a machine whose evaluated system is not this machine's.
+//!   machine) but is refused for a machine whose evaluated system is not this machine's. It
+//!   runs none of the checks above: they are about what an update does to a machine.
 //! - **Quitting waits for the process.** With an action running, `q` asks; `y` cancels it
 //!   through [`Effect::Cancel`](crate::Effect::Cancel), and [`ViewModel::quit`] only becomes
 //!   true when the shell has answered that the process group is killed and reaped. A second
@@ -30,8 +44,9 @@
 //! [`ViewModel::quit`]: crate::ViewModel::quit
 
 use auspex_domain::eval::EvalOutcome;
-use auspex_domain::fleet::is_plain_name;
-use auspex_domain::observe::ProbeOutcome;
+use auspex_domain::fleet::{is_plain_name, shared_ips};
+use auspex_domain::observe::{ProbeOutcome, StorePath};
+use auspex_domain::preflight::{Addresses, Facts, Preflight, estimate, preflight};
 use auspex_domain::status::NarCache;
 use crux_core::Command;
 use crux_core::render::render;
@@ -39,9 +54,9 @@ use crux_core::render::render;
 use super::{Event, Model, Pending};
 use crate::effects::{
     ActionEnd, ActionKind, ActionRequest, CancelRequest, Effect, EvalMachine, EvalRequest,
-    ProbeRequest, RequestId,
+    PreflightAnswer, PreflightRequest, ProbeRequest, RequestId,
 };
-use crate::view::{ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode};
+use crate::view::{ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode, TypedView};
 
 /// The notice of an action key pressed in observe mode.
 pub const ACT_MODE_OFF: &str = "act mode is off (A)";
@@ -49,20 +64,49 @@ pub const ACT_MODE_OFF: &str = "act mode is off (A)";
 /// The notice of a `y` while the machine's evaluation is being refreshed.
 pub const REFRESH_RUNNING: &str = "a refresh is running; ask again when it has finished";
 
-/// A question waiting for y or N.
+/// The longest a typed confirmation can be: a machine name's own limit
+/// ([`auspex_domain::fleet::is_plain_name`]).
+const MAX_TYPED: usize = 63;
+
+/// A question waiting for an answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Confirm {
     /// Turn act mode on.
     Act,
-    /// Update `machine` to the pending system `to` (what the question shows: hash prefix and
-    /// name), whose store path was `path` when it was asked.
-    Update {
+    /// The checks before an update of `machine` (to the system named `to`) are running in the
+    /// shell as request `id`. Any key cancels them.
+    Checking {
         machine: String,
         to: String,
+        /// The pending system's store path when the checks were asked for.
         path: String,
+        id: RequestId,
+    },
+    /// The checks are in. `review` is what they decided when they came in (shown); it is
+    /// decided again when the operator confirms.
+    Update {
+        machine: String,
+        /// The pending system as the question shows it (hash prefix and name), and its store
+        /// path when it was asked about: the answer is for that system, and if a refresh changes
+        /// it the question is asked again.
+        to: String,
+        path: String,
+        answer: PreflightAnswer,
+        review: Preflight,
+        /// What has been typed, when the machine is one whose name has to be typed. Only for
+        /// a review with no refusals: there is nothing to confirm otherwise.
+        typed: Option<Typed>,
     },
     /// Quit while an action runs.
     Quit,
+}
+
+/// A typed confirmation in progress.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Typed {
+    text: String,
+    /// The last Enter did not match.
+    mismatch: bool,
 }
 
 /// Where the current (or last) action is.
@@ -133,22 +177,74 @@ pub(super) fn views(model: &Model) -> (Mode, Option<ActionView>, Option<ConfirmV
             Phase::Ended(end) => ActionStatus::Ended(end.clone()),
         },
     });
-    let confirm = model.confirm.as_ref().map(|c| ConfirmView {
-        kind: match c {
-            Confirm::Act => ConfirmKind::Act,
-            Confirm::Update { .. } => ConfirmKind::Update,
-            Confirm::Quit => ConfirmKind::Quit,
-        },
-        question: question(model, c),
-        serial: model.confirm_serial,
-    });
+    let confirm = model.confirm.as_ref().map(|c| confirm_view(model, c));
     (mode, action, confirm)
+}
+
+fn confirm_view(model: &Model, confirm: &Confirm) -> ConfirmView {
+    let (kind, refusals, warnings, typed) = match confirm {
+        Confirm::Act => (ConfirmKind::Act, Vec::new(), Vec::new(), None),
+        Confirm::Checking { .. } => (ConfirmKind::Checking, Vec::new(), Vec::new(), None),
+        Confirm::Quit => (ConfirmKind::Quit, Vec::new(), Vec::new(), None),
+        Confirm::Update {
+            machine,
+            review,
+            typed,
+            ..
+        } => {
+            let kind = if !review.refusals.is_empty() {
+                ConfirmKind::Refused
+            } else if typed.is_some() {
+                ConfirmKind::UpdateTyped
+            } else {
+                ConfirmKind::Update
+            };
+            (
+                kind,
+                review.refusals.clone(),
+                review.warnings.clone(),
+                typed.as_ref().map(|t| TypedView {
+                    expected: machine.clone(),
+                    text: t.text.clone(),
+                    mismatch: t.mismatch,
+                }),
+            )
+        }
+    };
+    ConfirmView {
+        kind,
+        question: question(model, confirm),
+        serial: model.confirm_serial,
+        refusals,
+        warnings,
+        typed,
+    }
 }
 
 fn question(model: &Model, confirm: &Confirm) -> String {
     match confirm {
         Confirm::Act => "turn on act mode? updates will be possible. y/N".to_owned(),
-        Confirm::Update { machine, to, .. } => format!("update {machine} to {to}? y/N"),
+        Confirm::Checking { machine, .. } => {
+            format!("checking {machine} before the update… any key cancels")
+        }
+        Confirm::Update {
+            machine,
+            to,
+            review,
+            typed,
+            ..
+        } => {
+            if !review.refusals.is_empty() {
+                format!("{machine} will not be updated.")
+            } else if typed.is_some() {
+                format!(
+                    "update {machine} to {to}? it is marked public: type {machine}, then \
+                     Enter. Esc cancels"
+                )
+            } else {
+                format!("update {machine} to {to}? y/N")
+            }
+        }
         Confirm::Quit => {
             let what = model.action.as_ref().map_or_else(
                 || "an action".to_owned(),
@@ -174,6 +270,18 @@ fn question(model: &Model, confirm: &Confirm) -> String {
     }
 }
 
+/// Forgets the open question. If it was the checks of an update still running in the shell,
+/// they are cancelled: the returned commands must be sent, or the shell keeps a `git` and a
+/// `nix` running for a dialog nobody is looking at.
+fn drop_confirm(model: &mut Model) -> Vec<Command<Effect, Event>> {
+    match model.confirm.take() {
+        Some(Confirm::Checking { id, .. }) => {
+            vec![Command::notify_shell(CancelRequest { id }).into()]
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// `A`: toggles act mode. Turning it off is immediate; turning it on asks.
 pub(super) fn toggle_act(model: &mut Model) -> Command<Effect, Event> {
     model.view.notice = None;
@@ -182,11 +290,14 @@ pub(super) fn toggle_act(model: &mut Model) -> Command<Effect, Event> {
     }
     if model.act {
         model.act = false;
-        model.confirm = None;
-        return render();
+        let mut commands = drop_confirm(model);
+        commands.push(render());
+        return Command::all(commands);
     }
+    let mut commands = drop_confirm(model);
     model.ask(Confirm::Act);
-    render()
+    commands.push(render());
+    Command::all(commands)
 }
 
 /// `u` or `b` on the selected machine.
@@ -210,14 +321,10 @@ pub(super) fn request(model: &mut Model, kind: ActionKind) -> Command<Effect, Ev
     };
     match check(model, kind, &machine) {
         Err(why) => model.notice(why),
-        Ok(Shown { shown, path }) if kind == ActionKind::Update => {
-            model.ask(Confirm::Update {
-                machine,
-                to: shown,
-                path,
-            });
-            render()
-        }
+        Ok(checked) if kind == ActionKind::Update => match not_yet(model, &machine) {
+            Some(why) => model.notice(why),
+            None => start_checks(model, machine, checked),
+        },
         Ok(_) => launch(model, kind, machine),
     }
 }
@@ -236,9 +343,11 @@ struct Shown {
     /// As the question shows it, as the detail panel does: the hash's first 8 characters and
     /// the name (the name alone does not identify a system: two configurations on one nixpkgs
     /// share it).
-    shown: String,
+    label: String,
     /// The whole store path, to tell at `y` whether it is still the one that was asked about.
     path: String,
+    /// The same, as the value whose closure the checks size.
+    store_path: StorePath,
 }
 
 /// Everything that must hold before an action on `machine` may be asked for. On success, the
@@ -283,12 +392,204 @@ fn check(model: &Model, kind: ActionKind, machine: &str) -> Result<Shown, String
         }
     }
     Ok(Shown {
-        shown: format!("{} {}", &eval.out_path.hash()[..8], eval.out_path.name()),
+        label: format!("{} {}", &eval.out_path.hash()[..8], eval.out_path.name()),
         path: eval.out_path.as_str().to_owned(),
+        store_path: eval.out_path.clone(),
     })
 }
 
-/// Issues the request. Called only after [`check`] and, for an update, the operator's `y`.
+/// `u` has passed [`check`]: asks the shell for what the checks need, and shows that they are
+/// running. The dialog proper opens when [`preflight_answered`] has the answer.
+fn start_checks(model: &mut Model, machine: String, shown: Shown) -> Command<Effect, Event> {
+    let mut commands = drop_confirm(model);
+    let (flake, timeout_seconds) = model.config.as_ref().map_or_else(
+        || (String::new(), 0),
+        |c| (c.flake.clone(), c.preflight_timeout_seconds),
+    );
+    let id = model.fresh_id();
+    // A new question, so a shell must draw it before a key counts for it.
+    model.ask(Confirm::Checking {
+        machine: machine.clone(),
+        to: shown.label,
+        path: shown.path,
+        id,
+    });
+    commands.push(
+        Command::request_from_shell(PreflightRequest {
+            id,
+            machine,
+            flake,
+            store_path: shown.store_path,
+            timeout_seconds,
+        })
+        .then_send(move |answer| Event::PreflightAnswered { id, answer }),
+    );
+    commands.push(render());
+    Command::all(commands)
+}
+
+/// `machine`'s probe is out in this refresh: what it would say is not "unknown", it is not here
+/// yet (a refresh clears every probe and asks for them again).
+fn probing(model: &Model, machine: &str) -> bool {
+    model
+        .outstanding
+        .values()
+        .any(|p| matches!(p, Pending::Probe(n) if n == machine))
+}
+
+/// Address resolution is out in this refresh: until it answers, no collision can be ruled out.
+fn resolving(model: &Model) -> bool {
+    model
+        .outstanding
+        .values()
+        .any(|p| matches!(p, Pending::Resolve(_)))
+}
+
+/// `machine`'s probe was cut off at the settle deadline: it never answered. (A probe that
+/// answered, even to say the machine is unreachable, is another matter: that is information.)
+fn probe_timed_out(model: &Model, machine: &str) -> bool {
+    model.rows.iter().any(|r| {
+        r.machine.name == machine
+            && matches!(
+                &r.probe,
+                Some(ProbeOutcome::Unreachable { reason }) if reason == super::PROBE_TIMED_OUT
+            )
+    })
+}
+
+/// Address resolution was cut off at this refresh's settle deadline.
+fn resolution_timed_out(model: &Model) -> bool {
+    model.resolution_timed_out == Some(model.generation)
+}
+
+/// Why an update of `machine` cannot be asked about yet, when what the checks need from the
+/// core is still on its way. Refused at `u` rather than shown as a warning: "not known yet"
+/// must not read as "not known".
+fn not_yet(model: &Model, machine: &str) -> Option<String> {
+    if probing(model, machine) {
+        return Some(format!("still probing {machine}; try again in a moment"));
+    }
+    if probe_timed_out(model, machine) {
+        return Some(format!(
+            "{machine}'s probe timed out; an update needs ssh: refresh and try again"
+        ));
+    }
+    if resolving(model) {
+        return Some("still resolving addresses; try again in a moment".to_owned());
+    }
+    resolution_timed_out(model)
+        .then(|| "address resolution timed out: refresh and try again".to_owned())
+}
+
+/// What the checks decide for `machine` now: the shell's `answer` and what the core holds.
+///
+/// Called when the answer comes in (what the dialog shows) and again when the operator
+/// confirms (what decides), so a refresh in between that changed an address or a probe's free
+/// space is seen by the second.
+fn review(model: &Model, machine: &str, answer: &PreflightAnswer) -> Preflight {
+    let free_bytes = model
+        .rows
+        .iter()
+        .find(|r| r.machine.name == machine)
+        .and_then(|r| match &r.probe {
+            Some(ProbeOutcome::Observed(o)) => o.ssh_health.store_disk,
+            _ => None,
+        })
+        .map(|d| d.available_bytes);
+    // What the machine already has, when the package preview fetched its closure: the update adds
+    // only the rest.
+    let deployed = model
+        .rows
+        .iter()
+        .find(|r| r.machine.name == machine)
+        .and_then(|r| r.deployed_paths.as_ref());
+    let known = |name: &str| model.addresses.get(name).is_some_and(|a| !a.is_empty());
+    let shared = shared_ips(&model.addresses);
+    let others_unknown = model
+        .rows
+        .iter()
+        // A machine with no target at all has nothing to collide with; one whose hostname has
+        // not (yet) resolved might.
+        .filter(|r| r.machine.name != machine && r.target.is_ok() && !known(&r.machine.name))
+        .count();
+    let public = model
+        .config
+        .as_ref()
+        .is_some_and(|c| c.public_machines.contains(machine));
+    preflight(&Facts {
+        machine,
+        tree: answer.tree.as_ref().map_err(String::as_str),
+        closure: answer
+            .closure
+            .as_ref()
+            .map(|sizes| estimate(sizes, deployed))
+            .map_err(String::as_str),
+        free_bytes,
+        probing: probing(model, machine),
+        probe_timed_out: probe_timed_out(model, machine),
+        addresses: Addresses {
+            own_known: known(machine),
+            shared: &shared,
+            others_unknown,
+            resolving: resolving(model),
+            resolution_timed_out: resolution_timed_out(model),
+        },
+        public,
+    })
+}
+
+/// The checks are in: opens the dialog.
+fn preflight_answered(
+    model: &mut Model,
+    id: RequestId,
+    answer: PreflightAnswer,
+) -> Command<Effect, Event> {
+    let Some(Confirm::Checking {
+        machine,
+        to,
+        path,
+        id: waiting,
+    }) = model.confirm.clone()
+    else {
+        return Command::done();
+    };
+    if waiting != id {
+        return Command::done();
+    }
+    // The list may have been refreshed while the shell was looking.
+    let now = match check(model, ActionKind::Update, &machine) {
+        Ok(now) => now,
+        Err(why) => {
+            model.confirm = None;
+            return model.notice(why);
+        }
+    };
+    // ... and if that changed the pending system, the answer is about another closure: look
+    // again, at the new one.
+    if now.path != path {
+        let note = format!("the pending system of {machine} changed; checking again");
+        model.confirm = None;
+        let command = start_checks(model, machine, now);
+        model.view.notice = Some(note);
+        return command;
+    }
+    let review = review(model, &machine, &answer);
+    let typed = (review.refusals.is_empty() && review.typed_confirmation).then(Typed::default);
+    // A new question (the dialog proper): a shell must draw it before a key counts for it, so
+    // a key typed while the checks ran can neither confirm nor cancel what it never saw.
+    model.ask(Confirm::Update {
+        machine,
+        to,
+        path,
+        answer,
+        review,
+        typed,
+    });
+    render()
+}
+
+/// Issues the request. Called only after [`check`] and, for an update, the operator's
+/// confirmation.
 fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effect, Event> {
     let (class, system) = {
         let Some(row) = model.rows.iter().find(|r| r.machine.name == machine) else {
@@ -329,56 +630,198 @@ fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effec
     ])
 }
 
+/// The operator has confirmed the update of `machine` (a `y`, or the exact name). The world
+/// may have moved while the dialog was open: act mode turned off, an action started, the list
+/// refreshed, an address changed. Everything is decided again, with the checks' answer the
+/// dialog was showing.
+fn confirm_update(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
+    let Asked {
+        machine,
+        to,
+        path,
+        answer,
+        review: shown,
+        typed_given,
+    } = asked;
+    if !model.act {
+        return model.notice(ACT_MODE_OFF);
+    }
+    if model.action_active() {
+        return model.notice("another action is already running");
+    }
+    // The tree is being read again (the list, the fleet's evaluation or this machine's own):
+    // what would be deployed is not settled, and the evaluation the dialog showed may be the one
+    // being replaced. The operator asks again once it is.
+    if model.refresh_running(&machine) {
+        return model.notice(REFRESH_RUNNING);
+    }
+    let now = match check(model, ActionKind::Update, &machine) {
+        Ok(now) => now,
+        Err(why) => return model.notice(why),
+    };
+    // The pending system is not the one the operator was shown (a refresh evaluated the tree
+    // again): what they said yes to is not what would be deployed, and the checks were about
+    // another closure. Nothing is deployed; the checks run again for the new one.
+    if now.path != path {
+        let note = format!("the pending system of {machine} changed; checking again");
+        let command = start_checks(model, machine, now);
+        model.view.notice = Some(note);
+        return command;
+    }
+    let now = review(model, &machine, &answer);
+    if !now.refusals.is_empty() {
+        return model.notice(format!(
+            "not updating {machine}: {}",
+            now.refusals.join("; ")
+        ));
+    }
+    // Every rule is decided again, not only the refusals: what the operator confirmed is the
+    // dialog they saw. If the rules now say something else, they are asked again about that.
+    // The typed name may have become required (a reconfigured `public`, or the AUS-22 hook
+    // reading the pending system), and a check may have turned up something new to read.
+    let again = if now.typed_confirmation && !typed_given {
+        Some(format!(
+            "{machine} now has to be confirmed by typing its name"
+        ))
+    } else if now.warnings != shown.warnings {
+        Some("what the checks found changed; asking again".to_owned())
+    } else {
+        None
+    };
+    if let Some(note) = again {
+        let typed = (now.refusals.is_empty() && now.typed_confirmation).then(Typed::default);
+        model.ask(Confirm::Update {
+            machine,
+            to,
+            path,
+            answer,
+            review: now,
+            typed,
+        });
+        return model.notice(note);
+    }
+    launch(model, ActionKind::Update, machine)
+}
+
+/// What the dialog the operator confirmed was about.
+struct Asked {
+    machine: String,
+    to: String,
+    path: String,
+    answer: PreflightAnswer,
+    /// What the checks decided when the dialog was drawn.
+    review: Preflight,
+    /// The operator typed the machine's name (so the typed confirmation, if required now, is
+    /// satisfied).
+    typed_given: bool,
+}
+
 /// `y` or anything else, to the open question.
 pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
     model.view.notice = None;
     let Some(confirm) = model.confirm.take() else {
         return Command::done();
     };
-    if !yes {
-        return render();
-    }
     match confirm {
+        // Anything cancels the checks: nothing was decided yet, so there is nothing to
+        // confirm, and a `y` typed ahead of the dialog must not confirm what it never saw.
+        Confirm::Checking { id, .. } => {
+            Command::all([Command::notify_shell(CancelRequest { id }).into(), render()])
+        }
+        // A refusal has no yes.
+        Confirm::Update { ref review, .. } if !review.refusals.is_empty() => render(),
+        // A typed confirmation is not answered by `y`: only the name confirms. `y` leaves it
+        // open and as it was; anything else cancels.
+        confirm @ Confirm::Update { typed: Some(_), .. } => {
+            if yes {
+                model.confirm = Some(confirm);
+            }
+            render()
+        }
+        _ if !yes => render(),
         Confirm::Act => {
             // Re-checked: the question may have been answered after nothing could ask it.
             model.act = model.config.as_ref().is_some_and(|c| c.allow_act);
             render()
         }
-        Confirm::Update { machine, path, .. } => {
-            // The world may have moved while the question was open: act mode turned off, an
-            // action started, the list refreshed. Everything is checked again.
-            if !model.act {
-                return model.notice(ACT_MODE_OFF);
-            }
-            if model.action_active() {
-                return model.notice("another action is already running");
-            }
-            // The tree is being read again (the list, the fleet's evaluation or this machine's
-            // own): what would be deployed is not settled, and the evaluation the question
-            // showed may be the one being replaced. The operator asks again once it is.
-            if model.refresh_running(&machine) {
-                return model.notice(REFRESH_RUNNING);
-            }
-            match check(model, ActionKind::Update, &machine) {
-                Ok(now) if now.path == path => launch(model, ActionKind::Update, machine),
-                // The pending system is not the one the operator was shown (a refresh
-                // evaluated the tree again): what they said yes to is not what would be
-                // deployed, so ask again about the new one.
-                Ok(now) => {
-                    let note = format!("the pending system of {machine} changed; asking again");
-                    model.ask(Confirm::Update {
-                        machine,
-                        to: now.shown,
-                        path: now.path,
-                    });
-                    model.view.notice = Some(note);
-                    render()
-                }
-                Err(why) => model.notice(why),
-            }
-        }
+        Confirm::Update {
+            machine,
+            to,
+            path,
+            answer,
+            review,
+            ..
+        } => confirm_update(
+            model,
+            Asked {
+                machine,
+                to,
+                path,
+                answer,
+                review,
+                typed_given: false,
+            },
+        ),
         Confirm::Quit => stop_and_quit(model),
     }
+}
+
+/// A character typed into the typed confirmation.
+pub(super) fn typed_char(model: &mut Model, c: char) -> Command<Effect, Event> {
+    if let Some(Confirm::Update {
+        typed: Some(typed), ..
+    }) = &mut model.confirm
+    {
+        // Only what a machine name can contain: nothing else can be the name, and nothing else
+        // is worth showing back.
+        if (c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) && typed.text.len() < MAX_TYPED {
+            typed.text.push(c);
+            typed.mismatch = false;
+        }
+    }
+    render()
+}
+
+/// Backspace in the typed confirmation.
+pub(super) fn typed_backspace(model: &mut Model) -> Command<Effect, Event> {
+    if let Some(Confirm::Update {
+        typed: Some(typed), ..
+    }) = &mut model.confirm
+    {
+        typed.text.pop();
+        typed.mismatch = false;
+    }
+    render()
+}
+
+/// Enter in the typed confirmation: the update goes ahead only for the exact name.
+pub(super) fn typed_submit(model: &mut Model) -> Command<Effect, Event> {
+    model.view.notice = None;
+    let Some(Confirm::Update {
+        machine,
+        to,
+        path,
+        answer,
+        review,
+        typed: Some(typed),
+    }) = &mut model.confirm
+    else {
+        return Command::done();
+    };
+    if typed.text != *machine {
+        typed.mismatch = true;
+        return render();
+    }
+    let asked = Asked {
+        machine: machine.clone(),
+        to: to.clone(),
+        path: path.clone(),
+        answer: answer.clone(),
+        review: review.clone(),
+        typed_given: true,
+    };
+    model.confirm = None;
+    confirm_update(model, asked)
 }
 
 /// The operator's request to quit (`q`, Esc, Ctrl-C, `:q`).
@@ -386,10 +829,13 @@ pub(super) fn quit(model: &mut Model) -> Command<Effect, Event> {
     model.view.notice = None;
     match model.action.as_ref().map(|a| &a.phase) {
         Some(Phase::Running) => {
+            let mut commands = Vec::new();
             if model.confirm != Some(Confirm::Quit) {
+                commands.extend(drop_confirm(model));
                 model.ask(Confirm::Quit);
             }
-            render()
+            commands.push(render());
+            Command::all(commands)
         }
         // The second quit: the process is not dying, the operator does not want to wait.
         Some(Phase::Stopping) => force_quit(model),
@@ -408,17 +854,17 @@ pub(super) fn terminate(model: &mut Model) -> Command<Effect, Event> {
 
 /// Nothing is running: cancel the rest and quit.
 fn finish_quit(model: &mut Model) -> Command<Effect, Event> {
-    model.confirm = None;
+    let mut commands = drop_confirm(model);
     model.view.quit = true;
-    let mut commands = model.cancel_all();
+    commands.extend(model.cancel_all());
     commands.push(render());
     Command::all(commands)
 }
 
 /// An action is running: cancel everything, and quit when the action has been answered.
 fn stop_and_quit(model: &mut Model) -> Command<Effect, Event> {
-    model.confirm = None;
-    let mut commands = model.cancel_all();
+    let mut commands = drop_confirm(model);
+    commands.extend(model.cancel_all());
     if let Some(a) = model.action.as_mut().filter(|a| a.active()) {
         a.phase = Phase::Stopping;
         a.quit_when_ended = true;
@@ -434,9 +880,9 @@ fn stop_and_quit(model: &mut Model) -> Command<Effect, Event> {
 /// stopped, so the cancel has been asked for already; the shell still waits for the adapter
 /// when it shuts down.
 fn force_quit(model: &mut Model) -> Command<Effect, Event> {
-    model.confirm = None;
+    let mut commands = drop_confirm(model);
     model.view.quit = true;
-    let mut commands = model.cancel_all();
+    commands.extend(model.cancel_all());
     commands.push(render());
     Command::all(commands)
 }
@@ -484,6 +930,7 @@ pub(super) fn refresh_machine(model: &mut Model, name: &str) -> Vec<Command<Effe
     row.probe = None;
     row.cache = NarCache::NotApplicable;
     row.diff = super::DiffSlot::Idle;
+    row.deployed_paths = None;
     if !fleet_eval_out {
         row.eval = None;
     }
@@ -548,6 +995,10 @@ pub(super) fn event(model: &mut Model, event: Event) -> Command<Effect, Event> {
         Event::UpdateSelected => request(model, ActionKind::Update),
         Event::BuildSelected => request(model, ActionKind::Build),
         Event::ConfirmAnswer(yes) => answer(model, yes),
+        Event::ConfirmChar(c) => typed_char(model, c),
+        Event::ConfirmBackspace => typed_backspace(model),
+        Event::ConfirmSubmit => typed_submit(model),
+        Event::PreflightAnswered { id, answer } => preflight_answered(model, id, answer),
         Event::ActionEnded { id, end } => ended(model, id, end),
         // Not an acting event: `update` never routes one here.
         _ => Command::done(),
