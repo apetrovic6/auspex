@@ -35,8 +35,9 @@
 //!   found there is honoured, and an update whose file cannot be read is refused.
 //!
 //! The save is [`SaveFreezeRequest`]: one machine, frozen or not. The shell changes that entry
-//! in the file under a lock and answers with the whole set as written, which the core adopts,
-//! so a freeze made by another running auspex is also seen after the next `f` here.
+//! in the file under a lock and answers with the whole set as written, which the core merges in
+//! (a union: see `Freezes::merge`), so a freeze made by another running auspex is also seen after
+//! the next `f` here.
 
 use std::collections::BTreeSet;
 
@@ -44,6 +45,7 @@ use auspex_domain::fleet::is_plain_name;
 use crux_core::Command;
 use crux_core::render::render;
 
+use super::act::{Asked, confirm_update_after_read};
 use super::{Event, Model};
 use crate::config::{FreezeConfig, SavedFreezes};
 use crate::effects::{
@@ -59,13 +61,23 @@ struct Save {
     frozen: bool,
 }
 
-/// The re-read of the file that stands between the operator's `y` and the update.
+/// Why the file is being read again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Why {
+    /// The operator confirmed this update, and every rule said yes: the last look before it is
+    /// requested. Carries what the confirmed dialog was about, so every rule can be decided
+    /// again on the answer.
+    Update(Asked),
+    /// The operator confirmed unfreezing a machine that is frozen for this run only: whether the
+    /// file holds it now decides whether lifting it is a write.
+    Unfreeze(String),
+}
+
+/// The re-read of the file that stands between the operator's word and what follows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Recheck {
     id: RequestId,
-    machine: String,
-    /// The pending system the operator confirmed: what the update would deploy.
-    path: String,
+    why: Why,
 }
 
 /// Which machines are frozen, and from where.
@@ -149,12 +161,21 @@ impl Freezes {
         &self.run_only
     }
 
-    /// Takes in what the file says now: the set the file holds replaces the saved set, and a
-    /// run-only freeze the file now holds is an ordinary one. A run-only freeze the file does
-    /// not hold stays: only the operator lifts it.
-    fn adopt(&mut self, set: BTreeSet<String>) {
+    /// Takes in what the file said: **a union, never a replacement.** An answer can be older
+    /// than something the core already knows (a read that started before a save that was kept
+    /// answers after it), and a freeze the operator was told is kept must not be undone by it.
+    /// So what is frozen only grows here; the one way a machine leaves is the operator's own
+    /// unfreeze of it (`removed`). A run-only freeze the file now holds is an ordinary one.
+    /// The price: a machine another auspex *un*froze stays frozen here until this one restarts or
+    /// its operator unfreezes it, which fails safe.
+    fn merge(&mut self, set: BTreeSet<String>, removed: Option<&str>) {
         self.run_only.retain(|m| !set.contains(m));
-        self.saved = SavedFreezes::Known(set);
+        if let SavedFreezes::Known(known) = &mut self.saved {
+            known.extend(set);
+            if let Some(machine) = removed {
+                known.remove(machine);
+            }
+        }
     }
 }
 
@@ -188,6 +209,9 @@ pub(super) fn toggle(model: &mut Model) -> Command<Effect, Event> {
         return model.notice("the previous freeze is still being saved; try again");
     }
     if model.freeze.by_f(&machine) {
+        if model.freeze.rechecking() {
+            return model.notice("still reading which machines are frozen; try again");
+        }
         model.ask(super::act::Confirm::Unfreeze { machine });
         return render();
     }
@@ -202,13 +226,14 @@ pub(super) fn unfreeze_confirmed(model: &mut Model, machine: String) -> Command<
     if model.freeze.is_declared(&machine) || !model.freeze.by_f(&machine) {
         return model.notice(format!("{machine} is not frozen with f any more"));
     }
-    // Frozen for this run only: the file never held it, so there is nothing to keep. Lifting it
-    // is the operator's word, and it needs no write that could fail.
+    if model.freeze.rechecking() {
+        return model.notice("still reading which machines are frozen; try again");
+    }
+    // Frozen for this run only: this process's file view does not hold it, but the file may by
+    // now (another auspex froze it). The file is read first: lifting it is a write only if the
+    // file holds it, and the operator is not told it was "for this run only" if it was not.
     if !model.freeze.in_file(&machine) {
-        model.freeze.run_only.remove(&machine);
-        return model.notice(format!(
-            "unfroze {machine} (it was frozen for this run only)"
-        ));
+        return read(model, Why::Unfreeze(machine));
     }
     request(model, machine, false)
 }
@@ -263,7 +288,11 @@ pub(super) fn saved(
             if !save.frozen {
                 model.freeze.run_only.remove(&save.machine);
             }
-            model.freeze.adopt(set);
+            // The operator's own unfreeze removes its machine, unless the file, after our write,
+            // holds it again: another auspex froze it meanwhile, and that wins.
+            let removed =
+                (!save.frozen && !set.contains(&save.machine)).then_some(save.machine.as_str());
+            model.freeze.merge(set, removed);
             // A freeze that came back without its machine stays: `request` made it run-only
             // and `adopt` keeps what the file does not hold, so a deploy is not let through.
             let now = if save.frozen { "frozen" } else { "unfrozen" };
@@ -281,11 +310,15 @@ pub(super) fn saved(
     }
 }
 
-/// The operator said yes to the update of `machine` (whose pending system was `path`) and every
-/// check passed: the last look at the file before the update is requested.
-pub(super) fn recheck(model: &mut Model, machine: String, path: String) -> Command<Effect, Event> {
+/// The operator said yes to an update and every rule said yes: the last look at the file before it
+/// is requested.
+pub(super) fn recheck(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
+    read(model, Why::Update(asked))
+}
+
+fn read(model: &mut Model, why: Why) -> Command<Effect, Event> {
     let id = model.fresh_id();
-    model.freeze.recheck = Some(Recheck { id, machine, path });
+    model.freeze.recheck = Some(Recheck { id, why });
     Command::all([
         Command::request_from_shell(LoadFreezesRequest { id })
             .then_send(move |answer| Event::FreezesLoaded { id, answer }),
@@ -293,9 +326,8 @@ pub(super) fn recheck(model: &mut Model, machine: String, path: String) -> Comma
     ])
 }
 
-/// The shell's answer to [`recheck`]: what the file says now. The freeze is honoured, an
-/// unreadable file refuses, and only then is the update requested (after every check is made
-/// again: the world may have moved while the file was being read).
+/// The shell's answer to [`read`]: what the file says now, merged into what the core knows, and
+/// then what was waiting for it.
 pub(super) fn loaded(
     model: &mut Model,
     id: RequestId,
@@ -308,18 +340,31 @@ pub(super) fn loaded(
     if model.view.quit {
         return Command::done();
     }
-    let Recheck { machine, path, .. } = waiting;
-    match answer {
-        Err(why) => model.notice(format!(
-            "could not read which machines are frozen ({why}); not updating {machine}"
+    match (waiting.why, answer) {
+        (Why::Update(asked), Err(why)) => model.notice(format!(
+            "could not read which machines are frozen ({why}); not updating {}",
+            asked.machine
         )),
-        Ok(set) => {
-            // Only while the file was understood at start-up: an unknown state stays unknown
-            // (and refuses in `check`), it is not repaired by one good read.
-            if matches!(model.freeze.saved(), SavedFreezes::Known(_)) {
-                model.freeze.adopt(set);
+        (Why::Unfreeze(machine), Err(why)) => model.notice(format!(
+            "could not read which machines are frozen ({why}); {machine} is still frozen"
+        )),
+        (why, Ok(set)) => {
+            // Merged only while the file was understood at start-up: an unknown state stays
+            // unknown (and refuses in `check`), it is not repaired by one good read.
+            model.freeze.merge(set, None);
+            match why {
+                // Every rule is decided again on what the core knows now.
+                Why::Update(asked) => confirm_update_after_read(model, asked),
+                Why::Unfreeze(machine) if model.freeze.in_file(&machine) => {
+                    request(model, machine, false)
+                }
+                Why::Unfreeze(machine) => {
+                    model.freeze.run_only.remove(&machine);
+                    model.notice(format!(
+                        "unfroze {machine} (it was frozen for this run only)"
+                    ))
+                }
             }
-            super::act::launch_after_recheck(model, machine, &path)
         }
     }
 }

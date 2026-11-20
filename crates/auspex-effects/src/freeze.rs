@@ -572,14 +572,20 @@ impl FreezeStore {
 /// Whether the file with these facts may be used: a regular file (not a symlink), this user's, with
 /// no group or other permission bit, and at most one name. A function of the numbers, so each
 /// rule is tested without another user's file.
+///
+/// `mode` and `links` are generic over what converts to the widest width: `Stat`'s `st_mode` is a
+/// `u32` on Linux and a `u16` on darwin, and `st_nlink` a `u64` on x86_64 Linux, a `u32` on
+/// aarch64 Linux and a `u16` on darwin, so a fixed width here breaks the build on a target the
+/// development shell cannot build for (the test `the_rules_take_every_width…` is the guard).
 fn check_file_facts(
     shown: &str,
     kind: FileType,
     owner: u32,
     me: u32,
-    mode: u32,
-    links: u64,
+    mode: impl Into<u32>,
+    links: impl Into<u64>,
 ) -> Result<()> {
+    let (mode, links) = (mode.into(), links.into());
     match kind {
         FileType::RegularFile => {}
         FileType::Symlink => {

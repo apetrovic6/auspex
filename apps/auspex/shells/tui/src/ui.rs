@@ -791,10 +791,22 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         parts.push(format!("count {c}"));
     }
     let mut errors: Vec<String> = Vec::new();
-    match view.report.errors.as_slice() {
+    // Not the unknown freezes: that error is written for `--json` readers, and is long. The bar
+    // says what it costs, below.
+    let fleet: Vec<_> = view
+        .report
+        .errors
+        .iter()
+        .filter(|e| e.kind != auspex_core::FleetErrorKind::FreezesUnknown)
+        .collect();
+    match fleet.as_slice() {
         [] => {}
         [one] => errors.push(format!("fleet error: {}", one.reason)),
         many => errors.push(format!("{} fleet errors: {}", many.len(), many[0].reason)),
+    }
+    if view.freeze.unknown.is_some() {
+        // The reason is in the detail panel and the log; here, what it costs.
+        errors.push("freezes unknown: u and f refused".to_owned());
     }
     if let Some(a) = &view.action
         && let ActionStatus::Ended(end) = &a.status

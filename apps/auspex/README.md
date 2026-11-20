@@ -143,7 +143,10 @@ frozen and says so.
 the `y` of every update and once more right before `clan` is started: a machine frozen from the
 other terminal in the meantime is refused (`luna is frozen; f to unfreeze`) and the ❄ appears here
 too, and an update whose file cannot be read at that point is refused too. The list does not
-redraw other terminals' freezes until then (or until your own next `f`).
+redraw other terminals' freezes until then (or until your own next `f`). What a terminal knows
+only grows: a freeze it has seen stays until its own operator unfreezes it, so a machine
+unfrozen in another terminal stays frozen here until you restart or unfreeze it here too (which
+fails safe).
 
 **The key is the fleet's path.** Freezes are filed under the fleet flake's canonical path
 (`path:` and `git+file://` spellings of a plain directory are the same fleet as the directory).

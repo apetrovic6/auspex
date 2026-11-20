@@ -346,8 +346,12 @@ async fn when_it_is_unknown_which_machines_are_frozen_every_screen_says_so() {
     type_keys(&shell, &mut ui, &km, "/luna\n");
     let frame = render(&shell.view(), &mut ui, &km, &[], 120, 30);
     assert!(
-        frame.contains("fleet error: freezes made with f are unknown"),
-        "the report's fleet error is on the status bar:\n{frame}"
+        frame.contains("freezes unknown: u and f refused"),
+        "the status bar says what it costs:\n{frame}"
+    );
+    assert!(
+        !frame.contains("fleet error: freezes made with f"),
+        "the report's error is for --json readers, not the status bar:\n{frame}"
     );
     assert!(frame.contains("unknown: the state file"), "{frame}");
     expect_file("snapshots", "freeze_unknown_120.txt", &frame);
@@ -658,17 +662,25 @@ async fn every_freeze_and_unfreeze_is_a_row_in_the_action_log() {
     r.quit().await;
 
     let luna = rows(&db, fleet.path(), "luna").await;
-    let kinds: Vec<_> = luna.iter().map(|a| (a.kind, a.result)).collect();
-    // Newest first.
+    // Not by order: two rows written within one millisecond of two quick presses may sort
+    // either way, and which is newer is not what is tested.
+    let rows_of: BTreeSet<_> = luna
+        .iter()
+        .map(|a| {
+            (
+                a.kind.as_str(),
+                a.result.map(LoggedResult::as_str),
+                a.detail.clone().unwrap_or_default(),
+            )
+        })
+        .collect();
     assert_eq!(
-        kinds,
-        [
-            (LoggedKind::Unfreeze, Some(LoggedResult::Succeeded)),
-            (LoggedKind::Freeze, Some(LoggedResult::Succeeded)),
-        ]
+        rows_of,
+        BTreeSet::from([
+            ("freeze", Some("succeeded"), "frozen".to_owned()),
+            ("unfreeze", Some("succeeded"), "unfrozen".to_owned()),
+        ])
     );
-    assert_eq!(luna[0].detail.as_deref(), Some("unfrozen"));
-    assert_eq!(luna[1].detail.as_deref(), Some("frozen"));
     assert!(
         luna.iter()
             .all(|a| a.who == "tester" && a.machine == "luna")
@@ -1358,4 +1370,99 @@ fn plain_with_a_corrupt_state_file_prints_the_freeze_error() {
         .find(|l| l.starts_with("error: freezes_unknown"))
         .unwrap_or_else(|| panic!("no freeze error in:\n{stdout}"));
     assert!(line.contains("not valid"), "{line}");
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2: N4 (the gate before the spawn, through `run_action`), N5 (the status note)
+// ---------------------------------------------------------------------------------------
+
+async fn run_op(
+    shell: &Arc<Shell>,
+    op: auspex_core::effects::ActionRequest,
+) -> auspex_core::ActionEnd {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    shell.start_action(op, move |_, end| {
+        let _ = tx.send(end);
+    });
+    tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("the action to end")
+        .expect("an answer")
+}
+
+/// A stale core can ask for the update of a machine that is frozen in the file by now. The shell
+/// reads the file once more before it starts `clan`, and a frozen machine, or a file that cannot
+/// be read, ends the action there: `clan` is never started and no row says a deploy was tried.
+#[tokio::test]
+async fn the_shell_never_starts_clan_for_a_machine_frozen_in_the_file() {
+    use auspex_core::ActionResult;
+    use auspex_core::effects::{ActionKind, ActionRequest, RequestId};
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let fleet = tempdir();
+    let clan = t.script(dir.path(), "clan", "echo ran >> '@dir@/clan-ran'\nexit 0");
+    let nix = t.script(dir.path(), "nix", "exit 99");
+    let real = auspex_tui::backend::Real::for_actions(nix.into_os_string(), Some(clan));
+    let shell = Shell::new(
+        Backend::Demo(Demo {
+            real_actions: Some(Box::new(real)),
+            ..Demo::default()
+        }),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    let state = state_file(dir.path());
+    let store = FreezeStore::new(state.clone(), "/fleet".to_owned());
+    shell.set_freeze_store(store.clone());
+    let db = dir.path().join("logs").join("log.sqlite");
+    shell.set_action_log(OpenParams::new(
+        db.clone(),
+        identity(),
+        fleet.path().to_path_buf(),
+    ));
+    let ran = dir.path().join("clan-ran");
+    let op = |id| ActionRequest {
+        id: RequestId(id),
+        kind: ActionKind::Update,
+        machine: "alfrost".to_owned(),
+        class: auspex_domain::fleet::MachineClass::Nixos,
+        system: Some("x86_64-linux".to_owned()),
+        flake: fleet.path().to_str().unwrap().to_owned(),
+        build_host: None,
+        target: None,
+    };
+
+    // Control: nothing frozen, so it goes through.
+    let end = run_op(&shell, op(1)).await;
+    assert_eq!(end.result, ActionResult::Succeeded, "{end:?}");
+    assert!(ran.exists(), "clan ran");
+    fs::remove_file(&ran).unwrap();
+
+    // Frozen in the file: refused here, `clan` not started.
+    store.set("alfrost", true).await.unwrap();
+    let end = run_op(&shell, op(2)).await;
+    assert_eq!(end.result, ActionResult::Failed);
+    assert!(
+        end.summary.iter().any(|l| l.contains("alfrost is frozen")),
+        "{end:?}"
+    );
+    assert!(!ran.exists(), "clan was not started for a frozen machine");
+
+    // A file that cannot be read: refused too.
+    damage(&state, b"garbage {\n");
+    let end = run_op(&shell, op(3)).await;
+    assert_eq!(end.result, ActionResult::Failed);
+    assert!(
+        end.summary
+            .iter()
+            .any(|l| l.contains("could not read which machines are frozen")),
+        "{end:?}"
+    );
+    assert!(!ran.exists());
+
+    shell.shutdown().await;
+    // Only the control run is a deploy row: a refused one is not a deploy that was tried.
+    let rows = rows(&db, fleet.path(), "alfrost").await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].kind, LoggedKind::Deploy);
 }

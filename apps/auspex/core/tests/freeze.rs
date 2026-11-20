@@ -873,3 +873,96 @@ fn unknown_freezes_are_a_fleet_error_in_the_report_and_known_ones_are_not() {
     let s = settled(config(&["terra"], known(&["luna"])));
     assert_eq!(s.view().report.errors, []);
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2: N2 (a stale read never undoes a kept freeze), N6 (a run-only unfreeze reads first)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_read_that_a_kept_freeze_overtook_does_not_undo_it() {
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s); // luna, y: the file is being read
+    s.send(Event::ToggleFreeze); // the operator freezes luna meanwhile
+    let mut r = s.take_freeze();
+    saved(&mut s, &mut r, &["luna"]); // kept
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(set(&[]))); // the read that started before the write
+    assert!(
+        frozen(&s, "luna"),
+        "the freeze was kept; an older read does not undo it"
+    );
+    assert!(s.actions.is_empty(), "and the update is not requested");
+    assert!(has_snowflake(&s, "luna"));
+}
+
+#[test]
+fn a_read_that_a_kept_freeze_overtook_does_not_undo_another_machines_either() {
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s);
+    select(&mut s, "sol");
+    s.send(Event::ToggleFreeze);
+    let mut r = s.take_freeze();
+    saved(&mut s, &mut r, &["sol"]);
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(set(&[])));
+    assert!(
+        frozen(&s, "sol"),
+        "sol keeps its ❄ although the older read did not hold it"
+    );
+}
+
+#[test]
+fn an_older_save_answer_does_not_undo_what_a_read_learned() {
+    // The read learned that another auspex froze sol; luna's save, answered after, was written
+    // before that and does not hold sol.
+    let mut s = ready_to_update(&[]);
+    s.hold_freeze_loads = true;
+    ask_and_confirm(&mut s);
+    s.send(Event::ToggleFreeze); // luna
+    let mut r = s.take_freeze();
+    let mut load = s.loads.remove(0);
+    s.resolve(&mut load, Ok(set(&["sol"]))); // learned
+    saved(&mut s, &mut r, &["luna"]);
+    assert!(frozen(&s, "sol") && frozen(&s, "luna"));
+}
+
+#[test]
+fn a_run_only_unfreeze_reads_the_file_first_and_a_freeze_there_is_removed_through_a_save() {
+    let mut s = luna_frozen_for_this_run();
+    // Meanwhile another auspex froze luna in the file.
+    s.freeze_file = Ok(set(&["luna"]));
+    s.send(Event::ToggleFreeze);
+    s.send(Event::ConfirmAnswer(true));
+    // The file holds it, so lifting it is a write, like any saved freeze's.
+    let r = s.take_freeze();
+    assert!(!r.operation.frozen && r.operation.machine == "luna");
+    assert!(frozen(&s, "luna"), "still frozen until the write is kept");
+}
+
+#[test]
+fn a_run_only_unfreeze_is_local_when_the_file_does_not_hold_it() {
+    let mut s = luna_frozen_for_this_run();
+    s.freeze_file = Ok(set(&[]));
+    s.send(Event::ToggleFreeze);
+    s.send(Event::ConfirmAnswer(true));
+    assert!(s.freezes.is_empty());
+    assert!(!frozen(&s, "luna"));
+    assert!(notice(&s).contains("unfroze luna"), "{}", notice(&s));
+}
+
+#[test]
+fn a_run_only_unfreeze_whose_file_cannot_be_read_leaves_it_frozen_and_says_so() {
+    let mut s = luna_frozen_for_this_run();
+    s.freeze_file = Err("the state file is not valid".to_owned());
+    s.send(Event::ToggleFreeze);
+    s.send(Event::ConfirmAnswer(true));
+    assert!(frozen(&s, "luna"));
+    assert!(s.freezes.is_empty());
+    let n = notice(&s);
+    assert!(
+        n.contains("could not read") && n.contains("still frozen"),
+        "{n}"
+    );
+}

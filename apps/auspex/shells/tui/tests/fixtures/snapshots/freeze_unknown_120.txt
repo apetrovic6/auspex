@@ -27,4 +27,4 @@
 │                                                    ││                                                                │
 └────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
 fleet demo:omnissiah
-OBSERVE │ settled │ 0 pending │ prom: ok │ fleet error: freezes made with f are unknown, so `frozen` is only what the c…
+OBSERVE │ settled │ 0 pending │ prom: ok │ freezes unknown: u and f refused                                       ? help

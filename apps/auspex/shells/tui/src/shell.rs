@@ -875,13 +875,24 @@ impl Shell {
 
     fn run_action(self: &Arc<Self>, mut request: Request<auspex_core::effects::ActionRequest>) {
         let op = request.operation.clone();
+        // Answered on cancellation too: quitting waits for this.
+        self.start_action(op, move |shell, end| shell.resolve(&mut request, end));
+    }
+
+    /// Runs `op` and hands its end to `answer`: [`Shell::run_action`] without the core's
+    /// request, so a test can ask for an update directly, as a core that is behind the file
+    /// would.
+    pub fn start_action(
+        self: &Arc<Self>,
+        op: auspex_core::effects::ActionRequest,
+        answer: impl FnOnce(&Arc<Self>, ActionEnd) + Send + 'static,
+    ) {
         let token = self.open(op.id);
         self.output
             .begin(&format!("{} {}", op.kind.label(), op.machine));
         // The action's first line, before clan's: where it builds. Auspex's own words (Note),
         // not clan's output.
         self.output.push(Stream::Note, &op.start_note());
-        let logged = self.log_action(&op);
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {
             // An update is the one action that can lift nothing a freeze holds: asked again, here.
@@ -890,32 +901,36 @@ impl Shell {
             } else {
                 Ok(())
             };
-            let ran = match gate {
-                Err(reason) => Ok(Err(reason)),
-                Ok(()) => {
-                    shell
-                        .backend
-                        .run_action(&op, &token, &|stream, text| shell.output.push(stream, text))
-                        .await
-                }
+            // The row is written only for an action that starts: a refused one is not a deploy
+            // that was tried.
+            let (logged, ran) = if let Err(reason) = gate {
+                (None, Ok(Err(reason)))
+            } else {
+                let logged = shell.log_action(&op);
+                let ran = shell
+                    .backend
+                    .run_action(&op, &token, &|stream, text| shell.output.push(stream, text))
+                    .await;
+                (Some(logged), ran)
             };
             shell.forget(op.id);
             let end = action_end(&shell.output, &op, ran);
             shell.output.finish(&ended_line(&end));
             // The result is the action's. The row is a record of it: a closed receiver (the
             // log task gave up) is not an error here.
-            let _ = logged.send(Outcome {
-                result: match end.result {
-                    ActionResult::Succeeded => LoggedResult::Succeeded,
-                    ActionResult::Failed => LoggedResult::Failed,
-                    ActionResult::TimedOut => LoggedResult::TimedOut,
-                    ActionResult::Cancelled => LoggedResult::Cancelled,
-                },
-                exit_code: end.exit_code,
-                detail: (!end.summary.is_empty()).then(|| end.summary.join(" | ")),
-            });
-            // Answered on cancellation too: quitting waits for this.
-            shell.resolve(&mut request, end);
+            if let Some(logged) = logged {
+                let _ = logged.send(Outcome {
+                    result: match end.result {
+                        ActionResult::Succeeded => LoggedResult::Succeeded,
+                        ActionResult::Failed => LoggedResult::Failed,
+                        ActionResult::TimedOut => LoggedResult::TimedOut,
+                        ActionResult::Cancelled => LoggedResult::Cancelled,
+                    },
+                    exit_code: end.exit_code,
+                    detail: (!end.summary.is_empty()).then(|| end.summary.join(" | ")),
+                });
+            }
+            answer(&shell, end);
         });
     }
 }

@@ -661,7 +661,17 @@ fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effec
 /// may have moved while the dialog was open: act mode turned off, an action started, the list
 /// refreshed, an address changed. Everything is decided again, with the checks' answer the
 /// dialog was showing.
-fn confirm_update(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
+/// Whether the file of freezes was read again since the `y`: the first time through, an update that
+/// passes every rule asks for that read ([`super::freeze::recheck`]); the second, it is requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Stage {
+    /// Straight from the operator's `y` (or typed name).
+    Confirmed,
+    /// The file has been read again, and merged into what the core knows.
+    FreezesRead,
+}
+
+fn confirm_update(model: &mut Model, asked: Asked, stage: Stage) -> Command<Effect, Event> {
     let Asked {
         machine,
         to,
@@ -727,42 +737,38 @@ fn confirm_update(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
         });
         return model.notice(note);
     }
+    if stage == Stage::FreezesRead {
+        return launch(model, ActionKind::Update, machine);
+    }
     // Everything the core can know says yes. The last look is at the file, which another
-    // running auspex may have changed since this one read it (`freeze.rs`).
-    super::freeze::recheck(model, machine, path)
+    // running auspex may have changed since this one read it (`freeze.rs`); every rule above is
+    // decided once more on what the core knows when the answer is in.
+    super::freeze::recheck(
+        model,
+        Asked {
+            machine,
+            to,
+            path,
+            answer,
+            review: shown,
+            typed_given,
+        },
+    )
 }
 
-/// The file was read again and no freeze stopped the update (`freeze::loaded`): every rule is
-/// decided once more, since the world may have moved while it was read, and the update is
-/// requested only if all still hold.
-pub(super) fn launch_after_recheck(
-    model: &mut Model,
-    machine: String,
-    path: &str,
-) -> Command<Effect, Event> {
-    if !model.act {
-        return model.notice(ACT_MODE_OFF);
-    }
-    if model.action_active() {
-        return model.notice("another action is already running");
-    }
-    if model.refresh_running(&machine) {
-        return model.notice(REFRESH_RUNNING);
-    }
-    match check(model, ActionKind::Update, &machine) {
-        Ok(now) if now.path == path => launch(model, ActionKind::Update, machine),
-        Ok(_) => model.notice(format!(
-            "the pending system of {machine} changed while the freeze state was read; ask again"
-        )),
-        Err(why) => model.notice(why),
-    }
+/// The file was read again and merged: the update is decided as at the `y`, on what the core
+/// knows now (the disk and address rules, the refresh and act-mode guards, the pending system,
+/// the freeze, the typed name), and requested only if every rule still says yes.
+pub(super) fn confirm_update_after_read(model: &mut Model, asked: Asked) -> Command<Effect, Event> {
+    confirm_update(model, asked, Stage::FreezesRead)
 }
 
 /// What the dialog the operator confirmed was about.
-struct Asked {
-    machine: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Asked {
+    pub(super) machine: String,
     to: String,
-    path: String,
+    pub(super) path: String,
     answer: PreflightAnswer,
     /// What the checks decided when the dialog was drawn.
     review: Preflight,
@@ -899,6 +905,7 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
                 review,
                 typed_given: false,
             },
+            Stage::Confirmed,
         ),
         Confirm::Unfreeze { machine } => super::freeze::unfreeze_confirmed(model, machine),
         Confirm::Quit => stop_and_quit(model),
@@ -960,7 +967,7 @@ pub(super) fn typed_submit(model: &mut Model) -> Command<Effect, Event> {
         typed_given: true,
     };
     model.confirm = None;
-    confirm_update(model, asked)
+    confirm_update(model, asked, Stage::Confirmed)
 }
 
 /// The operator's request to quit (`q`, Esc, Ctrl-C, `:q`).

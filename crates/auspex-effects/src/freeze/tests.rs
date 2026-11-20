@@ -602,3 +602,93 @@ fn a_symlink_a_directory_and_a_second_name_are_refused() {
     let e = facts(FileType::RegularFile, 1000, 0o600, 2).unwrap_err();
     assert!(e.to_string().contains("2 hard links"), "{e}");
 }
+
+// Fix round 2, N1: `Stat`'s field widths differ by target (`st_mode` is a u32 on Linux and a u16
+// on darwin, `st_nlink` a u64 on x86_64 Linux, a u32 on aarch64 Linux and a u16 on darwin), and
+// the code that reads them must build on all of them. Another target's std is not available
+// here, so the rules take any width that converts: this test is the guard, and stops
+// compiling if the signature goes back to one fixed width.
+
+#[test]
+fn the_rules_take_every_width_the_stat_fields_have_on_any_target() {
+    // darwin
+    assert!(
+        check_file_facts(
+            "/x",
+            FileType::RegularFile,
+            1000,
+            1000,
+            0o100_600_u16,
+            1_u16
+        )
+        .is_ok()
+    );
+    assert!(
+        check_file_facts(
+            "/x",
+            FileType::RegularFile,
+            1000,
+            1000,
+            0o100_640_u16,
+            1_u16
+        )
+        .is_err()
+    );
+    assert!(
+        check_file_facts(
+            "/x",
+            FileType::RegularFile,
+            1000,
+            1000,
+            0o100_600_u16,
+            2_u16
+        )
+        .is_err()
+    );
+    // aarch64 Linux
+    assert!(
+        check_file_facts(
+            "/x",
+            FileType::RegularFile,
+            1000,
+            1000,
+            0o100_600_u32,
+            1_u32
+        )
+        .is_ok()
+    );
+    assert!(
+        check_file_facts(
+            "/x",
+            FileType::RegularFile,
+            1000,
+            1000,
+            0o100_600_u32,
+            2_u32
+        )
+        .is_err()
+    );
+    // x86_64 Linux
+    assert!(
+        check_file_facts(
+            "/x",
+            FileType::RegularFile,
+            1000,
+            1000,
+            0o100_600_u32,
+            1_u64
+        )
+        .is_ok()
+    );
+    assert!(
+        check_file_facts(
+            "/x",
+            FileType::RegularFile,
+            1000,
+            1000,
+            0o100_600_u32,
+            2_u64
+        )
+        .is_err()
+    );
+}
