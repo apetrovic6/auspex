@@ -207,7 +207,7 @@ impl Drop for Pty {
 }
 
 /// Where `needle` last occurs in `haystack`.
-fn last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+pub fn last(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).rposition(|w| w == needle)
 }
 

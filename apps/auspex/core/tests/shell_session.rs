@@ -223,3 +223,55 @@ fn a_termination_signal_while_ssh_is_open_quits() {
     s.send(Event::Terminate);
     assert!(s.view().quit);
 }
+
+#[test]
+fn an_answer_for_another_request_while_a_session_is_open_does_not_close_it() {
+    // The id is what ties an answer to the session: a stray one (a stale request, a bug) must
+    // not end the session the operator is in, or the next `s` would open a second one.
+    let mut s = listed(config(), THREE);
+    act_on(&mut s);
+    s.send(Event::ShellSelected);
+    let _open = take(&mut s);
+    s.send(Event::ShellEnded {
+        id: auspex_core::RequestId(9999),
+        end: ShellEnd::Exited { code: 1 },
+    });
+    assert_eq!(s.view().notice, None, "the stray answer says nothing");
+    s.send(Event::ShellSelected);
+    assert_eq!(notice(&s), "ssh to luna is already open");
+    assert!(s.shells.is_empty(), "and no second request was made");
+}
+
+#[test]
+fn s_refuses_a_machine_name_the_domain_does_not_allow_even_with_a_good_target() {
+    // The inventory parser would have refused these names; the core does not rely on that, as
+    // for `u`. The name is what the status bar shows and what the core is asked about.
+    use auspex_domain::fleet::{Machine, MachineClass};
+    let bad = ["-h", "a b", "x;y", "a/b", ""];
+    let mut s = Shell::new();
+    s.send(Event::Start(config()));
+    let mut list = s.take_inventory();
+    let machines = bad
+        .iter()
+        .map(|name| Machine {
+            name: (*name).to_owned(),
+            class: MachineClass::Nixos,
+            tags: Vec::new(),
+            target_host: Some("root@192.168.1.50".to_owned()),
+            build_host: None,
+        })
+        .collect();
+    s.resolve(&mut list, Ok(machines));
+    act_on(&mut s);
+    s.send(Event::MoveTop);
+    for _ in bad {
+        s.send(Event::ShellSelected);
+        assert!(
+            notice(&s).contains("not a plain machine name"),
+            "{}",
+            notice(&s)
+        );
+        assert!(s.shells.is_empty(), "no request");
+        s.send(Event::MoveDown(1));
+    }
+}

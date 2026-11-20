@@ -978,15 +978,24 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
 ///   command, and a host-key question, a password or a passphrase must be able to prompt: the
 ///   operator is sitting there, and the agent (or `SSH_ASKPASS`) is theirs.
 /// - **No `ConnectTimeout`, `ServerAliveInterval` or `ControlPersist`**: those are auspex's
-///   settings for a probe nobody is watching. The operator's `~/.ssh/config` decides here, and
-///   Ctrl-C ends a connect that hangs.
+///   settings for a probe nobody is watching. For a connection this ssh makes itself, the
+///   operator's `~/.ssh/config` decides, and Ctrl-C ends a connect that hangs.
 /// - **`ControlMaster=no` with the probes' `ControlPath`**: reuse the master auspex keeps for
 ///   this destination if one is live (no second agent approval, no second login), and never
 ///   start one. `auto` would make this ssh the master, and when the operator logged out ssh
 ///   would fork into the background to keep it for `ControlPersist` seconds, a process the
-///   operator did not ask for. With no live master `no` is simply a direct connection, and a
-///   stale socket is ignored. Both are `%C`, so the same destination and port give the same
+///   operator did not ask for. Both are `%C`, so the same destination and port give the same
 ///   socket as [`SshOperation::Probe`].
+///
+/// **With a live master, the connection is auspex's, not the operator's.** The session is a
+/// channel on the master's transport, so what governs that transport is what auspex opened it
+/// with: `ServerAliveInterval=5` (a network drop of about 15 s ends the session, which a direct
+/// ssh under the operator's own keepalive settings might have survived), and the master's
+/// `Compression`, `TCPKeepAlive` and `IPQoS`. The operator's own `ControlPath` and `ControlMaster`
+/// do not apply (auspex's come first). What is per session still follows their config: the tty,
+/// `ForwardAgent`, `RemoteCommand`, `SendEnv`. Without a live master ssh connects directly, with
+/// the operator's config and none of that; a socket left by a dead master makes ssh print
+/// `Control socket connect(...): Connection refused` before it does.
 ///
 /// The target's own options and port are passed as for a probe: they are the machine's, not a
 /// probe's.
@@ -1382,25 +1391,50 @@ mod tests {
             "host?ProxyJump=a\u{0}b",
             "host?A=b%20c",
         ];
+        // Every hostile string above is refused by `Target::parse`, so on their own they make
+        // this loop's body unreachable (it was, in the first version of the interactive case,
+        // and a missing `--` went unnoticed). These parse, so the argv shape is checked.
+        let awkward = [
+            "root@host",
+            "user.name@host-1.example",
+            "root@[fd00::1]:2222",
+            "[::1]",
+            "host:22?Compression=yes&IPQoS=ef",
+            "root@10.0.0.9?AddressFamily=inet&ConnectionAttempts=2",
+        ];
         // The interactive login has no `BatchMode` to fall back on, so it must hold too.
         for operation in [SshOperation::Probe, SshOperation::Interactive] {
-            for h in hostile {
+            let mut parsed = 0;
+            for h in hostile.iter().chain(&awkward) {
                 if let Ok(target) = Target::parse(h) {
+                    parsed += 1;
                     let mut options = SshOptions::new(DIR);
                     options.operation = operation;
                     let args = ssh_args(&target, &options).unwrap();
                     let dd = args.iter().position(|a| a == "--").unwrap();
                     assert_eq!(dd, args.len() - 2, "{h:?}: {args:?}");
                     assert!(!args[dd + 1].starts_with('-'), "{h:?}: {args:?}");
-                    for a in &args {
+                    for (i, a) in args.iter().enumerate() {
                         assert!(
                             !a.chars().any(|c| c.is_whitespace() || c.is_control()),
                             "{h:?}: {a:?}"
                         );
                         assert!(!a.to_ascii_lowercase().contains("proxycommand"), "{h:?}");
+                        // Before `--`, an element starting with `-` is a flag auspex wrote, or
+                        // the value of one (`-o`'s `Name=value`, `-p`'s port) which cannot.
+                        if i < dd && a.starts_with('-') {
+                            assert!(
+                                ["-T", "-o", "-p", "-O"].contains(&a.as_str()),
+                                "{h:?}: {a:?}"
+                            );
+                        }
                     }
                 }
             }
+            assert!(
+                parsed >= awkward.len(),
+                "{operation:?}: only {parsed} targets parsed, so the argv was barely checked"
+            );
         }
     }
 
