@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use auspex_core::effects::{EvalAnswer, Generation, RequestId};
+use auspex_core::effects::{EvalAnswer, Generation, RequestId, ShellEnd, ShellRequest};
 use auspex_core::{ActionEnd, ActionKind, ActionResult, Auspex, Core, Effect, Event, ViewModel};
 use auspex_effects::clan::{ClanRun, RunEnd};
 use auspex_effects::deploylog::{
@@ -43,11 +43,12 @@ use auspex_effects::nix::EvalItem;
 use auspex_effects::{CancellationToken, Cancelled};
 use crux_core::Request;
 use crux_core::capability::Operation;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio_util::task::TaskTracker;
 
 use crate::backend::Backend;
+use crate::handoff::Handoff;
 use crate::log::Log;
 use crate::output::{Output, Stream};
 
@@ -117,6 +118,9 @@ pub struct Shell {
     action_log: OnceCell<Option<ActionLog>>,
     /// The last thing auspex could not do besides the action itself, for the status bar.
     warning: Mutex<Option<String>>,
+    /// Where `s` asks the TUI loop for the terminal. `None` in every run that has no loop to
+    /// give it: headless, and tests of the core's effects.
+    handoff: Mutex<Option<UnboundedSender<Handoff>>>,
 }
 
 impl Shell {
@@ -143,6 +147,7 @@ impl Shell {
             action_log_params: Mutex::new(None),
             action_log: OnceCell::new(),
             warning: Mutex::new(None),
+            handoff: Mutex::new(None),
         })
     }
 
@@ -374,6 +379,7 @@ impl Shell {
                 });
             }
             Effect::RunAction(request) => self.run_action(request),
+            Effect::OpenShell(request) => self.open_shell(request),
             Effect::Cancel(request) => self.cancel(request.operation.id),
         }
     }
@@ -590,6 +596,53 @@ where
 const EXPLAIN_LINES: usize = 40;
 
 impl Shell {
+    /// Where `s` asks for the terminal. The TUI loop is the only one that has a terminal to
+    /// lend, so only it calls this, before the first key; without it `s` answers that there is
+    /// none, which is the headless case and the one the core already refuses.
+    pub fn set_handoff(&self, to: UnboundedSender<Handoff>) {
+        *lock(&self.handoff) = Some(to);
+    }
+
+    /// `Effect::OpenShell`: asks the TUI loop to lend the terminal to ssh, and answers the core
+    /// when the loop says ssh is over.
+    ///
+    /// Every refusal is an answer ([`ShellEnd::NotStarted`]), delivered from a task like every
+    /// other answer: the core is told why nothing happened and the status bar says it. The
+    /// request is not cancellable (see [`auspex_core::effects::ShellRequest`]); the only thing
+    /// that cuts the wait short is the shell shutting down, which drops it unanswered as a
+    /// cancelled request is.
+    fn open_shell(self: &Arc<Self>, mut request: Request<ShellRequest>) {
+        let op = request.operation.clone();
+        let started = self.backend.shell_command(&op).and_then(|command| {
+            let sender = lock(&self.handoff)
+                .clone()
+                .ok_or_else(|| "there is no terminal to give ssh in this run".to_owned())?;
+            let (reply, answer) = oneshot::channel();
+            let (program, args) = command;
+            sender
+                .send(Handoff {
+                    program,
+                    args,
+                    reply,
+                })
+                .map_err(|_| "the terminal is gone".to_owned())?;
+            Ok(answer)
+        });
+        let shell = Arc::clone(self);
+        self.tasks.spawn(async move {
+            let end = match started {
+                Err(reason) => ShellEnd::NotStarted { reason },
+                Ok(answer) => tokio::select! {
+                    ended = answer => ended.unwrap_or_else(|_| ShellEnd::NotStarted {
+                        reason: "the terminal went away before ssh ended".to_owned(),
+                    }),
+                    () = shell.root.cancelled() => return,
+                },
+            };
+            shell.resolve(&mut request, end);
+        });
+    }
+
     /// Where the action log is, and who is writing it. Call before the first action; without
     /// it actions are not recorded (the demo, most tests).
     pub fn set_action_log(&self, params: OpenParams) {

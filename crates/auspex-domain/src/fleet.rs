@@ -834,6 +834,10 @@ pub enum SshOperation {
     Check,
     /// Authenticate by running `true`, letting `ControlPersist` detach a reusable master.
     Connect,
+    /// The operator's own login: ssh with the terminal, for `s` in the TUI. The one purpose
+    /// that is not a machine-run probe, so it has none of the probe's guards (see
+    /// [`ssh_args`]).
+    Interactive,
 }
 
 /// What [`ssh_args`] needs besides the target: the effects layer's settings.
@@ -887,6 +891,11 @@ pub const PROBE_REMOTE_COMMAND: &str = "/bin/sh -s";
 /// Connect uses `ControlMaster=auto`: a race loser runs the command and exits rather
 /// than detaching a socketless `-N -f` process without an idle timeout.
 ///
+/// [`SshOperation::Interactive`] is a different thing, the operator's own login (see
+/// `interactive_args` for the argv and why each probe guard is absent). Everything under
+/// "What the caller must do" is for the other three and is **reversed** for it: the adapter
+/// gives that ssh the terminal, a tty and the environment as it is, askpass included.
+///
 /// # What the caller must do
 ///
 /// `BatchMode=yes` here covers the one ssh process auspex starts. It does not cover the
@@ -920,6 +929,9 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
         });
     }
     let dir = control_dir.trim_end_matches('/');
+    if options.operation == SshOperation::Interactive {
+        return Ok(interactive_args(target, dir));
+    }
     let mut args: Vec<String> = vec![
         "-T".to_owned(),
         "-o".to_owned(),
@@ -952,6 +964,50 @@ pub fn ssh_args(target: &Target, options: &SshOptions<'_>) -> Result<Vec<String>
         args.push("true".to_owned());
     }
     Ok(args)
+}
+
+/// The argv of [`SshOperation::Interactive`]: the operator's login to `target`, with the terminal.
+///
+/// ```text
+/// -o ControlMaster=no -o ControlPath=<control_dir>/%C [-o Opt=val]… [-p port] -- [user@]host
+/// ```
+///
+/// What is left out, and why each omission is the point:
+///
+/// - **No `-T`, no `BatchMode`**: ssh asks for a tty by itself when it has one and no remote
+///   command, and a host-key question, a password or a passphrase must be able to prompt: the
+///   operator is sitting there, and the agent (or `SSH_ASKPASS`) is theirs.
+/// - **No `ConnectTimeout`, `ServerAliveInterval` or `ControlPersist`**: those are auspex's
+///   settings for a probe nobody is watching. The operator's `~/.ssh/config` decides here, and
+///   Ctrl-C ends a connect that hangs.
+/// - **`ControlMaster=no` with the probes' `ControlPath`**: reuse the master auspex keeps for
+///   this destination if one is live (no second agent approval, no second login), and never
+///   start one. `auto` would make this ssh the master, and when the operator logged out ssh
+///   would fork into the background to keep it for `ControlPersist` seconds, a process the
+///   operator did not ask for. With no live master `no` is simply a direct connection, and a
+///   stale socket is ignored. Both are `%C`, so the same destination and port give the same
+///   socket as [`SshOperation::Probe`].
+///
+/// The target's own options and port are passed as for a probe: they are the machine's, not a
+/// probe's.
+fn interactive_args(target: &Target, dir: &str) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "-o".to_owned(),
+        "ControlMaster=no".to_owned(),
+        "-o".to_owned(),
+        format!("ControlPath={dir}/%C"),
+    ];
+    for (k, v) in &target.options {
+        args.push("-o".to_owned());
+        args.push(format!("{k}={v}"));
+    }
+    if let Some(p) = target.port {
+        args.push("-p".to_owned());
+        args.push(p.to_string());
+    }
+    args.push("--".to_owned());
+    args.push(target.destination());
+    args
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1326,20 +1382,86 @@ mod tests {
             "host?ProxyJump=a\u{0}b",
             "host?A=b%20c",
         ];
-        for h in hostile {
-            if let Ok(target) = Target::parse(h) {
-                let args = ssh_args(&target, &SshOptions::new(DIR)).unwrap();
-                let dd = args.iter().position(|a| a == "--").unwrap();
-                assert_eq!(dd, args.len() - 2, "{h:?}: {args:?}");
-                assert!(!args[dd + 1].starts_with('-'), "{h:?}: {args:?}");
-                for a in &args {
-                    assert!(
-                        !a.chars().any(|c| c.is_whitespace() || c.is_control()),
-                        "{h:?}: {a:?}"
-                    );
-                    assert!(!a.to_ascii_lowercase().contains("proxycommand"), "{h:?}");
+        // The interactive login has no `BatchMode` to fall back on, so it must hold too.
+        for operation in [SshOperation::Probe, SshOperation::Interactive] {
+            for h in hostile {
+                if let Ok(target) = Target::parse(h) {
+                    let mut options = SshOptions::new(DIR);
+                    options.operation = operation;
+                    let args = ssh_args(&target, &options).unwrap();
+                    let dd = args.iter().position(|a| a == "--").unwrap();
+                    assert_eq!(dd, args.len() - 2, "{h:?}: {args:?}");
+                    assert!(!args[dd + 1].starts_with('-'), "{h:?}: {args:?}");
+                    for a in &args {
+                        assert!(
+                            !a.chars().any(|c| c.is_whitespace() || c.is_control()),
+                            "{h:?}: {a:?}"
+                        );
+                        assert!(!a.to_ascii_lowercase().contains("proxycommand"), "{h:?}");
+                    }
                 }
             }
+        }
+    }
+
+    /// `s` in the TUI: the operator's own login. Exact argv, because each omission is a rule:
+    /// no `-T` and no `BatchMode` (a tty and prompts), none of the probe's timeouts or
+    /// `ControlPersist`, and `ControlMaster=no` on the probes' socket (reuse, never start).
+    #[test]
+    fn ssh_interactive_has_exact_argv() {
+        let mut options = SshOptions::new(DIR);
+        // Settings that belong to a probe must not leak into the operator's login.
+        options.connect_timeout = ConnectTimeout::new(7).unwrap();
+        options.control_persist = 1200;
+        options.operation = SshOperation::Interactive;
+        assert_eq!(
+            ssh_args(&t("root@[fd00::1]:2222?Compression=yes"), &options).unwrap(),
+            [
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=/run/user/1000/auspex/%C",
+                "-o",
+                "Compression=yes",
+                "-p",
+                "2222",
+                "--",
+                "root@fd00::1",
+            ]
+        );
+        assert_eq!(
+            ssh_args(&t("terra"), &options).unwrap(),
+            [
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=/run/user/1000/auspex/%C",
+                "--",
+                "terra"
+            ]
+        );
+    }
+
+    /// The interactive argv shares the control directory's checks with the probe's, and uses
+    /// the same `%C` socket as a probe of the same destination.
+    #[test]
+    fn ssh_interactive_uses_the_probes_socket_and_the_same_checks() {
+        let mut options = SshOptions::new(DIR);
+        let probe = ssh_args(&t("root@10.0.0.9:2222"), &options).unwrap();
+        options.operation = SshOperation::Interactive;
+        let interactive = ssh_args(&t("root@10.0.0.9:2222"), &options).unwrap();
+        let socket = |args: &[String]| args.iter().find(|a| a.starts_with("ControlPath=")).cloned();
+        assert!(socket(&probe).is_some());
+        assert_eq!(socket(&probe), socket(&interactive));
+        for bad in [
+            "relative/dir",
+            "/run/with space",
+            "/run/pct%C",
+            "/run/$HOME",
+        ] {
+            let mut o = SshOptions::new(bad);
+            o.operation = SshOperation::Interactive;
+            assert!(ssh_args(&t("terra"), &o).is_err(), "{bad}");
         }
     }
 

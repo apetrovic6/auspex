@@ -173,6 +173,20 @@ impl Termination {
         })
     }
 
+    /// Forgets every `SIGINT` and `SIGQUIT` that has arrived and not been read.
+    ///
+    /// For when the terminal's own Ctrl-C or Ctrl-\ reached auspex and a child at once and the
+    /// child is the one it was meant for (`s`): ssh can be gone before the runtime has even
+    /// noticed auspex's copy of the signal, which would then quit auspex from the next `recv`.
+    /// `SIGTERM` and `SIGHUP` are kept: nobody aims those at a child.
+    pub async fn forget_interrupts(&mut self) {
+        use std::time::Duration;
+
+        use tokio::time::timeout;
+        while timeout(Duration::ZERO, self.int.recv()).await.is_ok() {}
+        while timeout(Duration::ZERO, self.quit.recv()).await.is_ok() {}
+    }
+
     /// Waits for the next of the four (or returns at once if one arrived since the last
     /// call) and returns its name. Cancel-safe: use it in a `select!` loop.
     pub async fn recv(&mut self) -> &'static str {

@@ -9,6 +9,7 @@
 //!   adapters behind it, or [`demo`]'s script.
 //! - [`keymap`] and [`input`]: keys to core events; [`ui`] and [`theme`]: drawing.
 //! - [`output`]: the streamed output of updates and builds, which the Log tab draws.
+//! - [`handoff`]: `s`, lending the terminal to ssh and taking it back.
 //! - [`packages`]: the package preview as text, for the detail panel and the `d` view.
 //! - [`headless`]: `--plain` and `--json`.
 //! - [`app`]: putting it together, signals included.
@@ -20,6 +21,7 @@ pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod demo;
+pub mod handoff;
 pub mod headless;
 pub mod input;
 pub mod keymap;

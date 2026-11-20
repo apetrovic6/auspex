@@ -102,12 +102,9 @@ gpui-kit = "0.6"
 # was copied from, which nothing would report. Cargo manifests, so a workspace dependency
 # and not versions.toml, which is for numbers two *tools* must agree on (ADR 0005).
 ratatui = "0.30.2"
-# `event-stream` turns the keyboard into a `Stream`, which is what lets it sit in the same
-# `tokio::select!` as the frame timer. Without it the only way to read a key is a blocking
-# poll, and the loop is back to choosing between the keyboard and everything else.
-crossterm = { version = "0.29.0", features = ["event-stream"] }
-# `StreamExt::next` for that stream — the crate ratatui's own async example uses.
-tokio-stream = "0.1.19"
+# No `event-stream`: its reader thread cannot be stopped safely, and `s` has to stop reading the
+# keyboard while ssh has it. The TUI reads keys on a thread of its own (`handoff::TerminalEvents`).
+crossterm = "0.29.0"
 axum = "0.8"
 bytes = "1"
 http = "1"

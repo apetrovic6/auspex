@@ -226,6 +226,31 @@ pub fn probe_argv(target: &Target, params: &ProbeParams<'_>) -> Result<Vec<Strin
     Ok(args)
 }
 
+/// What `s` runs: the program (resolved to an absolute path now, as every program here is) and
+/// the argv of [`SshOperation::Interactive`] for `target`.
+///
+/// This is the one ssh in the crate that is **not** run by the crate: the TUI hands it the
+/// terminal (a tty, the operator's environment with `SSH_ASKPASS` and the agent as they are,
+/// the operator's `~/.ssh/config`), which every probe above is built to avoid. The crate only
+/// says what to run, so the argv still comes from the domain and nothing else reaches it.
+///
+/// # Errors
+///
+/// The program cannot be found (or is a relative path), or the domain refuses the control
+/// directory (not so for a prepared one).
+pub fn interactive_command(
+    program: &OsStr,
+    target: &Target,
+    control_dir: &ControlDir,
+) -> Result<(PathBuf, Vec<String>), String> {
+    let path = crate::process::resolve_in(program, std::env::var_os("PATH").as_deref())
+        .map_err(|e| spawn_error("run", program, &e))?;
+    let mut options = SshOptions::new(control_dir.as_str());
+    options.operation = auspex_domain::fleet::SshOperation::Interactive;
+    let args = ssh_args(target, &options).map_err(|e| e.to_string())?;
+    Ok((path, args))
+}
+
 /// A running connect phase: counted while it runs, and on the way out (return, cancel or
 /// drop alike) it stops counting and tells the phases still waiting that one has ended
 /// ([`ConnectWindow`]).

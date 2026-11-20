@@ -62,7 +62,7 @@ use crate::effects::{
     ActionEnd, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest, Effect,
     EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
     PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer, PrometheusRequest,
-    RequestId, ResolveRequest,
+    RequestId, ResolveRequest, ShellEnd,
 };
 use crate::view::{Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState};
 
@@ -235,6 +235,9 @@ pub enum Event {
     /// Build the selected machine's pending system here (`b`). Changes nothing on any machine,
     /// so it needs no act mode; refused for another system's machine.
     BuildSelected,
+    /// Open the operator's own ssh session to the selected machine (`s`). Act mode only; the
+    /// shell suspends its UI for as long as ssh runs, and answers with [`Event::ShellEnded`].
+    ShellSelected,
     /// The answer to the open question: `true` for `y`, `false` for anything else. For a
     /// question that asks for a typed name ([`crate::ConfirmKind::UpdateTyped`]) `true` is
     /// ignored: only [`Event::ConfirmSubmit`] with the exact name confirms, and `false`
@@ -271,6 +274,14 @@ pub enum Event {
         id: RequestId,
         /// How it ended.
         end: ActionEnd,
+    },
+    /// [`ShellRequest`](crate::effects::ShellRequest) answered: ssh is over and the terminal is
+    /// back. Says so in the status bar.
+    ShellEnded {
+        /// The request.
+        id: RequestId,
+        /// How it ended.
+        end: ShellEnd,
     },
 }
 
@@ -413,6 +424,9 @@ pub struct Model {
     /// The action in progress, or the last one to end. Not in `outstanding`: a refresh must not
     /// cancel it, and it must not hold the fleet unsettled.
     action: Option<act::Action>,
+    /// The ssh session open now: the shell has the terminal until it answers. Not in
+    /// `outstanding`: nothing may cancel it (see [`ShellRequest`](crate::effects::ShellRequest)).
+    shell: Option<(RequestId, String)>,
     /// The question waiting for y or N.
     confirm: Option<act::Confirm>,
     /// Counts the questions asked, so a shell can tell one question from the next (it may only
@@ -661,11 +675,13 @@ impl App for Auspex {
             | Event::ToggleAct
             | Event::UpdateSelected
             | Event::BuildSelected
+            | Event::ShellSelected
             | Event::ConfirmAnswer(_)
             | Event::ConfirmChar(_)
             | Event::ConfirmBackspace
             | Event::ConfirmSubmit
             | Event::PreflightAnswered { .. }
+            | Event::ShellEnded { .. }
             | Event::ActionEnded { .. }) => act::event(model, event),
             view_event => {
                 view_update(model, view_event);
@@ -1473,11 +1489,13 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::ToggleAct
         | Event::UpdateSelected
         | Event::BuildSelected
+        | Event::ShellSelected
         | Event::ConfirmAnswer(_)
         | Event::ConfirmChar(_)
         | Event::ConfirmBackspace
         | Event::ConfirmSubmit
         | Event::PreflightAnswered { .. }
+        | Event::ShellEnded { .. }
         | Event::ActionEnded { .. }
         | Event::Terminate
         | Event::Quit => {}

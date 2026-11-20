@@ -15,8 +15,9 @@
 │ ↑◆   sol                  upda│A             toggle act mode (asks first)            │                               │
 │ ✓    terra                in s│u             update the machine (act mode)           │eus)                           │
 │ ✓    titan                in s│b             build its pending system here           │ee (prometheus)                │
-│ ✗    triton               unre│r             scan again                              │                               │
-│ !    vulcan               eval│:             command (:q, :refresh)                  │                               │
+│ ✗    triton               unre│s             ssh to the machine (act mode)           │                               │
+│ !    vulcan               eval│r             scan again                              │                               │
+│                               │:             command (:q, :refresh)                  │                               │
 │                               │?             this help                               │                               │
 │                               │q esc ctrl-c  quit                                    │                               │
 │                               │:q            quit                                    │                               │
@@ -34,7 +35,6 @@
 │                               │! eval error                                          │                               │
 │                               │❄ frozen                                              │                               │
 │                               └──────────────────────────────────────────────────────┘                               │
-│                                                    ││                                                                │
 └────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
 log: eval results stored in the cache: cypramundi, deimos, luna
 OBSERVE │ settled │ 0 pending │ prom: ok                                                                          ? help

@@ -458,6 +458,50 @@ impl Operation for ActionRequest {
     type Output = ActionEnd;
 }
 
+/// Open the operator's own ssh session to a machine, with the terminal (`s`).
+///
+/// Unlike every other request this one is not a background call: the shell suspends its UI,
+/// gives the terminal to `ssh` and takes it back when ssh ends, so it can be answered only
+/// then. The core cannot cancel it (the operator is typing into ssh, not into auspex), so it
+/// has no [`CancelRequest`] either: on a termination signal the shell ends ssh itself.
+///
+/// The core has already checked that act mode is on and that `target` is the machine's
+/// resolved, validated target; the shell builds the argv from the domain
+/// ([`auspex_domain::fleet::SshOperation::Interactive`]) and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The machine, for the status bar.
+    pub machine: String,
+    /// The machine's resolved target, which passed [`Target::parse`].
+    pub target: Target,
+}
+
+/// How an ssh session ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellEnd {
+    /// ssh exited with this status (255 is ssh's own failure).
+    Exited {
+        /// The exit code.
+        code: i32,
+    },
+    /// ssh was killed by this signal.
+    Signaled {
+        /// The signal's number.
+        signal: i32,
+    },
+    /// ssh never ran: no terminal to give it, a demo run, a program that cannot be found.
+    NotStarted {
+        /// Why, in a line.
+        reason: String,
+    },
+}
+
+impl Operation for ShellRequest {
+    type Output = ShellEnd;
+}
+
 /// Stop request `id`: kill its process and drop its `Request`. Fire and forget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelRequest {
@@ -502,4 +546,6 @@ pub enum Effect {
     Cancel(CancelRequest),
     /// [`ActionRequest`]: an update or a build, with its output streamed to the shell's log.
     RunAction(ActionRequest),
+    /// [`ShellRequest`]: the operator's own ssh session, with the terminal.
+    OpenShell(ShellRequest),
 }

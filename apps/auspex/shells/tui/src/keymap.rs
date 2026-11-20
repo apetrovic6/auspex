@@ -61,13 +61,15 @@ pub enum Action {
     Update,
     /// Build the selected machine's pending system here (changes nothing on any machine).
     Build,
+    /// ssh to the selected machine, with the terminal (act mode only).
+    Shell,
     /// Quit.
     Quit,
 }
 
 impl Action {
     /// Every action, in the order the help overlay lists them.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Down,
         Self::Up,
         Self::HalfPageDown,
@@ -83,6 +85,7 @@ impl Action {
         Self::Act,
         Self::Update,
         Self::Build,
+        Self::Shell,
         Self::Refresh,
         Self::Command,
         Self::Help,
@@ -111,6 +114,7 @@ impl Action {
             Self::Act => "act",
             Self::Update => "update",
             Self::Build => "build",
+            Self::Shell => "shell",
             Self::Quit => "quit",
         }
     }
@@ -137,6 +141,7 @@ impl Action {
             Self::Act => "toggle act mode (asks first)",
             Self::Update => "update the machine (act mode)",
             Self::Build => "build its pending system here",
+            Self::Shell => "ssh to the machine (act mode)",
             Self::Quit => "quit",
         }
     }
@@ -163,6 +168,7 @@ impl Action {
             Self::Act => &["A"],
             Self::Update => &["u"],
             Self::Build => &["b"],
+            Self::Shell => &["s"],
             Self::Quit => &["q", "esc", "ctrl-c"],
         }
     }

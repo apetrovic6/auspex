@@ -33,14 +33,12 @@ auspex-effects = { path = "../../../../crates/auspex-effects" }
 clap.workspace = true
 crux_core.workspace = true
 ratatui.workspace = true
-# Inherited with `event-stream` on: see the root Cargo.toml for why the loop needs it.
 crossterm.workspace = true
 serde_json.workspace = true
 # `rt` for `TaskTracker`: on quit or a signal the shell waits for every adapter call to kill
 # and reap what it started before the runtime goes. Already in the graph (auspex-effects).
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "signal"] }
-tokio-stream.workspace = true
 # The config file. The version the workspace's other TOML readers (xtask, i18n-keygen)
 # already pull in, so nothing new enters Cargo.lock.
 toml = "0.9"
@@ -48,13 +46,17 @@ toml = "0.9"
 # or chars, or a long or wide name would push every column after it. ratatui's own.
 unicode-width = "0.2"
 # Opening the theme file non-blocking (`O_NONBLOCK`), so a FIFO cannot block start-up. Already in
-# the graph with `fs` (auspex-effects).
-rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+# the graph with `fs` (auspex-effects). `process` and `termios` and `stdio` for `s` (`handoff`):
+# waiting for ssh including its stops, signalling it by pid, and discarding input typed while it
+# had the terminal. All safe wrappers, which is why this is not `libc`: the workspace forbids
+# `unsafe`.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "termios", "stdio"] }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["sync", "time", "rt-multi-thread", "signal", "test-util"] }
-# Checking that a fake child is gone, by pid, without `unsafe`. Already in the graph.
-rustix = { version = "1", default-features = false, features = ["std", "process"] }
+# Checking that a fake child is gone, by pid, without `unsafe`; `pty` and `termios` for the
+# terminal the `s` tests give the binary (`tests/common/pty.rs`). Already in the graph.
+rustix = { version = "1", default-features = false, features = ["std", "process", "pty", "termios"] }
 # Only for `tests/translations.rs`; see the comment there. `format` for `plural_key`.
 i18n = { path = "../../../../crates/i18n", features = ["format"] }

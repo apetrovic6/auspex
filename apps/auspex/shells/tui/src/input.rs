@@ -248,7 +248,7 @@ impl Input {
             Action::Act => vec![Event::ToggleAct],
             // Observe mode: the key does nothing but say why. The core refuses too (it is the
             // one that must), but only this layer knows which key the operator bound to act.
-            Action::Update if !screen.act => {
+            Action::Update | Action::Shell if !screen.act => {
                 let key = keymap
                     .keys_for(Action::Act)
                     .into_iter()
@@ -259,6 +259,7 @@ impl Input {
             }
             Action::Update => vec![Event::UpdateSelected],
             Action::Build => vec![Event::BuildSelected],
+            Action::Shell => vec![Event::ShellSelected],
             Action::Down => vec![Event::MoveDown(n)],
             Action::Up => vec![Event::MoveUp(n)],
             // Counted: `n` half pages as one move of `n * max(page / 2, 1)` rows (the core's
@@ -338,7 +339,8 @@ impl Input {
             | Action::Log
             | Action::Act
             | Action::Update
-            | Action::Build => {}
+            | Action::Build
+            | Action::Shell => {}
         }
         Vec::new()
     }
@@ -394,7 +396,8 @@ impl Input {
             | Action::Diff
             | Action::Act
             | Action::Update
-            | Action::Build => {}
+            | Action::Build
+            | Action::Shell => {}
         }
         Vec::new()
     }

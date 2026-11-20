@@ -25,13 +25,12 @@ use auspex_core::{Config, DiffConfig, Event, PrometheusConfig, PrometheusStatus}
 use auspex_effects::Termination;
 use auspex_effects::deploylog::{self, Identity, OpenParams};
 use clap::Parser as _;
-use crossterm::event::EventStream;
-use tokio_stream::StreamExt as _;
 
 use crate::backend::{Backend, Real};
 use crate::cli::{Args, Mode};
 use crate::config::{self, FlakeSource, Settings};
 use crate::demo::{self, Demo};
+use crate::handoff::{self, TerminalEvents};
 use crate::headless;
 use crate::keymap::{Key, Keymap};
 use crate::log::{Log, say};
@@ -331,9 +330,14 @@ async fn tui(
         }
     };
     enter_bracketed_paste();
+    // Where `s` asks for the terminal; before the first key, so a request always has an answer.
+    let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel();
+    shell.set_handoff(handoff_tx);
     shell.send(Event::Start(config));
     let mut ui = Ui::default();
-    let mut events = EventStream::new();
+    let mut events = TerminalEvents::start();
+    // The terminal is the shell's, not ours: ssh was stopped by a signal and auspex is leaving.
+    let mut terminal_left = false;
     let mut frames = tokio::time::interval(FRAME);
     let mut failure: Option<String> = None;
     // When the current refresh started, so a second `r` can tell a list that is merely
@@ -383,6 +387,32 @@ async fn tui(
                 }
                 None => shell.send(Event::Terminate),
             },
+            // `s`: the terminal goes to ssh until it ends. Nothing is drawn and no key is read
+            // meanwhile (this arm does not return), but the runtime goes on without us.
+            Some(request) = handoff_rx.recv() => {
+                // The reader is stopped before ssh starts, or it would take ssh's keys.
+                events.stop();
+                handoff::leave_terminal();
+                let session = handoff::run(&request.program, &request.args, term).await;
+                if let Some(signal) = session.stopped_by {
+                    // ssh is gone and the terminal is already the shell's: leave it so.
+                    terminal_left = true;
+                    code = ExitCode::from(signal_exit(signal));
+                    let _ = request.reply.send(session.end);
+                    break;
+                }
+                if let Err(e) = handoff::enter_terminal(&mut terminal) {
+                    terminal_left = true;
+                    failure = Some(format!("cannot take the terminal back from ssh: {e}"));
+                    code = ExitCode::from(USAGE);
+                    let _ = request.reply.send(session.end);
+                    break;
+                }
+                events = TerminalEvents::start();
+                // The frames that were due while ssh ran are not owed.
+                frames.reset();
+                let _ = request.reply.send(session.end);
+            }
             signal = term.recv() => {
                 code = ExitCode::from(signal_exit(signal));
                 break;
@@ -394,7 +424,9 @@ async fn tui(
     // `cancelled`) and cancel the rest, then give the terminal back.
     shell.terminate().await;
     leave_bracketed_paste();
-    ratatui::restore();
+    if !terminal_left {
+        ratatui::restore();
+    }
     if let Some(f) = failure {
         say(&f);
     }
