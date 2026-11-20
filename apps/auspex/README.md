@@ -222,7 +222,7 @@ client of its own and not `kubectl` over ssh.
   <t>s` before the update, uncordon after the wait. Off by default because a NixOS switch does not
   reboot the node and RKE2's containers survive a restart of the service.
 - **When a node is put back and when it is not.** After a failed or timed-out drain, or a quit before
-  the update started, the node is **uncordoned** (nothing was done to the machine). After a failed
+  the update started (that is, before `clan` is spawned: resolving the fleet's pinned `clan` can take minutes and counts as before), the node is **uncordoned** (nothing was done to the machine). After a failed
   update or a machine that never became healthy, and after a quit while its update or its wait was
   under way, the node **stays cordoned**: the machine may be half updated or broken, and workloads
   must not return to it unasked. That is said in the Log tab, the status bar (`LEFT CORDONED: luna`),

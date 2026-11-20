@@ -354,8 +354,13 @@ pub(super) fn request(model: &mut Model, kind: ActionKind) -> Command<Effect, Ev
     if kind == ActionKind::Update && !model.act {
         return model.notice(ACT_MODE_OFF);
     }
+    // From the `y` of an update (of one machine or of all) to its start the fleet's lock is being
+    // taken: nothing else is asked for or started meanwhile.
     if model.roll_active() {
         return model.notice("an update of all machines is running");
+    }
+    if model.lock_wait.is_some() {
+        return model.notice("an update is starting: ask again in a moment");
     }
     if model.freeze.rechecking() {
         return model

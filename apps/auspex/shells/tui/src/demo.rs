@@ -635,10 +635,14 @@ impl Demo {
         op: &auspex_core::effects::ActionRequest,
         cancel: &CancellationToken,
         sink: &(dyn Fn(Stream, &str) + Sync),
+        starting: &(dyn Fn() + Sync),
     ) -> Result<Result<ClanRun, String>, Cancelled> {
         use auspex_core::ActionKind;
         if let Some(real) = &self.real_actions {
-            return real.run_action(op, cancel, sink).await;
+            return real.run_action(op, cancel, sink, starting).await;
+        }
+        if op.kind == ActionKind::Update {
+            starting();
         }
         let unreachable =
             script(&op.machine).is_some_and(|s| matches!(s.probe, Probe::Unreachable(_)));

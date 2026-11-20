@@ -1728,3 +1728,26 @@ fn a_refresh_between_the_y_and_the_lock_is_refused() {
     assert_eq!(state(&s, "luna"), RollState::Checking);
     assert!(preflights(&s).contains("luna"));
 }
+
+/// Round 3. From the `y` to the lock's answer nothing else may be asked for: `b` (which `r` was
+/// already refused beside) would start a build beside the roll, and a `u` would open a question
+/// that can only be refused.
+#[test]
+fn a_build_or_an_update_between_the_y_and_the_lock_is_refused() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    s.hold_lock = true;
+    s.send(Event::ConfirmAnswer(true));
+    assert_eq!(s.held_locks.len(), 1, "the lock is being taken");
+    for event in [Event::BuildSelected, Event::UpdateSelected] {
+        s.send(event);
+        assert_eq!(notice(&s), "an update is starting: ask again in a moment");
+    }
+    assert!(s.actions.is_empty() && s.preflights.is_empty());
+    assert!(s.view().confirm.is_none());
+    let mut lock = s.held_locks.remove(0);
+    s.hold_lock = false;
+    s.resolve(&mut lock, Ok(()));
+    assert_eq!(state(&s, "luna"), RollState::Checking);
+}

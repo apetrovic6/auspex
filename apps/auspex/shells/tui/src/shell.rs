@@ -1158,14 +1158,10 @@ impl Shell {
             // The row is written only for an action that starts: a refused one is not a deploy
             // that was tried.
             let gate_refused = gate.is_err();
+            let started = AtomicBool::new(false);
             let (logged, ran) = if let Err(reason) = gate {
                 (None, Ok(Err(reason)))
             } else {
-                // The update starts now: a node drained for it is not auspex's to put back if auspex
-                // goes away (the machine may be half updated), only to say.
-                if op.kind == ActionKind::Update {
-                    shell.cordons.commit(&op.machine);
-                }
                 // A machine of an update of all has its row open already when it was drained, and
                 // closes it when its run ends (with the wait, the uncordon); a lone `u` or `b` has
                 // one that ends with it.
@@ -1175,16 +1171,35 @@ impl Shell {
                 } else {
                     Some(shell.log_action(&op))
                 };
+                // `clan` is about to be spawned (not before: resolving the pinned one can take
+                // minutes, and a quit then has done nothing to the machine): a node drained for
+                // it is not auspex's to put back if auspex goes away (the machine may be half
+                // updated), only to say.
                 let ran = shell
                     .backend
-                    .run_action(&op, &token, &|stream, text| {
-                        shell.output.push_to(key, stream, text);
-                    })
+                    .run_action(
+                        &op,
+                        &token,
+                        &|stream, text| {
+                            shell.output.push_to(key, stream, text);
+                        },
+                        &|| {
+                            started.store(true, Ordering::SeqCst);
+                            shell.cordons.commit(&op.machine);
+                        },
+                    )
                     .await;
                 (logged, ran)
             };
             shell.forget(op.id);
-            let end = action_end(&shell.output, key, &op, gate_refused, ran);
+            let end = action_end(
+                &shell.output,
+                key,
+                &op,
+                gate_refused,
+                started.load(Ordering::SeqCst),
+                ran,
+            );
             if key.is_none() {
                 shell.output.finish(&ended_line(&end));
             }
@@ -1229,6 +1244,7 @@ fn action_end(
     key: Option<u64>,
     op: &auspex_core::effects::ActionRequest,
     refused: bool,
+    started: bool,
     ran: Result<Result<ClanRun, String>, Cancelled>,
 ) -> ActionEnd {
     let summary = || {
@@ -1242,6 +1258,19 @@ fn action_end(
         // run): a refusal and not a failure of the machine, which an update of all skips, and
         // puts a drained node back for. A build that did not start stays a failure.
         Ok(Err(reason)) if refused || op.kind == ActionKind::Update => {
+            output.push_to(key, Stream::Note, &reason);
+            ActionEnd {
+                result: ActionResult::Refused,
+                exit_code: None,
+                summary: vec![reason],
+                explanation: None,
+            }
+        }
+        // Stopped before `clan` was spawned (while the pinned one was being resolved), in a roll:
+        // nothing was done to the machine, so a drained node is given back, as for a refusal.
+        Err(Cancelled) if !started && key.is_some() && op.kind == ActionKind::Update => {
+            let reason =
+                "cancelled before clan was started: nothing was done to the machine".to_owned();
             output.push_to(key, Stream::Note, &reason);
             ActionEnd {
                 result: ActionResult::Refused,
@@ -1489,5 +1518,43 @@ mod tests {
                 "── failed: boom ──"
             ]
         );
+    }
+
+    /// A stop that comes before `clan` was spawned (while the pinned one is being resolved, which
+    /// can take minutes) has done nothing to the machine: in a roll it is a refusal, so the
+    /// drained node is given back. After the spawn it is a cancellation, and the node stays
+    /// cordoned; and a lone `u` or a build has no node to give back and says what happened.
+    #[test]
+    fn a_stop_before_clan_was_spawned_is_a_refusal_only_in_a_roll() {
+        let request = |kind, log| auspex_core::effects::ActionRequest {
+            id: RequestId(1),
+            kind,
+            machine: "luna".to_owned(),
+            class: auspex_domain::fleet::MachineClass::Nixos,
+            system: None,
+            flake: "/f".to_owned(),
+            build_host: None,
+            target: None,
+            log,
+        };
+        let end = |kind, log: Option<RequestId>, started| {
+            action_end(
+                &Output::default(),
+                log.map(|r| r.0),
+                &request(kind, log),
+                false,
+                started,
+                Err(Cancelled),
+            )
+            .result
+        };
+        let run = Some(RequestId(5));
+        assert_eq!(end(ActionKind::Update, run, false), ActionResult::Refused);
+        assert_eq!(end(ActionKind::Update, run, true), ActionResult::Cancelled);
+        assert_eq!(
+            end(ActionKind::Update, None, false),
+            ActionResult::Cancelled
+        );
+        assert_eq!(end(ActionKind::Build, run, false), ActionResult::Cancelled);
     }
 }

@@ -264,6 +264,9 @@ impl Backend {
     /// `Effect::RunAction`: the process's lines go to `sink` as they are printed; the result is
     /// how it ended, or why it could not be started or was refused.
     ///
+    /// `starting` is called once, right before an update's `clan` is spawned, and not at all when
+    /// it never is: from then on the machine may be changed.
+    ///
     /// # Errors
     ///
     /// [`Cancelled`] when `cancel` fired: the process group has been killed and reaped.
@@ -272,10 +275,11 @@ impl Backend {
         op: &ActionRequest,
         cancel: &CancellationToken,
         sink: &(dyn Fn(Stream, &str) + Sync),
+        starting: &(dyn Fn() + Sync),
     ) -> Result<Result<ClanRun, String>, Cancelled> {
         match self {
-            Self::Real(r) => r.run_action(op, cancel, sink).await,
-            Self::Demo(d) => d.run_action(op, cancel, sink).await,
+            Self::Real(r) => r.run_action(op, cancel, sink, starting).await,
+            Self::Demo(d) => d.run_action(op, cancel, sink, starting).await,
         }
     }
 
@@ -937,6 +941,7 @@ impl Real {
         op: &ActionRequest,
         cancel: &CancellationToken,
         sink: &(dyn Fn(Stream, &str) + Sync),
+        starting: &(dyn Fn() + Sync),
     ) -> Result<Result<ClanRun, String>, Cancelled> {
         let flake = match FlakeRef::new(&op.flake) {
             Ok(f) => f,
@@ -977,6 +982,8 @@ impl Real {
                             .unwrap_or_default()
                     ),
                 );
+                // From here the machine may be changed: the shell is told before `clan` exists.
+                starting();
                 let work = act::update(&binary.path, &flake, &op.machine, &params, cancel, tx);
                 pump(work, &mut rx, &forward).await?
             }

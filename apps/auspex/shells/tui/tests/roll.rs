@@ -1135,3 +1135,64 @@ async fn a_clan_that_cannot_be_started_refuses_the_machine_and_gives_the_node_ba
         "nothing is left"
     );
 }
+
+/// Round 3. A node is auspex's to leave cordoned only from the moment `clan` is spawned. Before
+/// that (here: no `clan` could be found) the update has done nothing to the machine, so the node
+/// stays in the record of nodes to give back, and is **not** reported as "left cordoned, the
+/// machine may be broken".
+#[tokio::test]
+async fn a_node_is_committed_when_clan_is_spawned_and_not_before() {
+    use auspex_core::effects::{ActionKind, ActionRequest, RequestId};
+    use auspex_domain::fleet::MachineClass;
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let run = |clan: String| {
+        let t = &t;
+        async move {
+            let w = world(t, &clan, &kubectl_body(NODES_READY, 0), kube_rule(true), 20);
+            settled(&w.shell).await;
+            w.shell.cordons().register(
+                "luna",
+                "/nonexistent/kubectl".into(),
+                "/k/config".into(),
+                Some("rke2".to_owned()),
+            );
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            w.shell.start_action(
+                ActionRequest {
+                    id: RequestId(900),
+                    kind: ActionKind::Update,
+                    machine: "luna".to_owned(),
+                    class: MachineClass::Nixos,
+                    system: None,
+                    flake: w.fleet.path().to_str().unwrap().to_owned(),
+                    build_host: None,
+                    target: None,
+                    log: None,
+                },
+                move |_, end| {
+                    let _ = tx.send(end);
+                },
+            );
+            let end = tokio::time::timeout(Duration::from_secs(20), rx)
+                .await
+                .expect("the action ends")
+                .unwrap();
+            let report = w.shell.cordons().last_resort(Duration::from_secs(1));
+            w.shell.shutdown().await;
+            (end, report)
+        }
+    };
+    let (end, report) = run("MISSING".to_owned()).await;
+    assert_eq!(end.result, auspex_core::ActionResult::Refused, "{end:?}");
+    assert!(
+        report.len() == 1 && report[0].starts_with("node luna is STILL CORDONED"),
+        "still to be given back, not left on purpose: {report:?}"
+    );
+    let (_, report) = run(clan_body("0")).await;
+    assert!(
+        report.len() == 1 && report[0].starts_with("node luna was left cordoned"),
+        "clan was spawned: left on purpose: {report:?}"
+    );
+}
