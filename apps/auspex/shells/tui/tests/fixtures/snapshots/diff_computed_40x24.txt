@@ -4,7 +4,7 @@
 │reason    pending                     │
 │          nixos-system-luna-25.11.2026│
 │          1101.6a2f1c0                │
-│diff      +3 −2 ~10 packages (d)      │
+│diff      +3 −2 ~12 packages (d)      │
 │host      root@192.168.1.11 (inventory│
 │          deploy.targetHost)          │
 │build     localhost                   │

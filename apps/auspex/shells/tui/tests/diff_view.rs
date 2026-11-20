@@ -52,7 +52,7 @@ async fn a_computed_diff_at_120_columns() {
     assert!(at("critical  linux") < at("systemd 256.10 → 257.2"));
     assert!(at("systemd 256.10") < at("glibc"));
     assert!(at("glibc") < at("nix rebuilt"));
-    assert!(at("nix rebuilt") < at("3 other major-version changes; +3 −2 ~10"));
+    assert!(at("nix rebuilt") < at("4 other major-version changes; +3 −2 ~12"));
     // The headline once: the reason line no longer carries it.
     assert_eq!(
         frame.matches("linux 6.12.38 → 6.12.41, +3").count(),
@@ -116,15 +116,21 @@ async fn d_opens_the_full_list_and_q_closes_it_without_quitting() {
     let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), 120, 30);
     for needle in [
         "package diff: luna",
-        "changed (10)",
+        "changed (12)",
         "added (3)",
         "removed (2)",
         "linux  6.12.38 → 6.12.41",
         "ripgrep  14.1.1",
         "htop  3.3.0",
+        "firefox  133.0 → 134.0 (+ unwrapped)",
+        "gnome-settings-daemon-gsettings-schemas  47.2 → 48.0",
     ] {
         assert!(frame.contains(needle), "{needle}\n{frame}");
     }
+    assert!(
+        !frame.contains("firefox-unwrapped"),
+        "folded into firefox: {frame}"
+    );
     expect_file("snapshots", "diff_list_120.txt", &frame);
 
     // `q` is quit by default; with the list open it closes the list.
@@ -244,7 +250,7 @@ async fn failed_units_and_systemd_stay_visible_on_a_24_row_panel() {
         type_keys(&shell, &mut ui, &km, keys);
         let frame = render(&shell.view(), &mut ui, &km, &shell.log.lines(), width, 24);
         // Re-review N4: however short the panel, one row says a preview exists and how to open it.
-        assert!(frame.contains("+3 −2 ~10 packages (d)"), "{width}\n{frame}");
+        assert!(frame.contains("+3 −2 ~12 packages (d)"), "{width}\n{frame}");
         if width >= 100 {
             for needle in ["systemd   running", "failed    none"] {
                 assert!(frame.contains(needle), "{width}: {needle}\n{frame}");

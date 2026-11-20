@@ -508,3 +508,79 @@ fn review_preview_records_toplevel_pair() {
     assert_eq!(json["deployed"], deployed);
     assert_eq!(json["pending"], pending);
 }
+
+fn changed_pair(before: &[&str], after: &[&str]) -> PackageDiff {
+    let before: Vec<String> = before.iter().map(|n| path(n)).collect();
+    let after: Vec<String> = after.iter().map(|n| path(n)).collect();
+    diff_closures(&before, Some(&after)).unwrap().unwrap()
+}
+
+type Shown = (String, Vec<Option<String>>, Vec<Option<String>>);
+
+fn shown(diff: &PackageDiff) -> Vec<Shown> {
+    diff.changed
+        .iter()
+        .map(|c| (c.name.clone(), c.before.clone(), c.after.clone()))
+        .collect()
+}
+
+fn one(v: &str) -> Vec<Option<String>> {
+    vec![Some(v.to_owned())]
+}
+
+#[test]
+fn a_suffix_both_sides_carry_is_part_of_the_name() {
+    let diff = changed_pair(
+        &[
+            "gnome-settings-daemon-47.2-gsettings-schemas",
+            "proton-ge-bin-GE-Proton-10-4-steamcompattool",
+        ],
+        &[
+            "gnome-settings-daemon-48.0-gsettings-schemas",
+            "proton-ge-bin-GE-Proton-11-11-steamcompattool",
+        ],
+    );
+    let shown = shown(&diff);
+    assert!(
+        shown.contains(&(
+            "gnome-settings-daemon-gsettings-schemas".into(),
+            one("47.2"),
+            one("48.0")
+        )),
+        "{shown:?}"
+    );
+    assert!(
+        shown.contains(&(
+            "proton-ge-bin-GE-Proton-steamcompattool".into(),
+            one("10-4"),
+            one("11-11")
+        )),
+        "{shown:?}"
+    );
+    assert_eq!(diff.counts.changed, shown.len());
+}
+
+#[test]
+fn a_suffix_on_one_side_only_stays_a_version_change() {
+    let diff = changed_pair(&["tool-1.0"], &["tool-1.0-schemas"]);
+    assert_eq!(
+        shown(&diff),
+        [("tool".into(), one("1.0"), one("1.0-schemas"))]
+    );
+    // Pre-release words are versions, even on both sides: the number still differs.
+    let diff = changed_pair(&["tool-1.0-beta"], &["tool-2.0-beta"]);
+    assert_eq!(
+        shown(&diff),
+        [("tool".into(), one("1.0-beta"), one("2.0-beta"))]
+    );
+}
+
+#[test]
+fn a_shared_suffix_never_hides_a_version_change() {
+    let diff = changed_pair(&["tool-1.0-schemas"], &["tool-2.0-schemas"]);
+    assert_eq!(
+        shown(&diff),
+        [("tool-schemas".into(), one("1.0"), one("2.0"))]
+    );
+    assert_eq!(diff.counts.changed, 1);
+}

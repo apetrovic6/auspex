@@ -9,8 +9,9 @@
 //! The display rules (AUS-35):
 //!
 //! - the critical highlights (linux, systemd, glibc, nix) come first, with their versions;
-//! - a `-unwrapped` variant is not a highlight of its own when its wrapper is one too: the
-//!   operator reads one line for `firefox`, not two;
+//! - a `-unwrapped` variant is not a highlight of its own when its wrapper is one too and both
+//!   change the same way, and the `d` view folds the same pair: the operator reads one line for
+//!   `firefox`, not two (`--json` keeps both);
 //! - every other highlight is a major-version bump, and many of those are a count, not a
 //!   list: the full list (`d`) has them all.
 
@@ -23,7 +24,7 @@ use auspex_domain::status::Badge;
 /// What a line of the full list is, for styling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
-    /// A section title (`changed (10)`).
+    /// A section title (`changed (12)`).
     Heading,
     /// One package.
     Item,
@@ -88,15 +89,19 @@ fn is_critical(h: &PackageHighlight) -> bool {
 /// The highlights worth a line of their own, in the report's order, and how many other
 /// highlights (major-version bumps) there are.
 ///
-/// A `-unwrapped` highlight is dropped when its wrapper is highlighted too, from the critical
+/// A `-unwrapped` highlight is dropped when its wrapper is highlighted too and both change the
+/// same way (the same versions before and after), from the critical
 /// ones and from the count alike. When the report capped its highlights the count is a lower
 /// bound, which [`panel_lines`] says.
 #[must_use]
 pub fn split_highlights(diff: &PackageDiff) -> (Vec<&PackageHighlight>, usize) {
     let kept = diff.highlights.iter().filter(|h| {
-        h.name
-            .strip_suffix("-unwrapped")
-            .is_none_or(|wrapper| !diff.highlights.iter().any(|o| o.name == wrapper))
+        h.name.strip_suffix("-unwrapped").is_none_or(|wrapper| {
+            !diff
+                .highlights
+                .iter()
+                .any(|o| o.name == wrapper && o.before == h.before && o.after == h.after)
+        })
     });
     let (mut critical, other): (Vec<_>, Vec<_>) = kept.partition(|h| is_critical(h));
     // The kernel, systemd, glibc, nix: the order the ticket names them in, not the report's
@@ -198,7 +203,7 @@ pub fn panel_rows(
 
 /// One row for the detail panel, near its top, saying that a preview exists and how to open it.
 ///
-/// `+3 −2 ~10 packages (d)`, `not cached (d)`, `failed (d)`, `checking…`; nothing for a machine
+/// `+3 −2 ~12 packages (d)`, `not cached (d)`, `failed (d)`, `checking…`; nothing for a machine
 /// that is not update pending or has no preview coming. `key` is the key bound to the `d` view,
 /// or `None` when it is unbound. The value is cut to `cells` with the key hint kept, so a
 /// preview is always visible however short the panel is.
@@ -334,6 +339,24 @@ pub fn panel_lines(m: &MachineReport, cache_configured: bool) -> Vec<(&'static s
     out
 }
 
+/// Whether `c` is `X-unwrapped` and `X` is in the same list with the same versions: one line for
+/// both.
+fn folded_unwrapped(c: &PackageChange, list: &[PackageChange]) -> bool {
+    c.name.strip_suffix("-unwrapped").is_some_and(|wrapper| {
+        list.iter()
+            .any(|o| o.name == wrapper && o.before == c.before && o.after == c.after)
+    })
+}
+
+/// Whether `list` has `c-unwrapped` with the same versions as `c`.
+fn has_unwrapped(c: &PackageChange, list: &[PackageChange]) -> bool {
+    list.iter().any(|o| {
+        o.name.strip_suffix("-unwrapped") == Some(c.name.as_str())
+            && o.before == c.before
+            && o.after == c.after
+    })
+}
+
 fn change_line(c: &PackageChange) -> String {
     let before = versions(&c.before, c.before_truncated);
     let after = versions(&c.after, c.after_truncated);
@@ -414,7 +437,14 @@ pub fn full_lines(m: &MachineReport, cache_configured: bool) -> Vec<(Kind, Strin
             continue;
         }
         out.push((Kind::Heading, format!("{title} ({count})")));
-        out.extend(list.iter().map(|c| (Kind::Item, change_line(c))));
+        out.extend(list.iter().filter(|c| !folded_unwrapped(c, list)).map(|c| {
+            let more = if has_unwrapped(c, list) {
+                " (+ unwrapped)"
+            } else {
+                ""
+            };
+            (Kind::Item, format!("{}{more}", change_line(c)))
+        }));
         if truncated {
             out.push((
                 Kind::Note,
@@ -483,6 +513,36 @@ mod tests {
         let names: Vec<&str> = critical.iter().map(|h| h.name.as_str()).collect();
         assert_eq!(names, ["linux", "systemd"]);
         assert_eq!(major, 2, "firefox and thunderbird-unwrapped");
+    }
+
+    #[test]
+    fn an_unwrapped_variant_that_changes_differently_is_not_folded() {
+        let mut diff = PackageDiff::not_cached();
+        let mut other = highlight("firefox-unwrapped", &[HighlightKind::MajorVersion]);
+        other.after = vec![Some("3.0".to_owned())];
+        diff.highlights = vec![highlight("firefox", &[HighlightKind::MajorVersion]), other];
+        assert_eq!(split_highlights(&diff).1, 2);
+    }
+
+    #[test]
+    fn the_full_list_folds_an_unwrapped_pair_and_keeps_a_different_one() {
+        let change = |name: &str, after: &str| PackageChange {
+            name: name.to_owned(),
+            before: vec![Some("1.0".to_owned())],
+            after: vec![Some(after.to_owned())],
+            before_truncated: false,
+            after_truncated: false,
+        };
+        let list = [
+            change("chromium", "2.0"),
+            change("chromium-unwrapped", "2.0"),
+            change("electron", "2.0"),
+            change("electron-unwrapped", "3.0"),
+        ];
+        let folded: Vec<bool> = list.iter().map(|c| folded_unwrapped(c, &list)).collect();
+        assert_eq!(folded, [false, true, false, false]);
+        assert!(has_unwrapped(&list[0], &list));
+        assert!(!has_unwrapped(&list[2], &list));
     }
 
     #[test]

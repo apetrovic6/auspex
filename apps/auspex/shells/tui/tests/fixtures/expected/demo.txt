@@ -7,7 +7,7 @@
 ✓⟳    ganymede                                in sync         root@192.168.1.33        inventory     -
 ✓     genetor                                 in sync         admin@192.168.1.109      inventory     -
 ✓     io                                      in sync         root@io.lab.example      inventory     -
-↑◆    luna                                    update pending  root@192.168.1.11        inventory     pending nixos-system-luna-25.11.20261101.6a2f1c0; linux 6.12.38 → 6.12.41, +3 −2 ~10
+↑◆    luna                                    update pending  root@192.168.1.11        inventory     pending nixos-system-luna-25.11.20261101.6a2f1c0; linux 6.12.38 → 6.12.41, +3 −2 ~12
 ✗     mars                                    unreachable     root@192.168.1.20        inventory     ssh: connect to host 192.168.1.20 port 22: Connection timed out
 ✓     mechanicus-forge-world-archive-node-01  in sync         root@192.168.1.50        inventory     -
 ✓     phobos                                  in sync         root@192.168.1.42        inventory     -

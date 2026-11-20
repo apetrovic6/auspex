@@ -370,6 +370,12 @@ const CHANGED: &[(&str, &str, &str)] = &[
     ("postgresql", "16.6", "17.2"),
     ("nodejs", "20.18.1", "22.12.0"),
     ("firefox", "133.0", "134.0"),
+    ("firefox-unwrapped", "133.0", "134.0"),
+    (
+        "gnome-settings-daemon",
+        "47.2-gsettings-schemas",
+        "48.0-gsettings-schemas",
+    ),
     ("python3", "3.12.8", "3.13.1"),
 ];
 
