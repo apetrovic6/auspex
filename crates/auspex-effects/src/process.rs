@@ -298,12 +298,39 @@ pub fn spawn(
 /// watching still refer to the same leader.
 #[cfg(target_os = "linux")]
 fn limited_command(cmd: &Command, bytes: u64) -> io::Result<Command> {
+    let hard = rustix::process::getrlimit(rustix::process::Resource::As).maximum;
+    limited_command_under(cmd, bytes, hard)
+}
+
+/// [`limited_command`] given this process's own hard address-space limit (`None`: unlimited).
+///
+/// `prlimit --as=N:N` sets the hard limit too, and a process may lower a hard limit but only
+/// a privileged one (`CAP_SYS_RESOURCE`) may raise it. So under an inherited hard limit below
+/// `bytes` (a service manager's `LimitAS=`, a login shell's `ulimit -v`) `prlimit` itself
+/// fails with `EPERM` before it execs anything, and that used to surface as "not a git
+/// repository (… prlimit: failed to set the AS resource limit: Operation not permitted)"
+/// (review of PR #8, N4): the wrong cause, and a different misleading line per command. The
+/// check is made here instead, so the message names the limit and says what follows from it.
+/// Not clamped to the inherited limit: git's own failures under it would then be reported
+/// as hitting auspex's `bytes`, which is not the limit that stopped it.
+#[cfg(target_os = "linux")]
+fn limited_command_under(cmd: &Command, bytes: u64, hard: Option<u64>) -> io::Result<Command> {
     let original = cmd.as_std();
     if !Path::new(original.get_program()).is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "a bounded command needs an absolute program path",
         ));
+    }
+    if let Some(hard) = hard.filter(|h| *h < bytes) {
+        return Err(io::Error::other(format!(
+            "auspex's {} MiB address-space limit for git cannot be set: this process already \
+             has a hard address-space limit of {hard} bytes ({} MiB), inherited from whatever \
+             started it (`ulimit -v`, `LimitAS=`), which only a privileged process can raise. \
+             Git is not run without its limit, so there is no caching",
+            bytes >> 20,
+            hard >> 20
+        )));
     }
     // A packaged build names util-linux's `prlimit` by its absolute store path at compile
     // time (`AUSPEX_PRLIMIT`, set in nix/auspex/package.nix), so the installed program needs
@@ -714,6 +741,38 @@ pub fn describe_status(status: Option<ExitStatus>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of PR #8, N4: under an inherited hard address-space limit below auspex's own,
+    /// `prlimit` could not raise it and failed, and the failure was reported as something
+    /// else. The refusal names the limit it found.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_inherited_hard_limit_below_ours_is_named() {
+        let cmd = command(OsStr::new("sh")).unwrap();
+        let ours = 512u64 << 20;
+        let e = limited_command_under(&cmd, ours, Some(500_000 * 1024)).unwrap_err();
+        let text = e.to_string();
+        for part in [
+            "512 MiB",
+            "512000000 bytes",
+            "488 MiB",
+            "no caching",
+            "ulimit -v",
+        ] {
+            assert!(text.contains(part), "{part:?} missing from: {text}");
+        }
+        // One byte below is below; at the limit, above it, or unlimited is not.
+        assert!(limited_command_under(&cmd, ours, Some(ours - 1)).is_err());
+        for hard in [None, Some(ours), Some(ours + 1), Some(u64::MAX)] {
+            if let Err(e) = limited_command_under(&cmd, ours, hard) {
+                // Only the launcher itself may be missing, never the limit.
+                assert!(
+                    !e.to_string().contains("hard address-space limit"),
+                    "{hard:?}: {e}"
+                );
+            }
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

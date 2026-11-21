@@ -1113,3 +1113,106 @@ async fn evaluator_output_not_read_to_its_end_is_an_error() {
         "{items:?}"
     );
 }
+
+/// Review of PR #8, N6: a configuration that imports a new, untracked module fails with nix's
+/// "path '/nix/store/…-source/new.nix' does not exist", which says nothing about git. When
+/// the named file exists in the worktree, the operator gets one note saying why nix cannot
+/// see it. Nothing is said for a file that is not there, for a path that leaves the
+/// repository, or for a path that is not below a store path.
+#[tokio::test]
+async fn an_untracked_file_nix_cannot_find_is_explained_once() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let repo = fs::canonicalize(dir.path()).unwrap().join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::create_dir_all(repo.join("modules")).unwrap();
+    fs::write(repo.join("modules/new.nix"), "{}").unwrap();
+    fs::write(repo.join("outside-the-store.nix"), "{}").unwrap();
+    fs::write(dir.path().join("secret.nix"), "{}").unwrap();
+    let store = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-source";
+    let err = |name: &str, text: String| {
+        format!(
+            r#"{{"attr":"{name}","attrPath":["{name}"],"error":{}}}"#,
+            serde_json::Value::String(text)
+        )
+    };
+    let lines = [
+        // The same missing module, from two machines: one note.
+        err(
+            "a",
+            format!("error: path '{store}/modules/new.nix' does not exist"),
+        ),
+        err(
+            "b",
+            format!("error: getting status of '{store}/modules/new.nix': No such file"),
+        ),
+        // Not in the worktree, an escape attempt, and no store path before `-source/`.
+        err(
+            "c",
+            format!("error: path '{store}/modules/gone.nix' does not exist"),
+        ),
+        err(
+            "d",
+            format!("error: path '{store}/../secret.nix' does not exist"),
+        ),
+        err(
+            "e",
+            "error: path '/home/u/0123456789abcdfghijklmnpqrsvwxyz-source/outside-the-store.nix' does not exist".to_owned(),
+        ),
+        err(
+            "f",
+            format!("error: path '{store}//modules/new.nix' does not exist"),
+        ),
+    ];
+    let script = lines
+        .iter()
+        .map(|l| format!("printf '%s\\n' '{}'", l.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prog = t.script(dir.path(), "nix-eval-jobs", &script);
+    let flake = FlakeRef::new(repo.to_str().unwrap()).unwrap();
+    assert!(flake.is_git(), "{flake:?}");
+    let (tx, mut rx) = unbounded_channel();
+    let ms = machines(&["a", "b", "c", "d", "e", "f"]);
+    evaluate(
+        &flake,
+        &ms,
+        &params(&prog, Duration::from_secs(10)),
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let items = collect(&mut rx).await;
+    let notes: Vec<&str> = items
+        .iter()
+        .filter_map(|i| match i {
+            EvalItem::Note(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let note = notes[0];
+    for part in [
+        "modules/new.nix",
+        "not tracked by git",
+        "git+file",
+        "git add",
+    ] {
+        assert!(note.contains(part), "{part:?} missing from: {note}");
+    }
+    // Every machine still has its own error, untouched.
+    let errors = items
+        .iter()
+        .filter(|i| {
+            matches!(
+                i,
+                EvalItem::Machine {
+                    outcome: EvalOutcome::Error(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(errors, 6);
+}

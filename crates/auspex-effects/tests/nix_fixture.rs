@@ -729,3 +729,211 @@ async fn a_soft_reset_undone_during_real_worker_restarts_is_not_cached() {
     )
     .await;
 }
+
+/// Review item N3: `[`, `]`, `|` and `^` in a repository path made nix refuse the reference
+/// ("is not an absolute path"), for the machine list and for the evaluation alike. The
+/// repository and a nested flake directory carry all four, and the evaluation is cached and
+/// read back.
+#[tokio::test]
+async fn brackets_pipes_and_carets_in_the_repository_path_still_evaluate() {
+    for tool in ["nix", "nix-eval-jobs", "git"] {
+        if find_on_path(tool).is_none() {
+            eprintln!("SKIPPED: {tool} is not on PATH");
+            return;
+        }
+    }
+    let temp = tempdir();
+    let root = temp.path().join("fleet|[1]^");
+    let nested = root.join("sub]|^[");
+    fs::create_dir_all(&nested).unwrap();
+    let source = r#"{
+      outputs = _: {
+        clanInternals.inventoryClass.inventory.machines.terra = {};
+        nixosConfigurations.terra.config.system.build.toplevel = derivation {
+          name = "brackets";
+          system = "x86_64-linux";
+          builder = "/auspex-fixture-never-built";
+        };
+      };
+    }"#;
+    for dir in [&root, &nested] {
+        fs::write(dir.join("flake.nix"), source).unwrap();
+    }
+    git(&root, &["init", "-q"]);
+    git(&root, &["add", "."]);
+    git(&root, &["commit", "-q", "-m", "brackets"]);
+    let cache_dir = tempdir();
+    let machines = [EvalMachine {
+        name: "terra".to_owned(),
+        class: MachineClass::Nixos,
+    }];
+    for dir in [&root, &nested] {
+        let flake = FlakeRef::new(dir.to_str().unwrap()).unwrap();
+        let list = inventory(
+            OsStr::new(DEFAULT_NIX),
+            &flake,
+            Duration::from_secs(120),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap_or_else(|e| panic!("{}: {e}", flake.as_str()));
+        assert_eq!(
+            list.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            ["terra"]
+        );
+        let cache = CacheParams {
+            cache_dir: Some(cache_dir.path()),
+            flake_dir: dir,
+            git: GitParams::new(),
+        };
+        let (first, error) = split(&run(&flake, &machines, &cache).await);
+        assert_eq!(error, None, "{}", flake.as_str());
+        assert!(matches!(first["terra"], (false, EvalOutcome::Success(_))));
+        let (warm, error) = split(&run(&flake, &machines, &cache).await);
+        assert_eq!(error, None);
+        assert!(warm["terra"].0, "the second run is served from the cache");
+        assert_eq!(first["terra"].1, warm["terra"].1);
+    }
+}
+
+/// Review item N1, setup A, end to end with the real nix: a committed file made executable
+/// is dirty to nix under `core.fileMode=true` and clean under `false`, so `self.rev` and
+/// every toplevel that records it differ. One key used to stand for both.
+#[tokio::test]
+async fn a_git_setting_that_changes_dirtiness_is_not_a_stale_hit() {
+    for tool in ["nix", "nix-eval-jobs", "git"] {
+        if find_on_path(tool).is_none() {
+            eprintln!("SKIPPED: {tool} is not on PATH");
+            return;
+        }
+    }
+    let repo = tempdir();
+    let r = repo.path();
+    fs::write(
+        r.join("flake.nix"),
+        r#"{ outputs = { self }: {
+          nixosConfigurations.m.config.system.build.toplevel = derivation {
+            name = "toplevel";
+            system = "x86_64-linux";
+            builder = "/auspex-fixture-never-built";
+            configurationRevision = self.rev or self.dirtyRev or "none";
+            v = builtins.readFile ./v.txt;
+          };
+        }; }"#,
+    )
+    .unwrap();
+    fs::write(r.join("v.txt"), "one\n").unwrap();
+    git(r, &["init", "-q"]);
+    git(r, &["add", "."]);
+    git(r, &["commit", "-q", "-m", "one"]);
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(r.join("v.txt"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let flake = FlakeRef::new(r.to_str().unwrap()).unwrap();
+    let machines = [EvalMachine {
+        name: "m".to_owned(),
+        class: MachineClass::Nixos,
+    }];
+    let cache_dir = tempdir();
+    let cached = CacheParams {
+        cache_dir: Some(cache_dir.path()),
+        flake_dir: r,
+        git: GitParams::new(),
+    };
+    let uncached = CacheParams {
+        cache_dir: None,
+        ..cached
+    };
+    let (first, error) = split(&run(&flake, &machines, &cached).await);
+    assert_eq!(error, None);
+    assert!(!first["m"].0);
+
+    git(r, &["config", "core.fileMode", "false"]);
+    let (warm, error) = split(&run(&flake, &machines, &cached).await);
+    assert_eq!(error, None);
+    let (fresh, error) = split(&run(&flake, &machines, &uncached).await);
+    assert_eq!(error, None);
+    // The experiment must be able to tell: nix does read the two settings differently.
+    assert_ne!(
+        first["m"].1, fresh["m"].1,
+        "core.fileMode did not change nix's answer"
+    );
+    assert_eq!(warm["m"].1, fresh["m"].1, "a stale result was served");
+    assert!(
+        !warm["m"].0,
+        "the second setting must not hit the first one's entry"
+    );
+}
+
+/// Review item N6, with the real nix: a tracked configuration imports a module that is not
+/// tracked. nix's own error names neither git nor tracking; the operator gets a note that does,
+/// and once the file is added the machine evaluates.
+#[tokio::test]
+async fn an_untracked_import_is_explained_and_added_it_evaluates() {
+    for tool in ["nix", "nix-eval-jobs", "git"] {
+        if find_on_path(tool).is_none() {
+            eprintln!("SKIPPED: {tool} is not on PATH");
+            return;
+        }
+    }
+    let repo = tempdir();
+    let r = repo.path();
+    fs::write(
+        r.join("flake.nix"),
+        r#"{ outputs = _: {
+          nixosConfigurations.m.config.system.build.toplevel = derivation {
+            name = "toplevel";
+            system = "x86_64-linux";
+            builder = "/auspex-fixture-never-built";
+            v = import ./new-module.nix;
+          };
+        }; }"#,
+    )
+    .unwrap();
+    git(r, &["init", "-q"]);
+    git(r, &["add", "."]);
+    git(r, &["commit", "-q", "-m", "one"]);
+    fs::write(r.join("new-module.nix"), "\"x\"").unwrap();
+    let flake = FlakeRef::new(r.to_str().unwrap()).unwrap();
+    let machines = [EvalMachine {
+        name: "m".to_owned(),
+        class: MachineClass::Nixos,
+    }];
+    let uncached = CacheParams {
+        cache_dir: None,
+        flake_dir: r,
+        git: GitParams::new(),
+    };
+    let items = run(&flake, &machines, &uncached).await;
+    let (by, error) = split(&items);
+    assert_eq!(error, None);
+    assert!(matches!(by["m"].1, EvalOutcome::Error(_)), "{:?}", by["m"]);
+    let notes: Vec<&String> = items
+        .iter()
+        .filter_map(|i| match i {
+            EvalItem::Note(n) => Some(n),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("new-module.nix") && n.contains("not tracked by git")),
+        "{notes:?}"
+    );
+    git(r, &["add", "new-module.nix"]);
+    let items = run(&flake, &machines, &uncached).await;
+    let (by, _) = split(&items);
+    assert!(
+        matches!(by["m"].1, EvalOutcome::Success(_)),
+        "{:?}",
+        by["m"]
+    );
+    assert!(
+        !items
+            .iter()
+            .any(|i| matches!(i, EvalItem::Note(n) if n.contains("not tracked")))
+    );
+}

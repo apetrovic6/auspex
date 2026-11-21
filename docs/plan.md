@@ -147,7 +147,11 @@ Cache under `$XDG_CACHE_HOME/auspex/`, keyed by:
 - the format version;
 - `git rev-parse HEAD`;
 - a hash of `flake.lock`;
-- when the tree is dirty, a hash of `git diff HEAD` plus the untracked file list.
+- a digest of the index (`git ls-files -s -v`) and of every tracked file's worktree state (bytes
+  and owner exec bit, a symlink's target), plus the git settings that change what nix reads as
+  modified when they are not the defaults (`core.fileMode`, `core.symlinks`,
+  `core.ignorecase`). Untracked and ignored files are **not** keyed: a flake evaluated as
+  `git+file` does not see them (`crates/auspex-effects/README.md` has the current design).
 
 Write to a temp file, then rename. A failed cache write is ignored. The cache matters because
 re-evaluation isn't any faster warm.
@@ -307,8 +311,9 @@ Acceptance:
   - a core sequencing test;
   - an effects integration test with `nix-eval-jobs` against a fixture flake (no inputs; a
     fake nixos config, a fake darwin config, a fake inventory, and one machine that fails).
-    It's skipped when `nix` isn't on PATH. The fixture uses a `path:` flake ref, so it works
-    untracked.
+    It's skipped when `nix` isn't on PATH. The fixture tests commit to a temporary git
+    repository and refer to it by a plain path, which `FlakeRef` turns into `git+file`, so
+    they see exactly the tracked files, as the CLI does.
 - [ ] `auspex --plain` on omnissiah lists all 11 machines, genetor included, each with the
   right target and source. A machine that fails to evaluate shows `!` with the reason.
 - [ ] A powered-off machine shows `✗` within 10 s, with ssh's reason, and never delays other
@@ -453,7 +458,9 @@ Each one fails quietly, so test for it.
   readers about 250 ms and abort them.
 - **Not every eval error is catchable.** `tryEval` catches only `throw` and `assert`; fetch
   errors and missing attributes abort. That's why evaluation is one process per machine.
-- **Flakes only see tracked files.** The fixture test uses a `path:` flake ref.
+- **Flakes only see tracked files.** The fixture tests commit what they evaluate; a new module
+  must be `git add`ed, and auspex says so in the Log tab (stderr when headless) when an error
+  names an untracked file that exists in the worktree.
 - **BatchMode turns host-key prompts into failures.** That's correct, but show ssh's last
   stderr line.
 - **Probes must not land before the list.** Send the machine-list event before spawning any

@@ -124,9 +124,26 @@ impl FlakeRef {
     /// therefore read tracked files: `builtins.getFlake "/abs"` alone reads a path
     /// source, unlike the `nix eval /abs#…` CLI.
     ///
+    /// **This does filesystem I/O**: it canonicalizes the path and looks for `.git` in each
+    /// ancestor (a file or a directory: a linked worktree or a submodule has a file), so the
+    /// result depends on the disk as it is now, and a path that does not exist keeps its
+    /// lexical form.
+    ///
+    /// **A `git+file:` reference is rewritten too** when it has no query: it goes through
+    /// the same walk-up, so `git+file:///repo/x/y` becomes `git+file:///repo/?dir=x%2Fy`
+    /// (nix itself refuses the original, "Failed to fetch git repository"), and
+    /// `git+file://localhost/…` and `git+file:/…` are normalised alike (review of PR #8, N9).
+    /// Only a reference the operator gave a query (`?ref=`, `?rev=`, `?dir=`, …) is used as
+    /// written, and is not cached; other schemes (`github:`, `git+https:`) are untouched.
+    ///
+    /// The path is percent-encoded for nix's reference grammar, `[`, `]`, `|` and `^` included.
+    ///
     /// # Errors
     ///
-    /// When it is empty, starts with `-`, contains `#`, or contains a control character.
+    /// When it is empty, starts with `-`, contains `#`, or contains a control character;
+    /// when a path that must be put in the reference is not UTF-8, or has a character that
+    /// cannot be encoded (nothing is passed to nix that it would read as something else); when
+    /// the working directory cannot be found or a path cannot be made absolute.
     pub fn new(s: &str) -> Result<Self, FlakeRefError> {
         let cwd = std::env::current_dir()
             .map_err(|e| FlakeRefError(format!("cannot find the working directory: {e}")))?;
@@ -192,8 +209,13 @@ impl FlakeRef {
                         file.set_query(Some(&query));
                     }
                 }
+                let mut reference = format!("git+file://{}", nix_path(file.path())?);
+                if let Some(query) = file.query() {
+                    reference.push('?');
+                    reference.push_str(query);
+                }
                 return Ok(Self {
-                    reference: format!("git+{file}"),
+                    reference,
                     top: Some(top.to_path_buf()),
                     worktree: Some(path),
                     queried,
@@ -208,7 +230,7 @@ impl FlakeRef {
                 let file = url::Url::from_file_path(path)
                     .map_err(|()| FlakeRefError("cannot encode the flake path".to_owned()))?;
                 return Ok(Self {
-                    reference: format!("path:{}", file.path()),
+                    reference: format!("path:{}", nix_path(file.path())?),
                     worktree: None,
                     top: None,
                     queried: false,
@@ -351,16 +373,81 @@ fn absolute_local_scheme(s: &str, cwd: &Path) -> Result<String, FlakeRefError> {
     let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
     let file = url::Url::from_file_path(&abs)
         .map_err(|()| FlakeRefError(format!("cannot encode the path of {s:?}")))?;
+    let path = nix_path(file.path())?;
     let mut out = if git {
-        format!("git+file://{}", file.path())
+        format!("git+file://{path}")
     } else {
-        format!("path:{}", file.path())
+        format!("path:{path}")
     };
     if let Some(q) = query {
         out.push('?');
         out.push_str(q);
     }
     Ok(out)
+}
+
+/// The path part of a `file:` URL (`Url::path`, already percent-encoded by the `url` crate) as
+/// nix will accept it, or an error.
+///
+/// nix's flake reference parser takes only RFC 3986 path characters, unencoded or as `%XX`.
+/// The `url` crate follows the WHATWG URL standard instead, which leaves `[`, `]`, `|` and
+/// `^` unencoded in a path, and nix then refuses the whole reference ("is not an absolute
+/// path", review of PR #8, N3), so a repository in `~/t[1]` could be neither listed nor
+/// evaluated. They are encoded here. Everything else is checked against the grammar, so a
+/// character nobody thought of fails closed with this error instead of reaching nix as a
+/// reference that names something else, or nothing.
+fn nix_path(path: &str) -> Result<String, FlakeRefError> {
+    let mut out = String::with_capacity(path.len());
+    let mut chars = path.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => out.push_str("%5B"),
+            ']' => out.push_str("%5D"),
+            '|' => out.push_str("%7C"),
+            '^' => out.push_str("%5E"),
+            // An escape the `url` crate wrote: two hex digits must follow.
+            '%' => {
+                let rest = chars.as_str().as_bytes();
+                if rest.len() < 2 || !rest[..2].iter().all(u8::is_ascii_hexdigit) {
+                    return Err(unencodable(path));
+                }
+                out.push('%');
+            }
+            c if c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '/' | '-'
+                        | '.'
+                        | '_'
+                        | '~'
+                        | '!'
+                        | '$'
+                        | '&'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '*'
+                        | '+'
+                        | ','
+                        | ';'
+                        | '='
+                        | ':'
+                        | '@'
+                ) =>
+            {
+                out.push(c);
+            }
+            _ => return Err(unencodable(path)),
+        }
+    }
+    Ok(out)
+}
+
+fn unencodable(path: &str) -> FlakeRefError {
+    FlakeRefError(format!(
+        "cannot encode the path {path:?} as a flake reference: it has a character that nix's \
+         reference syntax does not take"
+    ))
 }
 
 /// `scheme:` at the start, as in a URL: a letter, then letters, digits, `+`, `-`, `.`.
@@ -705,6 +792,11 @@ struct Collector<'a> {
     delivered: BTreeSet<String>,
     notes: usize,
     tx: &'a UnboundedSender<EvalItem>,
+    /// The repository top level of a git reference: where an untracked file that nix said
+    /// it could not find would be.
+    top: Option<&'a Path>,
+    /// Paths already hinted about, so one missing module is one note, not one per machine.
+    hinted: BTreeSet<String>,
 }
 
 impl Collector<'_> {
@@ -712,6 +804,31 @@ impl Collector<'_> {
         if self.notes < MAX_LINE_NOTES {
             self.notes += 1;
             let _ = self.tx.send(EvalItem::Note(text));
+        }
+    }
+
+    /// One note when an evaluation error names a file in the repository that nix could not
+    /// find and that exists in the worktree (review of PR #8, N6).
+    ///
+    /// A plain path in a git repository is evaluated as `git+file`, which reads the tracked
+    /// files only, as `nix build .#…` does (review finding B1). A configuration that imports a
+    /// new, untracked module then fails with nix's "path '/nix/store/…-source/new.nix' does not
+    /// exist", which names neither git nor tracking, and an import guarded by `pathExists`
+    /// changes silently. The path after `-source/` is relative to the repository top level.
+    fn untracked_hint(&mut self, machine: &str, tail: &[String]) {
+        let Some(top) = self.top else { return };
+        for rel in tail.iter().flat_map(|l| source_paths(l)) {
+            if self.hinted.contains(&rel) || std::fs::symlink_metadata(top.join(&rel)).is_err() {
+                continue;
+            }
+            self.hinted.insert(rel.clone());
+            self.note(format!(
+                "{machine}: nix could not find {:?}, which exists in the worktree but is not \
+                 tracked by git. A plain path in a git repository is evaluated as a git+file \
+                 reference, which sees tracked files only (as `nix build .#…` does): `git add` \
+                 the file",
+                sanitize_line(&rel)
+            ));
         }
     }
 
@@ -750,12 +867,52 @@ impl Collector<'_> {
             return;
         }
         let outcome = named(outcome, &machine);
+        if let EvalOutcome::Error(failure) = &outcome {
+            self.untracked_hint(&machine, &failure.error_tail);
+        }
         let _ = self.tx.send(EvalItem::Machine {
             machine,
             outcome,
             from_cache: false,
         });
     }
+}
+
+/// The paths below a store path named `...-source` in one line of nix's error text, as written
+/// after `-source/` up to a quote or a space. Only a real store path counts (`/nix/store/`
+/// and 32 characters), and only a path that stays below its root: no `..`, nothing absolute.
+fn source_paths(line: &str) -> Vec<String> {
+    const MARK: &str = "-source/";
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = line[from..].find(MARK) {
+        let end = from + at;
+        from = end + MARK.len();
+        let before = &line[..end];
+        let hash_ok = before.len() >= 32
+            && before.is_char_boundary(before.len() - 32)
+            && before[before.len() - 32..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric())
+            && before[..before.len() - 32].ends_with("/nix/store/");
+        if !hash_ok {
+            continue;
+        }
+        let rest = &line[from..];
+        let rel = rest
+            .split(|c: char| c == '\'' || c == '"' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        let clean = !rel.is_empty()
+            && rel.len() <= 1024
+            && Path::new(rel)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if clean {
+            found.push(rel.to_owned());
+        }
+    }
+    found
 }
 
 /// The run error of an evaluator whose output was not read to its end.
@@ -854,6 +1011,8 @@ pub async fn evaluate(
         delivered: BTreeSet::new(),
         notes: 0,
         tx: &tx,
+        top: flake.repo_top(),
+        hinted: BTreeSet::new(),
     };
     let deadline = Instant::now() + params.timeout;
     let stop = pump(
@@ -1164,6 +1323,170 @@ mod tests {
         std::fs::create_dir(&q).unwrap();
         let f = FlakeRef::new(q.to_str().unwrap()).unwrap();
         assert!(f.as_str().ends_with("/q%3Fdir=sub"), "{f:?}");
+    }
+
+    /// Review item N9, now documented and pinned: an explicit `git+file:` reference without a
+    /// query is rewritten like a plain path (nix refuses `git+file:///repo/x/y` itself), and
+    /// one with a query is kept as written.
+    #[test]
+    fn explicit_git_file_references_are_rewritten_unless_they_carry_a_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(top.join(".git")).unwrap();
+        std::fs::create_dir_all(top.join("x/y")).unwrap();
+        let want = format!("git+file://{}/?dir=x%2Fy", top.display());
+        for given in [
+            format!("git+file://{}/x/y", top.display()),
+            format!("git+file://localhost{}/x/y", top.display()),
+            format!("git+file:{}/x/y", top.display()),
+        ] {
+            let f = FlakeRef::new(&given).unwrap();
+            assert_eq!(f.as_str(), want, "{given}");
+            assert!(f.is_git() && !f.has_query(), "{given}");
+            assert_eq!(f.worktree_dir(), Some(top.join("x/y").as_path()), "{given}");
+        }
+        let root = FlakeRef::new(&format!("git+file://{}", top.display())).unwrap();
+        assert_eq!(root.as_str(), format!("git+file://{}/", top.display()));
+        // The operator's own query is theirs: kept, and not cached.
+        let queried = format!("git+file://{}/x/y?ref=main", top.display());
+        let q = FlakeRef::new(&queried).unwrap();
+        assert_eq!(q.as_str(), queried);
+        assert!(q.has_query() && !q.is_git());
+    }
+
+    /// What nix's flake reference parser takes in a path: RFC 3986 `pchar`s and `/`, or an
+    /// escape. The test's own statement of the grammar, not `nix_path`'s code.
+    fn nix_takes(path: &str) -> bool {
+        let b = path.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'%' => {
+                    if !b
+                        .get(i + 1..i + 3)
+                        .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+                    {
+                        return false;
+                    }
+                    i += 2;
+                }
+                c if c.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:@".contains(&c) => {}
+                _ => return false,
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Review item N3: `[`, `]`, `|` and `^` in a repository path made nix refuse the
+    /// reference ("is not an absolute path"). Every awkward name the review tried names its
+    /// own directory in a reference nix takes, for the top level, for `?dir=`, and for
+    /// `path:`.
+    #[test]
+    fn awkward_directory_names_make_references_nix_takes() {
+        let names = [
+            "t[1]",
+            "t]b",
+            "t|b",
+            "t^b",
+            "[|]^",
+            "a b",
+            "a+b",
+            "a%20b",
+            "a%2Fb",
+            "a%",
+            "a?dir=x",
+            "a%3Fdir=x",
+            "a&dir=x",
+            "a;dir=x",
+            "a=b",
+            "é ü",
+            "a\\b",
+            "a'b",
+            "a\"b",
+            "a{b}",
+            "a`b",
+            "a<b>",
+            "a!$*@~,()b",
+            "a:b",
+        ];
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        for name in names {
+            // A repository named `name`, a nested flake directory named `name`, and a
+            // directory outside any repository named `name`.
+            let top = base.join("repos").join(name);
+            let nested = top.join(name);
+            let plain = base.join("plain").join(name);
+            std::fs::create_dir_all(top.join(".git")).unwrap();
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::create_dir_all(&plain).unwrap();
+
+            let root = FlakeRef::new(top.to_str().unwrap()).unwrap();
+            let file = root.as_str().strip_prefix("git+file://").unwrap();
+            assert!(nix_takes(file), "{name}: {}", root.as_str());
+            let decoded = url::Url::parse(&format!("file://{file}")).unwrap();
+            assert_eq!(decoded.to_file_path().unwrap(), top, "{name}");
+            assert!(root.is_git(), "{name}");
+
+            let sub = FlakeRef::new(nested.to_str().unwrap()).unwrap();
+            let (path, query) = sub
+                .as_str()
+                .strip_prefix("git+file://")
+                .unwrap()
+                .split_once("?dir=")
+                .unwrap();
+            assert!(
+                nix_takes(path) && nix_takes(query),
+                "{name}: {}",
+                sub.as_str()
+            );
+            assert_eq!(sub.worktree_dir(), Some(nested.as_path()), "{name}");
+
+            let p = FlakeRef::new(plain.to_str().unwrap()).unwrap();
+            let rest = p.as_str().strip_prefix("path:").unwrap();
+            assert!(nix_takes(rest), "{name}: {}", p.as_str());
+            assert_eq!(p.local_dir(), Some(plain), "{name}");
+            // The scheme form goes through the same encoding. (`path:a?dir=x` is a query
+            // there by definition, so those names are left out.)
+            if !name.contains('?') {
+                let rel = FlakeRef::new_in(&format!("path:{name}"), &base.join("plain")).unwrap();
+                assert_eq!(rel, p, "{name}");
+            }
+        }
+    }
+
+    /// The four characters from the review, spelled out, so the expected text is in the
+    /// tests and not only in the encoder.
+    #[test]
+    fn brackets_pipes_and_carets_are_percent_encoded() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let top = base.join("fleet|[1]^");
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        let f = FlakeRef::new(top.to_str().unwrap()).unwrap();
+        assert_eq!(
+            f.as_str(),
+            format!("git+file://{}/fleet%7C%5B1%5D%5E/", base.display())
+        );
+        let plain = base.join("p]b");
+        std::fs::create_dir(&plain).unwrap();
+        let p = FlakeRef::new(plain.to_str().unwrap()).unwrap();
+        assert_eq!(p.as_str(), format!("path:{}/p%5Db", base.display()));
+    }
+
+    /// N3's other half: what cannot be encoded is refused, never passed on. The `url` crate
+    /// encodes everything outside ASCII, but this is the last check before nix, so it does
+    /// not rely on that.
+    #[test]
+    fn a_path_that_cannot_be_encoded_is_refused() {
+        assert_eq!(nix_path("/a/b%20c").unwrap(), "/a/b%20c");
+        for bad in [
+            "/a b", "/a\u{e9}", "/a%", "/a%2", "/a%zz", "/a\"b", "/a\\b", "/a\u{7f}", "/a\n",
+        ] {
+            let e = nix_path(bad).unwrap_err();
+            assert!(e.0.contains("cannot encode the path"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

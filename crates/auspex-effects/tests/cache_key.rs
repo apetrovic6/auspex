@@ -799,3 +799,159 @@ async fn the_key_of_a_fixed_repository_is_pinned() {
         "v2-71451c8e29e86e59a2bd3be004df05e8a725aee5481e3a9ee3454b16b6bf2ab9"
     );
 }
+
+/// Review of PR #8, N4: auspex started under a hard address-space limit below its own 512 MiB
+/// for git. `prlimit` cannot raise a hard limit, and the failure used to be reported as "not
+/// a git repository (… prlimit: failed to set the AS resource limit …)". The note must name
+/// the limit and say that git is not run. In a child process, started by `sh` under
+/// `ulimit -v`.
+#[test]
+fn a_low_inherited_address_space_limit_is_named_not_blamed_on_the_repository() {
+    if std::env::var_os("AUSPEX_TEST_LOW_AS").is_some() {
+        return;
+    }
+    let Some(t) = tools(&["git"]) else {
+        return;
+    };
+    let _ = t;
+    let Some(r) = repo() else { return };
+    let out = Command::new("sh")
+        .args(["-c", "ulimit -v 400000 && exec \"$0\" \"$@\""])
+        .arg(std::env::current_exe().unwrap())
+        .args(["--exact", "low_as_inner", "--nocapture", "--test-threads=1"])
+        .env("AUSPEX_TEST_LOW_AS", r.path())
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "{text}");
+}
+
+#[tokio::test]
+async fn low_as_inner() {
+    let Some(repo) = std::env::var_os("AUSPEX_TEST_LOW_AS") else {
+        return;
+    };
+    let e = key(Path::new(&repo)).await.unwrap_err();
+    for part in [
+        "409600000 bytes",
+        "390 MiB",
+        "512 MiB",
+        "hard address-space limit",
+        "no caching",
+    ] {
+        assert!(e.contains(part), "{part:?} missing from: {e}");
+    }
+    for wrong in ["not a git repository", "Operation not permitted"] {
+        assert!(!e.contains(wrong), "{wrong:?} in: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Review of PR #8, N1: git settings nix's libgit2 reads
+// ---------------------------------------------------------------------------------------
+
+/// `core.fileMode` decides whether a mode-only change makes a file modified, so the same
+/// bytes and index give nix a clean revision under one value and a dirty one under the
+/// other. Each setting that changes that answer is part of the key; the default is not
+/// fed, so a key written before it was keyed (`the_key_of_a_fixed_repository_is_pinned`)
+/// still hits.
+#[tokio::test]
+async fn git_settings_that_change_what_nix_reads_as_modified_are_keyed() {
+    let Some(r) = repo() else { return };
+    let d = r.path();
+    let plain = key(d).await.unwrap();
+    for (name, other, default) in [
+        ("core.fileMode", "false", "true"),
+        ("core.symlinks", "false", "true"),
+        ("core.ignoreCase", "true", "false"),
+    ] {
+        git(d, &["config", name, other]);
+        let changed = key(d).await.unwrap();
+        assert_ne!(changed, plain, "{name}={other} is not in the key");
+        // Spelled the way git spells booleans, it is the same value, so the same key.
+        git(
+            d,
+            &["config", name, if other == "true" { "yes" } else { "no" }],
+        );
+        assert_eq!(
+            key(d).await.unwrap(),
+            changed,
+            "{name}: yes/no is true/false"
+        );
+        // The default, set explicitly or not, is the key it always was.
+        git(d, &["config", name, default]);
+        assert_eq!(
+            key(d).await.unwrap(),
+            plain,
+            "{name}={default} is the default"
+        );
+        git(d, &["config", "--unset", name]);
+        assert_eq!(key(d).await.unwrap(), plain, "{name} unset");
+    }
+    // The three together are not the sum of any two.
+    let mut seen = vec![plain];
+    for set in [
+        &[("core.fileMode", "false")][..],
+        &[("core.fileMode", "false"), ("core.symlinks", "false")],
+        &[("core.symlinks", "false")],
+    ] {
+        for (n, v) in set {
+            git(d, &["config", n, v]);
+        }
+        let k = key(d).await.unwrap();
+        assert!(!seen.contains(&k), "{set:?} shares a key");
+        seen.push(k);
+        for (n, _) in set {
+            git(d, &["config", "--unset", n]);
+        }
+    }
+}
+
+/// `core.trustctime=false` makes nix call a file unmodified when its size, mtime and inode
+/// still match the index, whatever its bytes are, which no key built from the bytes can
+/// follow: no caching, with a note that names the setting. Set to true, in any spelling, it
+/// is the default.
+#[tokio::test]
+async fn core_trustctime_false_means_no_caching_and_says_so() {
+    let Some(r) = repo() else { return };
+    let d = r.path();
+    let plain = key(d).await.unwrap();
+    git(d, &["config", "core.trustctime", "false"]);
+    let e = key(d).await.unwrap_err();
+    assert!(
+        e.contains("core.trustctime is false") && e.contains("size, mtime and inode"),
+        "{e}"
+    );
+    assert!(!e.contains("not a git repository"), "{e}");
+    git(d, &["config", "core.trustctime", "off"]);
+    assert!(key(d).await.is_err(), "off is false");
+    git(d, &["config", "core.trustctime", "yes"]);
+    assert_eq!(key(d).await.unwrap(), plain);
+}
+
+/// A value that is not a boolean is git's own error, and no caching: not a guess. Whichever
+/// git command meets it first, the note carries git's words.
+#[tokio::test]
+async fn a_status_setting_that_is_no_boolean_means_no_caching() {
+    let Some(r) = repo() else { return };
+    for name in [
+        "core.fileMode",
+        "core.symlinks",
+        "core.ignoreCase",
+        "core.trustctime",
+    ] {
+        git(r.path(), &["config", name, "banana"]);
+        let e = key(r.path()).await.unwrap_err();
+        assert!(
+            e.contains("bad boolean config value 'banana'"),
+            "{name}: {e}"
+        );
+        git(r.path(), &["config", "--unset", name]);
+    }
+    assert!(key(r.path()).await.is_ok());
+}

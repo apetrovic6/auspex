@@ -29,10 +29,39 @@
 //! symlink's target text, or that it is missing or not a regular file. Paths are walked
 //! from the top level without following symlinks, regular files are opened non-blocking,
 //! at most [`MAX_WORKTREE_BYTES`] are read in all, under [`GitParams::read_timeout`].
+//!
+//! **What decides clean or dirty** (review of PR #8, N1). nix sets `self.rev` or
+//! `self.dirtyRev` from libgit2's status, and the plan's `configurationRevision` puts it in
+//! every toplevel, so the key has to cover whatever that status depends on. It depends on the
+//! index (keyed), the worktree's bytes and owner exec bit (keyed), and three things more:
+//!
+//! - `core.fileMode`, `core.symlinks` and `core.ignorecase`, which change the answer for the
+//!   same bytes: keyed when they are not libgit2's defaults ([`STATUS_SETTINGS`]), read with
+//!   `git config` from the repository and the operator's global and system files. Not
+//!   verified: a configuration file that libgit2 searches and git does not (for instance
+//!   through git's own `GIT_CONFIG_*` variables, which this process may have set and nix
+//!   does not see) would be outside the key;
+//! - the index's stat data (size, mtime, `ctime`, inode, owner): libgit2 trusts it, and calls a
+//!   file unmodified when it matches the entry, without reading the bytes. With the default
+//!   `core.trustctime=true` it cannot match after a write, since no ordinary program sets
+//!   `ctime` back, so a changed file is always read and the bytes the key hashes decide; a
+//!   `touch` makes libgit2 read the file, find the committed bytes, and call it unmodified, as
+//!   before. The stat data is therefore not needed in the key. With `core.trustctime=false`
+//!   it would be (a same-size rewrite that restores the mtime is "unmodified" to nix), and it
+//!   cannot be keyed without missing after every `touch`, so there is no caching then, with a
+//!   note. What is left: a write in the same filesystem timestamp tick as the index entry's
+//!   own (a coarse-timestamp filesystem; see the guard's limits below).
+//!
 //! Untracked and ignored files are not in the key, because nix no longer sees them; the
 //! domain's untracked list is passed empty and `Tree::Clean` is never used. What an
 //! `--impure` evaluation reads from the environment or from outside the flake is not in
-//! the key either: that is the fleet's own choice, and no key can cover it.
+//! the key either: that is the fleet's own choice, and no key can cover it. One case worth
+//! naming (review of PR #8, N8): a tracked absolute symlink to a file outside the tree. The
+//! key holds the link's target *text*, nix reads the file behind it, so editing only that file
+//! leaves the key as it was. `--impure` is this crate's choice, because `getFlake` of a dirty
+//! `git+file` reference needs it, so auspex evaluates, and caches, fleets that the operator's
+//! own pure `nix build` would refuse. A pure evaluation of `?rev=<HEAD>` for clean trees would
+//! close this and the edit-and-undo window below, and is not done.
 //!
 //! **A changed tree during a scan** (review finding B2). Every nix-eval-jobs worker reads
 //! the tree again when it starts, and workers restart on their memory cap, so a file saved
@@ -59,7 +88,7 @@
 //!   `HEAD`'s id, so a linked worktree's own files), each by one `lstat`: `HEAD` and
 //!   `index`;
 //! - in the common git directory (named by the git directory's `commondir` file, else the
-//!   git directory itself): the loose file of the ref `HEAD` names (`rev-parse
+//!   git directory itself): `config`; the loose file of the ref `HEAD` names (`rev-parse
 //!   --symbolic-full-name HEAD`, the end of any chain of symbolic refs; per-worktree refs
 //!   are in the git directory), or that it is not loose; `packed-refs`; and
 //!   `reftable/tables.list` under the reftable backend. A detached `HEAD` is the `HEAD`
@@ -525,7 +554,7 @@ async fn key_and_top(
     params: &GitParams<'_>,
     cancel: &CancellationToken,
 ) -> Result<Result<Keyed, String>, Cancelled> {
-    let top = match git(
+    let top = match git_typed(
         params,
         flake_dir,
         &["rev-parse", "--show-toplevel"],
@@ -535,7 +564,17 @@ async fn key_and_top(
     .await?
     {
         Ok(t) => t,
-        Err(e) => return Ok(Err(format!("not a git repository ({e})"))),
+        // Only git itself saying no is "not a git repository" (or a repository it cannot open:
+        // an unreadable configuration is one). Everything else on the first
+        // command (no `prlimit`, an inherited address-space limit, a timeout) is reported as
+        // it is: this label used to go in front of all of them, and sent the operator to the
+        // repository (review of PR #8, N4).
+        Err(GitFailure::Exited { message: e, .. }) => {
+            return Ok(Err(format!(
+                "not a git repository, or one git cannot open ({e})"
+            )));
+        }
+        Err(GitFailure::Other(e)) => return Ok(Err(e)),
     };
     let top = {
         use std::os::unix::ffi::OsStrExt as _;
@@ -543,6 +582,10 @@ async fn key_and_top(
     };
     let (git_dir, head, head_ref) = match head_of(params, &top, cancel).await? {
         Ok(h) => h,
+        Err(e) => return Ok(Err(e)),
+    };
+    let settings = match status_settings(params, &top, cancel).await? {
+        Ok(s) => s,
         Err(e) => return Ok(Err(e)),
     };
     let index = match git(
@@ -584,7 +627,7 @@ async fn key_and_top(
         let mut guard = Sha256::new_with_prefix(b"auspex run guard v1\0");
         let lock = read_lock(&flake_dir, &stop, &mut guard)?;
         let digest = worktree_digest::<MAX_WORKTREE_BYTES>(
-            &tree_top, &rel, &index, &paths, &stop, &mut guard,
+            &tree_top, &rel, &index, &paths, &settings, &stop, &mut guard,
         )?;
         git_dir_stamps(&git_dir, &head_ref, &stop, &mut guard)?;
         Ok::<_, Stop>((lock, digest, Guard(guard.finalize().to_vec())))
@@ -622,6 +665,72 @@ async fn key_and_top(
         guard,
         worktree: digest.1,
     }))
+}
+
+/// The settings nix's libgit2 consults when it decides whether a tracked file is modified (and
+/// so whether `self.rev` or `self.dirtyRev` is set, and with it `configurationRevision` and
+/// every toplevel that records it), with the values libgit2 assumes when one is unset
+/// (review of PR #8, N1). Read the way git reads them: the repository's own configuration,
+/// then the operator's global and system files.
+const STATUS_SETTINGS: &[(&str, &str)] = &[
+    // A mode-only change (`chmod +x`) is modified, or is not.
+    ("core.filemode", "true"),
+    // A symlink is compared as a link, or as a file holding its target.
+    ("core.symlinks", "true"),
+    // How paths are matched against the index.
+    ("core.ignorecase", "false"),
+    // Whether `ctime` takes part in "the stat data still matches the index"; see below.
+    ("core.trustctime", "true"),
+];
+
+/// The non-default values of [`STATUS_SETTINGS`], as `name=value\0` each, to go into the key;
+/// empty when every setting is at its default. Or why there is no caching.
+///
+/// `core.filemode`, `core.symlinks` and `core.ignorecase` are keyed: they change what nix
+/// reads as modified for the same bytes, and the same key must not stand for two answers.
+/// Nothing is fed for a default, so keys written before this was keyed still hit.
+///
+/// `core.trustctime=false` is not keyed but refused. With it, nix calls a tracked file
+/// unmodified when its size, mtime, inode and owner still match the index entry, whatever
+/// its bytes are, and "matches the index" depends on stat data that no key can hold without
+/// missing after every `touch` and checkout: a same-size rewrite that puts the mtime back
+/// reads as the committed file to nix and as the new bytes to the key. With the default
+/// (`ctime` compared) the stat data cannot match after a write, because no ordinary program
+/// sets `ctime` back, so the bytes the key hashes decide. Stat data is therefore the one
+/// input of that decision that stays outside the key, and only under that setting.
+async fn status_settings(
+    params: &GitParams<'_>,
+    top: &Path,
+    cancel: &CancellationToken,
+) -> Result<Result<Vec<u8>, String>, Cancelled> {
+    let mut keyed = Vec::new();
+    for (name, default) in STATUS_SETTINGS {
+        // `--type=bool` spells `yes`, `on`, `1` and `true` one way, and a value that is no
+        // boolean is git's error (exit 128), so there is no caching rather than a guess.
+        let args = ["config", "--type=bool", "--default", default, "--get", name];
+        let out = match git(params, top, &args, 64, cancel).await? {
+            Ok(out) => out,
+            Err(e) => return Ok(Err(e)),
+        };
+        let value = lossy(&out);
+        let value = value.trim_end();
+        if *name == "core.trustctime" && value == "false" {
+            return Ok(Err(
+                "core.trustctime is false in this repository's git configuration, so nix \
+                 decides whether a tracked file changed from size, mtime and inode alone and \
+                 may read a rewritten file as the committed one, which the cache key cannot \
+                 follow; set it to true (the default) for caching"
+                    .to_owned(),
+            ));
+        }
+        if !matches!(value, "true" | "false") {
+            return Ok(Err(format!("git config printed {value:?} for {name}")));
+        }
+        if value != *default {
+            keyed.extend_from_slice(format!("{name}={value}\0").as_bytes());
+        }
+    }
+    Ok(Ok(keyed))
 }
 
 /// The git directory, HEAD's commit id (with its newline, as the key has always hashed it)
@@ -773,6 +882,9 @@ fn git_dir_stamps(
         stamp(g, b'R', loose.map(|(_, s)| s));
     }
     stamp(g, b'P', kind(common, b"packed-refs").ok().map(|(_, s)| s));
+    // The repository's own configuration: the settings that are keyed (`status_settings`)
+    // changed and put back during the scan leave two equal keys and a different file.
+    stamp(g, b'G', kind(common, b"config").ok().map(|(_, s)| s));
     let tables = walk_path(common, b"reftable/tables.list")
         .ok()
         .and_then(|(d, name)| kind(&d, name).ok());
@@ -882,6 +994,7 @@ fn worktree_digest<const MAX_BYTES: u64>(
     rel: &Path,
     index: &[u8],
     paths: &[&[u8]],
+    settings: &[u8],
     stop: &dyn Fn() -> bool,
     g: &mut Sha256,
 ) -> Result<(Vec<u8>, Vec<u8>), Stop> {
@@ -902,6 +1015,13 @@ fn worktree_digest<const MAX_BYTES: u64>(
     // (N2b).
     both.field(b'r', rel.as_os_str().as_bytes());
     field(&mut both.key, b'i', &Sha256::digest(index));
+    // The git settings that change what nix reads as modified, when they are not the
+    // defaults (N1); nothing is fed for the defaults, so those keys are what they always were.
+    // The update check's fingerprint takes them too: it says what nix reads, and a setting that
+    // flips clean and dirty changes the deployed toplevel as an edit does.
+    if !settings.is_empty() {
+        both.field(b'c', settings);
+    }
     // (The fingerprint's own index field comes after the walk: it leaves out the paths with nothing
     // on disk.)
     let mut missing: BTreeSet<&[u8]> = BTreeSet::new();
@@ -1297,11 +1417,31 @@ async fn evaluate_with(
     let Some((pending, finished)) = forwarded else {
         return Err(Cancelled);
     };
+    finish_run(flake, cache, cancel, &tx, (&key, &guard), pending, finished).await
+}
+
+/// What follows an evaluation that ran to its end: the stores, then the held `Finished`.
+///
+/// Nothing at all when the run was cancelled or the receiver dropped meanwhile: a cancelled
+/// call sends no `Finished` (see [`evaluate_cached`]), and that includes a run with nothing
+/// to store, where [`store_checked`] is never reached to notice (review of PR #8, T3). The
+/// window is the time between the evaluator's exit and this call, too short to hit on
+/// purpose, so it is a function of its own that a test can call with the token already
+/// cancelled.
+async fn finish_run(
+    flake: &FlakeRef,
+    cache: &CacheParams<'_>,
+    cancel: &CancellationToken,
+    tx: &UnboundedSender<EvalItem>,
+    (key, guard): (&CacheKey, &Guard),
+    pending: Vec<(String, EvalSuccess)>,
+    finished: Option<EvalItem>,
+) -> Result<(), Cancelled> {
     if cancel.is_cancelled() || tx.is_closed() {
         return Err(Cancelled);
     }
     if !pending.is_empty() {
-        store_checked(flake, cache, cancel, &tx, (&key, &guard), pending).await?;
+        store_checked(flake, cache, cancel, tx, (key, guard), pending).await?;
     }
     if let Some(finished) = finished {
         tx.send(finished).map_err(|_| Cancelled)?;
@@ -1348,6 +1488,70 @@ mod tests {
 
     use super::*;
 
+    /// Review of PR #8, T3 (mutation X10): a run cancelled after its evaluator exited sends no
+    /// `Finished`, whether or not it had anything to store, and the receiver dropped likewise.
+    #[tokio::test]
+    async fn a_run_cancelled_after_the_evaluator_exited_sends_nothing() {
+        let flake = FlakeRef::new("path:/x").unwrap();
+        let cache = CacheParams {
+            cache_dir: None,
+            flake_dir: Path::new("/x"),
+            git: GitParams::new(),
+        };
+        let key = cache_key(&CacheKeyInputs {
+            head: "0123\n",
+            flake_lock: None,
+            tree: Tree::Clean,
+        });
+        let guard = Guard(Vec::new());
+        let finished = || Some(EvalItem::Finished { error: None });
+
+        let (tx, mut rx) = unbounded_channel();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let r = finish_run(
+            &flake,
+            &cache,
+            &cancel,
+            &tx,
+            (&key, &guard),
+            vec![],
+            finished(),
+        )
+        .await;
+        assert!(r.is_err(), "a cancelled run is Cancelled");
+        assert!(rx.try_recv().is_err(), "and sends no Finished");
+
+        let (tx, rx) = unbounded_channel();
+        drop(rx);
+        let r = finish_run(
+            &flake,
+            &cache,
+            &CancellationToken::new(),
+            &tx,
+            (&key, &guard),
+            vec![],
+            finished(),
+        )
+        .await;
+        assert!(r.is_err(), "a dropped receiver is Cancelled");
+
+        // The ordinary end: nothing to store, and the held Finished goes out.
+        let (tx, mut rx) = unbounded_channel();
+        let r = finish_run(
+            &flake,
+            &cache,
+            &CancellationToken::new(),
+            &tx,
+            (&key, &guard),
+            vec![],
+            finished(),
+        )
+        .await;
+        assert!(r.is_ok());
+        assert_eq!(rx.try_recv().unwrap(), EvalItem::Finished { error: None });
+    }
+
     /// R03/R28: each file fits, but their total does not. Inject the cap into the same
     /// digest used in production instead of hashing a gigabyte under a wall-clock deadline.
     #[test]
@@ -1365,6 +1569,7 @@ mod tests {
                 Path::new(""),
                 b"",
                 paths,
+                b"",
                 &|| false,
                 &mut Sha256::new(),
             )

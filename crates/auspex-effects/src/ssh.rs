@@ -58,11 +58,44 @@ pub const STDERR_CAP: usize = 16 * 1024;
 /// it into place. So `<dir>` + 1 + 40 + 1 + 16 + NUL must fit in 104: 45 bytes.
 pub const MAX_CONTROL_DIR_LEN: usize = 104 - 1 - (1 + 40) - (1 + 16);
 
-/// The shared default for control sockets and evaluator machine-list files.
+/// The shared default for control sockets and evaluator machine-list files: `$XDG_RUNTIME_DIR/auspex`
+/// when that is an absolute path, else `auspex-<uid>` in [`fallback_base`].
 pub(crate) fn default_runtime_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(d) if Path::new(&d).is_absolute() => Path::new(&d).join("auspex"),
-        _ => std::env::temp_dir().join(format!("auspex-{}", rustix::process::getuid().as_raw())),
+    runtime_path(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        &fallback_base(),
+        rustix::process::getuid().as_raw(),
+    )
+}
+
+/// Where `auspex-<uid>` goes when there is no `XDG_RUNTIME_DIR`.
+///
+/// The system temporary directory (`TMPDIR`), except on macOS, where it is a per-user
+/// directory such as `/var/folders/zz/<28 characters>/T/`: about 49 bytes before `auspex-501`,
+/// against the 45 a control directory may have in all ([`MAX_CONTROL_DIR_LEN`]), so every
+/// default failed there and auspex had no ssh at all (review of PR #8, F9). `/tmp` is shared
+/// and writable by everyone, which is why the directory under it is not trusted for being
+/// there: [`prepare_private_dir`] creates it 0700 and refuses one that is a symlink, is not
+/// ours, or has another mode, so another user who got there first costs a refusal, not a
+/// socket in their reach. Linux keeps `TMPDIR`.
+fn fallback_base() -> PathBuf {
+    fallback_base_for(cfg!(target_os = "macos"), std::env::temp_dir())
+}
+
+/// [`fallback_base`] with the platform and the temporary directory given, so each platform's
+/// answer is tested on every platform.
+fn fallback_base_for(macos: bool, temp_dir: PathBuf) -> PathBuf {
+    if macos {
+        PathBuf::from("/tmp")
+    } else {
+        temp_dir
+    }
+}
+
+fn runtime_path(xdg_runtime_dir: Option<&std::ffi::OsStr>, base: &Path, uid: u32) -> PathBuf {
+    match xdg_runtime_dir {
+        Some(d) if Path::new(d).is_absolute() => Path::new(d).join("auspex"),
+        _ => base.join(format!("auspex-{uid}")),
     }
 }
 
@@ -125,9 +158,9 @@ impl ControlDir {
     /// temporary directory. This is the one place this module reads the environment
     /// (besides `PATH`, which `process::command` reads to find ssh).
     ///
-    /// On macOS, where `XDG_RUNTIME_DIR` is usually unset and `TMPDIR` is long, the fallback
-    /// is too long for a socket path and [`ControlDir::prepare`] refuses it (review finding
-    /// F9, out of scope: auspex runs on a Linux desktop).
+    /// On macOS, where `XDG_RUNTIME_DIR` is usually unset and `TMPDIR` is too long for a socket
+    /// path, the fallback is `/tmp/auspex-<uid>` instead (review of PR #8, F9); the directory is
+    /// private all the same, since [`ControlDir::prepare`] checks its owner and mode.
     #[must_use]
     pub fn default_path() -> PathBuf {
         default_runtime_path()
@@ -719,5 +752,79 @@ fn exit_of(s: std::process::ExitStatus) -> ProbeExit {
         (None, Some(sig)) => ProbeExit::Signal(sig),
         // Neither a code nor a signal is not a thing on unix; called a failure.
         (None, None) => ProbeExit::Code(-1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    /// Review of PR #8, F9: the default control directory must fit a socket path on the
+    /// platform it is chosen for. The test fixes what each platform's base is and checks the
+    /// longest name the uid can give.
+    #[test]
+    fn the_default_runtime_path_follows_xdg_runtime_dir_and_else_the_fallback() {
+        let base = Path::new("/var/folders/zz/0123456789abcdefghijklmnopqr/T");
+        let rt = |xdg: Option<&str>, uid| runtime_path(xdg.map(OsStr::new), base, uid);
+        assert_eq!(
+            rt(Some("/run/user/1000"), 7),
+            Path::new("/run/user/1000/auspex")
+        );
+        for unusable in [None, Some(""), Some("relative/run")] {
+            assert_eq!(rt(unusable, 501), base.join("auspex-501"), "{unusable:?}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_base_is_short_on_macos_and_the_temporary_directory_elsewhere() {
+        let long = PathBuf::from("/var/folders/zz/0123456789abcdefghijklmnopqr/T");
+        assert_eq!(fallback_base_for(false, long.clone()), long);
+        assert_eq!(fallback_base_for(true, long.clone()), Path::new("/tmp"));
+        // What macOS would pick for the longest uid still fits a control socket, and what
+        // its `TMPDIR` would pick does not: the reason for the special case.
+        let mac = runtime_path(None, &fallback_base_for(true, long.clone()), u32::MAX);
+        assert!(
+            mac.to_str().unwrap().len() <= MAX_CONTROL_DIR_LEN,
+            "{mac:?}"
+        );
+        let tmpdir = runtime_path(None, &long, 501);
+        assert!(
+            tmpdir.to_str().unwrap().len() > MAX_CONTROL_DIR_LEN,
+            "{tmpdir:?}"
+        );
+        // This platform's own choice.
+        let here = fallback_base();
+        if cfg!(target_os = "macos") {
+            assert_eq!(here, Path::new("/tmp"));
+        } else {
+            assert_eq!(here, std::env::temp_dir());
+        }
+    }
+
+    /// The short default on macOS is `/tmp/auspex-<uid>`: whatever the platform, a path of
+    /// that shape is accepted as a control directory, and is made private (0700, ours).
+    #[test]
+    fn a_tmp_style_default_is_short_enough_and_private() {
+        let uid = rustix::process::getuid().as_raw();
+        let shape = runtime_path(None, Path::new("/tmp"), u32::MAX);
+        assert!(
+            shape.to_str().unwrap().len() <= MAX_CONTROL_DIR_LEN,
+            "{shape:?}"
+        );
+        // The same shape under a real temporary directory, so the directory can be made.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = runtime_path(None, tmp.path(), uid);
+        if path.to_str().unwrap().len() <= MAX_CONTROL_DIR_LEN {
+            let dir = ControlDir::prepare(&path).unwrap();
+            assert_eq!(dir.as_str(), path.to_str().unwrap());
+        } else {
+            // A long TMPDIR: the evaluator's directory has no socket limit, and is private.
+            prepare_private_dir(&path, "runtime directory").unwrap();
+        }
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(meta.uid(), uid);
     }
 }

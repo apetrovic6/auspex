@@ -769,3 +769,16 @@ async fn a_packed_ref_moved_and_back_and_repacked_stores_nothing() {
     )
     .await;
 }
+
+/// Review of PR #8, N1: a git setting that the key covers (`core.fileMode`) changed at the
+/// first result and put back at the second leaves two equal keys; the repository's `config`
+/// file is in the run guard, so nothing is stored.
+#[tokio::test]
+async fn a_git_setting_changed_and_put_back_during_the_evaluation_stores_nothing() {
+    let Some(lab) = Lab::new() else { return };
+    lab.refuses(
+        || lab.git(&["config", "core.fileMode", "false"]),
+        || lab.git(&["config", "--unset", "core.fileMode"]),
+    )
+    .await;
+}
