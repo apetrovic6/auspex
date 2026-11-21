@@ -488,13 +488,14 @@ fn machines_public_reaches_the_core_and_defaults_to_false() {
 fn the_rolling_settings_reach_the_cores_configuration() {
     let (s, _) = config::parse(
         "[rolling.taghmata]\nkubernetes = true\ndrain = true\ndrain_timeout = 77\netcd = true\n\
-         [update]\nparallel = 5\nready_timeout = 321\n\
+         [update]\nparallel = 5\nready_timeout = 321\npoll_interval = 7\n\
          [kubernetes]\nkubeconfig = \"/k/config\"\n",
     )
     .unwrap();
     let core = auspex_tui::app::core_config(&s, "/fleet".to_owned());
     assert_eq!(core.rolling.parallel, 5);
     assert_eq!(core.rolling.ready_timeout_seconds, 321);
+    assert_eq!(core.rolling.poll_interval_seconds, 7);
     assert_eq!(
         core.rolling.rules["taghmata"],
         auspex_domain::roll::RollRule {

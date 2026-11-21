@@ -118,6 +118,7 @@ in {
         update = section {
           parallel = optional (types.ints.between 1 16) "How many machines with no rolling tag `U` updates at once (default 2): clan builds locally and copies each closure.";
           ready_timeout = timeout "How long `U` waits for an updated machine to be healthy (and its node Ready) before it gives the machine up, in seconds (default 600).";
+          poll_interval = optional (types.ints.between 1 60) "How often `U` looks again while it waits for an updated machine (and its node) to be healthy, in seconds (default 5). Must not be more than ready_timeout, which auspex enforces when it reads the file.";
         };
         kubernetes = section {
           kubeconfig = optional (types.either types.str types.path) "The kubeconfig `U` reads node state and drains with (kubectl --kubeconfig); a leading ~/ is your home directory. Default: \$KUBECONFIG, then ~/.kube/config. A path value is written as its string, not copied into the store; a path inside the Nix store is refused as a stale copy of a credentials file.";

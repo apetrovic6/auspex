@@ -39,7 +39,7 @@ let
       taghmata = { kubernetes = true; drain = true; drain_timeout = 900; etcd = true; };
       skitarii = { kubernetes = false; drain = false; };
     };
-    update = { parallel = 3; ready_timeout = 300; };
+    update = { parallel = 3; ready_timeout = 300; poll_interval = 10; };
     kubernetes.kubeconfig = "/home/me/.kube/fleet";
     keymap = { quit = [ "q" "esc" ]; down = "j"; };
     theme.file = "~/.config/auspex/theme.toml";
@@ -233,6 +233,7 @@ in {
     && boundedOK 5 600 [ "timeouts" "ssh_approval" ]
     && boundedOK 1 16 [ "update" "parallel" ]
     && numberOK true 86400 [ "update" "ready_timeout" ]
+    && boundedOK 1 60 [ "update" "poll_interval" ]
     && rollingOK);
   auspex-stylix = compareToml "stylix" [
     stylix.xdg.configFile."auspex/theme.toml".source

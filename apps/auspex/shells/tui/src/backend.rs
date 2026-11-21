@@ -75,9 +75,6 @@ pub fn rekey<T>(
         .collect()
 }
 
-/// How often the wait for an updated machine asks again: 5 seconds.
-pub const AWAIT_POLL: Duration = Duration::from_secs(5);
-
 /// The adapters or the demo.
 pub enum Backend {
     /// `auspex-effects`.
@@ -874,7 +871,7 @@ impl Real {
             }
             tokio::select! {
                 () = cancel.cancelled() => return Err(Cancelled),
-                () = tokio::time::sleep(left.min(AWAIT_POLL)) => {}
+                () = tokio::time::sleep(left.min(Duration::from_secs(op.poll_seconds.max(1)))) => {}
             }
         }
     }

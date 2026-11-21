@@ -638,8 +638,8 @@ impl Operation for KubeRequest {
 ///
 /// The shell polls: it probes `target` (the same probe a refresh runs), asks the domain whether
 /// the answer is [`auspex_domain::roll::healthy`] for `expect`, and when `node` is given also
-/// reads the cluster's nodes ([`auspex_domain::roll::node_state`]); it asks again every few
-/// seconds until both hold or `timeout_seconds` has passed. Time is the shell's: the core has no
+/// reads the cluster's nodes ([`auspex_domain::roll::node_state`]); it asks again every
+/// `poll_seconds` until both hold or `timeout_seconds` has passed. Time is the shell's: the core has no
 /// clock. Cancelling it ends the polling; it is not answered then (it has nothing to reap).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwaitRequest {
@@ -667,6 +667,8 @@ pub struct AwaitRequest {
     pub baseline: Vec<String>,
     /// How long to wait before giving up.
     pub timeout_seconds: u64,
+    /// How long to wait between two looks (`update.poll_interval`).
+    pub poll_seconds: u64,
 }
 
 /// `Ok(())` when the machine is healthy (and its node `Ready`); otherwise why it was not by the
