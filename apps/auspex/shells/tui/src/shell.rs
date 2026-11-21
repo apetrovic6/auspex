@@ -141,6 +141,8 @@ pub struct Shell {
     handoff: Mutex<Option<UnboundedSender<Handoff>>>,
     /// Where `f` keeps a freeze, when a state file is configured.
     freeze_store: Mutex<Option<FreezeStore>>,
+    /// The reason the CI badge was last written to the log, so it is written once.
+    ci_noted: Mutex<Option<String>>,
     /// What `f` froze in a run with no state file (the demo, most tests): kept for the run, so
     /// that freezing and unfreezing work as they do with a file.
     frozen_in_memory: Mutex<BTreeSet<String>>,
@@ -184,6 +186,7 @@ impl Shell {
             warning: Mutex::new(None),
             handoff: Mutex::new(None),
             freeze_store: Mutex::new(None),
+            ci_noted: Mutex::new(None),
             frozen_in_memory: Mutex::new(BTreeSet::new()),
             freeze_reads: AtomicUsize::new(0),
             locks: Mutex::new(HashMap::new()),
@@ -220,6 +223,29 @@ impl Shell {
         self.core.view()
     }
 
+    /// Writes why the CI badge is `unknown` (or `not_pushed`) to the log, once per reason: the
+    /// status bar has no room for it, and `--json` has it only in a report nobody reads while the
+    /// TUI runs. Called with each frame the TUI draws, and once by headless mode when it settles.
+    pub fn note_ci(&self, view: &ViewModel) {
+        let ci = &view.report.fleet_ci;
+        if view.refresh.ci_checking {
+            return;
+        }
+        let mut last = lock(&self.ci_noted);
+        let Some(reason) = ci.reason.as_deref() else {
+            // A success (or none, or off) in between: the next failure is news again.
+            *last = None;
+            return;
+        };
+        if last.as_deref() == Some(reason) {
+            return;
+        }
+        *last = Some(reason.to_owned());
+        drop(last);
+        self.log
+            .line(&format!("CI badge: {}: {reason}", ci.state.label()));
+    }
+
     /// Draws the core view together with the current shell-only connection count.
     pub fn draw(
         &self,
@@ -229,7 +255,9 @@ impl Shell {
     ) {
         ui.approvals = self.approvals();
         ui.warning = self.warning();
-        crate::ui::draw(frame, &self.view(), ui, ctx);
+        let view = self.view();
+        self.note_ci(&view);
+        crate::ui::draw(frame, &view, ui, ctx);
     }
 
     /// Probes currently connecting/authenticating, outside the core's report contract.
@@ -370,6 +398,22 @@ impl Shell {
                 let shell = Arc::clone(self);
                 self.one_shot(op.id, request, async move {
                     shell.backend.prometheus(&op, &token).await
+                });
+            }
+            Effect::ForgeHead(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                self.one_shot(op.id, request, async move {
+                    shell.backend.forge_head(&op, &token).await
+                });
+            }
+            Effect::ForgeStatus(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                self.one_shot(op.id, request, async move {
+                    shell.backend.forge_status(&op, &token).await
                 });
             }
             Effect::CacheLookup(request) => {

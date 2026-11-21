@@ -8,7 +8,7 @@ shells/tui      terminal (ratatui): rendering, keys, and fulfilling the core's e
 ```
 
 The core never performs an effect; it asks for one, and the shell fulfils it by calling
-`crates/auspex-effects` (ssh, nix, Prometheus, the binary cache). The rules both sides apply
+`crates/auspex-effects` (ssh, nix, Prometheus, the binary cache, the forge's CI status). The rules both sides apply
 live in `crates/auspex-domain`. Dependencies point inward: the core never sees the effects
 crate.
 
@@ -404,6 +404,11 @@ parallel = 2        # machines with no rolling tag updated at once by `U`
 
 [kubernetes]
 kubeconfig = "~/.kube/config"
+
+[forge]             # the CI badge for the fleet's current commit (see CI badge); omit it for no badge
+url = "https://forge.example.org"   # https only, no credentials
+repo = "owner/name"                 # optional; default: from the fleet checkout's `origin` remote
+token_file = "~/.config/auspex/forge-token"   # optional; a read-only API token, never inline
 ```
 
 The config file's `flake` and `CLAN_DIR` take a leading `~/` (your `$HOME`; `~user/` is refused);
@@ -447,6 +452,60 @@ auspex quits**. Lower the value to shorten that window, or close a known master 
 non-default port): ssh works out the socket name itself. Without `XDG_RUNTIME_DIR` (or with a
 relative one) the directory is `auspex-<uid>` under `$TMPDIR`, or `/tmp`; use that in place of
 `$XDG_RUNTIME_DIR/auspex`.
+
+## CI badge
+
+With `[forge]` configured, auspex shows one badge for the fleet flake's **current commit** (`HEAD`
+of the fleet checkout): the forge's *combined commit status* (Forgejo:
+`GET /api/v1/repos/{owner}/{repo}/commits/{sha}/status`). It is the second item of the status bar,
+`ci ok 0123abcd` (the badge and the first eight characters of the commit), and the top-level
+`fleet_ci` object of `--json`: `{"commit": …, "state": …, "url": …, "reason": …}`, every key
+always present, `null` when unknown.
+
+| `state` | status bar | meaning |
+|---|---|---|
+| `success` | `ci ok` | every status the forge holds for the commit passed |
+| `failure` | `ci failed` | a status failed or errored (Forgejo's `warning` too: a commit that is not green must not look like one) |
+| `pending` | `ci pending` | a status is still running |
+| `none` | `ci none` | the forge holds no status for that commit |
+| `not_pushed` | `ci not pushed` | `HEAD` is ahead of its upstream (the same `git status` the update's checks use), so the forge cannot have a status for it; **nothing is asked** |
+| `unknown` | `ci unknown` | it could not be found out; `reason` says why, and so does the Log tab (once per reason) and, in `--plain`/`--json` runs, stderr |
+| `off` | nothing | `[forge]` is not configured: nothing is read and nothing is asked |
+
+A **dirty** working tree is not a CI state: `HEAD`'s status is shown as it is (the plan of an update
+already warns about uncommitted changes). While the request is out the bar says `ci …`.
+
+**One request per refresh, and it never delays a row** (nor does a row delay it). The badge is asked beside
+the machine list, not after it: `git rev-parse HEAD`, the update checks' `git status` and, only
+when `forge.repo` is not set, `git remote get-url origin`, then one `GET` with the HTTP adapter's
+timeout (`timeouts.probe`), its no-redirect rule and a 1 MiB cap on the answer (at most 1,000
+statuses). Headless mode waits for the badge like it waits for Prometheus, bounded by the same
+global deadline, which makes it `unknown`. Only the *combined* status is read, not the Actions
+runs API, and there is one badge for the fleet, not one per machine.
+
+**Which repository.** `forge.repo` if set. Otherwise the fleet checkout's `origin`, in any of
+`ssh://[user@]host[:port]/owner/name.git`, `git@host:owner/name.git` and
+`https://[user[:password]@]host[:port]/owner/name.git`. If that remote's **host differs from
+`forge.url`'s**, auspex does not guess (a mirror, another forge): the badge is `unknown: set
+forge.repo`. A password in a remote is dropped by the parser and appears nowhere. A remote that
+is not one of these forms, or whose path is not exactly `owner/name` (a forge under a sub-path
+cannot be told from a group), says the same.
+
+**The token.** `token_file` names a file holding a read-only API token, read **once, at start**
+(a new token needs a restart), sent as `Authorization: token …`. auspex refuses the file, saying
+why, when it is **accessible to group or others** (any of the `0o077` mode bits: `chmod 600`), is
+not owned by you, is not a regular file, is empty or over 4 KiB, or holds anything but printable
+ASCII besides one trailing newline (which is stripped). The check is on the open file, so the
+file checked is the file read; a symlink is followed and its target checked. A refused token
+makes the badge `unknown` and **no request is made**: asking anonymously instead would hide that
+your token is not in use. Without `token_file` the forge is asked anonymously, which is how a
+public repository is read. The token is held in a type whose `Debug` is `Token(<redacted>)`, with
+no `Display` or `Serialize`; no error quotes the forge's answer (a forge can echo a credential);
+the `Authorization` header is marked sensitive; redirects are not followed, so a forge cannot
+send the token on to another host; and a token is sent only over `https` (or to a loopback
+address, which only a test uses: `forge.url` itself must be `https`). The token never reaches
+`config.toml` through Home Manager either: `programs.auspex.settings.forge.token_file` is a path,
+and one inside the Nix store (world-readable) is refused at evaluation.
 
 ## Package preview
 

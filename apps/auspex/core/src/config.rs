@@ -17,6 +17,9 @@ pub struct Config {
     /// Prometheus, or `None` when it is not configured (then it is never asked, and every
     /// health value comes from ssh).
     pub prometheus: Option<PrometheusConfig>,
+    /// The CI badge, or `None` when `[forge]` is not configured (then nothing is read or asked:
+    /// the badge is `off`).
+    pub forge: Option<ForgeConfig>,
     /// Whether a binary cache (ncps) is configured. Without one the "already cached" question
     /// is never asked.
     pub binary_cache: bool,
@@ -62,6 +65,20 @@ impl PrometheusConfig {
     pub fn instance_for<'a>(&'a self, machine: &'a str) -> &'a str {
         self.instances.get(machine).map_or(machine, String::as_str)
     }
+}
+
+/// The CI badge's settings the core decides with.
+///
+/// The URL and the token are the adapter's, as Prometheus's URL is: the core needs the host only,
+/// to tell whether the `origin` remote is on the forge, and the repository when the operator
+/// names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeConfig {
+    /// The host of `forge.url`, which the `origin` remote's host must equal for the repository to
+    /// be read from it ([`auspex_domain::ci::plan`]).
+    pub host: String,
+    /// `forge.repo` (`owner/name`), or `None` to read it from the `origin` remote.
+    pub repo: Option<String>,
 }
 
 /// The package preview's settings. `None` in [`Config::diff`] means the preview is off: no

@@ -34,8 +34,10 @@
 //!   one node (the kubeconfig is the operator's own).
 //! - [`fleetlock`]: the per-fleet update lock (`flock` in the state directory): one auspex updates a
 //!   fleet at a time.
+//! - [`forge`]: the CI badge: `HEAD` of the fleet checkout, the forge's combined commit status for it,
+//!   and the API token (read from a file that only its owner can reach).
 //! - [`dns`]: hostname resolution for the shared-IP lint.
-//! - [`http`]: the one HTTP client the two HTTP adapters share.
+//! - [`http`]: the one HTTP client the HTTP adapters share.
 //!
 //! # Timeouts and cancellation, everywhere the same
 //!
@@ -116,6 +118,7 @@ pub mod closure;
 pub mod deploylog;
 pub mod dns;
 pub mod fleetlock;
+pub mod forge;
 pub mod freeze;
 pub mod http;
 pub mod kube;

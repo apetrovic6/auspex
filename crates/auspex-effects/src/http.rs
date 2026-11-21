@@ -64,16 +64,49 @@ impl HttpClient {
         body_cap: usize,
         cancel: &CancellationToken,
     ) -> Result<Result<(StatusCode, Bytes), String>, Cancelled> {
+        self.send_call(
+            &Call {
+                method,
+                url,
+                accept,
+                timeout,
+                body_cap,
+                authorization: None,
+            },
+            cancel,
+        )
+        .await
+    }
+
+    /// [`Self::send`] with the options that most callers do not need.
+    pub(crate) async fn send_call(
+        &self,
+        call: &Call<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<Result<(StatusCode, Bytes), String>, Cancelled> {
+        let Call {
+            method,
+            url,
+            accept,
+            timeout,
+            body_cap,
+            authorization,
+        } = call;
+        let (timeout, body_cap) = (*timeout, *body_cap);
         let work = async {
             let uri: http::Uri = url
                 .as_str()
                 .parse()
                 .map_err(|e| format!("bad URL {url}: {e}"))?;
-            let req = Request::builder()
-                .method(method)
+            let mut builder = Request::builder()
+                .method(method.clone())
                 .uri(uri)
                 .header(header::USER_AGENT, "auspex")
-                .header(header::ACCEPT, accept)
+                .header(header::ACCEPT, *accept);
+            if let Some(value) = authorization {
+                builder = builder.header(header::AUTHORIZATION, (*value).clone());
+            }
+            let req = builder
                 .body(Empty::<Bytes>::new())
                 .map_err(|e| format!("bad request: {e}"))?;
             let resp = self.inner.request(req).await.map_err(|e| chain(&e))?;
@@ -101,6 +134,18 @@ impl HttpClient {
             })),
         }
     }
+}
+
+/// One request and its limits, for [`HttpClient::send_call`].
+pub(crate) struct Call<'a> {
+    pub method: Method,
+    pub url: &'a Url,
+    pub accept: &'a str,
+    pub timeout: Duration,
+    pub body_cap: usize,
+    /// Sent as `Authorization`. Build it with `set_sensitive(true)`: its `Debug` is then
+    /// `Sensitive`, in this crate's errors and in hyper's own.
+    pub authorization: Option<&'a header::HeaderValue>,
 }
 
 /// An error and its sources, which is where hyper keeps the useful part ("connection

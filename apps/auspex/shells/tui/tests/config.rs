@@ -47,6 +47,16 @@ fn the_home_manager_contract_fixture_loads_whole() {
         })
     );
     assert_eq!(s.cache_url.as_deref(), Some("https://ncps.example"));
+    // The CI badge's forge: every key, so one never read fails here.
+    assert_eq!(
+        s.forge,
+        Some(config::ForgeSettings {
+            url: "https://forge.example.org/".to_owned(),
+            host: "forge.example.org".to_owned(),
+            repo: Some("owner/fleet".to_owned()),
+            token_file: Some("/home/me/.config/auspex/forge-token".into()),
+        })
+    );
     assert_eq!(
         s.machines,
         BTreeMap::from([(
@@ -125,6 +135,14 @@ fn the_home_manager_contract_fixture_loads_whole() {
     assert_eq!(
         core.freeze.declared,
         std::collections::BTreeSet::from(["terra".to_owned()])
+    );
+    assert_eq!(
+        core.forge,
+        Some(auspex_core::ForgeConfig {
+            host: "forge.example.org".to_owned(),
+            repo: Some("owner/fleet".to_owned()),
+        }),
+        "the core gets the host and the repository, never the URL or the token file"
     );
     assert!(core.binary_cache);
     assert_eq!(
@@ -518,4 +536,122 @@ fn a_tilde_slash_kubeconfig_is_the_home_directory() {
     assert!(std::path::Path::new(&home).is_absolute(), "{home}");
     let (s, _) = config::parse("[kubernetes]\nkubeconfig = \"~/.kube/fleet\"\n").unwrap();
     assert_eq!(s.kubeconfig, Some(format!("{home}/.kube/fleet")));
+}
+
+// ---------------------------------------------------------------------------------------
+// `[forge]`: the CI badge (AUS-18)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn no_forge_section_is_no_badge() {
+    let (s, w) = config::parse("").unwrap();
+    assert_eq!(s.forge, None);
+    assert_eq!(w.len(), 0);
+    assert_eq!(core_config(&s, "/fleet".to_owned()).forge, None);
+}
+
+#[test]
+fn only_a_url_is_enough_and_the_rest_is_optional() {
+    let (s, w) = config::parse("[forge]\nurl = \"https://forge.example.org\"\n").unwrap();
+    assert!(w.is_empty(), "{w:?}");
+    assert_eq!(
+        s.forge,
+        Some(config::ForgeSettings {
+            url: "https://forge.example.org/".to_owned(),
+            host: "forge.example.org".to_owned(),
+            repo: None,
+            token_file: None,
+        })
+    );
+    // A path prefix is kept, a query is not.
+    let (s, _) = config::parse("[forge]\nurl = \"https://forge.example.org/git/?x=1\"\n").unwrap();
+    assert_eq!(s.forge.unwrap().url, "https://forge.example.org/git/");
+}
+
+#[test]
+fn forge_settings_without_a_url_are_ignored_with_a_warning() {
+    let (s, w) = config::parse("[forge]\nrepo = \"owner/fleet\"\n").unwrap();
+    assert_eq!(s.forge, None);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("no `forge.url`") && w.contains("off")),
+        "{w:?}"
+    );
+    // An empty table says nothing and is not worth a warning.
+    let (s, w) = config::parse("[forge]\n").unwrap();
+    assert_eq!((s.forge, w), (None, vec![]));
+}
+
+#[test]
+fn the_forge_url_is_https_only_and_never_quoted() {
+    for (url, why) in [
+        ("http://forge.example.org", "https"),
+        ("ssh://forge.example.org", "https"),
+        ("https://", "empty host"),
+        ("forge.example.org", "bad URL"),
+        ("https://user:hunter2@forge.example.org", "credentials"),
+    ] {
+        let e = config::parse(&format!("[forge]\nurl = \"{url}\"\n")).unwrap_err();
+        assert!(e.contains("`forge.url`") && e.contains(why), "{url}: {e}");
+        assert!(!e.contains("hunter2"), "{e}");
+    }
+    let e = config::parse("[forge]\nurl = 3\n").unwrap_err();
+    assert!(e.contains("`forge.url` must be a string"), "{e}");
+}
+
+#[test]
+fn the_forge_repo_is_owner_slash_name() {
+    let (s, _) =
+        config::parse("[forge]\nurl = \"https://f.example.org\"\nrepo = \"owner/fleet\"\n")
+            .unwrap();
+    assert_eq!(s.forge.unwrap().repo.as_deref(), Some("owner/fleet"));
+    for bad in ["fleet", "a/b/c", "", "owner/fl eet", "/owner/fleet"] {
+        let e = config::parse(&format!(
+            "[forge]\nurl = \"https://f.example.org\"\nrepo = \"{bad}\"\n"
+        ))
+        .unwrap_err();
+        assert!(
+            e.contains("`forge.repo`") && e.contains("owner/name"),
+            "{bad}: {e}"
+        );
+    }
+}
+
+#[test]
+fn the_token_file_is_an_absolute_path_and_tilde_is_home() {
+    let home = std::env::var("HOME").unwrap();
+    let (s, _) = config::parse(
+        "[forge]\nurl = \"https://f.example.org\"\ntoken_file = \"~/.config/auspex/forge-token\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        s.forge.unwrap().token_file,
+        Some(format!("{home}/.config/auspex/forge-token").into())
+    );
+    for bad in ["forge-token", "./forge-token", "~other/forge-token"] {
+        let e = config::parse(&format!(
+            "[forge]\nurl = \"https://f.example.org\"\ntoken_file = \"{bad}\"\n"
+        ))
+        .unwrap_err();
+        assert!(e.contains("`forge.token_file`"), "{bad}: {e}");
+    }
+    // A token is never a key of its own: there is no way to write one inline.
+    let (s, w) =
+        config::parse("[forge]\nurl = \"https://f.example.org\"\ntoken = \"hunter2\"\n").unwrap();
+    assert!(s.forge.is_some());
+    assert!(
+        w.iter().any(|w| w.contains("unknown key `forge.token`")),
+        "{w:?}"
+    );
+    assert!(!w.iter().any(|w| w.contains("hunter2")), "{w:?}");
+}
+
+#[test]
+fn debug_printing_the_settings_shows_a_path_and_never_a_token() {
+    let (s, _) = config::parse(
+        "[forge]\nurl = \"https://f.example.org\"\ntoken_file = \"/run/secrets/forge-token\"\n",
+    )
+    .unwrap();
+    let shown = format!("{s:?}");
+    assert!(shown.contains("/run/secrets/forge-token"), "{shown}");
 }

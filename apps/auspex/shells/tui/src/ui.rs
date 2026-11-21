@@ -748,7 +748,36 @@ fn draw_prompt_row(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &Ui, ctx
     frame.render_widget(Paragraph::new(line), area);
 }
 
-/// The status bar's text: mode, refresh state, pending machines, Prometheus, fleet errors.
+/// The CI badge as the status bar says it: `ci ok 0123abcd`.
+///
+/// `None` when `[forge]` is not configured (nothing to say, as for Prometheus). A short word and
+/// the first eight characters of the commit; the reason is on the Log tab and in `--json`, except
+/// for the one thing the operator can fix at once, which is said here.
+#[must_use]
+pub fn ci_text(view: &ViewModel) -> Option<String> {
+    use auspex_domain::ci::CiState;
+    let ci = &view.report.fleet_ci;
+    let commit = ci
+        .short_commit()
+        .map(|c| format!(" {c}"))
+        .unwrap_or_default();
+    if view.refresh.ci_checking {
+        return Some(format!("ci …{commit}"));
+    }
+    Some(match ci.state {
+        CiState::Off => return None,
+        CiState::Success => format!("ci ok{commit}"),
+        CiState::Failure => format!("ci failed{commit}"),
+        CiState::Pending => format!("ci pending{commit}"),
+        CiState::None => format!("ci none{commit}"),
+        CiState::NotPushed => format!("ci not pushed{commit}"),
+        CiState::Unknown if ci.wants_forge_repo() => "ci unknown: set forge.repo".to_owned(),
+        CiState::Unknown => format!("ci unknown{commit}"),
+    })
+}
+
+/// The status bar's text: mode, the CI badge, refresh state, pending machines, Prometheus, fleet
+/// errors.
 #[must_use]
 pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
     let refresh = match view.refresh.phase {
@@ -765,11 +794,13 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         PrometheusStatus::Available => Some("prom: ok".to_owned()),
         PrometheusStatus::Unavailable { .. } => Some("prom: down, ssh".to_owned()),
     };
-    let mut parts = vec![
-        mode_label(view).to_owned(),
-        refresh.to_owned(),
-        format!("{} pending", view.refresh.pending_machines),
-    ];
+    let mut parts = vec![mode_label(view).to_owned()];
+    // Right after the mode, before the refresh state: at 40 columns the bar is cut, and the badge
+    // is the one part that is about the commit and not about this refresh. After the mode it fits
+    // whole at 40 columns in every state, 'unknown: set forge.repo' included.
+    parts.extend(ci_text(view));
+    parts.push(refresh.to_owned());
+    parts.push(format!("{} pending", view.refresh.pending_machines));
     // The action first: what is running (or how the last one ended) matters more than the scan.
     if let Some(a) = &view.action {
         parts.insert(1, action_text(a));

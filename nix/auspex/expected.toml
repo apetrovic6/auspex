@@ -55,3 +55,8 @@ down = "j"
 
 [theme]
 file = "~/.config/auspex/theme.toml"
+
+[forge]
+url = "https://forge.example.org"
+repo = "owner/fleet"
+token_file = "/home/me/.config/auspex/forge-token"

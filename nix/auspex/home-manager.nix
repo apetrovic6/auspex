@@ -45,6 +45,11 @@ let
   # the store, and what `kubectl` would then read is a frozen copy of a credentials file.
   hasKubeconfig = (pruned.kubernetes or { }) ? kubeconfig;
   kubeconfigPath = if hasKubeconfig then toString pruned.kubernetes.kubeconfig else "";
+  # The forge token is a path on this machine too, and worse to copy than a kubeconfig: a Nix path
+  # value would put the token in the world-readable store. Written as its string and expanded as
+  # `flake` is; one that is already a store path is refused below.
+  hasTokenFile = (pruned.forge or { }) ? token_file;
+  tokenFilePath = if hasTokenFile then toString pruned.forge.token_file else "";
   expandHome = path: if lib.hasPrefix "~/" path
     then "${config.home.homeDirectory}/${lib.removePrefix "~/" path}"
     else path;
@@ -54,6 +59,9 @@ let
     }
     // lib.optionalAttrs hasKubeconfig {
       kubernetes = pruned.kubernetes // { kubeconfig = expandHome kubeconfigPath; };
+    }
+    // lib.optionalAttrs hasTokenFile {
+      forge = pruned.forge // { token_file = expandHome tokenFilePath; };
     };
   themePath = "${config.xdg.configHome}/auspex/theme.toml";
   selectedThemePath =
@@ -123,6 +131,11 @@ in {
         kubernetes = section {
           kubeconfig = optional (types.either types.str types.path) "The kubeconfig `U` reads node state and drains with (kubectl --kubeconfig); a leading ~/ is your home directory. Default: \$KUBECONFIG, then ~/.kube/config. A path value is written as its string, not copied into the store; a path inside the Nix store is refused as a stale copy of a credentials file.";
         };
+        forge = section {
+          url = optional (types.strMatching "https://[^@/?#]+([/?#].*)?") "The forge whose combined commit status for the fleet's current commit is shown as a CI badge (status bar and `fleet_ci` in --json); https only, without credentials. Omit it to switch the badge off: nothing is then read or asked. Forgejo's API: GET /api/v1/repos/{owner}/{repo}/commits/{sha}/status.";
+          repo = optional (types.strMatching "[A-Za-z0-9._-]+/[A-Za-z0-9._-]+") "The repository on the forge, owner/name. Default: read from the fleet checkout's `origin` remote, which must then be on the same host as forge.url (otherwise the badge says `unknown: set forge.repo`).";
+          token_file = optional (types.either types.str types.path) "A file holding a read-only API token for the forge, sent as `Authorization: token …`; a leading ~/ is your home directory. Never the token itself: it would be written to config.toml. auspex refuses a file that group or others can access (use mode 0600) or that you do not own, and strips one trailing newline. Without it the forge is asked anonymously (public repositories). A path value is written as its string, not copied into the store; a path inside the Nix store is refused, since the store is world-readable.";
+        };
         keymap = mkOption {
           default = { };
           type = types.attrsOf (types.either types.str (types.listOf types.str));
@@ -154,6 +167,10 @@ in {
       {
         assertion = !hasKubeconfig || !lib.hasPrefix "${builtins.storeDir}/" kubeconfigPath;
         message = "programs.auspex.settings.kubernetes.kubeconfig is a ${builtins.storeDir} path, a frozen copy of a credentials file (a relative path literal in a flake is evaluated from the flake's store copy). Use an absolute path or a string such as \"~/.kube/config\".";
+      }
+      {
+        assertion = !hasTokenFile || !lib.hasPrefix "${builtins.storeDir}/" tokenFilePath;
+        message = "programs.auspex.settings.forge.token_file is a ${builtins.storeDir} path, which is world-readable (a relative path literal in a flake is evaluated from the flake's store copy, and so is a token file added to the flake). Use a path outside the store that only you can read, such as \"~/.config/auspex/forge-token\" or a secrets manager's runtime path.";
       }];
       xdg.configFile = lib.mkIf (settings != { }) {
         "auspex/config.toml".source = toml.generate "auspex-config.toml" settings;

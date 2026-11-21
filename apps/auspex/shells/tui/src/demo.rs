@@ -60,6 +60,7 @@ pub fn config() -> Config {
             instances: BTreeMap::new(),
             max_age_seconds: 60,
         }),
+        forge: None,
         binary_cache: true,
         diff: Some(DiffConfig {
             timeout_seconds: 120,

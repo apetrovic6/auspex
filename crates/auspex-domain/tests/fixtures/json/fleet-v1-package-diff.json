@@ -406,5 +406,11 @@
         "mars"
       ]
     }
-  ]
+  ],
+  "fleet_ci": {
+    "commit": null,
+    "state": "off",
+    "url": null,
+    "reason": null
+  }
 }

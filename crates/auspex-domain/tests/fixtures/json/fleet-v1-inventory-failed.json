@@ -8,5 +8,11 @@
     }
   ],
   "machines": [],
-  "shared_ips": []
+  "shared_ips": [],
+  "fleet_ci": {
+    "commit": null,
+    "state": "off",
+    "url": null,
+    "reason": null
+  }
 }

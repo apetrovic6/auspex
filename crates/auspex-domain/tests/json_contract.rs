@@ -348,6 +348,7 @@ fn failed_inventory_report() -> FleetReport {
                 FleetErrorKind::InventoryFailed,
                 "\u{1b}[31merror:\u{1b}[0m flake 'path:/home/op/fleet' does not provide attribute 'clanInternals'",
             )],
+            ..FleetFacts::default()
         },
     )
 }
@@ -381,6 +382,7 @@ fn fleet_errors_are_reported_and_never_settle() {
                     kind,
                     reason: "x\u{202e}y\u{1b}[2J".to_owned(),
                 }],
+                ..FleetFacts::default()
             },
         );
         assert!(!r.settled, "{spelling}");
@@ -417,6 +419,7 @@ fn deadline_means_not_settled() {
             scan_complete: true,
             timed_out: true,
             errors: vec![],
+            ..FleetFacts::default()
         },
     );
     assert!(!cut.settled);
@@ -783,4 +786,69 @@ fn evaluator_exit_without_a_result_settles_as_an_error() {
     assert_eq!(row.reason.as_deref(), failure.summary());
     assert!(row.settled);
     assert!(fleet_report(vec![row], vec![], complete()).settled);
+}
+
+/// AUS-18: the CI badge's shape. Every key is always present (`null` when unknown, as
+/// everywhere in the contract), `state` is a `snake_case` string, and an old report without the
+/// key still reads, as `off`.
+#[test]
+fn fleet_ci_shape() {
+    use auspex_domain::ci::{CiState, CiStatus, FleetCi};
+
+    const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+    let with = |ci: FleetCi| {
+        let r = fleet_report(
+            vec![],
+            vec![],
+            FleetFacts {
+                scan_complete: true,
+                fleet_ci: ci,
+                ..FleetFacts::default()
+            },
+        );
+        serde_json::to_value(&r).unwrap()["fleet_ci"].clone()
+    };
+    assert_eq!(
+        with(FleetCi::off()),
+        serde_json::json!({"commit": null, "state": "off", "url": null, "reason": null})
+    );
+    assert_eq!(
+        with(FleetCi::from_answer(
+            SHA,
+            Ok(CiStatus {
+                state: CiState::Success,
+                url: Some("https://ci.example.org/owner/fleet/actions/runs/7".to_owned()),
+            })
+        )),
+        serde_json::json!({
+            "commit": SHA,
+            "state": "success",
+            "url": "https://ci.example.org/owner/fleet/actions/runs/7",
+            "reason": null,
+        })
+    );
+    assert_eq!(
+        with(FleetCi::not_pushed(SHA, "origin/main", 1)),
+        serde_json::json!({
+            "commit": SHA,
+            "state": "not_pushed",
+            "url": null,
+            "reason": "HEAD is 1 commit ahead of origin/main, so the forge has no status for it",
+        })
+    );
+    assert_eq!(
+        with(FleetCi::unknown(Some(SHA), "no answer within 10000 ms")),
+        serde_json::json!({
+            "commit": SHA,
+            "state": "unknown",
+            "url": null,
+            "reason": "no answer within 10000 ms",
+        })
+    );
+
+    // A report written before the key existed still reads.
+    let mut old = serde_json::to_value(snapshot_report()).unwrap();
+    old.as_object_mut().unwrap().remove("fleet_ci");
+    let back: FleetReport = serde_json::from_value(old).unwrap();
+    assert_eq!(back.fleet_ci, FleetCi::off());
 }
