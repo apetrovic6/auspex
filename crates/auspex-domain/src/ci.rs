@@ -297,7 +297,14 @@ pub fn plan(head: &HeadFacts, forge_host: &str, configured_repo: Option<&str>) -
 }
 
 fn same_host(a: &str, b: &str) -> bool {
-    let norm = |h: &str| h.trim_end_matches('.').to_ascii_lowercase();
+    // Brackets are how a URL writes an IPv6 host and not part of it: `Url::host_str` keeps them
+    // and `parse_remote` does not, so each side is compared without.
+    let norm = |h: &str| {
+        h.trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+    };
     norm(a) == norm(b)
 }
 
@@ -726,6 +733,62 @@ mod tests {
     fn a_reason_is_sanitised() {
         let ci = FleetCi::unknown(None, "bad \u{1b}[31mnews\u{1b}[0m\u{202e}");
         assert_eq!(ci.reason.as_deref(), Some("bad news"));
+    }
+
+    /// Fix round 1, finding 2: `url::Url::host_str` keeps the brackets of an IPv6 host and
+    /// `parse_remote` does not, so the two never compared equal. Both forms must match, from
+    /// whichever side they come.
+    #[test]
+    fn an_ipv6_forge_host_matches_the_remote_whichever_way_it_is_written() {
+        let h = head(tracking(0, 0), Some(Ok(remote("fd00::1", "owner/fleet"))));
+        for forge_host in ["[fd00::1]", "fd00::1", "[FD00::1]"] {
+            assert!(
+                matches!(plan(&h, forge_host, None), Plan::Ask { .. }),
+                "{forge_host}"
+            );
+        }
+        // And the remote the other way round.
+        let h = head(tracking(0, 0), Some(Ok(remote("[fd00::1]", "owner/fleet"))));
+        assert!(matches!(plan(&h, "fd00::1", None), Plan::Ask { .. }));
+        // A different address is still not guessed.
+        assert!(matches!(plan(&h, "[fd00::2]", None), Plan::Settled(_)));
+        // End to end from the text of the remote.
+        let parsed = parse_remote("ssh://git@[fd00::1]:22/owner/fleet.git").unwrap();
+        let h = head(tracking(0, 0), Some(Ok(parsed)));
+        assert!(matches!(plan(&h, "[fd00::1]", None), Plan::Ask { .. }));
+    }
+
+    #[test]
+    fn a_port_is_at_most_five_digits() {
+        assert!(parse_remote("ssh://git@forge.example.org:65535/owner/fleet.git").is_ok());
+        assert!(parse_remote("ssh://git@forge.example.org:123456/owner/fleet.git").is_err());
+        assert!(parse_remote("ssh://git@forge.example.org:000001/owner/fleet.git").is_err());
+    }
+
+    #[test]
+    fn a_segment_is_at_most_100_bytes() {
+        let hundred = "a".repeat(100);
+        let long = "a".repeat(101);
+        assert_eq!(
+            parse_repo(&format!("{hundred}/{hundred}")),
+            Ok(format!("{hundred}/{hundred}"))
+        );
+        assert!(parse_repo(&format!("{long}/name")).is_err());
+        assert!(parse_repo(&format!("owner/{long}")).is_err());
+        assert!(parse_remote(&format!("https://forge.example.org/owner/{long}.git")).is_err());
+    }
+
+    /// The credentials end at the last `@` of the authority: a password may hold a raw `@`.
+    #[test]
+    fn a_password_with_a_raw_at_sign_is_dropped_whole() {
+        assert_eq!(
+            parse_remote("https://user:p@ss@forge.example.org/owner/fleet.git"),
+            Ok(remote("forge.example.org", "owner/fleet"))
+        );
+        assert_eq!(
+            parse_remote("ssh://us@er@forge.example.org:2222/owner/fleet.git"),
+            Ok(remote("forge.example.org", "owner/fleet"))
+        );
     }
 
     #[test]

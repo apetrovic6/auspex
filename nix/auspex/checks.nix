@@ -250,7 +250,18 @@ let
       && builtins.all (rejected "url") [ "http://forge.example.org" "https://user:pw@forge.example.org" "forge.example.org" "https://" "ftp://forge.example.org" 1 ]
       && probe "repo" "owner/fleet" == "owner/fleet"
       && (option "repo").check "owner/fleet" && !(option "repo").check "fleet"
-      && builtins.all (rejected "repo") [ "fleet" "a/b/c" "a/b c" "/a/b" "" 1 ];
+      && builtins.all (rejected "repo") [ "fleet" "a/b/c" "a/b c" "/a/b" "" 1 ]
+      # What the binary refuses (`auspex_domain::ci::parse_repo`): a `.` or `..` segment and a
+      # segment over 100 bytes, so a switch fails here instead of auspex failing at start.
+      && builtins.all (rejected "repo") [ "owner/.." "../fleet" "./fleet" "owner/." "../.."
+        "${lib.fixedWidthString 101 "a" ""}/name" "owner/${lib.fixedWidthString 101 "a" ""}" ]
+      && builtins.all (name: probe "repo" name == name) [ "owner/.fleet" "owner/..fleet" "o/a.b" "owner/..." "a/b"
+        "${lib.fixedWidthString 100 "a" ""}/${lib.fixedWidthString 100 "a" ""}" ]
+      # And a URL the parser refuses: whitespace or a forbidden host character.
+      && builtins.all (rejected "url") [ "https://a b" "https://a b.example.org/x" "https://forge.example.org/a b"
+        "https://forge.example.org/\n" "https://a<b>.example.org" "https://a|b.example.org" "https://a%b.example.org" ]
+      && builtins.all (url: probe "url" url == url) [ "https://[fd00::1]:3000/forgejo" "https://forge.example.org:8443/x?y#z"
+        "https://forge.example.org/a%20b" ];
 in {
   auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;

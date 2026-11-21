@@ -246,15 +246,24 @@ fn success_body() -> String {
 struct Scene {
     dir: tempfile::TempDir,
     tools: common::Tools,
+    /// `timeouts.probe` for the child, in seconds, when the default is not wanted.
+    probe: Option<u64>,
+    /// `git rev-parse` never answers.
+    slow_git: bool,
 }
 
 impl Scene {
     fn new() -> Option<Self> {
-        let tools = tools(&["cat"])?;
+        let tools = tools(&["cat", "sleep"])?;
         let dir = tempdir();
         fs::create_dir(dir.path().join("run")).unwrap();
         fs::create_dir(dir.path().join("fleet")).unwrap();
-        Some(Self { dir, tools })
+        Some(Self {
+            dir,
+            tools,
+            probe: None,
+            slow_git: false,
+        })
     }
 
     fn token(&self, mode: u32) -> PathBuf {
@@ -271,19 +280,27 @@ impl Scene {
             "nix",
             "echo 'error: no fleet here' >&2; exit 1",
         );
+        let rev_parse = if self.slow_git {
+            "@sleep@ 30".to_owned()
+        } else {
+            format!("printf '{SHA}\\n'; exit 0")
+        };
         let git = self.tools.script(
             self.dir.path(),
             "git",
             &format!(
                 "case \" $* \" in\n\
                    *\" config \"*) printf 'core.bare\\0'; exit 0;;\n\
-                   *\" rev-parse \"*) printf '{SHA}\\n'; exit 0;;\n\
+                   *\" rev-parse \"*) {rev_parse};;\n\
                    *\" status \"*) printf '{status}'; exit 0;;\n\
                    *\" remote \"*) echo 'a remote must not be read: forge.repo is set' >&2; exit 9;;\n\
                  esac\nexit 9"
             ),
         );
         let mut cmd = Command::new(std::env::current_exe().unwrap());
+        if let Some(probe) = self.probe {
+            cmd.env("AUSPEX_TEST_FORGE_PROBE", probe.to_string());
+        }
         cmd.args(["--exact", "forge_wiring_child", "--nocapture"])
             .env("AUSPEX_TEST_FORGE_DIR", self.dir.path())
             .env("AUSPEX_TEST_FORGE_PORT", forge.port.to_string())
@@ -409,6 +426,61 @@ fn a_token_file_that_others_can_read_is_refused_and_nothing_is_sent() {
     );
 }
 
+/// Fix round 1, finding 3: the three git commands for HEAD are bounded by `timeouts.probe`, not
+/// by the git adapter's 2 s default. With `probe = 1` a git that never answers is reported as
+/// timed out after 1 s (the default would say 2 s).
+#[test]
+fn the_git_commands_for_head_are_bounded_by_timeouts_probe() {
+    let Some(mut scene) = Scene::new() else {
+        return;
+    };
+    scene.probe = Some(1);
+    scene.slow_git = true;
+    let Some(forge) = forge(200, success_body()) else {
+        return;
+    };
+    let token = scene.token(0o600);
+    let out = scene.run(&forge, Some(&token), "## main...origin/main\\0");
+    let ci = &json_of(&out)["fleet_ci"];
+    assert_eq!(ci["state"], "unknown", "{out}");
+    let reason = ci["reason"].as_str().unwrap();
+    assert!(reason.contains("timed out after 1s"), "{reason}");
+    assert!(forge.seen.lock().unwrap().is_empty());
+}
+
+/// Fix round 1, finding 3: a reason is written to the log once, and again when the same failure
+/// returns after a success in between.
+#[tokio::test(start_paused = true)]
+async fn a_reason_is_logged_again_when_it_returns_after_a_success() {
+    let shell = settled_demo().await;
+    let base = shell.view();
+    let with = |ci: FleetCi| {
+        let mut v = base.clone();
+        v.report.fleet_ci = ci;
+        v
+    };
+    let failed = with(FleetCi::unknown(
+        Some(SHA),
+        "forge: no answer within 10000 ms",
+    ));
+    let fine = with(badge(CiState::Success, Some(SHA), None));
+    let lines = || {
+        shell
+            .log
+            .lines()
+            .iter()
+            .filter(|l| l.starts_with("CI badge:"))
+            .count()
+    };
+    shell.note_ci(&failed);
+    shell.note_ci(&failed);
+    assert_eq!(lines(), 1, "once per reason");
+    shell.note_ci(&fine);
+    assert_eq!(lines(), 1);
+    shell.note_ci(&failed);
+    assert_eq!(lines(), 2, "news again after a success");
+}
+
 #[test]
 fn a_head_ahead_of_its_upstream_is_not_pushed_and_the_forge_is_not_asked() {
     let Some(scene) = Scene::new() else { return };
@@ -459,7 +531,15 @@ async fn forge_wiring_child() {
     let token_file = std::env::var_os("AUSPEX_TEST_FORGE_TOKEN_FILE")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
+    let mut timeouts = Settings::default().timeouts;
+    if let Some(probe) = std::env::var("AUSPEX_TEST_FORGE_PROBE")
+        .ok()
+        .and_then(|p| p.parse().ok())
+    {
+        timeouts.probe = probe;
+    }
     let settings = Settings {
+        timeouts,
         forge: Some(ForgeSettings {
             url: format!("http://127.0.0.1:{port}/"),
             host: "forge.example.org".to_owned(),

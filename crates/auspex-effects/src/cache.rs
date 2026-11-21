@@ -291,6 +291,26 @@ fn out_of_memory(stderr: &str, status: std::process::ExitStatus) -> bool {
         || matches!(status.signal(), Some(6 | 7 | 11))
 }
 
+/// Why a git command did not give an answer.
+#[derive(Debug)]
+pub(crate) enum GitFailure {
+    /// git ran and exited non-zero (out of memory aside). `code` is its exit status, which a few
+    /// commands give a meaning (`git remote get-url` exits 2 for "no such remote").
+    Exited { code: Option<i32>, message: String },
+    /// Anything else: it could not be run, timed out, printed too much, or ran out of memory.
+    Other(String),
+}
+
+impl GitFailure {
+    /// One line on why.
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            Self::Exited { message, .. } | Self::Other(message) => message,
+        }
+    }
+}
+
+/// [`git_typed`] with the failure as one line.
 pub(crate) async fn git(
     params: &GitParams<'_>,
     dir: &Path,
@@ -298,6 +318,18 @@ pub(crate) async fn git(
     cap: usize,
     cancel: &CancellationToken,
 ) -> Result<Result<Vec<u8>, String>, Cancelled> {
+    Ok(git_typed(params, dir, args, cap, cancel)
+        .await?
+        .map_err(GitFailure::into_message))
+}
+
+pub(crate) async fn git_typed(
+    params: &GitParams<'_>,
+    dir: &Path,
+    args: &[&str],
+    cap: usize,
+    cancel: &CancellationToken,
+) -> Result<Result<Vec<u8>, GitFailure>, Cancelled> {
     // The subcommand, for messages: the first argument that is not a global option or the
     // value of `-c` (the tree check passes `--no-optional-locks -c k=v status …`).
     let mut rest = args.iter();
@@ -313,7 +345,13 @@ pub(crate) async fn git(
     let what = format!("git {subcommand}");
     let mut cmd = match command(params.program) {
         Ok(c) => c,
-        Err(e) => return Ok(Err(spawn_error(&what, params.program, &e))),
+        Err(e) => {
+            return Ok(Err(GitFailure::Other(spawn_error(
+                &what,
+                params.program,
+                &e,
+            ))));
+        }
     };
     let deadline = Instant::now() + params.timeout;
     // `GIT_OPTIONAL_LOCKS=0` guards nothing today (none of these commands refreshes or
@@ -334,33 +372,49 @@ pub(crate) async fn git(
     };
     let ran = match run(cmd, None, OnExit::KillGroup, limits, deadline, cancel).await {
         Ok(r) => r,
-        Err(e) => return Ok(Err(spawn_error(&what, params.program, &e))),
+        Err(e) => {
+            return Ok(Err(GitFailure::Other(spawn_error(
+                &what,
+                params.program,
+                &e,
+            ))));
+        }
     };
     Ok(match ran.end {
         End::Cancelled => return Err(Cancelled),
-        End::TimedOut => Err(format!("{what} timed out after {:?}", params.timeout)),
-        End::Overflow => Err(format!("{what} printed more than {cap} bytes")),
+        End::TimedOut => Err(GitFailure::Other(format!(
+            "{what} timed out after {:?}",
+            params.timeout
+        ))),
+        End::Overflow => Err(GitFailure::Other(format!(
+            "{what} printed more than {cap} bytes"
+        ))),
         // Only an output read to its end and within the cap is git's answer: the exit can
         // be seen before the last bytes are read, and a truncated listing would leave
         // tracked files out of the key (PR #9, fix round 1).
         End::Exited(s) if s.success() => match ran.whole_stdout() {
             Ok(_) => Ok(ran.stdout),
-            Err(true) => Err(format!("{what} printed more than {cap} bytes")),
-            Err(false) => Err(format!(
+            Err(true) => Err(GitFailure::Other(format!(
+                "{what} printed more than {cap} bytes"
+            ))),
+            Err(false) => Err(GitFailure::Other(format!(
                 "{what} exited, but its output was not read to the end (something still \
                  held it open)"
-            )),
+            ))),
         },
         End::Exited(s) => {
             let stderr = lossy(&ran.stderr);
             let why = last_line(&stderr).unwrap_or_default();
             if out_of_memory(&stderr, s) {
-                Err(format!(
+                Err(GitFailure::Other(format!(
                     "{what} ran into auspex's memory limit for git ({} MiB): {why}",
                     GIT_MEMORY_LIMIT >> 20
-                ))
+                )))
             } else {
-                Err(format!("{what} {}: {why}", describe_status(Some(s))))
+                Err(GitFailure::Exited {
+                    code: s.code(),
+                    message: format!("{what} {}: {why}", describe_status(Some(s))),
+                })
             }
         }
     })

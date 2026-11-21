@@ -279,6 +279,73 @@ async fn the_token_never_appears_in_an_answer_the_adapter_returns() {
     }
 }
 
+/// Fix round 1, finding 1: a forge that reflects the credential must not get it into the badge
+/// through a link either. The bare token (what `Authorization: token <x>` carries after the
+/// prefix), the whole header value, a percent-encoded copy and a copy in another case-sensitive
+/// position are all dropped; the state stays, and a clean link is still used.
+#[tokio::test]
+async fn a_forge_that_echoes_the_token_into_a_link_gets_no_link() {
+    let reflected = [
+        format!("https://ci.example.org/run?{TOKEN}"),
+        format!("https://ci.example.org/{TOKEN}/run"),
+        format!("https://ci.example.org/run?auth=token%20{TOKEN}"),
+        // A percent-encoded copy of one character: the decoded link still holds the token.
+        format!(
+            "https://ci.example.org/run?{}",
+            TOKEN.replacen('t', "%74", 1)
+        ),
+        format!("https://ci.example.org/run#{TOKEN}"),
+    ];
+    for link in reflected {
+        let body = serde_json::json!({
+            "state": "success", "total_count": 1,
+            "statuses": [{"state": "success", "target_url": link}],
+        })
+        .to_string();
+        let Some(server) = serve(move |_| Reply::Status(200, body.clone())).await else {
+            return;
+        };
+        let t = token();
+        let answer = ask(&server, Some(&t), T).await.unwrap().unwrap();
+        assert_eq!(answer.state, CiState::Success, "{link}");
+        assert_eq!(answer.url, None, "{link}");
+        // And in nothing built from it.
+        let badge = auspex_domain::ci::FleetCi::from_answer(SHA, Ok(answer));
+        assert!(
+            !serde_json::to_string(&badge).unwrap().contains(TOKEN),
+            "{link}"
+        );
+    }
+    // A clean link on another status is still used: only the reflecting one is dropped.
+    let body = serde_json::json!({
+        "state": "failure", "total_count": 2,
+        "statuses": [
+            {"state": "failure", "target_url": format!("https://ci.example.org/run?{TOKEN}")},
+            {"state": "success", "target_url": "https://ci.example.org/owner/fleet/actions/runs/3"},
+        ],
+    })
+    .to_string();
+    let Some(server) = serve(move |_| Reply::Status(200, body.clone())).await else {
+        return;
+    };
+    let answer = ask(&server, Some(&token()), T).await.unwrap().unwrap();
+    assert_eq!(
+        answer.url.as_deref(),
+        Some("https://ci.example.org/owner/fleet/actions/runs/3")
+    );
+    // Without a token nothing was sent, so nothing can have been reflected, and the link stays.
+    let body = serde_json::json!({
+        "state": "success", "total_count": 1,
+        "statuses": [{"state": "success", "target_url": format!("https://ci.example.org/run?{TOKEN}")}],
+    })
+    .to_string();
+    let Some(server) = serve(move |_| Reply::Status(200, body.clone())).await else {
+        return;
+    };
+    let answer = ask(&server, None, T).await.unwrap().unwrap();
+    assert!(answer.url.is_some());
+}
+
 #[tokio::test]
 async fn a_401_and_a_404_say_what_to_check() {
     let Some(server) = serve(|seen| {
@@ -301,6 +368,18 @@ async fn a_401_and_a_404_say_what_to_check() {
     assert!(
         without.contains("wants a token") && without.contains("forge.token_file"),
         "{without}"
+    );
+
+    // Forgejo answers 403 for a token that lacks the scope: the same advice as for a 401.
+    let Some(scope) = serve(|_| Reply::Status(403, "{}".to_owned())).await else {
+        return;
+    };
+    let why = ask(&scope, Some(&token()), T).await.unwrap().unwrap_err();
+    assert!(
+        why.contains("refused the token")
+            && why.contains("HTTP 403")
+            && why.contains("forge.token_file"),
+        "{why}"
     );
 
     let Some(missing) = serve(|_| Reply::Status(404, "{}".to_owned())).await else {
@@ -628,6 +707,61 @@ async fn a_missing_or_odd_origin_is_an_answer_not_a_failure() {
     }
 }
 
+/// Fix round 1, finding 5: only git's own "no such remote" (exit 2) is "no origin remote". A
+/// timeout, too much output or any other failure says it could not be read, with git's reason.
+#[tokio::test]
+async fn an_origin_that_could_not_be_read_is_not_a_missing_one() {
+    let Some(t) = tools(&["cat", "sleep"]) else {
+        return;
+    };
+    for (remote, want, not) in [
+        (
+            "echo 'error: No such remote origin' >&2; exit 2",
+            "no origin remote",
+            "could not read",
+        ),
+        (
+            "echo 'fatal: bad config line 3' >&2; exit 128",
+            "could not read the origin remote",
+            "no origin remote",
+        ),
+        (
+            "echo 'boom' >&2; exit 1",
+            "could not read the origin remote",
+            "no origin remote",
+        ),
+        (
+            "@sleep@ 30",
+            "could not read the origin remote",
+            "no origin remote",
+        ),
+        (
+            // More than the 4 KiB read for one URL.
+            "@cat@ /dev/zero",
+            "could not read the origin remote",
+            "no origin remote",
+        ),
+    ] {
+        let dir = tempdir();
+        let program = fake_git(
+            &t,
+            dir.path(),
+            &format!("printf '{SHA}\\n'"),
+            "printf '## main\\0'",
+            remote,
+        );
+        let mut params = git_params(&program);
+        params.timeout = Duration::from_millis(700);
+        let head = forge::head(&params, &local(dir.path()), true, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let origin = head.origin.expect("asked").unwrap_err();
+        assert!(origin.contains(want), "{remote}: {origin}");
+        assert!(!origin.contains(not), "{remote}: {origin}");
+    }
+}
+
 #[tokio::test]
 async fn head_failures_are_reasons() {
     let Some(t) = tools(&["cat"]) else { return };
@@ -770,4 +904,33 @@ async fn head_of_a_real_repository() {
     .unwrap()
     .unwrap();
     assert_eq!(again.commit, want);
+}
+
+/// Fix round 1, finding 5: the exit status that means "no such remote" is a fact about git, so it
+/// is pinned against the real one.
+#[tokio::test]
+async fn a_real_repository_without_an_origin_says_so() {
+    let Some(program) = find_on_path("git") else {
+        assert!(!in_nix_build(), "git is not on PATH inside the Nix build");
+        eprintln!("SKIPPED: git is not on PATH");
+        return;
+    };
+    let dir = tempdir();
+    let repo = dir.path().join("fleet");
+    fs::create_dir(&repo).unwrap();
+    real_git(&repo, &["init", "-q", "-b", "main"]);
+    fs::write(repo.join("flake.nix"), "{}\n").unwrap();
+    real_git(&repo, &["add", "flake.nix"]);
+    real_git(&repo, &["commit", "-q", "-m", "one"]);
+    let head = forge::head(
+        &git_params(&program),
+        &local(&repo),
+        true,
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let origin = head.origin.expect("asked").unwrap_err();
+    assert_eq!(origin, "the fleet repository has no origin remote");
 }

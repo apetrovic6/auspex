@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use crate::Cancelled;
-use crate::cache::{GitParams, git};
+use crate::cache::{GitFailure, GitParams, git, git_typed};
 use crate::http::{Call, HttpClient, base_url, join};
 use crate::nix::FlakeRef;
 use crate::preflight::fleet_tree;
@@ -51,6 +51,9 @@ use crate::preflight::fleet_tree;
 /// each, so a real answer is a few tens of KiB. [`MAX_STATUSES`] bounds what the parsed list
 /// costs on top of the body.
 pub const BODY_CAP: usize = 1024 * 1024;
+
+/// The exit status of `git remote get-url <name>` for a name that is not a remote.
+const NO_SUCH_REMOTE: i32 = 2;
 
 /// The revision `git rev-parse` is asked for: `HEAD`, peeled to a commit.
 const HEAD_COMMIT: &str = "HEAD^{commit}";
@@ -72,6 +75,17 @@ impl std::fmt::Debug for Token {
 }
 
 impl Token {
+    /// Whether `text` holds the token: bare (which is also what the header's `token <value>`
+    /// carries), or with the percent-encoding a URL may have applied to it.
+    ///
+    /// This is how text that came from the forge is checked before it can reach output, without
+    /// the secret having an accessor: a forge that reflects the credential must not be able to
+    /// put it in the badge. A token this short is not told apart from ordinary text by chance
+    /// (the shortest a forge issues is dozens of characters).
+    fn appears_in(&self, text: &str) -> bool {
+        text.contains(self.0.as_str()) || percent_decoded(text).contains(self.0.as_str())
+    }
+
     /// The `Authorization` header value, `token <the token>`, marked sensitive.
     ///
     /// # Errors
@@ -185,6 +199,31 @@ fn check_owner_and_mode(shown: &str, uid: u32, mode: u32, me: u32) -> Result<(),
     Ok(())
 }
 
+/// `text` with every valid `%XX` replaced by its byte, lossily as UTF-8. Invalid escapes are
+/// left as they are.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| char::from(b).to_digit(16);
+        if bytes[i] == b'%'
+            && let (Some(hi), Some(lo)) = (
+                bytes.get(i + 1).copied().and_then(hex),
+                bytes.get(i + 2).copied().and_then(hex),
+            )
+            && let Ok(byte) = u8::try_from(hi * 16 + lo)
+        {
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn errno_words(e: rustix::io::Errno) -> String {
     match e {
         rustix::io::Errno::NOENT => "it does not exist".to_owned(),
@@ -263,7 +302,7 @@ pub async fn combined_status(
         Err(e) => return Ok(Err(format!("forge: {e}"))),
     };
     Ok(match status {
-        StatusCode::OK => parse(&body),
+        StatusCode::OK => parse(&body, token),
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(if token.is_some() {
             format!("forge: the forge refused the token (HTTP {status}): check forge.token_file")
         } else {
@@ -363,7 +402,11 @@ fn capped_statuses<'de, D: serde::Deserializer<'de>>(
 }
 
 /// Reads a 200 answer.
-pub(crate) fn parse(body: &[u8]) -> Result<CiStatus, String> {
+///
+/// `token` is the one that was sent, if any: a link that holds it (a forge that reflects the
+/// credential) is dropped, so it cannot reach `--json`. The state is a fixed vocabulary and every
+/// error is fixed text, so the link is the only forge text that reaches output.
+pub(crate) fn parse(body: &[u8], token: Option<&Token>) -> Result<CiStatus, String> {
     let doc: Answer = serde_json::from_slice(body)
         .map_err(|_| "forge: the answer is not a combined commit status".to_owned())?;
     let Some(raw) = doc.state.as_deref() else {
@@ -380,13 +423,17 @@ pub(crate) fn parse(body: &[u8]) -> Result<CiStatus, String> {
     // state's own kind, else the first with a usable link.
     let url = (state != CiState::None)
         .then(|| {
-            let usable = |s: &&Status| s.target_url.as_deref().and_then(clean_url).is_some();
+            let link = |s: &Status| {
+                s.target_url
+                    .as_deref()
+                    .and_then(clean_url)
+                    .filter(|u| !token.is_some_and(|t| t.appears_in(u)))
+            };
             statuses
                 .iter()
-                .filter(usable)
-                .find(|s| s.state.as_deref() == Some(raw))
-                .or_else(|| statuses.iter().find(usable))
-                .and_then(|s| s.target_url.as_deref().and_then(clean_url))
+                .find(|s| s.state.as_deref() == Some(raw) && link(s).is_some())
+                .or_else(|| statuses.iter().find(|s| link(s).is_some()))
+                .and_then(link)
         })
         .flatten();
     Ok(CiStatus { state, url })
@@ -440,11 +487,20 @@ pub async fn head(
         Err(why) => return Ok(Err(why)),
     };
     let origin = if want_origin {
-        let asked = git(params, &dir, &["remote", "get-url", "origin"], 4096, cancel).await?;
-        Some(asked.map_or_else(
-            |_| Err("the fleet repository has no origin remote".to_owned()),
-            |out| parse_remote(&String::from_utf8_lossy(&out)),
-        ))
+        let asked = git_typed(params, &dir, &["remote", "get-url", "origin"], 4096, cancel).await?;
+        Some(match asked {
+            Ok(out) => parse_remote(&String::from_utf8_lossy(&out)),
+            // `git remote get-url` exits 2 for a remote that does not exist; anything else (a
+            // timeout, too much output, a broken config) is not the same thing and says so.
+            Err(GitFailure::Exited {
+                code: Some(NO_SUCH_REMOTE),
+                ..
+            }) => Err("the fleet repository has no origin remote".to_owned()),
+            Err(other) => Err(format!(
+                "could not read the origin remote: {}",
+                other.into_message()
+            )),
+        })
     } else {
         None
     };
@@ -542,8 +598,18 @@ mod tests {
             0,
         )
         .unwrap();
-        // Returns, rather than waiting for a writer.
-        let e = read_token_file(&fifo).unwrap_err();
+        // Returns, rather than waiting for a writer. On a thread, so that a regression (a
+        // blocking open) fails in seconds instead of hanging the whole test binary until the
+        // harness kills it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo;
+        std::thread::spawn(move || {
+            let _ = tx.send(read_token_file(&path));
+        });
+        let e = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("read_token_file(fifo) must return, not wait for a writer")
+            .unwrap_err();
         assert!(e.contains("not a regular file"), "{e}");
     }
 
@@ -674,7 +740,7 @@ mod tests {
     }
 
     fn answer(body: &str) -> Result<CiStatus, String> {
-        parse(body.as_bytes())
+        parse(body.as_bytes(), None)
     }
 
     #[test]

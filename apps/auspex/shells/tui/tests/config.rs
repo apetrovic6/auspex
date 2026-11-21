@@ -599,6 +599,28 @@ fn the_forge_url_is_https_only_and_never_quoted() {
     assert!(e.contains("`forge.url` must be a string"), "{e}");
 }
 
+/// Fix round 1, finding 2: an IPv6 `forge.url` keeps no brackets in the host the core compares
+/// with the remote's, so the badge asks the forge instead of "unknown: set forge.repo".
+#[test]
+fn an_ipv6_forge_url_has_its_brackets_stripped_and_matches_the_remote() {
+    let (s, _) = config::parse("[forge]\nurl = \"https://[fd00::1]:3000/forgejo\"\n").unwrap();
+    let forge = s.forge.clone().unwrap();
+    assert_eq!(forge.host, "fd00::1");
+    assert_eq!(forge.url, "https://[fd00::1]:3000/forgejo");
+    let core = core_config(&s, "/fleet".to_owned()).forge.unwrap();
+    assert_eq!(core.host, "fd00::1");
+    let remote = auspex_domain::ci::parse_remote("ssh://git@[fd00::1]:22/owner/fleet.git").unwrap();
+    let head = auspex_domain::ci::HeadFacts {
+        commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        upstream: auspex_domain::preflight::Upstream::None,
+        origin: Some(Ok(remote)),
+    };
+    assert!(matches!(
+        auspex_domain::ci::plan(&head, &core.host, None),
+        auspex_domain::ci::Plan::Ask { .. }
+    ));
+}
+
 #[test]
 fn the_forge_repo_is_owner_slash_name() {
     let (s, _) =

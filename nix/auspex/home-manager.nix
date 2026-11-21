@@ -50,6 +50,10 @@ let
   # `flake` is; one that is already a store path is refused below.
   hasTokenFile = (pruned.forge or { }) ? token_file;
   tokenFilePath = if hasTokenFile then toString pruned.forge.token_file else "";
+  # `forge.repo` is `owner/name` as `auspex_domain::ci::parse_repo` reads it: letters, digits, `.`,
+  # `_` and `-`, each part 1 to 100 bytes and not `.` or `..` (POSIX ERE has no lookahead, so the
+  # three ways a part can start without being a dot-only name are spelled out).
+  repoPart = "([A-Za-z0-9_-][A-Za-z0-9._-]{0,99}|\\.[A-Za-z0-9_-][A-Za-z0-9._-]{0,98}|\\.\\.[A-Za-z0-9._-]{1,98})";
   expandHome = path: if lib.hasPrefix "~/" path
     then "${config.home.homeDirectory}/${lib.removePrefix "~/" path}"
     else path;
@@ -132,8 +136,8 @@ in {
           kubeconfig = optional (types.either types.str types.path) "The kubeconfig `U` reads node state and drains with (kubectl --kubeconfig); a leading ~/ is your home directory. Default: \$KUBECONFIG, then ~/.kube/config. A path value is written as its string, not copied into the store; a path inside the Nix store is refused as a stale copy of a credentials file.";
         };
         forge = section {
-          url = optional (types.strMatching "https://[^@/?#]+([/?#].*)?") "The forge whose combined commit status for the fleet's current commit is shown as a CI badge (status bar and `fleet_ci` in --json); https only, without credentials. Omit it to switch the badge off: nothing is then read or asked. Forgejo's API: GET /api/v1/repos/{owner}/{repo}/commits/{sha}/status.";
-          repo = optional (types.strMatching "[A-Za-z0-9._-]+/[A-Za-z0-9._-]+") "The repository on the forge, owner/name. Default: read from the fleet checkout's `origin` remote, which must then be on the same host as forge.url (otherwise the badge says `unknown: set forge.repo`).";
+          url = optional (types.strMatching "https://[^@/?#<>^|%\\[:space:][:cntrl:]]+([/?#][^[:space:][:cntrl:]]*)?") "The forge whose combined commit status for the fleet's current commit is shown as a CI badge (status bar and `fleet_ci` in --json); https only, without credentials, whitespace or a character a host cannot hold; what only the parser can see (a port out of range, an unmatched bracket) is refused by auspex at start. Omit it to switch the badge off: nothing is then read or asked. Forgejo's API: GET /api/v1/repos/{owner}/{repo}/commits/{sha}/status.";
+          repo = optional (types.strMatching "${repoPart}/${repoPart}") "The repository on the forge, owner/name (letters, digits, `.`, `_` and `-`; no part is `.` or `..` or over 100 bytes). Default: read from the fleet checkout's `origin` remote, which must then be on the same host as forge.url (otherwise the badge says `unknown: set forge.repo`).";
           token_file = optional (types.either types.str types.path) "A file holding a read-only API token for the forge, sent as `Authorization: token …`; a leading ~/ is your home directory. Never the token itself: it would be written to config.toml. auspex refuses a file that group or others can access (use mode 0600) or that you do not own, and strips one trailing newline. Without it the forge is asked anonymously (public repositories). A path value is written as its string, not copied into the store; a path inside the Nix store is refused, since the store is world-readable.";
         };
         keymap = mkOption {

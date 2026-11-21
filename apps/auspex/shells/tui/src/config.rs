@@ -452,7 +452,14 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                             .transpose()
                             .map_err(|e| format!("`forge.repo` {e}"))?;
                         s.forge = Some(ForgeSettings {
-                            host: url.host_str().unwrap_or_default().to_owned(),
+                            // Without the brackets an IPv6 host is written in: the core compares
+                            // it with the host of the `origin` remote, which has none.
+                            host: url
+                                .host_str()
+                                .unwrap_or_default()
+                                .trim_start_matches('[')
+                                .trim_end_matches(']')
+                                .to_owned(),
                             url: url.to_string(),
                             repo,
                             token_file,
