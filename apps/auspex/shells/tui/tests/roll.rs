@@ -691,10 +691,10 @@ async fn quitting_mid_update_kills_clan_starts_nothing_and_names_the_cordon() {
     let r = rows(&w.db, w.fleet.path(), "luna").await;
     assert_eq!(r.len(), 1, "{r:?}");
     assert!(
-        r[0].detail
-            .clone()
-            .unwrap_or_default()
-            .contains("is left cordoned"),
+        r[0].detail.clone().unwrap_or_default().contains(&format!(
+            "kubectl --kubeconfig {}/kubeconfig --context rke2 uncordon luna",
+            w.dir.path().display()
+        )),
         "{:?}",
         r[0].detail
     );

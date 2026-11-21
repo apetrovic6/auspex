@@ -109,6 +109,7 @@ fn cluster() -> ClusterId {
     ClusterId {
         context: "rke2".to_owned(),
         server: "https://10.0.0.1:6443".to_owned(),
+        kubeconfig: "/k/config".to_owned(),
     }
 }
 
@@ -660,7 +661,7 @@ fn an_uncordon_that_fails_is_a_failure_that_says_to_do_it_by_hand() {
                 "{why}"
             );
             assert!(
-                why.contains("uncordon it by hand (kubectl --context rke2 uncordon luna)"),
+                why.contains("uncordon it by hand (kubectl --kubeconfig /k/config --context rke2 uncordon luna)"),
                 "{why}"
             );
         }
@@ -688,7 +689,7 @@ fn a_drained_node_stays_cordoned_after_a_failed_update_and_after_a_failed_wait_a
             s.resolve(&mut w, Err("systemd is degraded".to_owned()));
         }
         assert!(s.kubes.is_empty(), "{failing}: no uncordon is asked for");
-        let by_hand = "kubectl --context rke2 uncordon luna";
+        let by_hand = "kubectl --kubeconfig /k/config --context rke2 uncordon luna";
         match state(&s, "luna") {
             RollState::Failed(why) => assert!(
                 why.contains("node luna is left cordoned") && why.contains(by_hand),
@@ -1199,7 +1200,7 @@ fn quitting_asks_cancels_the_updates_never_starts_the_next_and_names_the_cordon(
     match state(&s, "luna") {
         RollState::Failed(why) => assert!(
             why.starts_with("cancelled; node luna is left cordoned")
-                && why.contains("kubectl --context rke2 uncordon luna"),
+                && why.contains("kubectl --kubeconfig /k/config --context rke2 uncordon luna"),
             "{why}"
         ),
         other => panic!("{other:?}"),
@@ -1677,7 +1678,7 @@ fn a_cancelled_uncordon_is_not_an_uncordon() {
         RollState::Failed(why) => assert!(
             why.contains(
                 "may still be cordoned: could not uncordon it (the request was cancelled)"
-            ) && why.contains("kubectl --context rke2 uncordon luna"),
+            ) && why.contains("kubectl --kubeconfig /k/config --context rke2 uncordon luna"),
             "{why}"
         ),
         other => panic!("{other:?}"),

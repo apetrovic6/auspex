@@ -273,7 +273,7 @@ pub async fn cluster_id(
     };
     Ok(text(params, argv, "kubectl config view", cancel)
         .await?
-        .and_then(|out| parse_cluster_id(&out)))
+        .and_then(|out| parse_cluster_id(&out, &params.kubeconfig.display().to_string())))
 }
 
 /// Cordons (`cordon`) or uncordons `node`.
