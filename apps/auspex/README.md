@@ -214,13 +214,15 @@ client of its own and not `kubectl` over ssh.
   A machine that **is** a node of the cluster but has no rolling tag would update beside the
   cluster's group; the plan says so in a `warning:` line naming it (it does not refuse anything).
 - **A kubelet that has gone quiet is not healthy.** A node whose kubelet stopped keeps
-  `Ready=True` for about 40 s before the node controller flips it. A `Ready` node whose newest
-  heartbeat (the newer of the `Ready` condition's `lastHeartbeatTime` and the node lease's
-  `renewTime`) is **more than 40 s older** than the newest heartbeat of any node in the same read
-  counts as not healthy: it refuses the group in the plan and stops it before the next machine, with
-  a sentence naming the node and the age (`node mars is Ready, but its kubelet has been silent for
-  45 s`). The age is node against node, never against this machine's clock, so a skew between the
-  desktop and the cluster does not matter. 40 s is fixed, not a setting. When the leases cannot be
+  `Ready=True` for about 40 s before the node controller flips it, so a kubelet that has missed
+  three 10 s lease renewals still looks `Ready`. A `Ready` node whose newest heartbeat (the newer
+  of the `Ready` condition's `lastHeartbeatTime` and the node lease's `renewTime`) is **more than
+  25 s older** than the newest heartbeat of any node in the same read counts as not healthy (two
+  missed renewals plus a margin for the read's own timing; the usual jitter of a renewal or two is
+  well inside it): it refuses the group in the plan and stops it before the next machine, with a
+  sentence naming the node and the age (`node mars is Ready, but its kubelet has been silent for
+  30 s`). The age is node against node, never against this machine's clock, so a skew between the
+  desktop and the cluster does not matter. 25 s is fixed, not a setting. When the leases cannot be
   read the check is skipped (the condition's own heartbeat is only rewritten every few minutes, so
   it would call every node silent), and the machine's Log line says so.
 - **Before every machine** that uses the cluster, the nodes are read again (so also right after the
@@ -293,13 +295,17 @@ that was never tried and has none.
 alfrost); quit and stop it? …`). On `y` nothing new starts, the running `clan` processes are
 cancelled (their process groups are killed and reaped), a drain in progress is cancelled and its
 node uncordoned, a node whose update was under way stays cordoned and is named; auspex exits when
-every machine has ended. A second `q`, a termination signal (SIGTERM, SIGHUP, SIGINT, SIGQUIT) and a
-panic do not wait for the question: the roll is stopped the same way within 20 s (a second signal
-cuts that wait short), and then **auspex itself runs `kubectl uncordon` for every node it cordoned
-for an update that had not started**, one at a time, each bounded at 15 s, with a plain process
-(the async machinery is gone by then, and a panic hook has none). What it could not give back, and
-what is left cordoned on purpose, is printed with the commands. While a roll runs, `u`, `b`, `r` and
-`A` say so and do nothing.
+every machine has ended. A second `q` and a termination signal (SIGTERM, SIGHUP, SIGINT, SIGQUIT)
+do not wait for the question: the roll is stopped the same way within 20 s (a second signal cuts
+that wait short), and then **auspex itself runs `kubectl uncordon` for every node it cordoned for
+an update that had not started**, one at a time, each bounded at 15 s, with a plain process (the
+async machinery is gone by then). A **panic has no 20 s stop**. A panic on the main thread (the one
+that runs the interface) runs that same uncordon from the panic hook, each node bounded at 10 s, and
+auspex exits. A panic in a task (an adapter or an effect handler) is caught by the runtime: the hook
+does nothing, auspex goes on and so does the roll, and no node is given back (uncordoning a node
+whose drain is still running would put it back in service before its update). What it could not
+give back, and what is left cordoned on purpose, is printed with the commands. While a roll
+runs, `u`, `b`, `r` and `A` say so and do nothing.
 
 ## Freezing
 

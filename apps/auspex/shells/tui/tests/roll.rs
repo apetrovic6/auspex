@@ -1707,8 +1707,9 @@ async fn a_short_poll_interval_ends_the_wait_sooner_than_the_default() {
 // the kubelets' heartbeats (N2, N4)
 // ---------------------------------------------------------------------------------------
 
-/// N2 (the reviewer's RR2), at the plan. mars's kubelet is 45 s behind every other: it is down, and
-/// the node controller has not yet turned its `Ready` into `Unknown` (its grace is about 40 s). The
+/// N2 (the reviewer's RR2), at the plan. mars's kubelet is 30 s behind every other (three missed
+/// renewals): it is down, and the node controller has not yet turned its `Ready` into `Unknown` (its
+/// grace is about 40 s), which is why the bound is below it. The
 /// plan refuses the cluster's group, saying which node and for how long, and `clan` is not run for
 /// it. The time is measured between the kubelets (the newest heartbeat of the same read), never
 /// against this machine's clock: the leases here are dated 2030.
@@ -1721,7 +1722,7 @@ async fn a_node_whose_kubelet_went_silent_refuses_the_group_at_the_plan() {
         &cat(NODES_READY),
         "echo drained",
         "echo uncordoned",
-        &leases(&["luna", "mars", "sol", "terra"], &[("mars", 45)], 0),
+        &leases(&["luna", "mars", "sol", "terra"], &[("mars", 30)], 0),
     );
     let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
     settled(&w.shell).await;
@@ -1730,7 +1731,7 @@ async fn a_node_whose_kubelet_went_silent_refuses_the_group_at_the_plan() {
     let lines = w.shell.view().confirm.unwrap().lines;
     assert!(
         lines.iter().any(|l| l.starts_with("skipped luna:")
-            && l.contains("node mars is Ready, but its kubelet has been silent for 45 s")),
+            && l.contains("node mars is Ready, but its kubelet has been silent for 30 s")),
         "{lines:?}"
     );
     w.shell.send(Event::ConfirmAnswer(true));
@@ -1759,7 +1760,7 @@ async fn a_kubelet_that_went_silent_after_the_plan_stops_the_group_before_the_ne
         &cat(NODES_READY),
         "echo drained",
         "echo uncordoned",
-        &leases(&["luna", "mars", "sol", "terra"], &[("mars", 45)], 1),
+        &leases(&["luna", "mars", "sol", "terra"], &[("mars", 30)], 1),
     );
     let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
     settled(&w.shell).await;
@@ -1768,7 +1769,7 @@ async fn a_kubelet_that_went_silent_after_the_plan_stops_the_group_before_the_ne
     until_over(&w.shell).await;
     match state(&w.shell, "luna") {
         RollState::Failed(why) => assert!(
-            why.contains("node mars is Ready, but its kubelet has been silent for 45 s"),
+            why.contains("node mars is Ready, but its kubelet has been silent for 30 s"),
             "{why}"
         ),
         other => panic!("{other:?}"),

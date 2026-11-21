@@ -26,7 +26,7 @@
 //!   (`public`) is skipped: that confirmation is for `u`.
 //! - **Kubernetes.** The cluster is read again before every machine that uses it (and so right
 //!   after the `y` for the first of each group): any node that is `NotReady` or cordoned, or
-//!   `Ready` with a kubelet silent for more than 40 s against the newest heartbeat of the same
+//!   `Ready` with a kubelet silent for more than 25 s against the newest heartbeat of the same
 //!   read ([`roll::silent_kubelets`]), stops the group, and a node is drained only when it is
 //!   schedulable at that moment, which is what makes it auspex's to uncordon. Every call is
 //!   pinned to the context the plan showed. Between machines the roll waits ([`AwaitRequest`])

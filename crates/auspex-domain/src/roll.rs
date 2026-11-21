@@ -484,10 +484,12 @@ pub fn parse_cluster_id(json: &str, kubeconfig: &str) -> Result<ClusterId, Strin
 
 /// How long a kubelet may be silent, in seconds, before its node is not healthy.
 ///
-/// The node still says `Ready` meanwhile: the node controller turns a silent node's `Ready` into `Unknown` only after about
-/// 40 s, and a kubelet renews its lease every 10 s, so 40 s is four missed renewals. A constant:
-/// it is the controller's own grace, not a preference.
-pub const KUBELET_SILENCE_SECONDS: i64 = 40;
+/// The node still says `Ready` meanwhile: the node controller turns a silent node's `Ready` into
+/// `Unknown` only after about 40 s, so a bound of 40 s would add nothing to what `Ready` already
+/// says. A kubelet renews its lease every 10 s, so 25 s is two missed renewals plus a margin for
+/// the read's own timing (the leases are a second call, made just after the nodes). A constant, not
+/// a setting.
+pub const KUBELET_SILENCE_SECONDS: i64 = 25;
 
 /// Whether the leases behind `nodes` were read: at least one node has a lease heartbeat.
 ///
@@ -1282,10 +1284,11 @@ mod tests {
     }
 
     /// N2. A kubelet that stopped renewing is still `Ready` for the node controller's grace (about
-    /// 40 s). It counts as down once its newest heartbeat is more than 40 s older than the newest of
-    /// the same read: 40 s itself is a missed beat or three, 41 s is not.
+    /// 40 s). It counts as down once its newest heartbeat is more than 25 s older than the newest of
+    /// the same read: 25 s itself (two missed renewals and a margin) is allowed, 26 s is not. The
+    /// reviewer's case, a kubelet silent for about 30 s, is refused.
     #[test]
-    fn a_ready_node_whose_kubelet_is_more_than_forty_seconds_behind_the_others_is_not_healthy() {
+    fn a_ready_node_whose_kubelet_is_more_than_25_seconds_behind_the_others_is_not_healthy() {
         let at = |mars: i64| {
             leased(&[
                 ("luna", Some(100)),
@@ -1295,27 +1298,52 @@ mod tests {
         };
         assert_eq!(cluster_unhealthy(&at(0)), Vec::<String>::new());
         assert_eq!(
-            cluster_unhealthy(&at(40)),
+            cluster_unhealthy(&at(25)),
             Vec::<String>::new(),
-            "40 s is allowed"
+            "25 s is allowed"
         );
         assert_eq!(
-            cluster_unhealthy(&at(41)),
-            ["node mars is Ready, but its kubelet has been silent for 41 s"]
+            cluster_unhealthy(&at(26)),
+            ["node mars is Ready, but its kubelet has been silent for 26 s"]
         );
-        // The plan says the same, and names the node and the age.
+        // The review's RR2: three missed renewals. The plan says the same, naming node and age.
         let (luna, sol) = (member("luna", true), member("sol", true));
         assert_eq!(
-            cluster_refusals(&at(90), &[&luna, &sol]),
-            ["node mars is Ready, but its kubelet has been silent for 90 s"]
+            cluster_refusals(&at(30), &[&luna, &sol]),
+            ["node mars is Ready, but its kubelet has been silent for 30 s"]
         );
         // The newest heartbeat is the reference, not a clock: the same ages at any date.
-        let far = leased(&[("luna", Some(1_000_000)), ("mars", Some(1_000_000 - 41))]);
+        let far = leased(&[("luna", Some(1_000_000)), ("mars", Some(1_000_000 - 26))]);
         assert_eq!(cluster_unhealthy(&far).len(), 1);
         // A node that is NotReady is said once, as NotReady.
         let mut nodes = at(90);
         nodes[1].ready = false;
         assert_eq!(cluster_unhealthy(&nodes), ["node mars is NotReady"]);
+    }
+
+    /// N2. Normal renewal jitter is not silence: a kubelet that renewed 10 s before the others (one
+    /// whole interval behind) and one 12 s behind (an interval plus the read's own timing) are
+    /// healthy, in the read before a machine and in the plan.
+    #[test]
+    fn a_node_twelve_seconds_behind_the_newest_heartbeat_is_not_refused() {
+        let (luna, sol) = (member("luna", true), member("sol", true));
+        for behind in [10, 12] {
+            let nodes = leased(&[
+                ("luna", Some(100)),
+                ("mars", Some(100 - behind)),
+                ("sol", Some(100)),
+            ]);
+            assert_eq!(
+                cluster_unhealthy(&nodes),
+                Vec::<String>::new(),
+                "{behind} s behind"
+            );
+            assert_eq!(
+                cluster_refusals(&nodes, &[&luna, &sol]),
+                Vec::<String>::new(),
+                "{behind} s behind, in the plan"
+            );
+        }
     }
 
     /// N2. Without any lease the condition's own heartbeat (rewritten every few minutes) would make
