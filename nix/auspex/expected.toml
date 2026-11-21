@@ -44,6 +44,7 @@ drain = false
 [update]
 parallel = 3
 ready_timeout = 300
+poll_interval = 10
 
 [kubernetes]
 kubeconfig = "/home/me/.kube/fleet"

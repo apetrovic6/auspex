@@ -188,6 +188,7 @@ pub(super) struct Roll {
     free: VecDeque<String>,
     parallel: usize,
     ready_timeout_seconds: u64,
+    poll_interval_seconds: u64,
     /// The cluster the plan named; every call after it is pinned to its context.
     context: Option<String>,
     /// The kubeconfig the shell resolved, for the command that gives a node back.
@@ -330,6 +331,7 @@ pub(super) struct Planned {
     skipped: Vec<(String, String)>,
     parallel: usize,
     ready_timeout_seconds: u64,
+    poll_interval_seconds: u64,
     /// The cluster the groups that use it will talk to, when any does.
     cluster: Option<ClusterId>,
     /// What the fleet repository's state warns about, once, for the whole roll.
@@ -463,6 +465,7 @@ pub(super) struct Draft {
     skipped: Vec<(String, String)>,
     parallel: usize,
     ready_timeout_seconds: u64,
+    poll_interval_seconds: u64,
     cluster: Option<Result<ClusterId, String>>,
     nodes: Option<Result<Vec<Node>, String>>,
     etcd: Option<Result<Vec<EtcdPod>, String>>,
@@ -534,6 +537,7 @@ impl Draft {
             skipped: self.skipped,
             parallel: self.parallel,
             ready_timeout_seconds: self.ready_timeout_seconds,
+            poll_interval_seconds: self.poll_interval_seconds,
             cluster,
             tree_warnings,
         }
@@ -628,6 +632,7 @@ pub(super) fn request(model: &mut Model) -> Command<Effect, Event> {
         skipped,
         parallel: config.rolling.parallel.max(1),
         ready_timeout_seconds: config.rolling.ready_timeout_seconds,
+        poll_interval_seconds: config.rolling.poll_interval_seconds,
         cluster: None,
         nodes: None,
         etcd: None,
@@ -949,6 +954,7 @@ fn start(model: &mut Model, planned: &Planned, lock: RequestId) -> Command<Effec
         free: planned.free.iter().cloned().collect(),
         parallel: planned.parallel,
         ready_timeout_seconds: planned.ready_timeout_seconds,
+        poll_interval_seconds: planned.poll_interval_seconds,
         context: planned.cluster.as_ref().map(|c| c.context.clone()),
         kubeconfig: planned.cluster.as_ref().map(|c| c.kubeconfig.clone()),
         tree_warnings: planned.tree_warnings.clone(),
@@ -1487,6 +1493,7 @@ fn start_wait(
             context,
             baseline,
             timeout_seconds: roll.ready_timeout_seconds,
+            poll_seconds: roll.poll_interval_seconds,
         })
         .then_send(move |answer| Event::AwaitAnswered { id, answer }),
     );

@@ -115,6 +115,8 @@ pub struct RollingConfig {
     /// How long to wait for an updated machine to be healthy (and its node `Ready`) before the
     /// roll gives up on it (`update.ready_timeout`), in seconds.
     pub ready_timeout_seconds: u64,
+    /// How often that wait looks again (`update.poll_interval`), in seconds.
+    pub poll_interval_seconds: u64,
     /// Why the cluster cannot be used (no kubeconfig could be chosen, `KUBECONFIG` names several
     /// files), or `None`. A Kubernetes rolling group is then refused with this reason; machines
     /// outside it are not affected. The shell owns the kubeconfig and `kubectl`: the core only
@@ -125,6 +127,9 @@ pub struct RollingConfig {
 /// `update.parallel` when the config says nothing.
 pub const DEFAULT_PARALLEL: usize = 2;
 
+/// `update.poll_interval` when the config says nothing: 5 seconds.
+pub const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
+
 /// `update.ready_timeout` when the config says nothing: ten minutes.
 pub const DEFAULT_READY_TIMEOUT_SECONDS: u64 = 600;
 
@@ -134,6 +139,7 @@ impl Default for RollingConfig {
             rules: auspex_domain::roll::RollRules::new(),
             parallel: DEFAULT_PARALLEL,
             ready_timeout_seconds: DEFAULT_READY_TIMEOUT_SECONDS,
+            poll_interval_seconds: DEFAULT_POLL_INTERVAL_SECONDS,
             kubernetes_unavailable: None,
         }
     }

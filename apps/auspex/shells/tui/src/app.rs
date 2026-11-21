@@ -98,6 +98,7 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
             rules: settings.rolling.clone(),
             parallel: usize::try_from(settings.update.parallel).unwrap_or(usize::MAX),
             ready_timeout_seconds: settings.update.ready_timeout,
+            poll_interval_seconds: settings.update.poll_interval,
             // Only a Kubernetes group needs it, and the group is the one refused: the others
             // are rolled whatever the kubeconfig says.
             kubernetes_unavailable: config::resolve_kubeconfig(settings.kubeconfig.as_deref())

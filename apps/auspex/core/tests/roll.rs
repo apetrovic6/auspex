@@ -1991,3 +1991,18 @@ fn the_wait_asks_for_etcd_only_when_the_group_does() {
     s.resolve(&mut a, ended(ActionResult::Succeeded));
     assert!(!take_await(&mut s, "luna").operation.etcd);
 }
+/// `update.poll_interval` and `update.ready_timeout` reach the wait: the request carries both.
+#[test]
+fn the_wait_is_asked_to_poll_at_the_configured_interval() {
+    let mut config = config_with(k8s(), 2);
+    config.rolling.poll_interval_seconds = 7;
+    config.rolling.ready_timeout_seconds = 321;
+    let mut s = settled(config);
+    start(&mut s, healthy_cluster());
+    pass_checks(&mut s, "luna");
+    let mut a = take_action(&mut s, "luna");
+    s.resolve(&mut a, ended(ActionResult::Succeeded));
+    let w = take_await(&mut s, "luna");
+    assert_eq!(w.operation.poll_seconds, 7);
+    assert_eq!(w.operation.timeout_seconds, 321);
+}

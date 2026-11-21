@@ -59,6 +59,8 @@ pub struct UpdateSettings {
     /// `update.ready_timeout`: seconds to wait for an updated machine to be healthy (and its node
     /// Ready).
     pub ready_timeout: u64,
+    /// `update.poll_interval`: seconds between two looks at an updating machine and its node.
+    pub poll_interval: u64,
 }
 
 impl Default for UpdateSettings {
@@ -66,9 +68,13 @@ impl Default for UpdateSettings {
         Self {
             parallel: auspex_core::config::DEFAULT_PARALLEL as u64,
             ready_timeout: auspex_core::config::DEFAULT_READY_TIMEOUT_SECONDS,
+            poll_interval: auspex_core::config::DEFAULT_POLL_INTERVAL_SECONDS,
         }
     }
 }
+
+/// The longest `update.poll_interval` may be, in seconds.
+pub const MAX_POLL_INTERVAL: u64 = 60;
 
 /// The most machines `update.parallel` may name: each is a local build and a copy.
 pub const MAX_PARALLEL: u64 = 16;
@@ -427,14 +433,32 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                 }
             }
             "update" => {
+                let mut poll = None;
                 for (k, v) in w.table(value, "update")? {
                     let name = format!("update.{k}");
                     match k.as_str() {
                         "parallel" => s.update.parallel = w.counted(v, &name, MAX_PARALLEL)?,
                         "ready_timeout" => s.update.ready_timeout = w.timeout(v, &name)?,
+                        "poll_interval" => {
+                            poll = Some(w.counted(v, &name, MAX_POLL_INTERVAL)?);
+                        }
                         _ => w.unknown(&name),
                     }
                 }
+                // Left unset it is the default, kept within a short `ready_timeout` so that a
+                // config that only shortens the timeout still loads; only a value the user wrote
+                // can contradict it.
+                s.update.poll_interval = match poll {
+                    Some(p) if p > s.update.ready_timeout => {
+                        return Err(format!(
+                            "`update.poll_interval` ({p}) must not be more than `update.ready_timeout` ({})",
+                            s.update.ready_timeout
+                        ));
+                    }
+                    Some(p) => p,
+                    None => auspex_core::config::DEFAULT_POLL_INTERVAL_SECONDS
+                        .min(s.update.ready_timeout),
+                };
             }
             "kubernetes" => {
                 for (k, v) in w.table(value, "kubernetes")? {
@@ -905,12 +929,29 @@ mod tests {
             ("[update]\nparallel = 17\n", "update.parallel"),
             ("[update]\nparallel = \"2\"\n", "update.parallel"),
             ("[update]\nready_timeout = 0\n", "update.ready_timeout"),
+            ("[update]\npoll_interval = 0\n", "update.poll_interval"),
+            ("[update]\npoll_interval = 61\n", "update.poll_interval"),
+            ("[update]\npoll_interval = \"5\"\n", "update.poll_interval"),
+            (
+                "[update]\npoll_interval = 5\nready_timeout = 4\n",
+                "update.poll_interval",
+            ),
         ] {
             let e = parse(text).unwrap_err();
             assert!(e.contains(&format!("`{key}`")), "{text:?}: {e}");
         }
         let (s, _) = parse("[update]\nparallel = 16\nready_timeout = 86400\n").unwrap();
         assert_eq!((s.update.parallel, s.update.ready_timeout), (16, 86_400));
+        // Only a shorter ready_timeout: valid before poll_interval existed, still valid, and the
+        // default poll is clamped to it rather than refused.
+        for (rt, poll) in [(1, 1), (3, 3), (5, 5), (6, 5)] {
+            let (s, _) = parse(&format!("[update]\nready_timeout = {rt}\n")).unwrap();
+            assert_eq!((s.update.ready_timeout, s.update.poll_interval), (rt, poll));
+        }
+        let (s, _) = parse("[update]\npoll_interval = 60\n").unwrap();
+        assert_eq!(s.update.poll_interval, 60);
+        let (s, _) = parse("[update]\npoll_interval = 2\nready_timeout = 2\n").unwrap();
+        assert_eq!(s.update.poll_interval, 2);
         let (s, w) = parse("[rolling.a]\nwarp = 1\n[update]\nwarp = 1\n").unwrap();
         assert_eq!(w.len(), 2, "{w:?}");
         assert_eq!(s.update, UpdateSettings::default());

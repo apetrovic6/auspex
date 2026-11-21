@@ -213,6 +213,19 @@ fn world_in(
     ready_timeout: u64,
     state: Option<&Path>,
 ) -> World {
+    world_polling(t, clan, kubectl, rule, ready_timeout, 5, state)
+}
+
+/// [`world_in`], with the wait between machines looking again every `poll` seconds.
+fn world_polling(
+    t: &Tools,
+    clan: &str,
+    kubectl: &str,
+    rule: RollRule,
+    ready_timeout: u64,
+    poll: u64,
+    state: Option<&Path>,
+) -> World {
     let dir = tempdir();
     let fleet = tempdir();
     // `MISSING`: no `clan` at all, so nothing can be started.
@@ -248,6 +261,7 @@ fn world_in(
     config.rolling.rules = [("k8s-server".to_owned(), rule)].into();
     config.rolling.parallel = 2;
     config.rolling.ready_timeout_seconds = ready_timeout;
+    config.rolling.poll_interval_seconds = poll;
     shell.send(Event::Start(config));
     World {
         dir,
@@ -1433,6 +1447,60 @@ async fn without_the_etcd_key_etcd_is_never_asked_about() {
         w.kubectl_calls().iter().all(|c| !c.contains(ETCD_POD_CALL)),
         "{:#?}",
         w.kubectl_calls()
+    );
+    w.shell.shutdown().await;
+}
+
+/// A fake `kubectl` whose node `luna` is `NotReady` for exactly one look after the two that
+/// precede the wait (the plan's and the one before luna's turn), and `Ready` ever after.
+fn kubectl_recovering() -> String {
+    let down = r#"{"items":[{"metadata":{"name":"luna"},"status":{"conditions":[{"type":"Ready","status":"False"}]}},{"metadata":{"name":"sol"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}"#;
+    let get_nodes = format!(
+        "n=$(@cat@ '@dir@/count' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '@dir@/count'; @date@ +%s >> '@dir@/times'; \
+         if [ $n -eq 3 ]; then {down}; else {ready}; fi",
+        down = cat(down),
+        ready = cat(NODES_READY)
+    );
+    kubectl_with(
+        &get_nodes,
+        "echo 'node drained (fake)'",
+        "echo 'node uncordoned (fake)'",
+        LEASES_NOW,
+    )
+}
+
+/// `update.poll_interval` is the wait's pace: a node that is back one look later is noticed after
+/// that interval, so with 1 s the wait ends well before the 5 s default could have looked again.
+#[tokio::test]
+async fn a_short_poll_interval_ends_the_wait_sooner_than_the_default() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let w = world_polling(
+        &t,
+        &clan_body("0.1"),
+        &kubectl_recovering(),
+        kube_rule(false),
+        60,
+        1,
+        None,
+    );
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_state(&w.shell, "luna", RollState::Done).await;
+    // The looks are the plan's, the one before luna's turn, the NotReady one and the Ready one:
+    // the last two are one interval apart (the clock has whole seconds, so 1 reads as 1 or 2),
+    // where the default would put them 5 apart.
+    let times: Vec<u64> = lines(&w.path("times"))
+        .iter()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert!(times.len() >= 2, "{times:?}");
+    let gap = times[times.len() - 1] - times[times.len() - 2];
+    assert!(
+        gap <= 2,
+        "a 1 s interval looked again after {gap} s: {times:?}"
     );
     w.shell.shutdown().await;
 }

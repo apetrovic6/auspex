@@ -39,7 +39,7 @@ let
       taghmata = { kubernetes = true; drain = true; drain_timeout = 900; etcd = true; };
       skitarii = { kubernetes = false; drain = false; };
     };
-    update = { parallel = 3; ready_timeout = 300; };
+    update = { parallel = 3; ready_timeout = 300; poll_interval = 10; };
     kubernetes.kubeconfig = "/home/me/.kube/fleet";
     keymap = { quit = [ "q" "esc" ]; down = "j"; };
     theme.file = "~/.config/auspex/theme.toml";
@@ -221,6 +221,8 @@ let
   storeKubeconfigRejected =
     !(builtins.tryEval (builtins.deepSeq (checked storeKubeconfig).assertions true)).success
     && builtins.any (a: !a.assertion && lib.hasInfix "store" a.message) storeKubeconfig.assertions;
+  updateWith = update: (evaluate { programs.auspex.settings.update = update; }).config;
+  assertionsHold = c: builtins.all (a: a.assertion) c.assertions;
 in {
   auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;
@@ -233,6 +235,7 @@ in {
     && boundedOK 5 600 [ "timeouts" "ssh_approval" ]
     && boundedOK 1 16 [ "update" "parallel" ]
     && numberOK true 86400 [ "update" "ready_timeout" ]
+    && boundedOK 1 60 [ "update" "poll_interval" ]
     && rollingOK);
   auspex-stylix = compareToml "stylix" [
     stylix.xdg.configFile."auspex/theme.toml".source
@@ -296,6 +299,14 @@ in {
   ];
   auspex-kubeconfig-store-path = check "kubeconfig-store-path" (storeKubeconfigRejected
     && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeKubeconfig pathKubeconfig ]);
+  # The Rust loader's rule: a short ready_timeout alone loads (the default poll is clamped to it);
+  # only an explicit poll_interval above the timeout (explicit or the 600 s default) is refused.
+  auspex-poll-interval = check "poll-interval" (
+    assertionsHold (updateWith { ready_timeout = 3; })
+    && assertionsHold (updateWith { poll_interval = 5; ready_timeout = 5; })
+    && assertionsHold (updateWith { poll_interval = 60; })
+    && !assertionsHold (updateWith { poll_interval = 5; ready_timeout = 4; })
+  );
   auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision
