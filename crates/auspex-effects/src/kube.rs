@@ -12,6 +12,7 @@
 //! # The argv, exactly
 //!
 //! - nodes: `kubectl --kubeconfig <path> get nodes -o json`
+//! - etcd pods: `kubectl --kubeconfig <path> get pods -n kube-system -l component=etcd -o json`
 //! - cordon: `kubectl --kubeconfig <path> cordon <node>`
 //! - uncordon: `kubectl --kubeconfig <path> uncordon <node>`
 //! - drain: `kubectl --kubeconfig <path> drain <node> --ignore-daemonsets --delete-emptydir-data
@@ -39,7 +40,8 @@ use std::time::Duration;
 
 use auspex_domain::fleet::is_plain_name;
 use auspex_domain::roll::{
-    ClusterId, Node, merge_leases, parse_cluster_id, parse_leases, parse_nodes,
+    ClusterId, EtcdPod, Node, merge_leases, parse_cluster_id, parse_etcd_pods, parse_leases,
+    parse_nodes,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::Instant;
@@ -137,6 +139,30 @@ pub fn nodes_argv(params: &KubeParams<'_>) -> Result<Vec<OsString>, String> {
 pub fn leases_argv(params: &KubeParams<'_>) -> Result<Vec<OsString>, String> {
     let mut argv = params.head()?;
     argv.extend(["get", "leases", "-n", "kube-node-lease", "-o", "json"].map(OsString::from));
+    Ok(argv)
+}
+
+/// The argv (after the program) of the etcd pods: the static pods of etcd, one per member, in
+/// `kube-system` (RKE2 and kubeadm label them `component=etcd`).
+///
+/// # Errors
+///
+/// The kubeconfig is not absolute.
+pub fn etcd_pods_argv(params: &KubeParams<'_>) -> Result<Vec<OsString>, String> {
+    let mut argv = params.head()?;
+    argv.extend(
+        [
+            "get",
+            "pods",
+            "-n",
+            "kube-system",
+            "-l",
+            "component=etcd",
+            "-o",
+            "json",
+        ]
+        .map(OsString::from),
+    );
     Ok(argv)
 }
 
@@ -255,6 +281,25 @@ pub async fn nodes(
         merge_leases(&mut nodes, &leases);
     }
     Ok(Ok(nodes))
+}
+
+/// The cluster's etcd pods, one per member: what [`auspex_domain::roll::etcd_unhealthy`] judges.
+///
+/// # Errors
+///
+/// [`Cancelled`] as [`nodes`]; a kubectl that failed, or printed something that is not a pod list,
+/// is the inner line.
+pub async fn etcd_pods(
+    params: &KubeParams<'_>,
+    cancel: &CancellationToken,
+) -> Result<Result<Vec<EtcdPod>, String>, Cancelled> {
+    let argv = match etcd_pods_argv(params) {
+        Ok(a) => a,
+        Err(why) => return Ok(Err(why)),
+    };
+    Ok(text(params, argv, "kubectl get pods", cancel)
+        .await?
+        .and_then(|out| parse_etcd_pods(&out)))
 }
 
 /// Which cluster `params`' kubeconfig is pointed at: its current context and API server.
@@ -454,6 +499,21 @@ mod tests {
                 "json"
             ]
         );
+        assert_eq!(
+            strings(&etcd_pods_argv(&p).unwrap()),
+            [
+                "--kubeconfig",
+                "/k/config",
+                "get",
+                "pods",
+                "-n",
+                "kube-system",
+                "-l",
+                "component=etcd",
+                "-o",
+                "json"
+            ]
+        );
         p.context = Some("rke2");
         let pinned = "--context=rke2";
         assert_eq!(
@@ -479,6 +539,7 @@ mod tests {
         // A context that looks like an option is still one argument, the flag's value.
         p.context = Some("--all");
         assert_eq!(strings(&nodes_argv(&p).unwrap())[2], "--context=--all");
+        assert_eq!(strings(&etcd_pods_argv(&p).unwrap())[2], "--context=--all");
     }
 
     #[test]

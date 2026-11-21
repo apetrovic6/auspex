@@ -53,7 +53,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Write as _;
 
 use auspex_domain::preflight::TreeState;
-use auspex_domain::roll::{self, Candidate, ClusterId, Group, Member, Node};
+use auspex_domain::roll::{self, Candidate, ClusterId, EtcdPod, Group, Member, Node};
 use auspex_domain::text::shell_quote;
 use crux_core::Command;
 use crux_core::render::render;
@@ -119,6 +119,9 @@ enum Step {
     Baseline,
     /// The cluster's nodes are being read before the machine's node goes out of service.
     Reading,
+    /// The nodes were read and are fine; the etcd pods are being read before the machine's node
+    /// goes out of service. Holds the nodes the pods are judged against.
+    ReadingEtcd(Vec<Node>),
     /// `kubectl drain` is running. `cancelling`: the operator quit; the answer will say the
     /// process is gone, and the node is then uncordoned.
     Draining {
@@ -277,7 +280,9 @@ impl Roll {
                     name: name.clone(),
                     state: match &e.step {
                         Step::Queued => RollState::Queued,
-                        Step::Checking | Step::Baseline | Step::Reading => RollState::Checking,
+                        Step::Checking | Step::Baseline | Step::Reading | Step::ReadingEtcd(_) => {
+                            RollState::Checking
+                        }
                         Step::Draining { .. } => RollState::Draining,
                         Step::Updating => RollState::Updating,
                         Step::Waiting => RollState::Waiting,
@@ -365,6 +370,13 @@ impl Planned {
             if group.kubernetes() {
                 how.push("each node must be Ready before the next".to_owned());
             }
+            if group.etcd() {
+                how.push(
+                    "every etcd member must be healthy before each machine goes out, and its etcd \
+                     Ready again after"
+                        .to_owned(),
+                );
+            }
             let drains: Vec<String> = group
                 .members
                 .iter()
@@ -440,6 +452,7 @@ impl Planned {
 pub(super) enum Stage {
     Context,
     Nodes,
+    Etcd,
     Tree,
 }
 
@@ -452,6 +465,7 @@ pub(super) struct Draft {
     ready_timeout_seconds: u64,
     cluster: Option<Result<ClusterId, String>>,
     nodes: Option<Result<Vec<Node>, String>>,
+    etcd: Option<Result<Vec<EtcdPod>, String>>,
     tree: Option<Result<TreeState, String>>,
 }
 
@@ -476,7 +490,14 @@ impl Draft {
                     }
                     (None, Some(Ok(_)), Some(Ok(nodes))) => {
                         let members: Vec<&Member> = group.members.iter().collect();
-                        let why = roll::cluster_refusals(nodes, &members);
+                        let mut why = roll::cluster_refusals(nodes, &members);
+                        if group.etcd() && why.is_empty() {
+                            match &self.etcd {
+                                Some(Ok(pods)) => why.extend(roll::etcd_unhealthy(nodes, pods)),
+                                Some(Err(e)) => why.push(format!("cannot read etcd: {e}")),
+                                None => why.push("etcd was not asked".to_owned()),
+                            }
+                        }
                         (!why.is_empty()).then(|| why.join("; "))
                     }
                     _ => Some("the cluster was not asked".to_owned()),
@@ -609,6 +630,7 @@ pub(super) fn request(model: &mut Model) -> Command<Effect, Event> {
         ready_timeout_seconds: config.rolling.ready_timeout_seconds,
         cluster: None,
         nodes: None,
+        etcd: None,
         tree: None,
     };
 
@@ -639,14 +661,14 @@ fn ask_stage(model: &mut Model, draft: Draft, stage: Stage) -> Command<Effect, E
         stage,
     });
     let asked = match stage {
-        Stage::Context | Stage::Nodes => Command::request_from_shell(KubeRequest {
+        Stage::Context | Stage::Nodes | Stage::Etcd => Command::request_from_shell(KubeRequest {
             id,
             log: None,
             context,
-            op: if stage == Stage::Context {
-                KubeOp::Context
-            } else {
-                KubeOp::Nodes
+            op: match stage {
+                Stage::Context => KubeOp::Context,
+                Stage::Nodes => KubeOp::Nodes,
+                _ => KubeOp::EtcdPods,
             },
         })
         .then_send(move |answer| Event::KubeAnswered { id, answer }),
@@ -725,6 +747,22 @@ fn stage_answered(
                 Ok(KubeReply::Nodes(nodes)) => Ok(nodes.clone()),
                 Ok(KubeReply::Cancelled) => Err("the request was cancelled".to_owned()),
                 Ok(_) => Err("the shell answered a node list with something else".to_owned()),
+                Err(why) => Err(why.clone()),
+            });
+            let next = if draft.plan.groups.iter().any(Group::etcd)
+                && matches!(draft.nodes, Some(Ok(_)))
+            {
+                Stage::Etcd
+            } else {
+                Stage::Tree
+            };
+            Some(ask_stage(model, *draft, next))
+        }
+        (Stage::Etcd, Found::Kube(answer)) => {
+            draft.etcd = Some(match answer {
+                Ok(KubeReply::EtcdPods(pods)) => Ok(pods.clone()),
+                Ok(KubeReply::Cancelled) => Err("the request was cancelled".to_owned()),
+                Ok(_) => Err("the shell answered a pod list with something else".to_owned()),
                 Err(why) => Err(why.clone()),
             });
             Some(ask_stage(model, *draft, Stage::Tree))
@@ -896,6 +934,7 @@ fn start(model: &mut Model, planned: &Planned, lock: RequestId) -> Command<Effec
                     name: name.clone(),
                     kubernetes: false,
                     drain: None,
+                    etcd: false,
                 },
                 None,
             ),
@@ -1236,6 +1275,32 @@ fn start_reading(
     );
 }
 
+/// The etcd pods, read right before this machine's node may go out of service: the nodes were
+/// just read and are fine, and `nodes` is what the pods are judged against.
+fn start_reading_etcd(
+    model: &mut Model,
+    roll: &mut Roll,
+    name: &str,
+    nodes: Vec<Node>,
+    out: &mut Vec<Command<Effect, Event>>,
+) {
+    let id = model.fresh_id();
+    roll.ids.insert(id, name.to_owned());
+    let run = roll.entries.get(name).and_then(|e| e.log);
+    if let Some(e) = roll.entries.get_mut(name) {
+        e.step = Step::ReadingEtcd(nodes);
+    }
+    out.push(
+        Command::request_from_shell(KubeRequest {
+            id,
+            log: run,
+            context: roll.context.clone(),
+            op: KubeOp::EtcdPods,
+        })
+        .then_send(move |answer| Event::KubeAnswered { id, answer }),
+    );
+}
+
 /// The drain, or the update itself.
 fn proceed(model: &mut Model, roll: &mut Roll, name: &str, out: &mut Vec<Command<Effect, Event>>) {
     match roll.entries.get(name).and_then(|e| e.member.drain) {
@@ -1366,6 +1431,7 @@ fn start_wait(
     };
     let run = entry.log;
     let node = entry.member.kubernetes.then(|| name.to_owned());
+    let etcd = entry.member.etcd;
     let baseline = entry.baseline.clone();
     let expect = entry
         .path
@@ -1397,7 +1463,9 @@ fn start_wait(
             run,
             format!(
                 "updated; waiting for {name} to be healthy{} (up to {}s)",
-                if node.is_some() {
+                if node.is_some() && etcd {
+                    " and its node Ready, with a heartbeat after the update, and its etcd Ready"
+                } else if node.is_some() {
                     " and its node Ready, with a heartbeat after the update"
                 } else {
                     ""
@@ -1415,6 +1483,7 @@ fn start_wait(
             target,
             expect,
             node,
+            etcd,
             context,
             baseline,
             timeout_seconds: roll.ready_timeout_seconds,
@@ -1500,7 +1569,11 @@ pub(super) fn kube_answered(
                     why.push(format!("{name} is not a node of the cluster"));
                 }
                 if why.is_empty() {
-                    proceed(model, roll, &name, out);
+                    if roll.entries.get(&name).is_some_and(|e| e.member.etcd) {
+                        start_reading_etcd(model, roll, &name, nodes.clone(), out);
+                    } else {
+                        proceed(model, roll, &name, out);
+                    }
                 } else {
                     // A cluster that is already short of a node is not the moment to take
                     // another out: not this machine's refusal but the group's stop.
@@ -1513,6 +1586,25 @@ pub(super) fn kube_answered(
                         out,
                     );
                 }
+            }
+            Step::ReadingEtcd(nodes) => {
+                if roll.stopping() {
+                    return;
+                }
+                let why = match answer {
+                    Ok(KubeReply::EtcdPods(pods)) => {
+                        let why = roll::etcd_unhealthy(&nodes, pods);
+                        if why.is_empty() {
+                            return proceed(model, roll, &name, out);
+                        }
+                        format!("etcd is not healthy: {}", why.join("; "))
+                    }
+                    Ok(_) => "etcd could not be read before it".to_owned(),
+                    Err(why) => format!("etcd could not be read before it: {why}"),
+                };
+                // Another member out of service while one is down can cost the quorum: the
+                // group's stop, as for a sick cluster.
+                end_member(model, roll, &name, Outcome::Failed(why), false, out);
             }
             Step::Draining { cancelling } => match answer {
                 Ok(KubeReply::Done) if !cancelling && !roll.stopping() => {
@@ -1745,7 +1837,11 @@ pub(super) fn stop(model: &mut Model, quit: bool) -> Vec<Command<Effect, Event>>
                 // machine has ended, which is then ignored): nothing is left to wait for. Only
                 // the wait follows an update, so only there is a node already ours and the
                 // machine already changed: it stays cordoned.
-                Step::Checking | Step::Baseline | Step::Reading | Step::Waiting => {
+                Step::Checking
+                | Step::Baseline
+                | Step::Reading
+                | Step::ReadingEtcd(_)
+                | Step::Waiting => {
                     for id in ids {
                         out.push(Command::notify_shell(CancelRequest { id }).into());
                         roll.ids.remove(&id);

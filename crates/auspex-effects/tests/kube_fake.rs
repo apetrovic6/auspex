@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use auspex_effects::kube::{KubeParams, drain, nodes, set_cordon};
+use auspex_effects::kube::{KubeParams, drain, etcd_pods, nodes, set_cordon};
 use auspex_effects::{CancellationToken, Cancelled};
 use common::{Tools, cleanup, still_alive_after_wait, tempdir, tools, wait_for_pids};
 use tokio::sync::mpsc::unbounded_channel;
@@ -412,5 +412,63 @@ async fn the_cluster_is_asked_which_it_is_and_every_pinned_call_carries_the_cont
             "uncordon",
             "luna"
         ]
+    );
+}
+
+const PODS: &str = r#"{"items":[{"spec":{"nodeName":"luna"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}},{"spec":{"nodeName":"sol"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"False"}]}}]}"#;
+
+#[tokio::test]
+async fn the_etcd_pods_are_asked_with_the_exact_argv_and_parsed() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let program = fake(&t, dir.path(), &format!("cat <<'EOF'\n{PODS}\nEOF"));
+    let pods = etcd_pods(
+        &params(&program, Duration::from_secs(10)),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        argv_log(dir.path()),
+        [vec![
+            "--kubeconfig",
+            KUBECONFIG,
+            "get",
+            "pods",
+            "-n",
+            "kube-system",
+            "-l",
+            "component=etcd",
+            "-o",
+            "json"
+        ]]
+    );
+    assert_eq!(pods.len(), 2);
+    assert!(pods[0].ready && !pods[1].ready);
+}
+
+#[tokio::test]
+async fn a_failing_pod_list_is_an_error_not_an_empty_one() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let program = fake(&t, dir.path(), "echo boom >&2\nexit 1");
+    let err = etcd_pods(
+        &params(&program, Duration::from_secs(10)),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(err.contains("kubectl get pods"), "{err}");
+    let garbage = fake(&t, dir.path(), "echo nope");
+    assert!(
+        etcd_pods(
+            &params(&garbage, Duration::from_secs(10)),
+            &CancellationToken::new()
+        )
+        .await
+        .unwrap()
+        .is_err()
     );
 }

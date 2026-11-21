@@ -155,6 +155,7 @@ never update together:
 kubernetes = true      # check node state in the cluster before and between machines
 drain = false          # cordon and drain before, uncordon after (default false)
 drain_timeout = 600    # kubectl drain's --timeout, seconds (default 600)
+etcd = false           # RKE2 control plane: every etcd member must be healthy before a machine goes out (default false)
 
 [update]
 parallel = 2           # machines with no rolling tag, at once (1..16, default 2)
@@ -189,6 +190,7 @@ before `clan` starts), and then:
 | it is marked `public` (its name has to be typed) | left out of the plan: update it with `u` |
 | it does not answer a probe at its turn | refused: its health afterwards could not be told from before |
 | the cluster is not healthy when its turn comes (see below) | **its rolling group stops** |
+| `etcd = true` and a member's etcd is not ready, or cannot be read, when its turn comes (see below) | **its rolling group stops** |
 | `clan` fails, a drain fails, or it does not become healthy | **its rolling group stops** (the rest is skipped); other groups carry on |
 
 **Kubernetes** (`kubernetes = true`, or `drain` set). auspex talks to the API with your `kubectl`
@@ -207,6 +209,29 @@ client of its own and not `kubectl` over ssh.
   or cordoned, **whoever cordoned it**, stops the group, and a node is drained only when it was
   schedulable a moment ago, which is what makes it auspex's to uncordon. A node someone else
   cordoned is never drained or uncordoned by auspex.
+- **etcd** (`etcd = true`, off by default; implies `kubernetes`). On RKE2 a control-plane node is an
+  etcd member, and taking one out while another member is down can cost the quorum even though every
+  node is `Ready`. With `etcd = true` auspex reads the etcd static pods (`kubectl get pods -n
+  kube-system -l component=etcd`, one per member) and the nodes' `node-role.kubernetes.io/etcd`
+  label, in the plan and again **before every machine of the group**: every labelled node must have
+  an etcd pod that is `Running` and `Ready`, otherwise the group is refused in the plan, or its next
+  machine fails (**the group stops**) before anything is cordoned or drained. The rule is stricter
+  than the quorum on purpose: *every* member, not "enough", and it applies to any machine of the
+  group, members or not. What cannot be told counts as unhealthy: a pod list that cannot be read, no
+  node with the label at all, an etcd pod on a node without it. After an update the machine is not
+  done until its own etcd pod is `Ready` again (as well as its node), so the last machine of a
+  group is checked too. Set `etcd = true` on the tag of an RKE2 control plane; leave it off on a
+  cluster without etcd pods in `kube-system` (k3s with sqlite, a managed control plane, external
+  etcd), where it could never pass.
+
+  **Verify before you rely on it.** Pod `Ready` is the kubelet's view of the etcd container's
+  *readiness probe*. Whether RKE2's probe reflects the member's health in the cluster, or only that
+  the process answers, was not checked against a real cluster (auspex's tests use a fake `kubectl`).
+  Check it once on your own control plane: `kubectl -n kube-system get pod etcd-<node> -o yaml` and
+  read `readinessProbe` (and `startupProbe`), and compare with what happens to the pod when a member
+  is stopped. Known gaps even then: a node whose kubelet died keeps a `Ready` pod for about 40 s;
+  a member that is not a labelled node (a learner, a removed node) is invisible; and a member that
+  goes down while the machine being updated is switching is noticed at the next turn.
 - **Between machines** the roll waits until the updated machine runs the system that was deployed,
   has **no failed unit that it did not already have** when its turn began (a baseline probe, compared
   by unit name: a unit that was failed before is not the update's doing, a new one is, and
@@ -370,6 +395,7 @@ frozen = true       # freeze it declaratively: `u` refuses it, `U` skips it, `f`
 [rolling.taghmata]  # `U`: machines with this tag update one at a time (see Updating everything)
 kubernetes = true
 drain = false
+etcd = false
 
 [update]
 parallel = 2        # machines with no rolling tag updated at once by `U`

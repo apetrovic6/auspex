@@ -36,7 +36,7 @@ let
     cache.url = "https://ncps.example";
     machines.terra = { target = "root@192.168.1.10"; prometheus_instance = "terra:9100"; public = true; frozen = true; };
     rolling = {
-      taghmata = { kubernetes = true; drain = true; drain_timeout = 900; };
+      taghmata = { kubernetes = true; drain = true; drain_timeout = 900; etcd = true; };
       skitarii = { kubernetes = false; drain = false; };
     };
     update = { parallel = 3; ready_timeout = 300; };
@@ -195,6 +195,8 @@ let
       rejected = value: !(builtins.tryEval (builtins.deepSeq (tag value) true)).success;
     in (tag { kubernetes = true; }).kubernetes == true
       && (tag { drain = false; }).drain == false
+      && (tag { etcd = true; }).etcd == true
+      && rejected { etcd = "yes"; }
       && (tag { drain_timeout = 86400; }).drain_timeout == 86400
       && rejected { kubernetes = 1; } && rejected { drain = "yes"; }
       && rejected { drain_timeout = 0; } && rejected { drain_timeout = 86401; }

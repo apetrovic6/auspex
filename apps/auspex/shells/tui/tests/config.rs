@@ -14,6 +14,10 @@ use common::{auspex, crate_dir, run_within, tempdir};
 /// options (`nix/auspex/checks.nix`, `auspex-full`). Every value must arrive here, so the
 /// module and the binary cannot drift apart.
 #[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one assertion per option of the whole contract: split, it stops reading as one fixture"
+)]
 fn the_home_manager_contract_fixture_loads_whole() {
     let fixture = crate_dir().join("../../../../nix/auspex/expected.toml");
     let loaded = config::load(Some(&fixture)).unwrap();
@@ -74,6 +78,7 @@ fn the_home_manager_contract_fixture_loads_whole() {
                     kubernetes: true,
                     drain: true,
                     drain_timeout_seconds: 900,
+                    etcd: true,
                 }
             ),
             (
@@ -82,6 +87,7 @@ fn the_home_manager_contract_fixture_loads_whole() {
                     kubernetes: false,
                     drain: false,
                     drain_timeout_seconds: auspex_domain::roll::DEFAULT_DRAIN_TIMEOUT_SECONDS,
+                    etcd: false,
                 }
             ),
         ])
@@ -481,7 +487,7 @@ fn machines_public_reaches_the_core_and_defaults_to_false() {
 #[test]
 fn the_rolling_settings_reach_the_cores_configuration() {
     let (s, _) = config::parse(
-        "[rolling.taghmata]\nkubernetes = true\ndrain = true\ndrain_timeout = 77\n\
+        "[rolling.taghmata]\nkubernetes = true\ndrain = true\ndrain_timeout = 77\netcd = true\n\
          [update]\nparallel = 5\nready_timeout = 321\n\
          [kubernetes]\nkubeconfig = \"/k/config\"\n",
     )
@@ -494,7 +500,8 @@ fn the_rolling_settings_reach_the_cores_configuration() {
         auspex_domain::roll::RollRule {
             kubernetes: true,
             drain: true,
-            drain_timeout_seconds: 77
+            drain_timeout_seconds: 77,
+            etcd: true
         }
     );
     assert_eq!(
