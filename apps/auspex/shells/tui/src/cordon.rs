@@ -92,7 +92,9 @@ impl Cordons {
             .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
-    /// `node`'s drain is starting: it is cordoned by auspex from now on.
+    /// `node`'s drain is starting: it is cordoned by auspex from now on, and only now: a node an
+    /// earlier run left cordoned (and the operator then uncordoned by hand) is not "left" any more,
+    /// whatever this drain comes to.
     pub fn register(
         &self,
         node: &str,
@@ -102,6 +104,7 @@ impl Cordons {
     ) {
         self.with(|i| {
             i.pending.retain(|h| h.node != node);
+            i.left.retain(|h| h.node != node);
             i.pending.push(Held {
                 node: node.to_owned(),
                 kubectl,
@@ -124,6 +127,9 @@ impl Cordons {
         self.with(|i| {
             if let Some(at) = i.pending.iter().position(|h| h.node == node) {
                 let held = i.pending.remove(at);
+                // One entry per node: a second commit (or one after a `left` that was never
+                // cleared) would name the node twice at exit.
+                i.left.retain(|h| h.node != node);
                 i.left.push(held);
             }
         });
@@ -295,6 +301,41 @@ mod tests {
         assert_eq!(c.held(), ["sol", "luna"]);
         // Releasing a node it never held is nothing.
         c.release("nobody");
+    }
+
+    /// N8. A node whose update failed is left cordoned and the operator uncordons it by hand; the next
+    /// `U` of the same process drains it again. The old record must not outlive the new drain: the
+    /// exit names the node once (and not as "left cordoned" when it was uncordoned at quit), and a
+    /// second commit never lists it twice.
+    #[test]
+    fn a_new_drain_replaces_what_an_earlier_run_left_and_a_commit_never_lists_a_node_twice() {
+        let c = Cordons::default();
+        held(&c, "luna");
+        c.commit("luna");
+        assert_eq!(c.held(), ["luna"], "left cordoned by the first run");
+        // The operator uncordoned it by hand; a later drain of luna starts.
+        held(&c, "luna");
+        assert_eq!(c.held(), ["luna"], "named once, as pending");
+        // Quit during that drain: the exit uncordons it, and does not also say it was left.
+        let report = c.last_resort(Duration::from_secs(1));
+        assert_eq!(report.len(), 1, "{report:?}");
+        assert!(
+            report[0].starts_with("node luna is STILL CORDONED"),
+            "{report:?}"
+        );
+        // `commit` is a guard of its own: a record that already has the node as left (it cannot
+        // through `register`, which clears it) still ends with one entry.
+        held(&c, "sol");
+        c.with(|i| {
+            let again = i.pending.last().unwrap().clone();
+            i.left.push(again);
+        });
+        c.commit("sol");
+        assert_eq!(
+            c.held(),
+            ["luna", "sol"],
+            "luna is still pending; sol is named once"
+        );
     }
 
     /// A panic in some other thread (an adapter's task) is not the end of auspex, so the hook must

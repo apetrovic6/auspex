@@ -121,8 +121,44 @@ const NODES_STALE: &str = r#"{"items":[
 
 const VIEW: &str = r#"{"current-context":"rke2","contexts":[{"name":"rke2","context":{"cluster":"c1"}}],"clusters":[{"name":"c1","cluster":{"server":"https://10.0.0.1:6443"}}]}"#;
 
-/// Every kubelet renewed its lease just now.
-const LEASES_NOW: &str = r#"now=$(@date@ -u +%Y-%m-%dT%H:%M:%SZ); printf '{"items":[{"metadata":{"name":"luna"},"spec":{"renewTime":"%s"}},{"metadata":{"name":"mars"},"spec":{"renewTime":"%s"}},{"metadata":{"name":"sol"},"spec":{"renewTime":"%s"}},{"metadata":{"name":"terra"},"spec":{"renewTime":"%s"}}]}\n' "$now" "$now" "$now" "$now""#;
+/// The lease list the fake `kubectl` answers, in which every kubelet renews at each read: the
+/// times are the kubelets' own, a fixed day plus one second per read, so they never come near this
+/// machine's clock (which auspex must not compare them with), and each read is newer than the one
+/// before it (a node is back only for a heartbeat newer than the one it had when the wait began).
+/// `behind` names the kubelets that are that many seconds behind the others, from read number
+/// `from_read` on (0: from the first). A node that is not in `nodes` has no lease.
+fn leases(nodes: &[&str], behind: &[(&str, u32)], from_read: u32) -> String {
+    use std::fmt::Write as _;
+    let mut items = Vec::new();
+    let mut args = Vec::new();
+    let mut backs = String::new();
+    for (i, node) in nodes.iter().enumerate() {
+        let back = behind
+            .iter()
+            .find(|(b, _)| b == node)
+            .map_or(0, |(_, secs)| *secs);
+        let _ = write!(backs, "b{i}=0; [ \"$r\" -gt {from_read} ] && b{i}={back}; ");
+        items.push(format!(
+            r#"{{"metadata":{{"name":"{node}"}},"spec":{{"renewTime":"%s"}}}}"#
+        ));
+        // `printf` and shell arithmetic only: nothing here is GNU-only, and it needs no `date`.
+        args.push(format!(
+            r#""$(printf '2030-01-01T%02d:%02d:%02dZ' $(((n-b{i})/3600)) $(((n-b{i})/60%60)) $(((n-b{i})%60)))""#
+        ));
+    }
+    format!(
+        "f='@dir@/lease.reads'; r=$(@cat@ \"$f\" 2>/dev/null || echo 0); r=$((r+1)); \
+         echo $r > \"$f\"; n=$((r+36000)); {backs}\
+         printf '{{\"items\":[{}]}}\\n' {}",
+        items.join(","),
+        args.join(" ")
+    )
+}
+
+/// Every kubelet of the demo cluster renews at every read.
+fn leases_alive() -> String {
+    leases(&["luna", "mars", "sol", "terra"], &[], 0)
+}
 
 /// The fake `clan`: records `start <machine>` and `end <machine>` around `sleep_seconds`, and
 /// its own pid, for the tests that kill it. `log` is where `start`/`end` go (shared by two
@@ -172,7 +208,7 @@ fn kubectl_body(nodes: &str, drain_exit: i32) -> String {
         &cat(nodes),
         &format!("echo 'node drained (fake)'; exit {drain_exit}"),
         "echo 'node uncordoned (fake)'",
-        LEASES_NOW,
+        &leases_alive(),
     )
 }
 
@@ -193,7 +229,7 @@ fn kubectl_degrading(healthy_calls: u32, later: &str) -> String {
         &get_nodes,
         "echo 'node drained (fake)'",
         "echo 'node uncordoned (fake)'",
-        LEASES_NOW,
+        &leases_alive(),
     )
 }
 
@@ -451,14 +487,18 @@ async fn u_updates_the_group_one_at_a_time_beside_the_free_machine() {
         "cypramundi is not part of the group: {events:?}"
     );
     // The cluster: which one (before the context is known, so unpinned), then the nodes for the
-    // plan, and for each of luna and sol one read before and one wait after. Every call after the
-    // question is pinned to the context it showed.
+    // plan, and for each of luna and sol one read before, and for the wait after two: the first
+    // records the node's heartbeat as the wait begins, the second finds a newer one (the fake
+    // lease moves on at every read). Every call after the question is pinned to the context it
+    // showed.
     let calls = w.kubectl_calls();
     assert_eq!(calls[0], w.kc("config view --minify -o json"), "{calls:#?}");
     let nodes = w.kcx("get nodes -o json");
     assert_eq!(
         calls[1..],
         [
+            nodes.clone(),
+            nodes.clone(),
             nodes.clone(),
             nodes.clone(),
             nodes.clone(),
@@ -498,7 +538,8 @@ async fn u_updates_the_group_one_at_a_time_beside_the_free_machine() {
 }
 
 /// With `drain = true`, in the order the brief says, each call pinned to the context: read the
-/// cluster, drain, update, wait for Ready, uncordon, and the next machine's read only after that.
+/// cluster, drain, update, wait for Ready (a read that records the node's heartbeat, then one that
+/// finds a newer), uncordon, and the next machine's read only after that.
 /// The drain is in the machine's action-log row.
 #[tokio::test]
 async fn with_drain_kubectl_is_read_drain_wait_uncordon_for_each_machine_in_turn() {
@@ -534,9 +575,11 @@ async fn with_drain_kubectl_is_read_drain_wait_uncordon_for_each_machine_in_turn
             nodes.clone(),
             drain("luna"),
             nodes.clone(),
+            nodes.clone(),
             w.kcx("uncordon luna"),
             nodes.clone(),
             drain("sol"),
+            nodes.clone(),
             nodes.clone(),
             w.kcx("uncordon sol"),
         ],
@@ -770,8 +813,9 @@ async fn a_signal_during_a_drain_uncordons_the_node_before_exit() {
     let kubectl = kubectl_with(
         &cat(NODES_READY),
         "echo 'evicting (fake)'; @sleep@ 30",
-        "echo 'node uncordoned (fake)'",
-        LEASES_NOW,
+        // Slow enough that the core's uncordon is still running when the shell could act.
+        "@sleep@ 1; echo 'node uncordoned (fake)'",
+        &leases_alive(),
     );
     let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
     settled(&w.shell).await;
@@ -784,6 +828,16 @@ async fn a_signal_during_a_drain_uncordons_the_node_before_exit() {
         calls.iter().any(|c| c.ends_with("uncordon luna")),
         "luna was left cordoned after a signal: {calls:#?}"
     );
+    // MC. Once: the core's own, given its grace to finish. A shell that went on to its own last
+    // resort at once would run a second one beside it.
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.ends_with("uncordon luna"))
+            .count(),
+        1,
+        "{calls:#?}"
+    );
     assert_eq!(
         w.shell.exit_report(),
         Vec::<String>::new(),
@@ -794,6 +848,18 @@ async fn a_signal_during_a_drain_uncordons_the_node_before_exit() {
         "luna was never updated: {:?}",
         w.clan_events()
     );
+    // MC. The core was given its grace to stop the roll itself: it cancelled the drain, uncordoned
+    // luna (that uncordon was not cut off by the shell's own cancelling) and ended the machine as
+    // cancelled, closing its row so. A shell that cancelled everything at once would leave the core
+    // with an uncordon that never ran, a node it thinks is still cordoned, and an interrupted row.
+    assert_eq!(state(&w.shell, "luna"), RollState::Cancelled);
+    assert_eq!(
+        w.shell.view().roll.unwrap().left_cordoned,
+        Vec::<String>::new()
+    );
+    let r = rows(&w.db, w.fleet.path(), "luna").await;
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].result, Some(LoggedResult::Cancelled), "{r:?}");
 }
 
 /// F2. A second `q` while the first is stopping the roll forces the exit and cancels the uncordon
@@ -808,7 +874,7 @@ async fn a_forced_quit_during_a_drain_still_uncordons_the_node() {
         &cat(NODES_READY),
         "echo 'evicting (fake)'; @sleep@ 30",
         "if [ -e '@dir@/unc1' ]; then echo 'node uncordoned (fake)'; else touch '@dir@/unc1'; @sleep@ 30; fi",
-        LEASES_NOW,
+        &leases_alive(),
     );
     let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
     settled(&w.shell).await;
@@ -856,7 +922,7 @@ async fn an_uncordon_that_cannot_be_made_at_exit_is_said_with_the_command() {
         &cat(NODES_READY),
         "echo 'evicting (fake)'; @sleep@ 30",
         "echo 'forbidden' >&2; exit 1",
-        LEASES_NOW,
+        &leases_alive(),
     );
     let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
     settled(&w.shell).await;
@@ -880,6 +946,113 @@ async fn an_uncordon_that_cannot_be_made_at_exit_is_said_with_the_command() {
             .iter()
             .any(|l| l.contains("STILL CORDONED")),
         "and in the log"
+    );
+}
+
+/// MD, ME, MF and N7 (the hanging case). A signal while luna is being drained, with a `kubectl
+/// uncordon` that never answers (the core's, and the shell's own at exit). A second signal (here: a
+/// second after the first) must cut the core's grace short, the exit must kill the hung uncordon at
+/// its bound, say which node is still cordoned, and the row of the machine whose run never ended must
+/// be closed saying so. Every bound is real time, so the test runs against a clock: it fails if the
+/// exit takes more than a few seconds (the grace is 20 s, the uncordon's `sleep` is 30 s).
+#[tokio::test]
+async fn a_second_signal_cuts_the_grace_short_and_a_hung_uncordon_is_killed_and_named() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let kubectl = kubectl_with(
+        &cat(NODES_READY),
+        "echo 'evicting (fake)'; @sleep@ 30",
+        // `exec`: killing the script kills the `sleep`, so nothing outlives the test.
+        "exec @sleep@ 30",
+        &leases_alive(),
+    );
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
+    w.shell.set_last_resort_bound(Duration::from_secs(1));
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_state(&w.shell, "luna", RollState::Draining).await;
+    let began = std::time::Instant::now();
+    let second_signal = tokio::time::sleep(Duration::from_secs(1));
+    if tokio::time::timeout(
+        Duration::from_secs(12),
+        w.shell.terminate_with(second_signal),
+    )
+    .await
+    .is_err()
+    {
+        panic!("leaving took more than 12 s: the second signal or the bound did nothing");
+    }
+    assert!(
+        began.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        began.elapsed()
+    );
+    let report = w.shell.exit_report();
+    assert!(
+        report
+            .iter()
+            .any(|l| l.starts_with("node luna is STILL CORDONED")
+                && l.contains("took more than 1s")
+                && l.contains("uncordon luna")),
+        "{report:?}"
+    );
+    // MF, and N7 from the other side: the row was held open (the core never ended luna), is closed
+    // as interrupted, and names the node, because it really is left cordoned.
+    let r = rows(&w.db, w.fleet.path(), "luna").await;
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].result, Some(LoggedResult::Interrupted), "{r:?}");
+    let detail = r[0].detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("auspex left before this was over"),
+        "{detail:?}"
+    );
+    assert!(
+        detail.contains("nodes still cordoned by auspex: luna"),
+        "{detail:?}"
+    );
+}
+
+/// N7. The same signal, but the shell's own uncordon at exit works (the core's hangs, the fake
+/// says so once). The node is back, so the row of the machine, closed after it, must not say it
+/// is still cordoned. Closed first, it did.
+#[tokio::test]
+async fn a_row_closed_at_exit_names_only_the_nodes_really_left_cordoned() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let kubectl = kubectl_with(
+        &cat(NODES_READY),
+        "echo 'evicting (fake)'; @sleep@ 30",
+        "if [ -e '@dir@/unc1' ]; then echo 'node uncordoned (fake)'; else touch '@dir@/unc1'; exec @sleep@ 30; fi",
+        &leases_alive(),
+    );
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_state(&w.shell, "luna", RollState::Draining).await;
+    let second_signal = tokio::time::sleep(Duration::from_secs(1));
+    w.shell.terminate_with(second_signal).await;
+    assert_eq!(w.shell.exit_report(), Vec::<String>::new(), "luna is back");
+    let uncordons = w
+        .kubectl_calls()
+        .into_iter()
+        .filter(|c| c.ends_with("uncordon luna"))
+        .count();
+    assert_eq!(uncordons, 2, "the core's (killed), then the shell's");
+    let r = rows(&w.db, w.fleet.path(), "luna").await;
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].result, Some(LoggedResult::Interrupted), "{r:?}");
+    let detail = r[0].detail.clone().unwrap_or_default();
+    assert!(
+        detail.contains("auspex left before this was over"),
+        "{detail:?}"
+    );
+    assert!(
+        !detail.contains("still cordoned"),
+        "the node was given back first: {detail:?}"
     );
 }
 
@@ -961,6 +1134,31 @@ async fn a_second_auspex_cannot_roll_the_fleet_while_the_first_does() {
     act_on(&a.shell);
     act_on(&b.shell);
     roll(&a.shell).await;
+    // MG. A lone `u` takes the same lock: while A rolls, B's `u` of a machine is refused too (the
+    // shell's lock is not only for "update all"). A took the lock at its `y`, before anything
+    // started, so this needs no race with A's machines.
+    b.shell.send(Event::Search("cypramundi".to_owned()));
+    b.shell.send(Event::UpdateSelected);
+    until(&b.shell, "B's `u` to be asked about", |v| {
+        v.confirm
+            .as_ref()
+            .is_some_and(|c| c.kind == ConfirmKind::Update)
+    })
+    .await;
+    b.shell.send(Event::ConfirmAnswer(true));
+    until(&b.shell, "B's refusal of the `u`", |v| {
+        v.notice.as_deref().is_some_and(|n| {
+            n.starts_with("not updating: another auspex is updating this fleet")
+                && n.contains("update all")
+        })
+    })
+    .await;
+    // (cypramundi is one of A's machines too: it is updated once, by A.)
+    let starts = lines(&clan_log)
+        .iter()
+        .filter(|l| *l == "start cypramundi")
+        .count();
+    assert!(starts <= 1, "B's `u` ran an update: {:?}", lines(&clan_log));
     // A is on sol when B asks.
     let log = clan_log.clone();
     let wait = async {
@@ -1269,7 +1467,7 @@ fn kubectl_etcd(healthy_calls: u32, pods: &str, later: &str) -> String {
          *) echo 'ok (fake)';;\n\
          esac\n",
         view = cat(VIEW),
-        leases = LEASES_NOW,
+        leases = leases_alive(),
         nodes = cat(NODES_ETCD),
     )
 }
@@ -1503,4 +1701,171 @@ async fn a_short_poll_interval_ends_the_wait_sooner_than_the_default() {
         "a 1 s interval looked again after {gap} s: {times:?}"
     );
     w.shell.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------
+// the kubelets' heartbeats (N2, N4)
+// ---------------------------------------------------------------------------------------
+
+/// N2 (the reviewer's RR2), at the plan. mars's kubelet is 45 s behind every other: it is down, and
+/// the node controller has not yet turned its `Ready` into `Unknown` (its grace is about 40 s). The
+/// plan refuses the cluster's group, saying which node and for how long, and `clan` is not run for
+/// it. The time is measured between the kubelets (the newest heartbeat of the same read), never
+/// against this machine's clock: the leases here are dated 2030.
+#[tokio::test]
+async fn a_node_whose_kubelet_went_silent_refuses_the_group_at_the_plan() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let kubectl = kubectl_with(
+        &cat(NODES_READY),
+        "echo drained",
+        "echo uncordoned",
+        &leases(&["luna", "mars", "sol", "terra"], &[("mars", 45)], 0),
+    );
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    plan(&w.shell).await;
+    let lines = w.shell.view().confirm.unwrap().lines;
+    assert!(
+        lines.iter().any(|l| l.starts_with("skipped luna:")
+            && l.contains("node mars is Ready, but its kubelet has been silent for 45 s")),
+        "{lines:?}"
+    );
+    w.shell.send(Event::ConfirmAnswer(true));
+    until_over(&w.shell).await;
+    assert_eq!(w.clan_events(), ["start cypramundi", "end cypramundi"]);
+    assert!(
+        w.kubectl_calls()
+            .iter()
+            .all(|c| !c.contains("drain") && !c.contains("uncordon")),
+        "{:#?}",
+        w.kubectl_calls()
+    );
+    w.shell.shutdown().await;
+}
+
+/// N2, at the read before a machine: the plan's look and the read at `y` are healthy, then mars's
+/// kubelet stops. The next read stops the group before luna is drained, and the Log says why. (With
+/// `drain = true`, the case the reviewer reproduced, and the default `drain = false` has the same
+/// read.)
+#[tokio::test]
+async fn a_kubelet_that_went_silent_after_the_plan_stops_the_group_before_the_next_machine() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let kubectl = kubectl_with(
+        &cat(NODES_READY),
+        "echo drained",
+        "echo uncordoned",
+        &leases(&["luna", "mars", "sol", "terra"], &[("mars", 45)], 1),
+    );
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_over(&w.shell).await;
+    match state(&w.shell, "luna") {
+        RollState::Failed(why) => assert!(
+            why.contains("node mars is Ready, but its kubelet has been silent for 45 s"),
+            "{why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(state(&w.shell, "sol"), RollState::Skipped(_)));
+    let events = w.clan_events();
+    assert!(!events.contains(&"start luna".to_owned()), "{events:?}");
+    assert!(
+        w.kubectl_calls()
+            .iter()
+            .all(|c| !c.contains("drain luna") && !c.contains("uncordon luna")),
+        "nothing was drained: {:#?}",
+        w.kubectl_calls()
+    );
+    w.shell.shutdown().await;
+}
+
+/// N2: leases that cannot be read leave the check as it was (a kubelet's silence is not judged on
+/// the `Ready` condition's own heartbeat, which is rewritten only every few minutes), and the
+/// machine's Log line says so.
+#[tokio::test]
+async fn without_the_leases_the_silence_is_not_judged_and_the_log_says_so() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    // luna's condition heartbeat is minutes older than mars's, and there are no leases.
+    let nodes = r#"{"items":[
+      {"metadata":{"name":"luna"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:00:00Z"}]}},
+      {"metadata":{"name":"mars"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:09:00Z"}]}},
+      {"metadata":{"name":"sol"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:09:00Z"}]}}
+    ]}"#;
+    let kubectl = kubectl_with(&cat(nodes), "echo drained", "echo uncordoned", "exit 1");
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(false), 1);
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_over(&w.shell).await;
+    // luna started: the read let it through (the wait then fails it, with no lease to show a
+    // new heartbeat; that is the wait's rule, not this one's).
+    assert!(
+        w.clan_events().contains(&"start luna".to_owned()),
+        "{:?}",
+        w.clan_events()
+    );
+    let out = w.shell.output();
+    let log: Vec<String> = out
+        .window(0, out.rows())
+        .into_iter()
+        .map(|l| l.text)
+        .collect();
+    assert!(
+        log.iter()
+            .any(|l| l.contains("luna: the node leases could not be read")),
+        "{log:#?}"
+    );
+    w.shell.shutdown().await;
+}
+
+/// The reviewer's RR3 lease list (frozen, and ahead of this machine's clock): every lease says one fixed time, in
+/// 2030, and no kubelet renews after the plan.
+fn leases_frozen() -> String {
+    let item = |n: &str| {
+        format!(r#"{{"metadata":{{"name":"{n}"}},"spec":{{"renewTime":"2030-01-01T00:01:00Z"}}}}"#)
+    };
+    format!(
+        "printf '%s\\n' '{{\"items\":[{}]}}'",
+        ["luna", "mars", "sol", "terra"].map(item).join(",")
+    )
+}
+
+/// N4 (the reviewer's RR3). The wait must not compare the kubelets' clock with this machine's:
+/// nodes a few years ahead whose kubelets never renew after the update would count as "heard from
+/// since" at once. A node is back only for a heartbeat newer than the one it had when the wait
+/// began, so these fail at the deadline.
+#[tokio::test]
+async fn a_node_clock_ahead_of_auspex_does_not_pass_the_wait_on_a_heartbeat_from_before() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let kubectl = kubectl_with(
+        &cat(NODES_READY),
+        "echo drained",
+        "echo uncordoned",
+        &leases_frozen(),
+    );
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(false), 3);
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_over(&w.shell).await;
+    let luna = state(&w.shell, "luna");
+    w.shell.shutdown().await;
+    match luna {
+        RollState::Failed(why) => assert!(
+            why.contains("its kubelet has not been heard from since the update"),
+            "{why}"
+        ),
+        other => panic!("no kubelet renewed after the update, yet: {other:?}"),
+    }
 }

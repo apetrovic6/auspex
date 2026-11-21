@@ -147,6 +147,12 @@ all`). The kernel drops the lock when the process ends, so a crash cannot leave 
 with no usable state directory has no lock to take, and then the freezes are unknown and nothing
 can be updated anyway.
 
+That lock is **per user, per machine and per checkout of the fleet**, not global: it lives in the
+state directory of the user running auspex and is keyed by the fleet's canonical path (or by the
+flake reference as written). Two operators, one operator on two machines, a second checkout of the
+same fleet, and a remote flake reference beside a local checkout each take a different lock and are
+**not** kept apart by it.
+
 **Rolling is configuration, not tag names built into auspex.** Name the tags whose machines must
 never update together:
 
@@ -204,7 +210,19 @@ client of its own and not `kubectl` over ssh.
   whose current context is another cluster, cannot send a drain elsewhere.
 - **Before the roll,** any node that is `NotReady` or cordoned refuses the group (listed as
   skipped, with the reason), and so does a machine that is no node of the cluster (a node is named
-  like its machine).
+  like its machine). So does a node that says `Ready` but whose kubelet has gone quiet (below).
+  A machine that **is** a node of the cluster but has no rolling tag would update beside the
+  cluster's group; the plan says so in a `warning:` line naming it (it does not refuse anything).
+- **A kubelet that has gone quiet is not healthy.** A node whose kubelet stopped keeps
+  `Ready=True` for about 40 s before the node controller flips it. A `Ready` node whose newest
+  heartbeat (the newer of the `Ready` condition's `lastHeartbeatTime` and the node lease's
+  `renewTime`) is **more than 40 s older** than the newest heartbeat of any node in the same read
+  counts as not healthy: it refuses the group in the plan and stops it before the next machine, with
+  a sentence naming the node and the age (`node mars is Ready, but its kubelet has been silent for
+  45 s`). The age is node against node, never against this machine's clock, so a skew between the
+  desktop and the cluster does not matter. 40 s is fixed, not a setting. When the leases cannot be
+  read the check is skipped (the condition's own heartbeat is only rewritten every few minutes, so
+  it would call every node silent), and the machine's Log line says so.
 - **Before every machine** that uses the cluster, the nodes are read again (so also right after the
   `y`, for the first of each group, however long the plan sat on screen): any node that is `NotReady`
   or cordoned, **whoever cordoned it**, stops the group, and a node is drained only when it was
@@ -237,14 +255,16 @@ client of its own and not `kubectl` over ssh.
   has **no failed unit that it did not already have** when its turn began (a baseline probe, compared
   by unit name: a unit that was failed before is not the update's doing, a new one is, and
   `degraded` is accepted only when every failed unit is in the baseline), systemd is past `starting`,
-  **and** its node is `Ready` **with a heartbeat newer than the end of the update** (the newer of the
-  `Ready` condition's `lastHeartbeatTime` and the node lease's `renewTime`, `kubectl get leases -n
-  kube-node-lease`): `Ready=True` stays true for about 40 s after a kubelet stops reporting, so a
-  switch that restarts rke2 for 20 s would otherwise pass on the condition it had before. `Unknown`
-  is not `Ready`. It polls every `update.poll_interval` (default 5 s, never above
-  `update.ready_timeout`) up to `update.ready_timeout`; a kubectl that fails or a node that is not
-  in the list is "not yet", never "healthy". (The comparison uses this machine's clock and the
-  kubelets'; a skew of seconds only makes the wait a little longer.)
+  **and** its node is `Ready` **with a heartbeat newer than the one it had when the wait began**
+  (the newer of the `Ready` condition's `lastHeartbeatTime` and the node lease's `renewTime`,
+  `kubectl get leases -n kube-node-lease`): `Ready=True` stays true for about 40 s after a kubelet
+  stops reporting, so a switch that restarts rke2 for 20 s would otherwise pass on the condition it
+  had before. `Unknown` is not `Ready`. It polls every `update.poll_interval` (default 5 s, never
+  above `update.ready_timeout`) up to `update.ready_timeout`; a kubectl that fails or a node that is
+  not in the list is "not yet", never "healthy". (Each node's heartbeat is compared with **its own** earlier one, recorded when the wait began, so no clock is
+  compared with another: not this machine's with the kubelets', in either direction, and not one
+  node's with another's. A node that was already back when the wait began shows its next heartbeat
+  within about 10 s.)
 - **Drain** (`drain = true`): `kubectl drain --ignore-daemonsets --delete-emptydir-data --timeout
   <t>s` before the update, uncordon after the wait. Off by default because a NixOS switch does not
   reboot the node and RKE2's containers survive a restart of the service.

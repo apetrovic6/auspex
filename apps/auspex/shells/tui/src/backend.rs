@@ -810,13 +810,14 @@ impl Real {
         probe: bool,
     ) -> Result<AwaitAnswer, Cancelled> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(op.timeout_seconds);
-        // The update has just ended: a node counts as back only for a heartbeat from now on. (The
-        // clock is this machine's; the kubelets' are NTP's: a skew of seconds would only make the
-        // wait a little longer.)
-        let since = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| i64::try_from(d.as_secs()).ok());
+        // The update has just ended: a node counts as back only for a heartbeat newer than the one
+        // it has now. Each node's own heartbeat is compared with its own earlier one, so no clock is
+        // compared with another: a node whose clock runs ahead of this machine's would pass on a
+        // heartbeat from before the switch, and one that runs behind would never pass.
+        let mut since = match &op.node {
+            Some(node) => self.heartbeat_now(op, node, cancel, sink).await?,
+            None => None,
+        };
         loop {
             let machine = if probe {
                 let request = ProbeRequest {
@@ -843,8 +844,18 @@ impl Real {
                     };
                     match self.kube(&ask, cancel, sink).await? {
                         Ok(KubeReply::Nodes(nodes)) => {
-                            use auspex_domain::roll::NodeState;
-                            match auspex_domain::roll::node_state(&nodes, node, since) {
+                            use auspex_domain::roll::{NodeState, Since};
+                            // The record could not be taken when the wait began (the cluster did
+                            // not answer, or did not list the node): the first look that has the
+                            // node takes it, and a heartbeat after that is the proof.
+                            if since.is_none() {
+                                since = auspex_domain::roll::heartbeat_of(&nodes, node);
+                            }
+                            match auspex_domain::roll::node_state(
+                                &nodes,
+                                node,
+                                since.unwrap_or(Since::Unasked),
+                            ) {
                                 NodeState::Ready => {
                                     match self.etcd_back(op, &nodes, node, cancel, sink).await? {
                                         None => return Ok(Ok(())),
@@ -874,6 +885,27 @@ impl Real {
                 () = tokio::time::sleep(left.min(Duration::from_secs(op.poll_seconds.max(1)))) => {}
             }
         }
+    }
+
+    /// The heartbeat `node` has as a wait begins, to be beaten (see `await_loop`); `None`
+    /// when the cluster could not be read or has no such node.
+    async fn heartbeat_now(
+        &self,
+        op: &AwaitRequest,
+        node: &str,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<Option<auspex_domain::roll::Since>, Cancelled> {
+        let ask = KubeRequest {
+            id: op.id,
+            log: op.log,
+            context: op.context.clone(),
+            op: KubeOp::Nodes,
+        };
+        Ok(match self.kube(&ask, cancel, sink).await? {
+            Ok(KubeReply::Nodes(nodes)) => auspex_domain::roll::heartbeat_of(&nodes, node),
+            _ => None,
+        })
     }
 
     /// For an etcd group, whether the node's etcd pod is `Ready` again: `None` when it is (or the

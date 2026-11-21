@@ -103,6 +103,7 @@ fn node(name: &str, ready: bool, cordoned: bool) -> Node {
         ready,
         cordoned,
         heartbeat: None,
+        lease: None,
         etcd: false,
     }
 }
@@ -2005,4 +2006,50 @@ fn the_wait_is_asked_to_poll_at_the_configured_interval() {
     let w = take_await(&mut s, "luna");
     assert_eq!(w.operation.poll_seconds, 7);
     assert_eq!(w.operation.timeout_seconds, 321);
+}
+
+/// A machine that is a node of the cluster but has no rolling group updates beside the cluster's
+/// group, which is what the group is for: the plan warns, naming it. A free machine that is no node
+/// of the cluster (alfrost) is no business of the cluster's and gets no warning.
+#[test]
+fn a_node_of_the_cluster_that_rolls_with_no_group_is_warned_about_in_the_plan() {
+    let fleet = r#"{
+      "alfrost": {"deploy": {"targetHost": "root@192.168.1.1"}},
+      "luna":    {"tags": ["a"], "deploy": {"targetHost": "root@192.168.1.11"}},
+      "mars":    {"tags": ["a"], "deploy": {"targetHost": "root@192.168.1.12"}},
+      "terra":   {"deploy": {"targetHost": "root@192.168.1.14"}}
+    }"#;
+    let mut config = config_with(k8s(), 2);
+    config.rolling.rules = [("a".to_owned(), k8s())].into();
+    let mut s = Shell::new();
+    s.start_with(config, fleet);
+    let mut eval = s.take_eval();
+    let names = ["alfrost", "luna", "mars", "terra"];
+    for m in names {
+        s.eval_item(&mut eval, m, evaluated(m, &new(m)));
+    }
+    s.resolve(&mut eval, EvalAnswer::Finished { error: None });
+    for m in names {
+        s.probe(m, observed(&old(m), ""));
+    }
+    s.send(Event::ToggleAct);
+    s.send(Event::ConfirmAnswer(true));
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    let lines = s.view().confirm.unwrap().lines;
+    let warnings: Vec<&String> = lines.iter().filter(|l| l.starts_with("warning:")).collect();
+    assert_eq!(warnings.len(), 1, "{lines:?}");
+    assert!(
+        warnings[0].starts_with("warning: terra is a node of the cluster but rolls with no group")
+            && warnings[0].contains("in parallel with the cluster's group"),
+        "{warnings:?}"
+    );
+    // The warning is the plan's alone: it does not stop a machine at its turn, and the
+    // roll goes ahead on the `y`.
+    s.send(Event::ConfirmAnswer(true));
+    assert!(
+        s.view().roll.is_some(),
+        "the roll started: {:?}",
+        s.view().notice
+    );
 }
