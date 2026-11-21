@@ -380,7 +380,38 @@ pub(crate) async fn git(
     cap: usize,
     cancel: &CancellationToken,
 ) -> Result<Result<Vec<u8>, String>, Cancelled> {
-    Ok(git_typed(params, dir, args, cap, cancel)
+    Ok(
+        git_typed(params, dir, args, cap, Some(GIT_MEMORY_LIMIT), cancel)
+            .await?
+            .map_err(GitFailure::into_message),
+    )
+}
+
+/// The address-space limit for the one git command that only gates a **hint** (the N6 note's
+/// `ls-files`, [`git_hint`]): [`GIT_MEMORY_LIMIT`] where a launcher can set it (`limiter_exists`,
+/// Linux), none elsewhere (review of PR #37, re-review A). Everywhere else every git command is
+/// refused for lack of the launcher, which is right for the cache key, whose answer must be
+/// bounded, and left the note silently off on macOS, the platform F9 made usable. For a hint
+/// the exposure is small: its output is capped, it has the git timeout, and it runs in the
+/// operator's own fleet repository after an evaluation that already ran their code.
+pub(crate) const fn hint_memory(limiter_exists: bool) -> Option<u64> {
+    if limiter_exists {
+        Some(GIT_MEMORY_LIMIT)
+    } else {
+        None
+    }
+}
+
+/// [`git`] for a command that gates a hint only, under `memory` (see [`hint_memory`]).
+pub(crate) async fn git_hint(
+    params: &GitParams<'_>,
+    dir: &Path,
+    args: &[&str],
+    cap: usize,
+    memory: Option<u64>,
+    cancel: &CancellationToken,
+) -> Result<Result<Vec<u8>, String>, Cancelled> {
+    Ok(git_typed(params, dir, args, cap, memory, cancel)
         .await?
         .map_err(GitFailure::into_message))
 }
@@ -390,6 +421,7 @@ pub(crate) async fn git_typed(
     dir: &Path,
     args: &[&str],
     cap: usize,
+    memory: Option<u64>,
     cancel: &CancellationToken,
 ) -> Result<Result<Vec<u8>, GitFailure>, Cancelled> {
     // The subcommand, for messages: the first argument that is not a global option or the
@@ -439,7 +471,7 @@ pub(crate) async fn git_typed(
     let limits = Limits {
         stdout: cap,
         stderr: 16 * 1024,
-        memory: Some(GIT_MEMORY_LIMIT),
+        memory,
     };
     let ran = match run(cmd, None, OnExit::KillGroup, limits, deadline, cancel).await {
         Ok(r) => r,
@@ -476,7 +508,7 @@ pub(crate) async fn git_typed(
         End::Exited(s) => {
             let stderr = lossy(&ran.stderr);
             let why = last_line(&stderr).unwrap_or_default();
-            if out_of_memory(&stderr, s) {
+            if memory.is_some() && out_of_memory(&stderr, s) {
                 Err(GitFailure::Other(format!(
                     "{what} ran into auspex's memory limit for git ({} MiB): {why}",
                     GIT_MEMORY_LIMIT >> 20
@@ -595,11 +627,40 @@ async fn key_and_top(
     params: &GitParams<'_>,
     cancel: &CancellationToken,
 ) -> Result<Result<Keyed, String>, Cancelled> {
+    key_and_top_in(flake_dir, params, &UserEnv::from_env(), cancel).await
+}
+
+/// The two environment variables that say where the operator's own git files are: where the
+/// default global attributes file and the user's git configuration are looked for. Read once,
+/// so a test can give another home without changing the process's environment.
+#[derive(Debug, Clone, Default)]
+struct UserEnv {
+    home: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+}
+
+impl UserEnv {
+    fn from_env() -> Self {
+        Self {
+            home: std::env::var_os("HOME"),
+            xdg_config_home: std::env::var_os("XDG_CONFIG_HOME"),
+        }
+    }
+}
+
+/// [`key_and_top`] with the user's environment given.
+async fn key_and_top_in(
+    flake_dir: &Path,
+    params: &GitParams<'_>,
+    user: &UserEnv,
+    cancel: &CancellationToken,
+) -> Result<Result<Keyed, String>, Cancelled> {
     let top = match git_typed(
         params,
         flake_dir,
         &["rev-parse", "--show-toplevel"],
         4096,
+        Some(GIT_MEMORY_LIMIT),
         cancel,
     )
     .await?
@@ -628,7 +689,7 @@ async fn key_and_top(
     let StatusInputs {
         settings,
         attribute_files,
-    } = match status_settings(params, &top, cancel).await? {
+    } = match status_settings(params, &top, user, cancel).await? {
         Ok(s) => s,
         Err(e) => return Ok(Err(e)),
     };
@@ -655,6 +716,7 @@ async fn key_and_top(
     let deadline = std::time::Instant::now() + params.read_timeout;
     let flake_dir = flake_dir.to_path_buf();
     let tree_top = top.clone();
+    let user = user.clone();
     let job = tokio::task::spawn_blocking(move || {
         let stop = || token.is_cancelled() || std::time::Instant::now() > deadline;
         let paths = index_paths(&index).map_err(Stop::NoCache)?;
@@ -665,7 +727,7 @@ async fn key_and_top(
         )?;
         let common = git_dir_stamps(&git_dir, &head_ref, &stop, &mut guard)?;
         let digest = with_attributes(digest, &common, attribute_files, &stop, &mut guard)?;
-        stamp_user_config(&mut guard);
+        stamp_user_config(&mut guard, &user);
         Ok::<_, Stop>((lock, digest, Guard(guard.finalize().to_vec())))
     });
     let (lock, digest, guard) = tokio::select! {
@@ -769,6 +831,7 @@ struct StatusInputs {
 async fn status_settings(
     params: &GitParams<'_>,
     top: &Path,
+    user: &UserEnv,
     cancel: &CancellationToken,
 ) -> Result<Result<StatusInputs, String>, Cancelled> {
     let mut keyed = Vec::new();
@@ -826,8 +889,8 @@ async fn status_settings(
     attribute_files.extend(global_attributes(
         &configured,
         top,
-        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
-        std::env::var_os("HOME").as_deref(),
+        user.xdg_config_home.as_deref(),
+        user.home.as_deref(),
     ));
     attribute_files.push(PathBuf::from("/etc/gitattributes"));
     Ok(Ok(StatusInputs {
@@ -857,26 +920,31 @@ fn global_attributes(
     )
 }
 
-/// The worktree `digest` with the attributes files outside the tree: the common git directory's
-/// `info/attributes` and the files `status_settings` found. Only a file that is there adds to
-/// it, so a repository with none of them has the key it always had.
+/// The worktree digests (the key's, and the update check's fingerprint) with the attributes files
+/// outside the tree: the common git directory's `info/attributes` and the files
+/// `status_settings` found. Only a file that is there adds to them, so a repository with none
+/// of them has the key it always had. The fingerprint takes them as it takes the settings: it
+/// says what nix reads, and the attributes decide whether the same bytes are clean.
 fn with_attributes(
-    digest: Vec<u8>,
+    (key, fingerprint): (Vec<u8>, Vec<u8>),
     common: &Path,
     attribute_files: Vec<PathBuf>,
     stop: &dyn Fn() -> bool,
     g: &mut Sha256,
-) -> Result<Vec<u8>, Stop> {
+) -> Result<(Vec<u8>, Vec<u8>), Stop> {
     let mut files = vec![common.join("info/attributes")];
     files.extend(attribute_files);
     let extra = attribute_digest(&files, stop, g)?;
     if extra.is_empty() {
-        return Ok(digest);
+        return Ok((key, fingerprint));
     }
-    let mut h = Sha256::new_with_prefix(b"auspex attribute files v1\0");
-    h.update(&digest);
-    h.update(&extra);
-    Ok(h.finalize().to_vec())
+    let combine = |digest: &[u8]| {
+        let mut h = Sha256::new_with_prefix(b"auspex attribute files v1\0");
+        h.update(digest);
+        h.update(&extra);
+        h.finalize().to_vec()
+    };
+    Ok((combine(&key), combine(&fingerprint)))
 }
 
 /// The guard record of a name outside the tree: its own `lstat`, or, when nothing is there, its
@@ -961,10 +1029,10 @@ fn attribute_digest(
 /// equal keys. Which files git reads is `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` (else
 /// `~/.config/git/config`) and `/etc/gitconfig`; a different system file compiled into git is
 /// not seen.
-fn stamp_user_config(g: &mut Sha256) {
+fn stamp_user_config(g: &mut Sha256, user: &UserEnv) {
     use std::os::unix::ffi::OsStrExt as _;
-    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
-    let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty());
+    let home = user.home.clone().filter(|h| !h.is_empty());
+    let xdg = user.xdg_config_home.clone().filter(|d| !d.is_empty());
     let mut files = vec![PathBuf::from("/etc/gitconfig")];
     files.extend(home.as_deref().map(|h| Path::new(h).join(".gitconfig")));
     files.push(match (xdg.as_deref(), home.as_deref()) {
@@ -1517,6 +1585,11 @@ pub async fn evaluate_cached(
             None
         }
     };
+    // The note about untracked files asks the same git the key does.
+    let eval = &EvalParams {
+        git: cache.git,
+        ..eval.clone()
+    };
     evaluate_with(flake, machines, eval, cache, cancel, tx, keyed).await
 }
 
@@ -1738,6 +1811,184 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    /// A committed repository, for the key tests below.
+    fn committed_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "user.name=a", "-c", "user.email=a@invalid"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        std::fs::write(repo.path().join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
+        run(&["init", "-q"]);
+        run(&["add", "flake.nix"]);
+        run(&["commit", "-q", "-m", "one"]);
+        repo
+    }
+
+    /// The key and guard of `dir` for the given user environment.
+    fn keyed(dir: &Path, user: &UserEnv) -> Keyed {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(key_and_top_in(
+                dir,
+                &GitParams::new(),
+                user,
+                &CancellationToken::new(),
+            ))
+            .unwrap()
+            .unwrap()
+    }
+
+    fn env(home: Option<&Path>, xdg: Option<&Path>) -> UserEnv {
+        UserEnv {
+            home: home.map(|p| p.as_os_str().to_owned()),
+            xdg_config_home: xdg.map(|p| p.as_os_str().to_owned()),
+        }
+    }
+
+    /// Review of PR #37, re-review D (mutation Q02) and the review's finding 1: the global
+    /// attributes file at its **default** location is a key input, `$XDG_CONFIG_HOME/git/attributes`
+    /// when that is set and not empty, else `$HOME/.config/git/attributes`, and not only when
+    /// `core.attributesFile` names it.
+    #[test]
+    fn the_default_global_attributes_location_is_a_key_input() {
+        let repo = committed_repo();
+        let (xdg, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let write = |p: &Path, text: &str| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        let xdg_file = xdg.path().join("git/attributes");
+        let home_file = home.path().join(".config/git/attributes");
+
+        // `XDG_CONFIG_HOME` set: its file counts, the one under HOME does not.
+        let user = env(Some(home.path()), Some(xdg.path()));
+        let plain = keyed(repo.path(), &user).key;
+        write(&home_file, "* text=auto\n");
+        assert_eq!(
+            keyed(repo.path(), &user).key,
+            plain,
+            "HOME's is shadowed by XDG"
+        );
+        write(&xdg_file, "* text=auto\n");
+        let with_xdg = keyed(repo.path(), &user).key;
+        assert_ne!(
+            with_xdg, plain,
+            "XDG_CONFIG_HOME/git/attributes is not keyed"
+        );
+        write(&xdg_file, "* text=auto eol=crlf\n");
+        assert_ne!(keyed(repo.path(), &user).key, with_xdg, "an edit of it");
+
+        // `XDG_CONFIG_HOME` unset or empty: HOME's counts.
+        for xdg in [None, Some(Path::new(""))] {
+            let user = env(Some(home.path()), xdg);
+            let with_home = keyed(repo.path(), &user).key;
+            assert_ne!(
+                with_home, plain,
+                "{xdg:?}: $HOME/.config/git/attributes is not keyed"
+            );
+            write(&home_file, "* text=auto eol=lf\n");
+            assert_ne!(
+                keyed(repo.path(), &user).key,
+                with_home,
+                "{xdg:?}: an edit of it"
+            );
+            write(&home_file, "* text=auto\n");
+        }
+        // Neither home nor xdg: nothing to read, the plain key.
+        std::fs::remove_file(&home_file).unwrap();
+        std::fs::remove_file(&xdg_file).unwrap();
+        assert_eq!(keyed(repo.path(), &env(None, None)).key, plain);
+        assert_eq!(keyed(repo.path(), &user_of(&home, &xdg)).key, plain);
+    }
+
+    fn user_of(home: &tempfile::TempDir, xdg: &tempfile::TempDir) -> UserEnv {
+        env(Some(home.path()), Some(xdg.path()))
+    }
+
+    /// The pure rule behind it, with every branch.
+    #[test]
+    fn the_global_attributes_file_is_found_where_libgit2_looks() {
+        let top = Path::new("/top");
+        let f = |configured: &str, xdg: Option<&str>, home: Option<&str>| {
+            global_attributes(configured, top, xdg.map(OsStr::new), home.map(OsStr::new))
+        };
+        assert_eq!(
+            f("/x/attrs", Some("/xdg"), Some("/h")),
+            Some("/x/attrs".into())
+        );
+        assert_eq!(f("rel", None, None), Some("/top/rel".into()));
+        assert_eq!(
+            f("", Some("/xdg"), Some("/h")),
+            Some("/xdg/git/attributes".into())
+        );
+        assert_eq!(
+            f("", None, Some("/h")),
+            Some("/h/.config/git/attributes".into())
+        );
+        assert_eq!(
+            f("", Some(""), Some("/h")),
+            Some("/h/.config/git/attributes".into())
+        );
+        assert_eq!(f("", None, Some("")), None);
+        assert_eq!(f("", None, None), None);
+    }
+
+    /// Review of PR #37, re-review D (mutations Q01, Q06, Q12, Q14): what is in the run guard.
+    /// Each case changes a file and puts the same bytes back (so the key does not move) and
+    /// the guard must.
+    #[test]
+    fn the_run_guard_sees_a_change_and_its_revert_in_each_file_it_stamps() {
+        let repo = committed_repo();
+        let (home, xdg) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let user = env(Some(home.path()), Some(xdg.path()));
+        let touch = |p: &Path| {
+            let bytes = std::fs::read(p).unwrap();
+            std::fs::write(p, b"changed").unwrap();
+            std::fs::write(p, bytes).unwrap();
+        };
+        let case = |name: &str, p: &Path| {
+            let before = keyed(repo.path(), &user);
+            touch(p);
+            let after = keyed(repo.path(), &user);
+            assert_eq!(after.key, before.key, "{name}: the key must not move");
+            assert_ne!(after.guard, before.guard, "{name}: not in the run guard");
+        };
+
+        // The user's git configuration: a file, and a symlink to one (home-manager) whose target
+        // is what changes.
+        let gitconfig = home.path().join(".gitconfig");
+        std::fs::write(&gitconfig, "[user]\n\tname = a\n").unwrap();
+        case("~/.gitconfig", &gitconfig);
+        std::fs::remove_file(&gitconfig).unwrap();
+        let target = home.path().join("gitconfig-target");
+        std::fs::write(&target, "[user]\n\tname = a\n").unwrap();
+        std::os::unix::fs::symlink(&target, &gitconfig).unwrap();
+        case("~/.gitconfig behind a symlink", &target);
+
+        // A linked worktree's own configuration.
+        let worktree_config = repo.path().join(".git/config.worktree");
+        std::fs::write(&worktree_config, "[core]\n").unwrap();
+        case("config.worktree", &worktree_config);
+
+        // An attributes file behind a symlink: the link itself does not change.
+        let info = repo.path().join(".git/info");
+        std::fs::create_dir_all(&info).unwrap();
+        let behind = home.path().join("attributes-target");
+        std::fs::write(&behind, "* text=auto\n").unwrap();
+        std::os::unix::fs::symlink(&behind, info.join("attributes")).unwrap();
+        case("info/attributes behind a symlink", &behind);
+    }
 
     /// Review of PR #8, T3 (mutation X10): a run cancelled after its evaluator exited sends no
     /// `Finished`, whether or not it had anything to store, and the receiver dropped likewise.

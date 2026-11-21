@@ -294,6 +294,29 @@ impl<'a> ProbeParams<'a> {
     }
 }
 
+/// Why an ssh could not be started.
+pub(crate) enum SshStartError {
+    /// The control directory is not the one that was prepared: nothing was started.
+    Refused(String),
+    /// The program could not be found or run.
+    CannotRun(io::Error),
+}
+
+impl ProbeParams<'_> {
+    /// The command for an ssh that uses the control directory: **the one way** one is made, for
+    /// the connect phase, the probe and the deployed-closure query alike (review of PR #37,
+    /// finding 3, and the re-review's B: the closure query started its own ssh without the
+    /// check). It first re-checks that the directory is still the one prepared
+    /// ([`ControlDir::recheck`]), because ssh binds and connects its sockets in it, and then
+    /// resolves the program. A test fails if any other `command(params.ssh_program)` exists.
+    pub(crate) fn ssh_command(&self) -> Result<tokio::process::Command, SshStartError> {
+        self.control_dir
+            .recheck()
+            .map_err(|e| SshStartError::Refused(e.0))?;
+        command(self.ssh_program).map_err(SshStartError::CannotRun)
+    }
+}
+
 /// The exact argv (after the program) a probe of `target` runs.
 ///
 /// # Errors
@@ -587,14 +610,12 @@ async fn connect_once(
                 window: connect_window(params.control_dir),
             }
         });
-        // Before each ssh: the directory it will bind and connect sockets in is still the one
-        // that was checked at start-up (review of PR #37, finding 3).
-        if let Err(e) = params.control_dir.recheck() {
-            return Ok(Some(ProbeOutcome::Failed { reason: e.0 }));
-        }
-        let mut cmd = match command(params.ssh_program) {
+        let mut cmd = match params.ssh_command() {
             Ok(cmd) => cmd,
-            Err(e) => {
+            Err(SshStartError::Refused(reason)) => {
+                return Ok(Some(ProbeOutcome::Failed { reason }));
+            }
+            Err(SshStartError::CannotRun(e)) => {
                 return Ok(Some(ProbeOutcome::Unreachable {
                     reason: spawn_error("cannot connect", params.ssh_program, &e),
                 }));
@@ -734,12 +755,10 @@ pub async fn probe(
         Ok(a) => a,
         Err(reason) => return Ok(ProbeOutcome::Failed { reason }),
     };
-    if let Err(e) = params.control_dir.recheck() {
-        return Ok(ProbeOutcome::Failed { reason: e.0 });
-    }
-    let mut cmd = match command(params.ssh_program) {
+    let mut cmd = match params.ssh_command() {
         Ok(c) => c,
-        Err(e) => {
+        Err(SshStartError::Refused(reason)) => return Ok(ProbeOutcome::Failed { reason }),
+        Err(SshStartError::CannotRun(e)) => {
             return Ok(ProbeOutcome::Unreachable {
                 reason: spawn_error("cannot probe", params.ssh_program, &e),
             });
@@ -885,5 +904,43 @@ mod tests {
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
         assert_eq!(meta.uid(), uid);
+    }
+}
+
+#[cfg(test)]
+mod spawn_sites {
+    /// Every ssh the crate starts is made by `ProbeParams::ssh_command`, which re-checks the
+    /// control directory first (review of PR #37, re-review B). The closure query once started
+    /// its own and missed the check; so no other `command(…ssh_program)` may exist.
+    #[test]
+    fn only_ssh_command_makes_an_ssh() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&src).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                // Code only: a comment may name the pattern.
+                let code = line.trim_start();
+                if !code.starts_with("//")
+                    && code.contains("command(")
+                    && code.contains("ssh_program")
+                {
+                    found.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "ssh is started in more than one place: {found:#?}"
+        );
+        assert!(
+            found[0].contains("ssh.rs") && found[0].contains("self.ssh_program"),
+            "{found:#?}"
+        );
     }
 }

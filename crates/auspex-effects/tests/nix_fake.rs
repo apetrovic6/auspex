@@ -1254,3 +1254,64 @@ async fn an_untracked_file_nix_cannot_find_is_explained_once() {
         .count();
     assert_eq!(errors, 9);
 }
+
+/// Review of PR #37, re-review A: the untracked-file check asks the git the cache parameters
+/// name (`AUSPEX_GIT` in the shell), not whatever `git` is on `PATH`.
+#[tokio::test]
+async fn the_untracked_check_uses_the_configured_git() {
+    let Some(t) = tools(&["git"]) else { return };
+    let dir = tempdir();
+    let repo = untracked_repository(dir.path());
+    let store = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-source";
+    let line = format!(
+        r#"{{"attr":"a","attrPath":["a"],"error":"error: path '{store}/modules/new.nix' does not exist"}}"#
+    );
+    let prog = t.script(
+        dir.path(),
+        "nix-eval-jobs",
+        &format!("printf '%s\\n' '{line}'"),
+    );
+    let git = t.script(
+        dir.path(),
+        "git-recorder",
+        "echo \"$*\" >> '@dir@/git-calls'\nulimit -v >> '@dir@/git-limits'\nexec @git@ \"$@\"",
+    );
+    let flake = FlakeRef::new(repo.to_str().unwrap()).unwrap();
+    let (tx, mut rx) = unbounded_channel();
+    let mut cache = auspex_effects::cache::CacheParams {
+        cache_dir: None,
+        flake_dir: &repo,
+        git: auspex_effects::cache::GitParams::new(),
+    };
+    cache.git.program = git.as_os_str();
+    auspex_effects::cache::evaluate_cached(
+        &flake,
+        &machines(&["a"]),
+        &params(&prog, Duration::from_secs(10)),
+        &cache,
+        &CancellationToken::new(),
+        tx,
+    )
+    .await
+    .unwrap();
+    let items = collect(&mut rx).await;
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(i, EvalItem::Note(n) if n.contains("not tracked by git"))),
+        "{items:?}"
+    );
+    // Where a launcher exists (Linux) the check runs under the 512 MiB limit like every git.
+    if cfg!(target_os = "linux") {
+        let limits = fs::read_to_string(dir.path().join("git-limits")).unwrap();
+        assert!(
+            limits.lines().all(|l| l == "524288"),
+            "the check ran without its address-space limit: {limits}"
+        );
+    }
+    let calls = fs::read_to_string(dir.path().join("git-calls")).unwrap();
+    assert!(
+        calls.lines().any(|l| l.contains(" ls-files ")),
+        "the configured git was not asked: {calls}"
+    );
+}

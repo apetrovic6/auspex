@@ -559,6 +559,10 @@ pub struct EvalParams<'a> {
     /// without a socket-path length limit. `None` uses `$XDG_RUNTIME_DIR/auspex`, or
     /// `auspex-<uid>` under the system temporary directory if it is unset or relative.
     pub runtime_dir: Option<std::path::PathBuf>,
+    /// The git the untracked-file note asks which files are tracked (`git ls-files`). Set from
+    /// the cache parameters by [`crate::cache::evaluate_cached`], so the operator's own git
+    /// program is used, as for the key.
+    pub git: crate::cache::GitParams<'a>,
 }
 
 impl EvalParams<'_> {
@@ -572,6 +576,7 @@ impl EvalParams<'_> {
             max_memory_mib: 4096,
             timeout: Duration::from_secs(300),
             runtime_dir: None,
+            git: crate::cache::GitParams::new(),
         }
     }
 }
@@ -799,9 +804,32 @@ struct Collector<'a> {
     hinted: BTreeSet<String>,
     /// (machine, path) pairs to check against the index once the run is over.
     candidates: Vec<(String, String)>,
+    /// The git for the check, and the address-space limit it runs under ([`crate::cache::hint_memory`]).
+    git: crate::cache::GitParams<'a>,
+    git_memory: Option<u64>,
 }
 
-impl Collector<'_> {
+impl<'a> Collector<'a> {
+    /// The bookkeeping for one evaluation of `machines` of `flake`.
+    fn new(
+        machines: &'a [EvalMachine],
+        tx: &'a UnboundedSender<EvalItem>,
+        flake: &'a FlakeRef,
+        params: &EvalParams<'a>,
+    ) -> Self {
+        Self {
+            requested: machines.iter().map(|m| m.name.as_str()).collect(),
+            delivered: BTreeSet::new(),
+            notes: 0,
+            tx,
+            top: flake.repo_top(),
+            hinted: BTreeSet::new(),
+            candidates: Vec::new(),
+            git: params.git,
+            git_memory: crate::cache::hint_memory(cfg!(target_os = "linux")),
+        }
+    }
+
     fn note(&mut self, text: String) {
         if self.notes < MAX_LINE_NOTES {
             self.notes += 1;
@@ -837,12 +865,14 @@ impl Collector<'_> {
     /// When git cannot answer, there is no note: it is a hint, never a guess.
     async fn explain_untracked(&mut self, cancel: &CancellationToken) -> Result<(), Cancelled> {
         let Some(top) = self.top else { return Ok(()) };
-        let git = crate::cache::GitParams::new();
+
         for (machine, rel) in std::mem::take(&mut self.candidates) {
             // `:(literal)`: the name is data, not a pathspec with wildcards.
             let spec = format!(":(literal){rel}");
             let args = ["ls-files", "-z", "--", spec.as_str()];
-            if let Ok(listed) = crate::cache::git(&git, top, &args, 64 * 1024, cancel).await?
+            if let Ok(listed) =
+                crate::cache::git_hint(&self.git, top, &args, 64 * 1024, self.git_memory, cancel)
+                    .await?
                 && listed.is_empty()
             {
                 self.note(format!(
@@ -1051,15 +1081,7 @@ pub async fn evaluate(
     let mut lines = sp.child.stdout.take().map(|o| Lines::new(o, EVAL_LINE_CAP));
     let mut err_pipe = sp.child.stderr.take();
     let mut err = Tail::new(STDERR_CAP);
-    let mut collect = Collector {
-        requested: unique.iter().map(|m| m.name.as_str()).collect(),
-        delivered: BTreeSet::new(),
-        notes: 0,
-        tx: &tx,
-        top: flake.repo_top(),
-        hinted: BTreeSet::new(),
-        candidates: Vec::new(),
-    };
+    let mut collect = Collector::new(&unique, &tx, flake, params);
     let stop = pump(
         &mut sp,
         &mut lines,
@@ -1369,6 +1391,96 @@ mod tests {
         std::fs::create_dir(&q).unwrap();
         let f = FlakeRef::new(q.to_str().unwrap()).unwrap();
         assert!(f.as_str().ends_with("/q%3Fdir=sub"), "{f:?}");
+    }
+
+    /// A repository with `a.nix` tracked and `[a].nix`, `b.nix` untracked, and a `Collector` over
+    /// it with those as candidates, run through `explain_untracked` with `git` and `memory`.
+    /// Returns the notes.
+    fn untracked_notes(git: crate::cache::GitParams<'_>, memory: Option<u64>) -> Vec<String> {
+        let repo = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(repo.path()).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&top)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(top.join("a.nix"), "{}").unwrap();
+        run(&["add", "a.nix"]);
+        std::fs::write(top.join("[a].nix"), "{}").unwrap();
+        std::fs::write(top.join("b.nix"), "{}").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut collect = Collector {
+            requested: BTreeSet::new(),
+            delivered: BTreeSet::new(),
+            notes: 0,
+            tx: &tx,
+            top: Some(&top),
+            hinted: BTreeSet::new(),
+            candidates: ["[a].nix", "a.nix", "b.nix"]
+                .map(|p| ("m".to_owned(), p.to_owned()))
+                .to_vec(),
+            git,
+            git_memory: memory,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(collect.explain_untracked(&CancellationToken::new()))
+            .unwrap();
+        drop(collect);
+        drop(tx);
+        let mut notes = Vec::new();
+        while let Ok(EvalItem::Note(n)) = rx.try_recv() {
+            notes.push(n);
+        }
+        notes
+    }
+
+    /// Review of PR #37, re-review A and mutations Q04 and Q13. The name is data, not a pathspec
+    /// (`[a].nix` is not `a.nix`), a tracked file gets no note, and with **no memory limit** (the
+    /// platforms without a launcher, macOS) the check still answers: the note is not silently off.
+    #[test]
+    fn the_untracked_check_reads_names_literally_and_needs_no_launcher() {
+        for memory in [None, Some(crate::cache::GIT_MEMORY_LIMIT)] {
+            let notes = untracked_notes(crate::cache::GitParams::new(), memory);
+            let mentioned = |p: &str| notes.iter().any(|n| n.contains(&format!("{p:?}")));
+            assert_eq!(notes.len(), 2, "{memory:?}: {notes:?}");
+            assert!(mentioned("[a].nix") && mentioned("b.nix"), "{notes:?}");
+            assert!(!mentioned("a.nix"), "a tracked file: {notes:?}");
+        }
+    }
+
+    /// Mutation Q13: when git cannot answer there is no note, never a guess.
+    #[test]
+    fn a_git_that_cannot_answer_gives_no_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("git");
+        std::fs::write(&fake, "#!/bin/sh\necho 'fatal: nope' >&2\nexit 128\n").unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut git = crate::cache::GitParams::new();
+        git.program = fake.as_os_str();
+        assert_eq!(untracked_notes(git, None), Vec::<String>::new());
+        let missing = std::ffi::OsString::from("/nonexistent/auspex-git");
+        git.program = &missing;
+        assert_eq!(untracked_notes(git, None), Vec::<String>::new());
+    }
+
+    /// Where a launcher exists the hint is bounded like every other git; elsewhere it is not.
+    #[test]
+    fn the_hint_is_bounded_where_a_launcher_exists() {
+        assert_eq!(
+            crate::cache::hint_memory(true),
+            Some(crate::cache::GIT_MEMORY_LIMIT)
+        );
+        assert_eq!(crate::cache::hint_memory(false), None);
     }
 
     /// Review of PR #37, finding 2 and mutations R14 and R15: which paths nix's error text

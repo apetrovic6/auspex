@@ -65,9 +65,14 @@ scan), a system git configuration compiled in at another path than `/etc/gitconf
 
 When a machine's error names a file below a `…-source/` store path that exists in the
 worktree but is untracked, the Log tab (stderr when headless) says why nix cannot see it, once
-per file: a new module has to be `git add`ed. A tracked absolute symlink to a file outside the
-tree, read under `--impure` (which this crate needs for a dirty `git+file` flake), is outside
-the key; so is anything else an `--impure` evaluation reads from outside the flake.
+per file: a new module has to be `git add`ed. Only for a path that is not in the index and
+only when the line says the file is missing, so a module-system error that names a tracked file
+gets nothing. The check is one `git ls-files`, run with the same git program as the key. On
+Linux it runs under the same 512 MiB limit; where there is no launcher for it (macOS, the
+platform with no caching) it runs without one, since its output is capped and it only gates
+this hint. On Linux without `prlimit` there is no note. A tracked absolute symlink to a file
+outside the tree, read under `--impure` (which this crate needs for a dirty `git+file` flake),
+is outside the key; so is anything else an `--impure` evaluation reads from outside the flake.
 
 The default ssh control directory is `$XDG_RUNTIME_DIR/auspex`, else `auspex-<uid>` in the
 temporary directory; on macOS, where that directory is too long for a socket path, `/tmp/auspex-<uid>`.

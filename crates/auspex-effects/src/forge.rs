@@ -41,7 +41,7 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use crate::Cancelled;
-use crate::cache::{GitFailure, GitParams, git, git_typed};
+use crate::cache::{GIT_MEMORY_LIMIT, GitFailure, GitParams, git, git_typed};
 use crate::http::{Call, HttpClient, base_url, join};
 use crate::nix::FlakeRef;
 use crate::preflight::fleet_tree;
@@ -565,7 +565,15 @@ pub async fn head(
         Err(why) => return Ok(Err(reason_line(token, &why))),
     };
     let origin = if want_origin {
-        let asked = git_typed(params, &dir, &["remote", "get-url", "origin"], 4096, cancel).await?;
+        let asked = git_typed(
+            params,
+            &dir,
+            &["remote", "get-url", "origin"],
+            4096,
+            Some(GIT_MEMORY_LIMIT),
+            cancel,
+        )
+        .await?;
         Some(match asked {
             Ok(out) => parse_remote(&String::from_utf8_lossy(&out)),
             // `git remote get-url` exits 2 for a remote that does not exist; anything else (a
