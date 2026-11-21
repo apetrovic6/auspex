@@ -54,6 +54,7 @@ use std::fmt::Write as _;
 
 use auspex_domain::preflight::TreeState;
 use auspex_domain::roll::{self, Candidate, ClusterId, Group, Member, Node};
+use auspex_domain::text::shell_quote;
 use crux_core::Command;
 use crux_core::render::render;
 
@@ -186,6 +187,8 @@ pub(super) struct Roll {
     ready_timeout_seconds: u64,
     /// The cluster the plan named; every call after it is pinned to its context.
     context: Option<String>,
+    /// The kubeconfig the shell resolved, for the command that gives a node back.
+    kubeconfig: Option<String>,
     /// The fleet repository's warnings in the confirmed plan: a machine's turn may show these and
     /// no others.
     tree_warnings: Vec<String>,
@@ -249,10 +252,14 @@ impl Roll {
     /// The `kubectl` words that name the cluster the roll works in, for the command that gives a
     /// node back.
     fn kubectl_prefix(&self) -> String {
-        self.context.as_ref().map_or_else(
-            || "kubectl".to_owned(),
-            |c| format!("kubectl --context {c}"),
-        )
+        let mut prefix = "kubectl".to_owned();
+        if let Some(k) = &self.kubeconfig {
+            let _ = write!(prefix, " --kubeconfig {}", shell_quote(k));
+        }
+        if let Some(c) = &self.context {
+            let _ = write!(prefix, " --context {}", shell_quote(c));
+        }
+        prefix
     }
 
     pub(super) fn view(&self) -> RollView {
@@ -904,6 +911,7 @@ fn start(model: &mut Model, planned: &Planned, lock: RequestId) -> Command<Effec
         parallel: planned.parallel,
         ready_timeout_seconds: planned.ready_timeout_seconds,
         context: planned.cluster.as_ref().map(|c| c.context.clone()),
+        kubeconfig: planned.cluster.as_ref().map(|c| c.kubeconfig.clone()),
         tree_warnings: planned.tree_warnings.clone(),
         lock,
         left_cordoned: Vec::new(),

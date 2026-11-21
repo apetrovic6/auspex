@@ -831,7 +831,7 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
         && !r.left_cordoned.is_empty()
     {
         errors.push(format!(
-            "LEFT CORDONED: {} (kubectl uncordon <node>; the Log tab has the command)",
+            "LEFT CORDONED: {} (the Log tab has the kubectl command)",
             r.left_cordoned.join(", ")
         ));
     }

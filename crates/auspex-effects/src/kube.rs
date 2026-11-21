@@ -267,13 +267,29 @@ pub async fn cluster_id(
     params: &KubeParams<'_>,
     cancel: &CancellationToken,
 ) -> Result<Result<ClusterId, String>, Cancelled> {
+    let kubeconfig = match kubeconfig_text(params.kubeconfig) {
+        Ok(k) => k,
+        Err(why) => return Ok(Err(why)),
+    };
     let argv = match cluster_id_argv(params) {
         Ok(a) => a,
         Err(why) => return Ok(Err(why)),
     };
     Ok(text(params, argv, "kubectl config view", cancel)
         .await?
-        .and_then(|out| parse_cluster_id(&out)))
+        .and_then(|out| parse_cluster_id(&out, kubeconfig)))
+}
+
+/// The kubeconfig path as text, for the command the operator is told to run by hand: a path that
+/// is not valid UTF-8 would be printed as a different one, so it is refused instead.
+fn kubeconfig_text(path: &Path) -> Result<&str, String> {
+    path.to_str().ok_or_else(|| {
+        format!(
+            "the kubeconfig path {} is not valid UTF-8, so a command to run by hand cannot name \
+             it: use another path (`kubernetes.kubeconfig`)",
+            path.display()
+        )
+    })
 }
 
 /// Cordons (`cordon`) or uncordons `node`.
@@ -356,6 +372,15 @@ mod tests {
 
     fn params(path: &'static str) -> KubeParams<'static> {
         KubeParams::new(OsStr::new("kubectl"), Path::new(path))
+    }
+
+    #[test]
+    fn a_kubeconfig_that_is_not_utf8_is_refused_not_printed_as_another_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        assert_eq!(kubeconfig_text(Path::new("/k/c")), Ok("/k/c"));
+        let bad = Path::new(OsStr::from_bytes(b"/k/\xff/config"));
+        let why = kubeconfig_text(bad).unwrap_err();
+        assert!(why.contains("not valid UTF-8"), "{why}");
     }
 
     fn strings(argv: &[OsString]) -> Vec<String> {

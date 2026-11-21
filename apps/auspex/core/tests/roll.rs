@@ -109,6 +109,7 @@ fn cluster() -> ClusterId {
     ClusterId {
         context: "rke2".to_owned(),
         server: "https://10.0.0.1:6443".to_owned(),
+        kubeconfig: "/k/config".to_owned(),
     }
 }
 
@@ -660,7 +661,7 @@ fn an_uncordon_that_fails_is_a_failure_that_says_to_do_it_by_hand() {
                 "{why}"
             );
             assert!(
-                why.contains("uncordon it by hand (kubectl --context rke2 uncordon luna)"),
+                why.contains("uncordon it by hand (kubectl --kubeconfig /k/config --context rke2 uncordon luna)"),
                 "{why}"
             );
         }
@@ -688,7 +689,7 @@ fn a_drained_node_stays_cordoned_after_a_failed_update_and_after_a_failed_wait_a
             s.resolve(&mut w, Err("systemd is degraded".to_owned()));
         }
         assert!(s.kubes.is_empty(), "{failing}: no uncordon is asked for");
-        let by_hand = "kubectl --context rke2 uncordon luna";
+        let by_hand = "kubectl --kubeconfig /k/config --context rke2 uncordon luna";
         match state(&s, "luna") {
             RollState::Failed(why) => assert!(
                 why.contains("node luna is left cordoned") && why.contains(by_hand),
@@ -1199,7 +1200,7 @@ fn quitting_asks_cancels_the_updates_never_starts_the_next_and_names_the_cordon(
     match state(&s, "luna") {
         RollState::Failed(why) => assert!(
             why.starts_with("cancelled; node luna is left cordoned")
-                && why.contains("kubectl --context rke2 uncordon luna"),
+                && why.contains("kubectl --kubeconfig /k/config --context rke2 uncordon luna"),
             "{why}"
         ),
         other => panic!("{other:?}"),
@@ -1677,7 +1678,7 @@ fn a_cancelled_uncordon_is_not_an_uncordon() {
         RollState::Failed(why) => assert!(
             why.contains(
                 "may still be cordoned: could not uncordon it (the request was cancelled)"
-            ) && why.contains("kubectl --context rke2 uncordon luna"),
+            ) && why.contains("kubectl --kubeconfig /k/config --context rke2 uncordon luna"),
             "{why}"
         ),
         other => panic!("{other:?}"),
@@ -1750,4 +1751,42 @@ fn a_build_or_an_update_between_the_y_and_the_lock_is_refused() {
     s.hold_lock = false;
     s.resolve(&mut lock, Ok(()));
     assert_eq!(state(&s, "luna"), RollState::Checking);
+}
+
+/// The by-hand command is meant to be pasted into a shell: a kubeconfig path with a space and a
+/// single quote, and a context with a space, are quoted (POSIX single quotes), in the roll's note
+/// and so in the Log run line and the action-log row.
+#[test]
+fn the_by_hand_command_quotes_a_kubeconfig_and_a_context_that_need_it() {
+    let mut s = settled(config_with(draining(), 2));
+    s.send(Event::UpdateAll);
+    let mut k = take_kube(&mut s);
+    assert_eq!(k.operation.op, KubeOp::Context);
+    s.resolve(
+        &mut k,
+        Ok(KubeReply::Cluster(ClusterId {
+            context: "my ctx".to_owned(),
+            server: "https://10.0.0.1:6443".to_owned(),
+            kubeconfig: "/my dir/it's/config".to_owned(),
+        })),
+    );
+    let mut k = take_kube(&mut s);
+    s.resolve(&mut k, Ok(KubeReply::Nodes(healthy_cluster())));
+    s.send(Event::ConfirmAnswer(true));
+    pass_checks(&mut s, "luna");
+    let mut drain = take_kube(&mut s);
+    s.resolve(&mut drain, Ok(KubeReply::Done));
+    let mut a = take_action(&mut s, "luna");
+    s.resolve(&mut a, ended(ActionResult::Failed));
+    let by_hand = r"kubectl --kubeconfig '/my dir/it'\''s/config' --context 'my ctx' uncordon luna";
+    match state(&s, "luna") {
+        RollState::Failed(why) => assert!(why.contains(by_hand), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(log_lines(&s).iter().any(|l| l.contains(by_hand)));
+    assert!(
+        s.logs
+            .iter()
+            .any(|l| matches!(&l.op, LogOp::End { text, .. } if text.contains(by_hand)))
+    );
 }

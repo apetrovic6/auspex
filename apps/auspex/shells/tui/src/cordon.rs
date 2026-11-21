@@ -26,6 +26,8 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use auspex_domain::text::shell_quote;
+
 /// How long one last-resort `kubectl uncordon` may take before it is killed.
 pub const LAST_RESORT_BOUND: Duration = Duration::from_secs(15);
 
@@ -58,10 +60,10 @@ impl Held {
         let context = self
             .context
             .as_ref()
-            .map_or_else(String::new, |c| format!(" --context {c}"));
+            .map_or_else(String::new, |c| format!(" --context {}", shell_quote(c)));
         format!(
             "kubectl --kubeconfig {}{context} uncordon {}",
-            self.kubeconfig.display(),
+            shell_quote(&self.kubeconfig.to_string_lossy()),
             self.node
         )
     }
@@ -237,6 +239,31 @@ mod tests {
             OsString::from("/nonexistent/kubectl"),
             PathBuf::from("/k/config"),
             Some("rke2".to_owned()),
+        );
+    }
+
+    /// The command is pasted into a shell: a kubeconfig with a space and a single quote, and a
+    /// context with a space, are quoted; plain ones stay bare.
+    #[test]
+    fn the_by_hand_command_quotes_what_needs_it() {
+        let h = Held {
+            node: "luna".to_owned(),
+            kubectl: OsString::from("kubectl"),
+            kubeconfig: PathBuf::from("/my dir/it's/config"),
+            context: Some("my ctx".to_owned()),
+        };
+        assert_eq!(
+            h.by_hand(),
+            r"kubectl --kubeconfig '/my dir/it'\''s/config' --context 'my ctx' uncordon luna"
+        );
+        let plain = Held {
+            kubeconfig: PathBuf::from("/k/config"),
+            context: Some("rke2".to_owned()),
+            ..h
+        };
+        assert_eq!(
+            plain.by_hand(),
+            "kubectl --kubeconfig /k/config --context rke2 uncordon luna"
         );
     }
 

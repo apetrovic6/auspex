@@ -408,6 +408,8 @@ pub struct ClusterId {
     pub context: String,
     /// That context's cluster's API server, sanitised, or `"unknown"`.
     pub server: String,
+    /// The kubeconfig file the shell asked (absolute): the one a by-hand `kubectl` must be given.
+    pub kubeconfig: String,
 }
 
 /// Parses `kubectl config view --minify -o json`.
@@ -415,7 +417,7 @@ pub struct ClusterId {
 /// # Errors
 ///
 /// Not the JSON of a kubeconfig, or it has no current context.
-pub fn parse_cluster_id(json: &str) -> Result<ClusterId, String> {
+pub fn parse_cluster_id(json: &str, kubeconfig: &str) -> Result<ClusterId, String> {
     let v: serde_json::Value = serde_json::from_str(json)
         .map_err(|e| format!("kubectl's config view is not the expected JSON: {e}"))?;
     let context = v
@@ -441,7 +443,11 @@ pub fn parse_cluster_id(json: &str) -> Result<ClusterId, String> {
             })
         })
         .unwrap_or_else(|| "unknown".to_owned());
-    Ok(ClusterId { context, server })
+    Ok(ClusterId {
+        context,
+        server,
+        kubeconfig: kubeconfig.to_owned(),
+    })
 }
 
 /// Why the cluster is not fit for the next node to go out of service, one sentence each; empty
@@ -991,19 +997,21 @@ mod tests {
         let id = parse_cluster_id(
             r#"{"current-context":"rke2","contexts":[{"name":"rke2","context":{"cluster":"c1","user":"u"}}],
                 "clusters":[{"name":"c1","cluster":{"server":"https://10.0.0.1:6443"}}]}"#,
+            "/k/config",
         )
         .unwrap();
         assert_eq!(
             id,
             ClusterId {
                 context: "rke2".to_owned(),
-                server: "https://10.0.0.1:6443".to_owned()
+                server: "https://10.0.0.1:6443".to_owned(),
+                kubeconfig: "/k/config".to_owned()
             }
         );
-        let no_server = parse_cluster_id(r#"{"current-context":"x"}"#).unwrap();
+        let no_server = parse_cluster_id(r#"{"current-context":"x"}"#, "/k").unwrap();
         assert_eq!(no_server.server, "unknown");
-        assert!(parse_cluster_id(r#"{"contexts":[]}"#).is_err());
-        assert!(parse_cluster_id(r#"{"current-context":""}"#).is_err());
-        assert!(parse_cluster_id("nope").is_err());
+        assert!(parse_cluster_id(r#"{"contexts":[]}"#, "/k").is_err());
+        assert!(parse_cluster_id(r#"{"current-context":""}"#, "/k").is_err());
+        assert!(parse_cluster_id("nope", "/k").is_err());
     }
 }
