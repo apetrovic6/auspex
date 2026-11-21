@@ -18,9 +18,14 @@
 //!   named, the terminal is restored by the loop, and the exit says a panic in a task ended the
 //!   run, with its message, and exits non-zero. The default hook's own print is skipped, because
 //!   stderr is the TUI's screen: the message is in the exit report instead.
+//! - **A task inside a call into the core** (it delivers an adapter's answer to it) takes the core
+//!   down: the hook marks it failed ([`while_in_core`]) before the unwind poisons its lock, so
+//!   the loop never looks at it again and the run ends without it ([`crate::shell::Shell`]).
 //! - **While `s` has the terminal** it is ssh's ([`Hooks::lend`]): the hook writes no escape
-//!   sequence into the operator's session, on any thread. A loop-thread panic still runs the
-//!   last resort, and the message is printed as plain text.
+//!   sequence into the operator's session, on any thread, and prints the message as plain text.
+//!   A loop-thread panic still runs the last resort.
+//! - **After the loop is done** ([`Hooks::finish`]) a panic in a task is printed as any panic is,
+//!   and [`late_task_panic`] makes `main` fail the exit.
 //!
 //! The hook is installed once ([`Hooks::install`]) and the terminal is touched only through
 //! [`Terminal`], so a test can count the calls: there is no TTY under `cargo test`.
@@ -42,12 +47,16 @@ const HOOK_BOUND: Duration = Duration::from_secs(10);
 /// The longest a panic's message is kept: it is shown in a status line and in the exit report.
 const MESSAGE_BOUND: usize = 240;
 
-/// What a panic hook may do to the terminal.
+/// What a panic hook may do to the terminal, and where it says things.
 pub trait Terminal: Send + Sync + 'static {
     /// Raw mode off, the alternate screen left (what `ratatui::restore` does).
     fn restore(&self);
     /// Bracketed paste off.
     fn paste_off(&self);
+    /// One line from the hook (the last resort's report, a task panic that came first): stderr.
+    fn say(&self, line: &str) {
+        say(line);
+    }
 }
 
 /// The process's own terminal.
@@ -64,6 +73,17 @@ impl Terminal for Real {
     }
 }
 
+/// Set when a task panics after the loop has finished with the terminal and read the record
+/// ([`Hooks::finish`]): nothing will say it in the exit report, so [`late_task_panic`] says it for
+/// `main`, which makes the exit a failure.
+static LATE: AtomicBool = AtomicBool::new(false);
+
+/// A task panicked after the loop was done with the record (see [`Hooks::finish`]).
+#[must_use]
+pub fn late_task_panic() -> bool {
+    LATE.load(Ordering::SeqCst)
+}
+
 /// The panic hook's state, shared with the loop.
 pub struct Hooks {
     loop_thread: ThreadId,
@@ -71,15 +91,20 @@ pub struct Hooks {
     terminal: Arc<dyn Terminal>,
     /// `s` has the terminal: nothing is written to it.
     lent: AtomicBool,
-    /// The first panic outside the loop thread.
+    /// The loop is done: the terminal is back and the record was read ([`Hooks::finish`]).
+    done: AtomicBool,
+    /// Put out of use ([`Hooks::uninstall`] on a thread that is panicking): the hook only chains.
+    disarmed: AtomicBool,
+    /// The first panic outside the loop thread. Only the first: it is what started the end, and a
+    /// later one is most often a consequence of it.
     task_panic: Mutex<Option<String>>,
     wake: Notify,
     /// The hook this one was put on top of, for [`Hooks::uninstall`].
-    previous: Mutex<Option<Previous>>,
+    previous: Previous,
 }
 
 /// A panic hook, as `std::panic::set_hook` takes it, shared.
-type Previous = Arc<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
+pub type Previous = Arc<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
 
 impl Hooks {
     /// Installs the hook on top of the one that is set now (the default one, which prints the
@@ -92,52 +117,85 @@ impl Hooks {
         cordons: Arc<Cordons>,
         terminal: Arc<dyn Terminal>,
     ) -> Arc<Self> {
+        let previous: Previous = Arc::from(std::panic::take_hook());
+        Self::install_over(loop_thread, cordons, terminal, previous)
+    }
+
+    /// [`Hooks::install`] over `previous`, which prints the message: a test passes one that
+    /// records what it was asked to print.
+    pub fn install_over(
+        loop_thread: ThreadId,
+        cordons: Arc<Cordons>,
+        terminal: Arc<dyn Terminal>,
+        previous: Previous,
+    ) -> Arc<Self> {
+        LATE.store(false, Ordering::SeqCst);
         let hooks = Arc::new(Self {
             loop_thread,
             cordons,
             terminal,
             lent: AtomicBool::new(false),
+            done: AtomicBool::new(false),
+            disarmed: AtomicBool::new(false),
             task_panic: Mutex::new(None),
             wake: Notify::new(),
-            previous: Mutex::new(None),
+            previous,
         });
-        let previous: Previous = Arc::from(std::panic::take_hook());
         let this = Arc::clone(&hooks);
-        let chained = Arc::clone(&previous);
-        std::panic::set_hook(Box::new(move |info| this.on_panic(info, &*chained)));
-        *hooks
-            .previous
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(previous);
+        std::panic::set_hook(Box::new(move |info| this.on_panic(info)));
         hooks
     }
 
     /// Puts back the hook that was in place before [`Hooks::install`]. For tests, which install
     /// the hook more than once in a process; a run installs it once and keeps it.
+    ///
+    /// `std::panic::set_hook` refuses on a thread that is panicking (a failed assertion's unwind
+    /// drops the test's guard): the hook then only chains to the old one from here on, so it
+    /// cannot swallow what a later test's failure prints.
     pub fn uninstall(&self) {
-        let previous = self
-            .previous
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(previous) = previous {
-            std::panic::set_hook(Box::new(move |info| previous(info)));
+        if std::thread::panicking() {
+            self.disarmed.store(true, Ordering::SeqCst);
+            return;
         }
+        let previous = Arc::clone(&self.previous);
+        std::panic::set_hook(Box::new(move |info| previous(info)));
     }
 
-    fn on_panic(&self, info: &PanicHookInfo<'_>, previous: &(dyn Fn(&PanicHookInfo<'_>) + Sync)) {
-        let lent = self.lent.load(Ordering::SeqCst);
+    fn on_panic(&self, info: &PanicHookInfo<'_>) {
+        let previous = &*self.previous;
+        if self.disarmed.load(Ordering::SeqCst) {
+            previous(info);
+            return;
+        }
+        // The terminal is not the hook's to touch while ssh has it, or once the loop has put it
+        // back for good.
+        let terminal_is_ours =
+            !self.lent.load(Ordering::SeqCst) && !self.done.load(Ordering::SeqCst);
         if std::thread::current().id() == self.loop_thread {
-            if !lent {
+            if terminal_is_ours {
                 self.terminal.paste_off();
                 self.terminal.restore();
             }
             previous(info);
+            // A panic in a task that came first (inside the core, where it poisons the model's
+            // lock, the loop's next look at the core is this panic): its message is not printed
+            // anywhere else.
+            if let Some(first) = self.task_panic() {
+                self.terminal
+                    .say(&format!("a panic in a task came first: {first}"));
+            }
             for line in self.cordons.last_resort(HOOK_BOUND) {
-                say(&line);
+                self.terminal.say(&line);
             }
             return;
         }
+        // Inside a call into the core: the core is down from this moment (the lock is poisoned a
+        // moment later, by the unwind), so the loop must not look at it. Before the loop is told.
+        IN_CORE.with(|c| {
+            if let Some(failed) = c.borrow().as_ref() {
+                failed.store(true, Ordering::SeqCst);
+            }
+        });
         // Recorded first: whatever the print below does, the loop is told.
         {
             let mut first = self
@@ -147,7 +205,11 @@ impl Hooks {
             first.get_or_insert_with(|| describe(info));
         }
         self.wake.notify_one();
-        if lent {
+        if self.done.load(Ordering::SeqCst) {
+            // Nobody reads the record any more: printed as any panic is, and `main` fails.
+            LATE.store(true, Ordering::SeqCst);
+            previous(info);
+        } else if self.lent.load(Ordering::SeqCst) {
             // Text only, to the terminal ssh is using; the loop acts when ssh ends.
             previous(info);
         }
@@ -167,6 +229,12 @@ impl Hooks {
     /// The terminal is the TUI's again.
     pub fn take_back(&self) {
         self.lent.store(false, Ordering::SeqCst);
+    }
+
+    /// The loop has given the terminal back for good and is about to read the record: from here
+    /// on a panic in a task is printed as it happens, and [`late_task_panic`] says it for `main`.
+    pub fn finish(&self) {
+        self.done.store(true, Ordering::SeqCst);
     }
 
     /// Completes when a panic happened outside the loop thread, with its message. Cancel-safe.
@@ -222,6 +290,28 @@ pub fn bounded(text: &str) -> String {
     let mut cut: String = one_line.chars().take(MESSAGE_BOUND).collect();
     cut.push('…');
     cut
+}
+
+thread_local! {
+    /// While a task's thread is inside a call into the core: the flag the panic hook sets, so
+    /// that the core is marked failed at the moment of the panic, before the unwind poisons the
+    /// model's lock. Otherwise the loop could see the recorded panic and look at the core in the
+    /// gap before the task's own `catch_unwind` has marked it, and panic on the poisoned lock.
+    static IN_CORE: std::cell::RefCell<Option<Arc<AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `call` with the hook told that a panic in it takes the core down: it sets `failed`.
+pub fn while_in_core<R>(failed: &Arc<AtomicBool>, call: impl FnOnce() -> R) -> R {
+    struct Leave;
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            IN_CORE.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    IN_CORE.with(|c| *c.borrow_mut() = Some(Arc::clone(failed)));
+    let _leave = Leave;
+    call()
 }
 
 /// A panic inside a future that [`guarded`] was polling.

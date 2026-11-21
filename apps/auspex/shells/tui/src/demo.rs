@@ -433,6 +433,19 @@ fn closure(machine: &str, pending: bool) -> ClosurePaths {
     }
 }
 
+/// Which call panics ([`Demo::fault`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fault {
+    /// The probe of this machine.
+    ProbeOf(String),
+    /// The call that drains a node: it was registered as cordoned, and the core must be answered
+    /// so that it gives it back.
+    Drain,
+    /// The update call, right after `clan` was started: the machine may be half updated, so the
+    /// node must stay cordoned and be named, never given back.
+    AfterClanStarted,
+}
+
 /// The script. `Demo::default()` is what `--demo` runs; the two fields exist for the shell's
 /// own tests, to make the evaluator misbehave in the two ways the shell must not hide.
 #[derive(Debug, Default)]
@@ -451,12 +464,9 @@ pub struct Demo {
     /// a fake `nix`), instead of answering them from `preflight_answer`. For the shell's own
     /// tests of what cancelling them does to the processes.
     pub real_preflight: bool,
-    /// The probe of this machine panics (an adapter that has a bug), for the tests of what the
-    /// shell does with a task that panicked: answer its request, and end the run.
-    pub panic_in_probe_of: Option<String>,
-    /// The call that drains a node panics, for the test of what a panicked drain leaves behind: the
-    /// node was registered as cordoned, and the core must be answered so that it gives it back.
-    pub panic_in_drain: bool,
+    /// A call that panics (an adapter that has a bug), for the tests of what the shell does with a
+    /// task that panicked: answer its request, and end the run.
+    pub fault: Option<Fault>,
 }
 
 impl Demo {
@@ -474,7 +484,7 @@ impl Demo {
         cancel: &CancellationToken,
     ) -> Result<ProbeOutcome, Cancelled> {
         assert!(
-            self.panic_in_probe_of.as_deref() != Some(op.machine.as_str()),
+            self.fault.as_ref() != Some(&Fault::ProbeOf(op.machine.clone())),
             "fault injected by a test: the probe of {} panics",
             op.machine
         );
@@ -656,7 +666,19 @@ impl Demo {
     ) -> Result<Result<ClanRun, String>, Cancelled> {
         use auspex_core::ActionKind;
         if let Some(real) = &self.real_actions {
-            return real.run_action(op, cancel, sink, starting).await;
+            let panic_after = self.fault == Some(Fault::AfterClanStarted);
+            // `starting` says `clan` is about to be spawned (the shell commits the node then); the
+            // fault is the call dying right after it, with the machine possibly half updated.
+            let starting_then_panic = || {
+                starting();
+                assert!(
+                    !panic_after,
+                    "fault injected by a test: the call panics after clan started"
+                );
+            };
+            return real
+                .run_action(op, cancel, sink, &starting_then_panic)
+                .await;
         }
         if op.kind == ActionKind::Update {
             starting();
@@ -726,7 +748,8 @@ impl Demo {
         sink: &(dyn Fn(Stream, &str) + Sync),
     ) -> Result<auspex_core::effects::KubeAnswer, Cancelled> {
         assert!(
-            !(self.panic_in_drain && matches!(op.op, auspex_core::effects::KubeOp::Drain { .. })),
+            !(self.fault == Some(Fault::Drain)
+                && matches!(op.op, auspex_core::effects::KubeOp::Drain { .. })),
             "fault injected by a test: the drain call panics"
         );
         if let Some(real) = &self.real_actions {

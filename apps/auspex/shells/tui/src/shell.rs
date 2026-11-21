@@ -29,7 +29,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread::ThreadId;
 use std::time::Duration;
 
 use auspex_core::effects::{
@@ -57,7 +58,7 @@ use crate::cordon::{Cordons, LAST_RESORT_BOUND};
 use crate::handoff::Handoff;
 use crate::log::Log;
 use crate::output::{Output, Stream};
-use crate::panics::{Internal, Panicked, guarded, internal_error};
+use crate::panics::{self, Internal, Panicked, guarded, internal_error};
 
 /// How many per-machine calls (probes, cache lookups) may run at once.
 ///
@@ -163,14 +164,24 @@ pub struct Shell {
     gave_back: AtomicBool,
     /// How long one last-resort `kubectl uncordon` may take ([`LAST_RESORT_BOUND`]; tests shorten it).
     last_resort_bound: Mutex<Duration>,
+    /// The thread that runs the TUI loop, once it is known ([`Shell::set_loop_thread`]).
+    loop_thread: OnceLock<ThreadId>,
+    /// A call into the core panicked on a thread other than the loop's: the core is not used again.
+    core_failed: Arc<AtomicBool>,
+    /// The last view the core gave, for the screen of a run whose core has failed.
+    last_view: Mutex<ViewModel>,
+    /// A test makes the next call into the core panic ([`Shell::fault_next_core_call`]).
+    core_fault: AtomicBool,
 }
 
 impl Shell {
     /// A shell over `backend`, logging to `log`.
     #[must_use]
     pub fn new(backend: Backend, log: Log, settle: Duration) -> Arc<Self> {
+        let core = Core::new();
+        let first_view = core.view();
         Arc::new(Self {
-            core: Core::new(),
+            core,
             backend,
             tokens: Mutex::new(HashMap::new()),
             root: CancellationToken::new(),
@@ -200,6 +211,10 @@ impl Shell {
             exit_report: Mutex::new(Vec::new()),
             gave_back: AtomicBool::new(false),
             last_resort_bound: Mutex::new(LAST_RESORT_BOUND),
+            loop_thread: OnceLock::new(),
+            core_failed: Arc::new(AtomicBool::new(false)),
+            last_view: Mutex::new(first_view),
+            core_fault: AtomicBool::new(false),
         })
     }
 
@@ -227,7 +242,64 @@ impl Shell {
     /// What to draw.
     #[must_use]
     pub fn view(&self) -> ViewModel {
-        self.core.view()
+        self.core_call(Core::view).map_or_else(
+            || lock(&self.last_view).clone(),
+            |view| {
+                *lock(&self.last_view) = view.clone();
+                view
+            },
+        )
+    }
+
+    /// The thread that runs the TUI loop. Call it once, from that thread, before anything runs.
+    ///
+    /// A panic on any other thread inside a call into the core (an adapter's answer is delivered
+    /// by a task, which runs the core's update) marks the core **failed** ([`Shell::core_failed`]) at
+    /// the moment of the panic, through the hook ([`panics::while_in_core`]). The loop, which would
+    /// otherwise panic at its next look at a core whose lock that panic poisoned, ends the run in
+    /// order without it. A panic on the loop thread is the loop's own.
+    pub fn set_loop_thread(&self, thread: ThreadId) {
+        let _ = self.loop_thread.set(thread);
+    }
+
+    /// A call into the core panicked in a task: the core is not asked again, [`Shell::view`] is the
+    /// last view it gave, and the roll cannot be stopped by it.
+    #[must_use]
+    pub fn core_failed(&self) -> bool {
+        self.core_failed.load(Ordering::SeqCst)
+    }
+
+    /// For tests: the next call into the core **from a task** panics, as a bug in the core's update
+    /// would when it reacts to an adapter's answer.
+    pub fn fault_next_core_call(&self) {
+        self.core_fault.store(true, Ordering::SeqCst);
+    }
+
+    /// Every call into the core goes through here. `None`: the core has failed (before, or in this
+    /// call, on a thread other than the loop's).
+    fn core_call<T>(&self, call: impl FnOnce(&Core<Auspex>) -> T) -> Option<T> {
+        if self.core_failed() {
+            return None;
+        }
+        let on_loop = self
+            .loop_thread
+            .get()
+            .is_none_or(|t| *t == std::thread::current().id());
+        let run = |core: &Core<Auspex>| {
+            // A test's fault is for a task's call: the loop's own would be the loop's panic.
+            assert!(
+                on_loop || !self.core_fault.swap(false, Ordering::SeqCst),
+                "fault injected by a test: the core panicked"
+            );
+            call(core)
+        };
+        if on_loop {
+            return Some(run(&self.core));
+        }
+        // A panic here is a task's: the panic hook (which runs before the unwind) is told which flag to
+        // set, so the core is marked failed before the unwind poisons its lock and the loop never
+        // looks at it afterwards. The task then unwinds like any task that panics.
+        Some(panics::while_in_core(&self.core_failed, || run(&self.core)))
     }
 
     /// Writes why the CI badge is `unknown` (or `not_pushed`) to the log, once per reason: the
@@ -325,8 +397,9 @@ impl Shell {
 
     /// Sends `event` to the core and fulfils whatever it asks for.
     pub fn send(self: &Arc<Self>, event: Event) {
-        let effects = self.core.process_event(event);
-        self.fulfil_all(effects);
+        if let Some(effects) = self.core_call(|core| core.process_event(event)) {
+            self.fulfil_all(effects);
+        }
         self.changed.notify_one();
     }
 
@@ -608,13 +681,15 @@ impl Shell {
     }
 
     fn resolve<Op: Operation>(self: &Arc<Self>, request: &mut Request<Op>, output: Op::Output) {
-        match self.core.resolve(request, output) {
-            Ok(effects) => self.fulfil_all(effects),
+        match self.core_call(|core| core.resolve(request, output)) {
+            Some(Ok(effects)) => self.fulfil_all(effects),
             // Only a request that cannot be resolved again (a one-shot resolved twice) gets
             // here, which this shell never does; say so rather than hide it.
-            Err(e) => self.log.line(&format!(
+            Some(Err(e)) => self.log.line(&format!(
                 "internal: an answer could not be delivered: {e:?}"
             )),
+            // The core has failed: there is nothing to deliver the answer to.
+            None => {}
         }
         self.changed.notify_one();
     }
@@ -843,7 +918,8 @@ impl Shell {
         lock(&self.warning).clone()
     }
 
-    fn warn(&self, text: &str) {
+    /// Puts `text` in the log and in the status bar (see [`Shell::warning`]).
+    pub fn warn(&self, text: &str) {
         self.log.line(text);
         *lock(&self.warning) = Some(text.to_owned());
         self.changed.notify_one();
@@ -883,7 +959,7 @@ impl Shell {
     pub async fn terminate_with(self: &Arc<Self>, interrupt: impl Future<Output = ()>) {
         self.send(Event::Terminate);
         let stopped = async {
-            while !self.view().quit {
+            while !self.core_failed() && !self.view().quit {
                 tokio::select! {
                     () = self.changed() => {}
                     () = tokio::time::sleep(Duration::from_millis(25)) => {}
@@ -896,6 +972,14 @@ impl Shell {
                 self.log.line("stopping took longer than the bound; cancelling everything");
             }
             () = interrupt => {}
+        }
+        if self.core_failed() {
+            // Said with the rest of what the exit has to say, after the terminal is back.
+            let line = "a panic in a task took the core down, so it could not stop the roll itself: auspex \
+                        cancelled what was running and gave back what it holds"
+                .to_owned();
+            self.log.line(&line);
+            lock(&self.exit_report).push(line);
         }
         self.shutdown().await;
     }
@@ -1240,7 +1324,11 @@ impl Shell {
         self.tasks.spawn(async move {
             // An update is the one action that can lift nothing a freeze holds: asked again, here.
             let gate = if op.kind == ActionKind::Update {
-                shell.freeze_gate(&op.machine).await
+                // A panic reading the file is a refusal (nothing was done), not a lost answer.
+                match guarded(shell.freeze_gate(&op.machine)).await {
+                    Ok(gate) => gate,
+                    Err(Panicked(why)) => Err(internal_error(&why)),
+                }
             } else {
                 Ok(())
             };

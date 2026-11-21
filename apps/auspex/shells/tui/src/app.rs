@@ -254,6 +254,11 @@ pub fn main() -> ExitCode {
     let code = runtime.block_on(run.run());
     // A DNS lookup cannot be interrupted, only abandoned: do not wait for its thread.
     runtime.shutdown_timeout(Duration::from_millis(500));
+    // A task that panicked after the loop had read the record (while the runtime was going down):
+    // printed by the hook, and never a success.
+    if panics::late_task_panic() && code == ExitCode::SUCCESS {
+        return ExitCode::from(USAGE);
+    }
     code
 }
 
@@ -421,11 +426,9 @@ async fn tui(
     // A panic on this thread ends auspex: the terminal is given back and what was cordoned for an
     // update that had not started is uncordoned. A panic anywhere else touches neither; it ends
     // the run through the loop, in order (see `panics`).
-    let hooks = Hooks::install(
-        std::thread::current().id(),
-        shell.cordons(),
-        Arc::new(panics::Real),
-    );
+    let loop_thread = std::thread::current().id();
+    shell.set_loop_thread(loop_thread);
+    let hooks = Hooks::install(loop_thread, shell.cordons(), Arc::new(panics::Real));
     enter_bracketed_paste();
     // Where `s` asks for the terminal; before the first key, so a request always has an answer.
     let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -442,7 +445,31 @@ async fn tui(
     let mut refresh = (shell.view().refresh.generation, std::time::Instant::now());
     let mut code: u8 = 0;
     let mut ended_by_panic = false;
-    while !shell.view().quit {
+    loop {
+        // Before anything looks at the core: a panic in a task is recorded by the hook before it
+        // unwinds, and the core's lock it may hold is poisoned only after that.
+        if let Some(message) = hooks.task_panic() {
+            // The wind-down below can take a while and draws nothing: say why, once, now.
+            let status = "a task panicked, so auspex is stopping the run";
+            shell.log.line(&format!("{status}: {message}"));
+            shell.warn(status);
+            let log = shell.log.lines();
+            let ctx = Context {
+                theme,
+                keymap,
+                flake,
+                log: &log,
+                output: shell.output(),
+                now: std::time::Instant::now(),
+            };
+            let _ = terminal.draw(|f| shell.draw(f, &mut ui, &ctx));
+            ended_by_panic = true;
+            code = USAGE;
+            break;
+        }
+        if shell.core_failed() || shell.view().quit {
+            break;
+        }
         tokio::select! {
             _ = frames.tick() => {
                 ui.frame = ui.frame.wrapping_add(1);
@@ -490,9 +517,7 @@ async fn tui(
             Some(request) = handoff_rx.recv() => {
                 // The reader is stopped before ssh starts, or it would take ssh's keys.
                 events.stop();
-                // The terminal is ssh's from here: no panic writes an escape sequence into it.
-                hooks.lend();
-                handoff::leave_terminal();
+                handoff::leave_terminal(&hooks);
                 let session = handoff::run(&request.program, &request.args, term).await;
                 if let Some(signal) = session.stopped_by {
                     // ssh is gone and the terminal is already the shell's: leave it so.
@@ -501,14 +526,13 @@ async fn tui(
                     let _ = request.reply.send(session.end);
                     break;
                 }
-                if let Err(e) = handoff::enter_terminal(&mut terminal) {
+                if let Err(e) = handoff::enter_terminal(&mut terminal, &hooks) {
                     terminal_left = true;
                     failure = Some(format!("cannot take the terminal back from ssh: {e}"));
                     code = USAGE;
                     let _ = request.reply.send(session.end);
                     break;
                 }
-                hooks.take_back();
                 events = TerminalEvents::start();
                 // The frames that were due while ssh ran are not owed.
                 frames.reset();
@@ -518,13 +542,8 @@ async fn tui(
                 code = signal_exit(signal);
                 break;
             }
-            // A panic outside this thread: auspex ends in order, as for a signal.
-            message = hooks.task_panicked() => {
-                shell.log.line(&format!("a task panicked, so auspex is stopping: {message}"));
-                ended_by_panic = true;
-                code = USAGE;
-                break;
-            }
+            // A panic outside this thread: the top of the loop ends the run in order, as for a signal.
+            _ = hooks.task_panicked() => {}
         }
     }
     // Cancel and reap first, then give the terminal back. A second signal ends the wait for the
@@ -582,6 +601,9 @@ pub async fn wind_down(
     if !leaving.terminal_left {
         hooks.terminal().restore();
     }
+    // The terminal is back for good: a task that panics from here on is printed as it happens, and
+    // makes the exit a failure ([`panics::late_task_panic`]); the record is read next.
+    hooks.finish();
     let mut code = leaving.code;
     let mut lines: Vec<String> = leaving.failure.into_iter().collect();
     if let Some(message) = hooks.task_panic() {

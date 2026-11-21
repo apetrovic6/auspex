@@ -17,8 +17,8 @@ mod common;
 
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use auspex_core::{ConfirmKind, Event, RollState, RollStatus, ViewModel};
@@ -26,7 +26,7 @@ use auspex_domain::roll::RollRule;
 use auspex_domain::status::Badge;
 use auspex_tui::app::{Leaving, wind_down};
 use auspex_tui::backend::{Backend, Real};
-use auspex_tui::demo::{self, Demo};
+use auspex_tui::demo::{self, Demo, Fault};
 use auspex_tui::log::Log;
 use auspex_tui::panics::{Hooks, Terminal};
 use auspex_tui::shell::Shell;
@@ -40,9 +40,15 @@ static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 struct Calls {
     restore: AtomicUsize,
     paste_off: AtomicUsize,
+    /// What the hook said (the last resort's lines, a task panic that came first).
+    said: Mutex<Vec<String>>,
 }
 
 impl Calls {
+    fn said(&self) -> Vec<String> {
+        self.said.lock().unwrap().clone()
+    }
+
     fn counts(&self) -> (usize, usize) {
         (
             self.restore.load(Ordering::SeqCst),
@@ -59,6 +65,10 @@ impl Terminal for Calls {
     fn paste_off(&self) {
         self.paste_off.fetch_add(1, Ordering::SeqCst);
     }
+
+    fn say(&self, line: &str) {
+        self.said.lock().unwrap().push(line.to_owned());
+    }
 }
 
 /// The hook installed on this thread (the loop's), over a terminal that only counts; the old
@@ -66,29 +76,37 @@ impl Terminal for Calls {
 struct Installed {
     hooks: Arc<Hooks>,
     calls: Arc<Calls>,
+    /// What the default hook was asked to print (the old hook still runs after: a failing
+    /// assertion in these tests is shown as usual).
+    printed: Arc<Mutex<Vec<String>>>,
     _serial: tokio::sync::MutexGuard<'static, ()>,
 }
 
 impl Drop for Installed {
     fn drop(&mut self) {
-        // Not while a failed assertion is unwinding: `set_hook` refuses then, and the abort would hide it.
-        if !std::thread::panicking() {
-            self.hooks.uninstall();
-        }
+        self.hooks.uninstall();
     }
 }
 
 async fn install(shell: &Arc<Shell>) -> Installed {
     let serial = SERIAL.lock().await;
     let calls = Arc::new(Calls::default());
-    let hooks = Hooks::install(
+    let printed = Arc::new(Mutex::new(Vec::new()));
+    let old: auspex_tui::panics::Previous = Arc::from(std::panic::take_hook());
+    let record = Arc::clone(&printed);
+    let hooks = Hooks::install_over(
         std::thread::current().id(),
         shell.cordons(),
         Arc::<Calls>::clone(&calls),
+        Arc::new(move |info| {
+            record.lock().unwrap().push(info.to_string());
+            old(info);
+        }),
     );
     Installed {
         hooks,
         calls,
+        printed,
         _serial: serial,
     }
 }
@@ -172,16 +190,16 @@ fn leases_alive() -> String {
     )
 }
 
-/// A cluster whose **drain never ends** (until it is killed) and whose uncordon works.
-fn kubectl_draining() -> String {
+/// A cluster whose drain and uncordon run the given shell snippets.
+fn kubectl_with(drain: &str, uncordon: &str) -> String {
     format!(
         "printf '%s\\n' \"$*\" >> '@dir@/kubectl.log'\n\
          case \" $* \" in\n\
          *\" config view \"*) {view}\n;;\n\
          *\" get leases \"*) {leases}\n;;\n\
          *\" get nodes \"*) {nodes}\n;;\n\
-         *\" drain \"*) echo 'evicting (fake)'; @sleep@ 30\n;;\n\
-         *\" uncordon \"*) echo 'node uncordoned (fake)'\n;;\n\
+         *\" drain \"*) {drain}\n;;\n\
+         *\" uncordon \"*) {uncordon}\n;;\n\
          *) echo 'ok (fake)';;\n\
          esac\n",
         view = cat(VIEW),
@@ -190,12 +208,23 @@ fn kubectl_draining() -> String {
     )
 }
 
-fn world(t: &Tools) -> World {
-    world_with(t, false)
+/// What a world's fake cluster and fault injection do.
+#[derive(Default)]
+struct Opts {
+    fault: Option<Fault>,
+    /// The drain ends at once (it never ends, until it is killed, otherwise).
+    quick_drain: bool,
+    /// The drain ends after this many seconds (0: it does not).
+    short_drain: u32,
+    /// The uncordon takes this many seconds.
+    slow_uncordon: u32,
 }
 
-/// [`world`], where the call that drains a node panics when `panic_in_drain`.
-fn world_with(t: &Tools, panic_in_drain: bool) -> World {
+fn world(t: &Tools) -> World {
+    world_with(t, &Opts::default())
+}
+
+fn world_with(t: &Tools, opts: &Opts) -> World {
     let dir = tempdir();
     let clan = t.script(
         dir.path(),
@@ -203,13 +232,24 @@ fn world_with(t: &Tools, panic_in_drain: bool) -> World {
         "for a in \"$@\"; do m=$a; done\nprintf 'start %s\\n' \"$m\" >> '@dir@/clan.log'\n@sleep@ 1",
     );
     let nix = t.script(dir.path(), "nix", "exit 0");
-    let kubectl = t.script(dir.path(), "kubectl", &kubectl_draining());
+    let drain = if opts.short_drain > 0 {
+        format!("@sleep@ {}; echo 'node drained (fake)'", opts.short_drain)
+    } else if opts.quick_drain {
+        "echo 'node drained (fake)'".to_owned()
+    } else {
+        "echo 'evicting (fake)'; @sleep@ 30".to_owned()
+    };
+    let uncordon = format!(
+        "@sleep@ {}; echo 'node uncordoned (fake)'",
+        opts.slow_uncordon
+    );
+    let kubectl = t.script(dir.path(), "kubectl", &kubectl_with(&drain, &uncordon));
     let real = Real::for_actions(nix.into_os_string(), Some(clan))
         .with_kubectl(kubectl.into_os_string(), dir.path().join("kubeconfig"));
     let shell = Shell::new(
         Backend::Demo(Demo {
             real_actions: Some(Box::new(real)),
-            panic_in_drain,
+            fault: opts.fault.clone(),
             ..Demo::default()
         }),
         Log::memory(),
@@ -230,6 +270,7 @@ fn world_with(t: &Tools, panic_in_drain: bool) -> World {
     .into();
     config.rolling.parallel = 2;
     config.rolling.ready_timeout_seconds = 20;
+    shell.set_loop_thread(std::thread::current().id());
     shell.send(Event::Start(config));
     World { dir, shell }
 }
@@ -251,8 +292,8 @@ async fn until(shell: &Arc<Shell>, what: &str, ready: impl Fn(&ViewModel) -> boo
     );
 }
 
-/// luna is being drained: cordoned by auspex, the drain running, its update not started.
-async fn draining_luna(w: &World) {
+/// `U` and `y` to the plan: the roll is started.
+async fn start_roll(w: &World) {
     until(&w.shell, "the fleet to settle", |v| {
         v.refresh.settled
             && ["luna", "sol", "cypramundi"].iter().all(|n| {
@@ -273,14 +314,32 @@ async fn draining_luna(w: &World) {
     })
     .await;
     w.shell.send(Event::ConfirmAnswer(true));
-    until(&w.shell, "luna to be draining", |v| {
+}
+
+/// The roll is started, and luna is (or comes to be) in a state `ready` accepts.
+async fn draining_to(w: &World, ready: impl Fn(&RollState) -> bool) {
+    start_roll(w).await;
+    until(&w.shell, "luna to reach the state", |v| {
         v.roll.as_ref().is_some_and(|r| {
             r.machines
                 .iter()
-                .any(|m| m.name == "luna" && m.state == RollState::Draining)
+                .any(|m| m.name == "luna" && ready(&m.state))
         })
     })
     .await;
+}
+
+/// luna is being drained: cordoned by auspex, the drain running, its update not started.
+async fn draining_luna(w: &World) {
+    draining_to(w, |s| *s == RollState::Draining).await;
+    // The core says "draining" a moment before the shell has registered the node (both happen on
+    // the task that delivered the last answer): wait for the registration.
+    for _ in 0..200 {
+        if w.shell.cordons().held() == ["luna"] {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert_eq!(w.shell.cordons().held(), ["luna"], "luna is registered");
 }
 
@@ -481,6 +540,13 @@ async fn a_panic_while_ssh_has_the_terminal_uncordons_and_writes_nothing() {
             .is_some_and(|m| m.contains("in a task, while ssh runs")),
         "the task's panic is recorded for when ssh ends"
     );
+    // Printed as text, by the default hook, on both threads while ssh has the terminal.
+    let printed = installed.printed.lock().unwrap().join("\n");
+    assert!(
+        printed.contains("in a task, while ssh runs")
+            && printed.contains("on the loop, while ssh runs"),
+        "{printed}"
+    );
 
     installed.hooks.take_back();
     let _ = std::panic::catch_unwind(|| panic!("after ssh"));
@@ -503,7 +569,7 @@ async fn a_panicked_effect_task_answers_its_request_as_a_failure() {
     let _serial = SERIAL.lock().await;
     let shell = Shell::new(
         Backend::Demo(Demo {
-            panic_in_probe_of: Some("luna".to_owned()),
+            fault: Some(Fault::ProbeOf("luna".to_owned())),
             ..Demo::default()
         }),
         Log::memory(),
@@ -556,7 +622,13 @@ async fn a_panicked_drain_is_answered_so_the_core_uncordons_the_node() {
         return;
     };
     let _serial = SERIAL.lock().await;
-    let w = world_with(&t, true);
+    let w = world_with(
+        &t,
+        &Opts {
+            fault: Some(Fault::Drain),
+            ..Opts::default()
+        },
+    );
     until(&w.shell, "the fleet to settle", |v| {
         v.refresh.settled
             && ["luna", "sol", "cypramundi"].iter().all(|n| {
@@ -603,5 +675,292 @@ async fn a_panicked_drain_is_answered_so_the_core_uncordons_the_node() {
         w.kubectl_calls().iter().all(|c| !c.contains("drain sol")),
         "the group stopped: {:#?}",
         w.kubectl_calls()
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1 (review of PR #41)
+// ---------------------------------------------------------------------------------------
+
+/// F1, the hook's half. A task panic inside the core poisons the model's lock, and the loop's next
+/// look at the core is a panic on the loop thread; the task's own message must not be lost then.
+/// The hook says it first. (And only the first of two task panics is kept: the second is most often
+/// a consequence of it.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_loop_thread_panic_after_a_task_panic_says_the_task_panic_first() {
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    let installed = install(&shell).await;
+    let _ = tokio::spawn(async { panic!("the root cause") }).await;
+    let _ = tokio::spawn(async { panic!("a consequence") }).await;
+    let first = installed.hooks.task_panicked().await;
+    assert!(first.contains("the root cause"), "{first}");
+    assert!(
+        installed
+            .hooks
+            .task_panic()
+            .is_some_and(|m| m.contains("the root cause")),
+        "the first one is kept"
+    );
+
+    let _ = std::panic::catch_unwind(|| panic!("Model RwLock was poisoned"));
+    let said = installed.calls.said();
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("a panic in a task came first: the root cause")),
+        "{said:?}"
+    );
+    // The loop's own message went to the default hook, as before.
+    assert!(
+        installed
+            .printed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains("Model RwLock was poisoned")),
+        "{:?}",
+        installed.printed
+    );
+    assert_eq!(installed.calls.counts(), (1, 1));
+}
+
+/// F1, the shell's half. A panic inside a call into the core, on a worker (an adapter's answer
+/// is delivered there), takes the core down. The loop does not look at the core again; the run ends
+/// in order without it: the drained node is given back by auspex itself, the exit names the
+/// panic and says the core could not stop the roll, and nothing waits out the 20 s bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panic_inside_the_core_in_a_task_still_ends_the_run_in_order() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let w = world_with(
+        &t,
+        &Opts {
+            short_drain: 2,
+            ..Opts::default()
+        },
+    );
+    // Installed first: it waits for the other tests that hold the process-wide hook, and the roll
+    // must not have moved on by then.
+    let installed = install(&w.shell).await;
+    draining_luna(&w).await;
+
+    // The next call into the core made by a task (here the free machine's update ending, or the
+    // drain's answer) is the one that panics.
+    w.shell.fault_next_core_call();
+    let message = tokio::time::timeout(Duration::from_secs(10), installed.hooks.task_panicked())
+        .await
+        .expect("the loop is told of the panic");
+    assert!(message.contains("the core panicked"), "{message}");
+    assert!(
+        w.shell.core_failed(),
+        "the core is marked failed, so that nothing looks at it again"
+    );
+    // What the loop does next must not panic: it reads the view.
+    let _ = w.shell.view();
+    assert_eq!(
+        installed.calls.counts(),
+        (0, 0),
+        "the hook left the terminal"
+    );
+
+    let began = std::time::Instant::now();
+    let (code, lines) = wind_down(
+        &w.shell,
+        &installed.hooks,
+        leaving(true),
+        std::future::pending(),
+    )
+    .await;
+    assert!(
+        began.elapsed() < Duration::from_secs(15),
+        "no wait for a core that cannot answer: {:?}",
+        began.elapsed()
+    );
+    assert_ne!(code, 0);
+    let said = lines.join("\n");
+    assert!(
+        said.contains("a panic in a task ended the run: ")
+            && said.contains("the core panicked")
+            && said.contains("could not stop the roll itself"),
+        "{said}"
+    );
+    assert_eq!(
+        w.uncordons_of_luna(),
+        1,
+        "auspex gave luna back itself: {:#?}",
+        w.kubectl_calls()
+    );
+    assert_eq!(w.shell.cordons().held(), Vec::<String>::new());
+    assert_eq!(installed.calls.counts(), (1, 1));
+}
+
+/// F2. A panic after `clan` was started: the machine may be half updated, so the node stays
+/// cordoned and the exit names it with the command; it is never uncordoned. (As a refusal, the core
+/// would give it back.) Also: the exit lines carry the report of nodes left cordoned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panic_after_clan_started_leaves_the_node_cordoned_and_named() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let w = world_with(
+        &t,
+        &Opts {
+            fault: Some(Fault::AfterClanStarted),
+            quick_drain: true,
+            ..Opts::default()
+        },
+    );
+    let installed = {
+        // Installed before the roll starts, as the loop's hook is.
+        let i = install(&w.shell).await;
+        draining_to(&w, |s| matches!(s, RollState::Failed(_))).await;
+        i
+    };
+    let roll = w.shell.view().roll.expect("there was a roll");
+    let luna = roll.machines.iter().find(|m| m.name == "luna").unwrap();
+    assert!(
+        matches!(&luna.state, RollState::Failed(why) if why.contains("internal error")),
+        "failed, not refused: {:?}",
+        luna.state
+    );
+    assert_eq!(
+        w.shell.cordons().held(),
+        ["luna"],
+        "luna is on the record as left cordoned"
+    );
+    let message = tokio::time::timeout(Duration::from_secs(10), installed.hooks.task_panicked())
+        .await
+        .expect("the panic was recorded");
+    assert!(message.contains("after clan started"), "{message}");
+
+    let (code, lines) = wind_down(
+        &w.shell,
+        &installed.hooks,
+        leaving(true),
+        std::future::pending(),
+    )
+    .await;
+    assert_ne!(code, 0);
+    assert_eq!(
+        w.uncordons_of_luna(),
+        0,
+        "never uncordoned: {:#?}",
+        w.kubectl_calls()
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("node luna was left cordoned") && l.contains("uncordon luna")),
+        "named, with the command, in what the exit says: {lines:?}"
+    );
+    drop(installed);
+}
+
+/// F3 (A2). The terminal is the shell's already (ssh was stopped by a signal): the loop does not
+/// restore it again, but bracketed paste is still switched off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_that_is_the_shells_already_is_not_restored_again() {
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    let installed = install(&shell).await;
+    let (code, lines) = wind_down(
+        &shell,
+        &installed.hooks,
+        Leaving {
+            code: 143,
+            ended_by_panic: false,
+            terminal_left: true,
+            failure: Some("cannot take the terminal back from ssh: x".to_owned()),
+        },
+        std::future::pending(),
+    )
+    .await;
+    assert_eq!(installed.calls.counts(), (0, 1));
+    assert_eq!(code, 143, "a signal's code is kept");
+    assert_eq!(lines, ["cannot take the terminal back from ssh: x"]);
+}
+
+/// F3 (A5). A panic that happens while the run is being wound down is said, and fails the exit:
+/// the record is read after the wait, not before. The `interrupt` here is a task that panics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_panic_during_the_wind_down_is_said() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let w = world_with(
+        &t,
+        &Opts {
+            slow_uncordon: 2,
+            ..Opts::default()
+        },
+    );
+    draining_luna(&w).await;
+    let installed = install(&w.shell).await;
+    assert_eq!(installed.hooks.task_panic(), None, "nothing yet");
+    let (code, lines) = wind_down(&w.shell, &installed.hooks, leaving(false), async {
+        let _ = tokio::spawn(async { panic!("during the wind-down") }).await;
+    })
+    .await;
+    assert_ne!(code, 0);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("a task panicked during the run: during the wind-down")),
+        "{lines:?}"
+    );
+    drop(installed);
+}
+
+/// F5. A task that panics once the loop has put the terminal back and read the record (a task
+/// that outlived the reap grace, or one that dies while the runtime goes down) is printed as any
+/// panic is, and `main` fails the exit. Before that, the hook prints nothing for a task panic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_panic_after_the_wind_down_is_printed_and_fails_the_exit() {
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    let installed = install(&shell).await;
+    let _ = tokio::spawn(async { panic!("while the loop runs") }).await;
+    assert!(
+        installed.printed.lock().unwrap().is_empty() && !auspex_tui::panics::late_task_panic(),
+        "a task panic is not printed over the TUI, and is not late"
+    );
+    let (code, _) = wind_down(
+        &shell,
+        &installed.hooks,
+        leaving(true),
+        std::future::pending(),
+    )
+    .await;
+    assert_ne!(code, 0);
+
+    let _ = tokio::spawn(async { panic!("after the exit report") }).await;
+    assert!(
+        auspex_tui::panics::late_task_panic(),
+        "main is told to fail the exit"
+    );
+    assert!(
+        installed
+            .printed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains("after the exit report")),
+        "and the panic is printed: {:?}",
+        installed.printed
+    );
+    assert_eq!(
+        installed.calls.counts(),
+        (1, 1),
+        "the hook did not restore the terminal again"
     );
 }

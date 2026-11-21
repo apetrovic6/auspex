@@ -49,8 +49,8 @@
 //! - **A pid that is no longer ssh's.** Signals go through [`signal_ssh`], which refuses once the
 //!   waiter has marked ssh reaped, and the waiter marks it before it reaps.
 //! - **A panic while the terminal is lent** must not write escape sequences into ssh's session.
-//!   The loop tells the panic hook before [`leave_terminal`] ([`crate::panics::Hooks::lend`]) and
-//!   after [`enter_terminal`] succeeded (`take_back`); while it is lent the hook does not restore
+//!   [`leave_terminal`] tells the panic hook ([`Hooks::lend`]) and
+//!   [`enter_terminal`] takes it back ([`Hooks::take_back`]) once it succeeded; while it is lent the hook does not restore
 //!   the terminal, but a panic on the loop thread still runs the cordon last resort, and the
 //!   message is printed as text only, to the terminal ssh is drawing on (stderr). When [`run`]
 //!   ends because auspex was told to terminate, the terminal is never taken back, so the hook
@@ -77,6 +77,8 @@ use rustix::process::{
 use rustix::termios::{OptionalActions, QueueSelector, Termios, tcflush, tcgetattr, tcsetattr};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::oneshot;
+
+use crate::panics::Hooks;
 
 /// How long after ssh ends auspex waits for the terminal's signals to reach it, before it forgets
 /// the ones meant for ssh.
@@ -201,9 +203,10 @@ impl Drop for TerminalEvents {
 ///
 /// What `ratatui::restore` and
 /// [`crate::app`]'s teardown do, plus the cursor, which a frame hides and `restore` does not
-/// show. The caller tells the panic hook first ([`crate::panics::Hooks::lend`]), so from here
-/// until the terminal is taken back a panic writes nothing into it.
-pub fn leave_terminal() {
+/// show. It lends the terminal to the panic hook's state first
+/// ([`Hooks::lend`]), so from here until [`enter_terminal`] succeeds a panic writes nothing into it.
+pub fn leave_terminal(hooks: &Hooks) {
+    hooks.lend();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     let _ = execute!(std::io::stdout(), Show);
@@ -222,7 +225,7 @@ pub fn leave_terminal() {
 /// # Errors
 ///
 /// The terminal cannot be put back. The caller says so and exits.
-pub fn enter_terminal(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
+pub fn enter_terminal(terminal: &mut DefaultTerminal, hooks: &Hooks) -> std::io::Result<()> {
     enable_raw_mode()?;
     execute!(
         std::io::stdout(),
@@ -233,6 +236,7 @@ pub fn enter_terminal(terminal: &mut DefaultTerminal) -> std::io::Result<()> {
     // Whatever was typed while ssh had the terminal and ssh did not read is not for auspex.
     let _ = tcflush(rustix::stdio::stdin(), QueueSelector::IFlush);
     *terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    hooks.take_back();
     Ok(())
 }
 
