@@ -1985,6 +1985,8 @@ fn world_whose_head_moves_after_the_plan(t: &Tools, rule: RollRule) -> World {
     let fleet = tempdir();
     let clan = t.script(dir.path(), "clan", &clan_body("0.1"));
     let nix = t.script(dir.path(), "nix", "exit 1");
+    // `mkdir` is atomic: exactly one look, the first, makes the directory and is the plan's. A
+    // counter in a file, read and rewritten by looks that run at once, is not.
     let git = t.script(
         dir.path(),
         "git",
@@ -1992,8 +1994,7 @@ fn world_whose_head_moves_after_the_plan(t: &Tools, rule: RollRule) -> World {
             "case \" $* \" in\n\
              *\" config \"*) exit 0;;\n\
              *\" rev-parse --verify \"*)\n\
-               n=$(@cat@ '@dir@/head.reads' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '@dir@/head.reads'\n\
-               if [ $n -le 1 ]; then printf '{PLAN_HEAD}\\n'; else printf '{MOVED_HEAD}\\n'; fi;;\n\
+               if @mkdir@ '@dir@/planned' 2>/dev/null; then printf '{PLAN_HEAD}\\n'; else printf '{MOVED_HEAD}\\n'; fi;;\n\
              *\" status \"*) printf '## main...origin/main\\0';;\n\
              *) exit 1;;\n\
              esac\n"
@@ -2035,7 +2036,7 @@ fn world_whose_head_moves_after_the_plan(t: &Tools, rule: RollRule) -> World {
 /// `U`'s whole path are the real ones, over fake programs.
 #[tokio::test]
 async fn a_head_that_moves_after_the_y_refuses_each_machine_and_clan_never_runs() {
-    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+    let Some(t) = tools(&["sleep", "cat", "date", "mkdir"]) else {
         return;
     };
     let w = world_whose_head_moves_after_the_plan(&t, kube_rule(false));

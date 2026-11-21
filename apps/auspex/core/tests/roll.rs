@@ -2233,3 +2233,26 @@ fn a_node_of_the_cluster_that_rolls_with_no_group_is_warned_about_in_the_plan() 
         s.view().notice
     );
 }
+
+/// The plan fingerprinted the changes and a machine's turn cannot: they are not known to be the
+/// ones confirmed, so the machine is refused (and the sentence says they could not be checked).
+#[test]
+fn a_turn_that_cannot_fingerprint_the_changes_the_plan_could_refuses_the_machine() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.tree_answer = Ok(tree_at(support::HEAD_A, 1, digest(support::DIGEST_A)));
+    start(&mut s, healthy_cluster());
+    let mut p = take_preflight(&mut s, "luna");
+    s.resolve(
+        &mut p,
+        checks_of(tree_at(
+            support::HEAD_A,
+            1,
+            Edits::Unavailable("timed out".to_owned()),
+        )),
+    );
+    match state(&s, "luna") {
+        RollState::Refused(why) => assert!(why.contains("could not be checked"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(actions(&s).is_empty(), "nothing was updated");
+}

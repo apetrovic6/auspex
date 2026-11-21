@@ -137,8 +137,8 @@ pub fn describe_tree(tree: &TreeState) -> String {
 pub enum TreeChange {
     /// The same commit, and the same changes (or both clean).
     Same,
-    /// The same commit; the changes could not be compared (one of the two looks could not
-    /// fingerprint them). The line says so, for the machine's log.
+    /// The same commit; the changes could not be compared because the plan could not fingerprint
+    /// them (its warning said so). The line says so, for the machine's log.
     CommitOnly(String),
     /// Not what the plan found: the sentence says how, for the refusal.
     Moved(String),
@@ -190,6 +190,14 @@ pub fn compare(planned: Result<&TreeState, &str>, now: Result<&TreeState, &str>)
              contents)"
                 .to_owned(),
         ),
+        // The plan had a fingerprint and this look cannot make one: the changes are not known
+        // to be the ones confirmed, which is a refusal, as for a repository that could not be
+        // read again. (When the plan itself had none, its warning said so, and the commit is all
+        // there is to compare.)
+        (Edits::Digest(_), Edits::Unavailable(why)) => TreeChange::Moved(format!(
+            "the uncommitted changes could not be checked against the confirmed plan: {}",
+            sanitize_line(why)
+        )),
         _ => TreeChange::CommitOnly(
             "the uncommitted changes could not be fingerprinted, so only the commit was compared \
              with the confirmed plan's"
@@ -934,19 +942,24 @@ mod tests {
     }
 
     #[test]
-    fn changes_that_cannot_be_fingerprinted_are_compared_by_commit_only_and_it_is_said() {
+    fn a_plan_that_could_not_fingerprint_compares_by_commit_only_and_it_is_said() {
         let known = at(Some(COMMIT_A), 1, digest(DIGEST_A));
         let unknown = at(
             Some(COMMIT_A),
             1,
             Edits::Unavailable("timed out".to_owned()),
         );
-        for (a, b) in [(&known, &unknown), (&unknown, &known), (&unknown, &unknown)] {
+        // The plan said it could not fingerprint: the turn compares the commit, whatever it finds.
+        for (a, b) in [(&unknown, &known), (&unknown, &unknown)] {
             match compared(a, b) {
                 TreeChange::CommitOnly(note) => assert!(note.contains("only the commit"), "{note}"),
                 other => panic!("{other:?}"),
             }
         }
+        // The plan had a digest and the turn has none: the changes are not known to be the ones
+        // confirmed, so that is a refusal, as a repository that could not be read again is.
+        let why = moved(compared(&known, &unknown));
+        assert!(why.contains("could not be checked"), "{why}");
         // The commit is still compared.
         let other_commit = at(
             Some(COMMIT_B),

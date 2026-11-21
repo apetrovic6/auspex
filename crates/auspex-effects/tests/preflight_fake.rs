@@ -1203,9 +1203,34 @@ async fn the_fingerprint_of_changes_moves_with_the_files_and_not_with_what_nix_d
         "edited again"
     );
 
-    // Staging what is already in the worktree changes what git has, which nix reads too.
+    // Staging what is already in the worktree changes nothing nix evaluates: a dirty `git+file`
+    // tree is read from the worktree, not the index. `git add` of an edited file, and a stash
+    // popped back (which comes back unstaged), are not changes.
     real_git(r, &["add", "host.nix"]);
-    assert_ne!(digest_of(&real_tree(r).await.unwrap()), digest, "staged");
+    assert_eq!(digest_of(&real_tree(r).await.unwrap()), digest, "staged");
+    real_git(r, &["stash", "push", "-q"]);
+    real_git(r, &["stash", "pop", "-q"]);
+    assert_eq!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "stashed and back"
+    );
+    // A further edit of the staged file is one.
+    fs::write(r.join("host.nix"), "4\n").unwrap();
+    assert_ne!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "edited after staging"
+    );
+    // Staging a file that was not tracked changes which files nix sees.
+    let digest = digest_of(&real_tree(r).await.unwrap());
+    fs::write(r.join("new.nix"), "n\n").unwrap();
+    real_git(r, &["add", "new.nix"]);
+    assert_ne!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "a new tracked file"
+    );
 }
 
 #[tokio::test]
@@ -1253,4 +1278,89 @@ async fn a_fingerprint_out_of_time_is_unavailable_and_the_commit_is_still_read()
         Edits::Unavailable(why) => assert!(why.contains("timed out"), "{why}"),
         other => panic!("{other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1 (PR #40 review)
+// ---------------------------------------------------------------------------------------
+
+/// `rev-parse --verify HEAD` failing after a good `status` is the check not running, never "no
+/// commit yet" (that is only for a branch the status line says has none).
+#[tokio::test]
+async fn a_head_that_cannot_be_read_after_a_good_status_fails_the_check() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "git",
+        "case \" $* \" in\n\
+         *\" config \"*) printf 'core.bare\\0'; exit 0;;\n\
+         *\" rev-parse --verify \"*) echo 'fatal: bad object HEAD' >&2; exit 128;;\n\
+         esac\n\
+         printf '## main...origin/main\\0'\n",
+    );
+    let why = tree_state(
+        &git_params(&program, Duration::from_secs(10)),
+        dir.path(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        why.contains("rev-parse") && why.contains("bad object"),
+        "{why}"
+    );
+    // Output that is not an id is the same.
+    let program = t.script(
+        dir.path(),
+        "git2",
+        "case \" $* \" in\n\
+         *\" config \"*) printf 'core.bare\\0'; exit 0;;\n\
+         *\" rev-parse --verify \"*) echo 'not an id'; exit 0;;\n\
+         esac\n\
+         printf '## main...origin/main\\0'\n",
+    );
+    let why = tree_state(
+        &git_params(&program, Duration::from_secs(10)),
+        dir.path(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(why.contains("commit id"), "{why}");
+}
+
+/// The whole look is bounded by the one timeout it is given, not by that timeout per git command:
+/// four commands of 0.6 s each are 2.4 s against a 1 s bound, and none of them is slow alone.
+#[tokio::test]
+async fn the_whole_tree_look_is_bounded_by_the_timeout_not_each_command() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "git",
+        "@sleep@ 0.6\n\
+         case \" $* \" in\n\
+         *\" config \"*) printf 'core.bare\\0'; exit 0;;\n\
+         *\" rev-parse --verify \"*) printf '1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d\\n'; exit 0;;\n\
+         esac\n\
+         printf '## main...origin/main\\0'\n",
+    );
+    let started = Instant::now();
+    let why = tree_state(
+        &git_params(&program, Duration::from_secs(1)),
+        dir.path(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(why.contains("timed out"), "{why}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1800),
+        "bounded by 1 s in all, took {:?}",
+        started.elapsed()
+    );
 }

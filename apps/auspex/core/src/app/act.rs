@@ -244,6 +244,19 @@ fn confirm_view(model: &Model, confirm: &Confirm) -> ConfirmView {
         typed,
         lines: match confirm {
             Confirm::UpdateAll(planned) => planned.lines(),
+            // The commit (and the digest of the changes) the update is held to at the `y`, so a
+            // refusal that names commits is checkable against what was shown.
+            Confirm::Update { answer, review, .. } if review.refusals.is_empty() => {
+                answer.tree.as_ref().map_or_else(
+                    |_| Vec::new(),
+                    |tree| {
+                        vec![format!(
+                            "fleet repository: {}",
+                            auspex_domain::preflight::describe_tree(tree)
+                        )]
+                    },
+                )
+            }
             _ => Vec::new(),
         },
     }

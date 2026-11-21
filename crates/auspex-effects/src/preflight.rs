@@ -57,13 +57,88 @@ const CONFIG_CAP: usize = 1024 * 1024;
 /// The most `rev-parse HEAD` output kept: a commit id is 65 bytes; anything past this is not one.
 const HEAD_CAP: usize = 4096;
 
-/// The fleet repository's state, read from `dir`.
+/// The fleet repository's state, read from `dir`, in at most `params.timeout` in all.
+///
+/// That is `timeouts.diff` for the shell: the one budget covers the config listing, the status,
+/// `HEAD`'s id and the fingerprint together, and each git command alone is also held to it.
+///
+/// A look that runs out of time before it has the status and `HEAD` is the inner `Err`; one that
+/// runs out of time in the fingerprint keeps what it has and says why the changes are
+/// [`Edits::Unavailable`].
 ///
 /// # Errors
 ///
 /// [`Cancelled`] when `cancel` fired. Anything else (no git, not a repository, a timeout,
 /// output that is not `git status`'s) is the inner `Err` line.
 pub async fn tree_state(
+    params: &GitParams<'_>,
+    dir: &Path,
+    cancel: &CancellationToken,
+) -> Result<Result<TreeState, String>, Cancelled> {
+    let started = Instant::now();
+    let budget = params.timeout;
+    let child = cancel.child_token();
+    let found = within(budget, &child, status_and_head(params, dir, &child), cancel).await?;
+    let mut state = match found {
+        None => {
+            return Ok(Err(format!(
+                "looking at the fleet repository timed out after {budget:?}"
+            )));
+        }
+        Some(Err(why)) => return Ok(Err(why)),
+        Some(Ok(state)) => state,
+    };
+    // What a deploy would evaluate, for a tree that has changes: nothing to fingerprint when
+    // it has none. The fingerprint is bounded as the cache key's worktree read is, and by what
+    // is left of the look's budget; when it cannot be had the state says why instead of failing
+    // the whole check, and the turn compares commits only.
+    if state.changed_files > 0 {
+        let child = cancel.child_token();
+        let left = budget.saturating_sub(started.elapsed());
+        state.edits = match within(
+            left,
+            &child,
+            worktree_fingerprint(dir, params, &child),
+            cancel,
+        )
+        .await?
+        {
+            Some(Ok(digest)) => Edits::Digest(digest),
+            Some(Err(why)) => Edits::Unavailable(sanitize_line(&why)),
+            None => Edits::Unavailable(format!(
+                "reading the worktree timed out (the whole look is held to {budget:?})"
+            )),
+        };
+    }
+    Ok(Ok(state))
+}
+
+/// Runs `work` for at most `budget`: `None` when the time ran out first (after `child`, the token
+/// `work` was built with, was cancelled and `work` had killed and reaped its processes).
+/// `outer` is the caller's token: when it fires `work` ends with [`Cancelled`], which is
+/// returned as such.
+async fn within<T>(
+    budget: Duration,
+    child: &CancellationToken,
+    work: impl std::future::Future<Output = Result<T, Cancelled>>,
+    outer: &CancellationToken,
+) -> Result<Option<T>, Cancelled> {
+    tokio::pin!(work);
+    tokio::select! {
+        r = &mut work => r.map(Some),
+        () = tokio::time::sleep(budget) => {
+            child.cancel();
+            match work.await {
+                Ok(done) => Ok(Some(done)),
+                Err(Cancelled) if outer.is_cancelled() => Err(Cancelled),
+                Err(Cancelled) => Ok(None),
+            }
+        }
+    }
+}
+
+/// The config listing, the status and `HEAD`'s id: what the look needs before anything else.
+async fn status_and_head(
     params: &GitParams<'_>,
     dir: &Path,
     cancel: &CancellationToken,
@@ -102,16 +177,6 @@ pub async fn tree_state(
         state.head = match parse_commit_id(&id) {
             Ok(id) => Some(id),
             Err(why) => return Ok(Err(why)),
-        };
-    }
-    // What a deploy would evaluate, for a tree that has changes: nothing to fingerprint when
-    // it has none. The fingerprint is bounded as the cache key's worktree read is; when it
-    // cannot be had the state says why instead of failing the whole check, and the turn
-    // compares commits only.
-    if state.changed_files > 0 {
-        state.edits = match worktree_fingerprint(dir, params, cancel).await? {
-            Ok(digest) => Edits::Digest(digest),
-            Err(why) => Edits::Unavailable(sanitize_line(&why)),
         };
     }
     Ok(Ok(state))

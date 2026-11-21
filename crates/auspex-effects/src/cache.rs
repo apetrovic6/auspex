@@ -466,9 +466,11 @@ pub async fn key_for(
 /// A fingerprint of the tracked files of `flake_dir`'s repository, as nix reads them.
 ///
 /// It is the 64 lowercase hex digits of the worktree digest the cache key is made of (see the
-/// module documentation: the index as `ls-files -s -v -z` prints it, and every index path's
-/// worktree state as nix reads it for a dirty `git+file` flake: a regular file's bytes and owner
-/// exec bit, a symlink's target, or that it is missing).
+/// module documentation), with one difference: the index enters as each record's status letter,
+/// stage and path, **not** its mode and blob id ([`fingerprint_index`]). Every index path's
+/// worktree state is in it as nix reads it for a dirty `git+file` flake: a regular file's bytes
+/// and owner exec bit, a symlink's target, or that it is missing. So `git add` of a file that is
+/// already edited, or a stash popped back, does not change it; an edit does, staged or not.
 ///
 /// This is what the update-time check of the fleet tree compares between the confirmed plan
 /// and a machine's turn (AUS-42). It is the same read, with the same bounds, as the cache's
@@ -608,7 +610,7 @@ async fn key_and_top(
         head: &head,
         flake_lock: lock.as_deref(),
         tree: Tree::Dirty {
-            diff: &digest,
+            diff: &digest.0,
             // Untracked names are not in the key: see the module documentation.
             untracked: &[],
         },
@@ -617,7 +619,7 @@ async fn key_and_top(
         key,
         top,
         guard,
-        worktree: digest,
+        worktree: digest.1,
     }))
 }
 
@@ -816,7 +818,50 @@ fn field(h: &mut Sha256, tag: u8, bytes: &[u8]) {
     h.update(bytes);
 }
 
-/// The digest of every tracked path's worktree state under `top`. Each path's [`Stamp`]
+/// The two digests the worktree read feeds: the cache key's, and the update check's fingerprint
+/// (AUS-42). They are fed the same path and file records; they differ only in how the index
+/// enters (below), so one read of the files serves both.
+struct Both {
+    key: Sha256,
+    fingerprint: Sha256,
+}
+
+impl Both {
+    fn field(&mut self, tag: u8, bytes: &[u8]) {
+        field(&mut self.key, tag, bytes);
+        field(&mut self.fingerprint, tag, bytes);
+    }
+}
+
+/// The index without what nix does not read from it: each record's status letter, stage and
+/// path, **not** its mode and blob id.
+///
+/// A dirty `git+file` flake is evaluated from the worktree, so staging a file that is already
+/// edited (`git add`, or a stash popped back, which comes back unstaged) changes nothing nix
+/// sees. What the index does decide is *which* paths are tracked (a `git add` of a new file
+/// makes nix see it), their stage (an unmerged path) and the assume-unchanged and skip-worktree
+/// tags, and those stay. The cache key keeps the whole listing: a key that misses once is
+/// cheap, a stale hit is not.
+fn fingerprint_index(index: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for rec in index.split(|&b| b == 0).filter(|r| !r.is_empty()) {
+        // `<tag> <mode> <oid> <stage>\t<path>`
+        let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
+            continue;
+        };
+        let meta = &rec[..tab];
+        out.extend_from_slice(&meta[..meta.len().min(1)]);
+        out.push(b' ');
+        out.extend_from_slice(meta.rsplit(|&b| b == b' ').next().unwrap_or_default());
+        out.push(b'\t');
+        out.extend_from_slice(&rec[tab + 1..]);
+        out.push(0);
+    }
+    out
+}
+
+/// The digests of every tracked path's worktree state under `top`: the cache key's and the
+/// update check's fingerprint ([`Both`]). Each path's [`Stamp`]
 /// goes to the guard `g`: the opened file's own, a symlink's or other entry's from the
 /// `lstat` that classified it, or, when nothing is there, the deepest directory reached
 /// (it changes when the name is created in it).
@@ -827,7 +872,7 @@ fn worktree_digest<const MAX_BYTES: u64>(
     paths: &[&[u8]],
     stop: &dyn Fn() -> bool,
     g: &mut Sha256,
-) -> Result<Vec<u8>, Stop> {
+) -> Result<(Vec<u8>, Vec<u8>), Stop> {
     use std::os::unix::ffi::OsStrExt as _;
     let root =
         open_root(top).map_err(|e| Stop::NoCache(format!("cannot open the worktree: {e:?}")))?;
@@ -835,39 +880,48 @@ fn worktree_digest<const MAX_BYTES: u64>(
     // Unmerged entries are listed once per stage.
     paths.sort_unstable();
     paths.dedup();
-    let mut h = Sha256::new();
-    h.update(b"auspex worktree digest v2\0");
+    let mut both = Both {
+        key: Sha256::new(),
+        fingerprint: Sha256::new(),
+    };
+    both.key.update(b"auspex worktree digest v2\0");
+    both.fingerprint.update(b"auspex worktree fingerprint v1\0");
     // Which flake in the repository (N2e), and the index itself, staged state included
     // (N2b).
-    field(&mut h, b'r', rel.as_os_str().as_bytes());
-    field(&mut h, b'i', &Sha256::digest(index));
+    both.field(b'r', rel.as_os_str().as_bytes());
+    field(&mut both.key, b'i', &Sha256::digest(index));
+    field(
+        &mut both.fingerprint,
+        b'i',
+        &Sha256::digest(fingerprint_index(index)),
+    );
     let mut left = MAX_BYTES;
     for p in paths {
         if stop() {
             return Err(Stop::Stopped);
         }
-        field(&mut h, b'p', p);
+        both.field(b'p', p);
         field(g, b'p', p);
         let (dir, name) = match walk(&root, p) {
             Ok(found) => found,
             Err((_, reached)) => {
                 // A directory on the way is missing or a symlink: the file is not there
                 // for nix either.
-                field(&mut h, b'x', &[]);
+                both.field(b'x', &[]);
                 stamp(g, b'x', reached.and_then(|d| Stamp::of_fd(&d).ok()));
                 continue;
             }
         };
         match kind(&dir, name) {
             Err(_) => {
-                field(&mut h, b'd', &[]);
+                both.field(b'd', &[]);
                 stamp(g, b'd', Stamp::of_fd(&dir).ok());
             }
             Ok((FileType::Symlink, s)) => {
                 let target = rustix::fs::readlinkat(&dir, name, Vec::new())
                     .map(std::ffi::CString::into_bytes)
                     .unwrap_or_default();
-                field(&mut h, b'l', &target);
+                both.field(b'l', &target);
                 stamp(g, b'l', Some(s));
             }
             Ok((FileType::RegularFile, lstat)) => {
@@ -879,7 +933,7 @@ fn worktree_digest<const MAX_BYTES: u64>(
                 }) {
                     Ok(read) => {
                         left -= n;
-                        field(&mut h, if read.exec { b'X' } else { b'f' }, &fh.finalize());
+                        both.field(if read.exec { b'X' } else { b'f' }, &fh.finalize());
                         stamp(g, b'f', Some(read.stamp));
                     }
                     Err(ReadError::TooBig) => {
@@ -891,7 +945,7 @@ fn worktree_digest<const MAX_BYTES: u64>(
                     Err(ReadError::Stopped) => return Err(Stop::Stopped),
                     // Replaced between the stat and the open, or unreadable.
                     Err(_) => {
-                        field(&mut h, b'e', &[]);
+                        both.field(b'e', &[]);
                         // The file's own `lstat` too: a `chmod` and an edit move only
                         // its `ctime` (review of `ca2cc3f`, F3).
                         stamp(g, b'e', Some(lstat));
@@ -901,12 +955,15 @@ fn worktree_digest<const MAX_BYTES: u64>(
             }
             // A submodule (a gitlink is a directory), a FIFO, a device: its kind only.
             Ok((other, s)) => {
-                field(&mut h, b'o', &other.as_raw_mode().to_be_bytes());
+                both.field(b'o', &other.as_raw_mode().to_be_bytes());
                 stamp(g, b'o', Some(s));
             }
         }
     }
-    Ok(h.finalize().to_vec())
+    Ok((
+        both.key.finalize().to_vec(),
+        both.fingerprint.finalize().to_vec(),
+    ))
 }
 
 fn file_name(machine: &str) -> String {
