@@ -224,7 +224,7 @@ let
   updateWith = update: (evaluate { programs.auspex.settings.update = update; }).config;
   assertionsHold = c: builtins.all (a: a.assertion) c.assertions;
 in {
-  auspex-empty =check "empty" ((evaluate { }).config.xdg.configFile == { });
+  auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;
   auspex-freeform = compareToml "freeform" unknown.xdg.configFile."auspex/config.toml".source { future.answer = 42; };
   # Positive evaluation and the declared type guard prevent an unrelated throw from passing.
@@ -307,7 +307,7 @@ in {
     && assertionsHold (updateWith { poll_interval = 60; })
     && !assertionsHold (updateWith { poll_interval = 5; ready_timeout = 4; })
   );
-  auspex-no-stylix =check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
+  auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision
     && builtins.all (self: revision (exports.lib.mkConfigurationRevisionModule self) { } { }
