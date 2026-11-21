@@ -98,7 +98,7 @@ hashes (SHA-256) what nix would evaluate: auspex evaluates the fleet as a `git+f
 reads the tracked files as they are in the **worktree**, so the digest covers each tracked
 file's bytes and executable bit (a symlink's target) and which paths are tracked (the index's
 paths, stages and assume-unchanged tags), and not the index's blob ids: `git add` of a file that
-is already edited, or a stash popped back, changes nothing nix reads and is not a change; a
+is already edited, a stash popped back, or the staging of a deletion (`git add -A`, `git add -u`, `git rm`: a tracked file that is missing is absent for nix either way) changes nothing nix reads and is not a change; a
 further edit is, staged or not. It is bounded to 1 GiB read and 30 s, as the evaluation cache
 key is, and the whole tree look (the status, `HEAD`, and this) to `timeouts.diff`. Untracked
 files, ignored or not, are **not** in it: nix does not see them, so they cannot change what is

@@ -169,6 +169,7 @@
 //!
 //! Nothing removes old keys' directories yet.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::DirBuilderExt as _;
@@ -831,6 +832,12 @@ impl Both {
         field(&mut self.key, tag, bytes);
         field(&mut self.fingerprint, tag, bytes);
     }
+
+    /// The fingerprint learns that `path` is there (a path with nothing on disk never is: see
+    /// [`fingerprint_index`]); the key already has it from `field(b'p', ..)`.
+    fn present(&mut self, path: &[u8]) {
+        field(&mut self.fingerprint, b'p', path);
+    }
 }
 
 /// The index without what nix does not read from it: each record's status letter, stage and
@@ -842,13 +849,18 @@ impl Both {
 /// makes nix see it), their stage (an unmerged path) and the assume-unchanged and skip-worktree
 /// tags, and those stay. The cache key keeps the whole listing: a key that misses once is
 /// cheap, a stale hit is not.
-fn fingerprint_index(index: &[u8]) -> Vec<u8> {
+fn fingerprint_index(index: &[u8], missing: &BTreeSet<&[u8]>) -> Vec<u8> {
     let mut out = Vec::new();
     for rec in index.split(|&b| b == 0).filter(|r| !r.is_empty()) {
         // `<tag> <mode> <oid> <stage>\t<path>`
         let Some(tab) = rec.iter().position(|&b| b == b'\t') else {
             continue;
         };
+        // A path with nothing on disk is not there for nix, whether its deletion is staged (no
+        // record at all) or not (a record of a missing file): neither says anything.
+        if missing.contains(&rec[tab + 1..]) {
+            continue;
+        }
         let meta = &rec[..tab];
         out.extend_from_slice(&meta[..meta.len().min(1)]);
         out.push(b' ');
@@ -890,34 +902,35 @@ fn worktree_digest<const MAX_BYTES: u64>(
     // (N2b).
     both.field(b'r', rel.as_os_str().as_bytes());
     field(&mut both.key, b'i', &Sha256::digest(index));
-    field(
-        &mut both.fingerprint,
-        b'i',
-        &Sha256::digest(fingerprint_index(index)),
-    );
+    // (The fingerprint's own index field comes after the walk: it leaves out the paths with nothing
+    // on disk.)
+    let mut missing: BTreeSet<&[u8]> = BTreeSet::new();
     let mut left = MAX_BYTES;
     for p in paths {
         if stop() {
             return Err(Stop::Stopped);
         }
-        both.field(b'p', p);
+        field(&mut both.key, b'p', p);
         field(g, b'p', p);
         let (dir, name) = match walk(&root, p) {
             Ok(found) => found,
             Err((_, reached)) => {
                 // A directory on the way is missing or a symlink: the file is not there
                 // for nix either.
-                both.field(b'x', &[]);
+                field(&mut both.key, b'x', &[]);
+                missing.insert(p);
                 stamp(g, b'x', reached.and_then(|d| Stamp::of_fd(&d).ok()));
                 continue;
             }
         };
         match kind(&dir, name) {
             Err(_) => {
-                both.field(b'd', &[]);
+                field(&mut both.key, b'd', &[]);
+                missing.insert(p);
                 stamp(g, b'd', Stamp::of_fd(&dir).ok());
             }
             Ok((FileType::Symlink, s)) => {
+                both.present(p);
                 let target = rustix::fs::readlinkat(&dir, name, Vec::new())
                     .map(std::ffi::CString::into_bytes)
                     .unwrap_or_default();
@@ -925,6 +938,7 @@ fn worktree_digest<const MAX_BYTES: u64>(
                 stamp(g, b'l', Some(s));
             }
             Ok((FileType::RegularFile, lstat)) => {
+                both.present(p);
                 let mut fh = Sha256::new();
                 let mut n: u64 = 0;
                 match read_file(&dir, name, left, stop, &mut |b| {
@@ -955,11 +969,17 @@ fn worktree_digest<const MAX_BYTES: u64>(
             }
             // A submodule (a gitlink is a directory), a FIFO, a device: its kind only.
             Ok((other, s)) => {
+                both.present(p);
                 both.field(b'o', &other.as_raw_mode().to_be_bytes());
                 stamp(g, b'o', Some(s));
             }
         }
     }
+    field(
+        &mut both.fingerprint,
+        b'i',
+        &Sha256::digest(fingerprint_index(index, &missing)),
+    );
     Ok((
         both.key.finalize().to_vec(),
         both.fingerprint.finalize().to_vec(),

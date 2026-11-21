@@ -1364,3 +1364,161 @@ async fn the_whole_tree_look_is_bounded_by_the_timeout_not_each_command() {
         started.elapsed()
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2 (PR #40 re-review)
+// ---------------------------------------------------------------------------------------
+
+/// A repository with `dirty.nix` edited (so every state is fingerprinted) and `gone.nix` tracked.
+fn repo_with_a_tracked_file_to_delete(r: &Path) {
+    real_git(r, &["init", "-q", "-b", "main"]);
+    fs::write(r.join("dirty.nix"), "1\n").unwrap();
+    fs::write(r.join("gone.nix"), "g\n").unwrap();
+    real_git(r, &["add", "dirty.nix", "gone.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    fs::write(r.join("dirty.nix"), "2\n").unwrap();
+}
+
+/// Staging the deletion of a tracked file changes nothing nix reads (a tracked file that is
+/// missing is absent either way), whichever command stages it; a deleted file is not a present
+/// one, and a further change of content is still a change.
+#[tokio::test]
+async fn staging_a_deletion_is_not_a_change_whichever_command_does_it() {
+    let Some(_t) = with_real_git() else { return };
+    let commands: [&[&str]; 3] = [
+        &["add", "-A"],
+        &["add", "-u"],
+        &["rm", "-q", "--cached", "gone.nix"],
+    ];
+    for staging in commands {
+        let dir = tempdir();
+        let r = dir.path();
+        repo_with_a_tracked_file_to_delete(r);
+        let present = digest_of(&real_tree(r).await.unwrap());
+
+        fs::remove_file(r.join("gone.nix")).unwrap();
+        let deleted = digest_of(&real_tree(r).await.unwrap());
+        assert_ne!(
+            deleted, present,
+            "{staging:?}: a deleted file is not a present one"
+        );
+
+        real_git(r, staging);
+        let tree = real_tree(r).await.unwrap();
+        assert_eq!(
+            tree.changed_files, 2,
+            "{staging:?}: dirty.nix and the deletion"
+        );
+        assert_eq!(
+            digest_of(&tree),
+            deleted,
+            "{staging:?}: staging the deletion"
+        );
+
+        // `git rm` of the file the worktree no longer has, the way the review ran it.
+        fs::write(r.join("dirty.nix"), "3\n").unwrap();
+        assert_ne!(
+            digest_of(&real_tree(r).await.unwrap()),
+            deleted,
+            "{staging:?}: a further change of content"
+        );
+    }
+    // `git rm <file>` of a file already deleted from the worktree.
+    let dir = tempdir();
+    let r = dir.path();
+    repo_with_a_tracked_file_to_delete(r);
+    fs::remove_file(r.join("gone.nix")).unwrap();
+    let deleted = digest_of(&real_tree(r).await.unwrap());
+    real_git(r, &["rm", "-q", "gone.nix"]);
+    assert_eq!(digest_of(&real_tree(r).await.unwrap()), deleted, "git rm");
+    fs::write(r.join("dirty.nix"), "3\n").unwrap();
+    assert_ne!(
+        digest_of(&real_tree(r).await.unwrap()),
+        deleted,
+        "git rm, then an edit"
+    );
+}
+
+/// A file that is already edited (so the status count cannot tell) and then made executable: nix
+/// sees the exec bit, so the fingerprint must.
+#[tokio::test]
+async fn the_exec_bit_of_an_already_edited_file_is_in_the_fingerprint() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    repo_with_a_tracked_file_to_delete(r);
+    let before = real_tree(r).await.unwrap();
+    fs::set_permissions(r.join("dirty.nix"), fs::Permissions::from_mode(0o755)).unwrap();
+    let after = real_tree(r).await.unwrap();
+    assert_eq!(
+        after.changed_files, before.changed_files,
+        "the count cannot tell"
+    );
+    assert_ne!(digest_of(&after), digest_of(&before), "chmod u+x");
+    // Only the owner's bit is what nix reads.
+    fs::set_permissions(r.join("dirty.nix"), fs::Permissions::from_mode(0o645)).unwrap();
+    assert_eq!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest_of(&before),
+        "go+x only"
+    );
+}
+
+/// A tracked symlink that is already changed and is retargeted again: same count, and only the
+/// target tells.
+#[tokio::test]
+async fn the_target_of_an_already_changed_symlink_is_in_the_fingerprint() {
+    use std::os::unix::fs::symlink;
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    real_git(r, &["init", "-q", "-b", "main"]);
+    symlink("a.nix", r.join("link.nix")).unwrap();
+    fs::write(r.join("a.nix"), "a\n").unwrap();
+    real_git(r, &["add", "link.nix", "a.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    fs::remove_file(r.join("link.nix")).unwrap();
+    symlink("b.nix", r.join("link.nix")).unwrap();
+    let first = real_tree(r).await.unwrap();
+    assert_eq!(first.changed_files, 1);
+    fs::remove_file(r.join("link.nix")).unwrap();
+    symlink("c.nix", r.join("link.nix")).unwrap();
+    let second = real_tree(r).await.unwrap();
+    assert_eq!(second.changed_files, 1, "the count cannot tell");
+    assert_ne!(digest_of(&second), digest_of(&first), "retargeted again");
+}
+
+/// The fingerprint gets what is left of the look's budget, not a budget of its own, and running out
+/// of it is `Unavailable`, never "no changes": the config, status and `HEAD` take 0.9 s of a 2 s
+/// budget, the fingerprint's first command would take 1.5 s (well inside 2 s) and is cut at 1.1 s.
+#[tokio::test]
+async fn the_fingerprint_gets_what_is_left_of_the_budget_and_running_out_is_unavailable() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "git",
+        "case \" $* \" in\n\
+         *\" config \"*) @sleep@ 0.3; printf 'core.bare\\0'; exit 0;;\n\
+         *\" rev-parse --verify \"*) @sleep@ 0.3; printf '1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d\\n'; exit 0;;\n\
+         *\" rev-parse \"*) @sleep@ 1.5; exit 1;;\n\
+         esac\n\
+         @sleep@ 0.3\n\
+         printf '## main...origin/main\\0 M a\\0'\n",
+    );
+    let tree = tree_state(
+        &git_params(&program, Duration::from_secs(2)),
+        dir.path(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(tree.changed_files, 1);
+    assert!(tree.head.is_some(), "status and HEAD were read");
+    match tree.edits {
+        Edits::Unavailable(why) => assert!(why.contains("timed out"), "{why}"),
+        other => panic!("a fingerprint out of time is unavailable, not {other:?}"),
+    }
+}
