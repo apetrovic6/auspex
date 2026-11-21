@@ -1668,13 +1668,14 @@ async fn without_the_etcd_key_etcd_is_never_asked_about() {
     w.shell.shutdown().await;
 }
 
-/// A fake `kubectl` whose node `luna` is `NotReady` for exactly one look after the two that
-/// precede the wait (the plan's and the one before luna's turn), and `Ready` ever after.
+/// A fake `kubectl` whose node `luna` is `NotReady` for exactly one look after the three that
+/// precede the wait's first (the plan's, the one before luna's turn and the wait's record), and `Ready`
+/// ever after.
 fn kubectl_recovering() -> String {
     let down = r#"{"items":[{"metadata":{"name":"luna"},"status":{"conditions":[{"type":"Ready","status":"False"}]}},{"metadata":{"name":"sol"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}"#;
     let get_nodes = format!(
         "n=$(@cat@ '@dir@/count' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '@dir@/count'; @date@ +%s >> '@dir@/times'; \
-         if [ $n -eq 3 ]; then {down}; else {ready}; fi",
+         if [ $n -eq 4 ]; then {down}; else {ready}; fi",
         down = cat(down),
         ready = cat(NODES_READY)
     );
@@ -1682,7 +1683,7 @@ fn kubectl_recovering() -> String {
         &get_nodes,
         "echo 'node drained (fake)'",
         "echo 'node uncordoned (fake)'",
-        LEASES_NOW,
+        &leases_alive(),
     )
 }
 
@@ -1706,7 +1707,8 @@ async fn a_short_poll_interval_ends_the_wait_sooner_than_the_default() {
     act_on(&w.shell);
     roll(&w.shell).await;
     until_state(&w.shell, "luna", RollState::Done).await;
-    // The looks are the plan's, the one before luna's turn, the NotReady one and the Ready one:
+    // The looks are the plan's, the one before luna's turn, the wait's record, the NotReady one and the
+    // Ready one:
     // the last two are one interval apart (the clock has whole seconds, so 1 reads as 1 or 2),
     // where the default would put them 5 apart.
     let times: Vec<u64> = lines(&w.path("times"))
