@@ -191,9 +191,13 @@ async fn ask(
 }
 
 fn token() -> Token {
+    token_with(TOKEN)
+}
+
+fn token_with(text: &str) -> Token {
     let dir = tempdir();
     let path = dir.path().join("forge-token");
-    fs::write(&path, format!("{TOKEN}\n")).unwrap();
+    fs::write(&path, format!("{text}\n")).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
     read_token_file(&path).unwrap()
 }
@@ -344,6 +348,64 @@ async fn a_forge_that_echoes_the_token_into_a_link_gets_no_link() {
     };
     let answer = ask(&server, None, T).await.unwrap().unwrap();
     assert!(answer.url.is_some());
+}
+
+/// Hardening round, R2: the link guard also catches a copy the forge disguised: another case,
+/// or percent-encoded more than once (decoded until nothing changes, up to a bound).
+#[tokio::test]
+async fn a_disguised_copy_of_the_token_in_a_link_is_dropped_too() {
+    let once = TOKEN.replacen('t', "%74", 1);
+    let twice = once.replace('%', "%25");
+    let thrice = twice.replace('%', "%25");
+    let four_times = thrice.replace('%', "%25");
+    let disguised = [
+        TOKEN.to_ascii_uppercase(),
+        format!("{}{}", TOKEN[..4].to_ascii_uppercase(), &TOKEN[4..]),
+        // Encoded twice and upper case at once.
+        twice.to_ascii_uppercase(),
+        twice,
+        thrice,
+        four_times,
+    ];
+    for copy in disguised {
+        let link = format!("https://ci.example.org/run?x={copy}");
+        let body = serde_json::json!({
+            "state": "success", "total_count": 1,
+            "statuses": [{"state": "success", "target_url": link}],
+        })
+        .to_string();
+        let Some(server) = serve(move |_| Reply::Status(200, body.clone())).await else {
+            return;
+        };
+        let answer = ask(&server, Some(&token()), T).await.unwrap().unwrap();
+        assert_eq!(answer.state, CiState::Success, "{link}");
+        assert_eq!(answer.url, None, "{link}");
+    }
+}
+
+/// Hardening round, R1: every reason `combined_status` returns goes through the token guard, not
+/// only the link. The reasons are fixed text, so the way to show it end to end is a token that is
+/// itself a word in them (here "refused"): the guard then replaces the reason, and nothing else
+/// would.
+#[tokio::test]
+async fn every_reason_goes_through_the_token_guard() {
+    let Some(server) = serve(|_| Reply::Status(401, "{}".to_owned())).await else {
+        return;
+    };
+    let plain = ask(&server, Some(&token()), T).await.unwrap().unwrap_err();
+    assert!(plain.contains("refused the token"), "{plain}");
+    let guarded = ask(&server, Some(&token_with("refused")), T)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(!guarded.contains("refused"), "{guarded}");
+    assert!(
+        guarded.starts_with("forge: ") && guarded.contains("not shown"),
+        "{guarded}"
+    );
+    // Without a token there is nothing to guard.
+    let anonymous = ask(&server, None, T).await.unwrap().unwrap_err();
+    assert!(anonymous.contains("wants a token"), "{anonymous}");
 }
 
 #[tokio::test]
@@ -613,6 +675,7 @@ async fn head_reads_the_commit_the_upstream_and_the_origin() {
         &git_params(&program),
         &local(dir.path()),
         true,
+        None,
         &CancellationToken::new(),
     )
     .await
@@ -661,6 +724,7 @@ async fn the_origin_is_not_read_when_forge_repo_is_configured() {
         &git_params(&program),
         &local(dir.path()),
         false,
+        None,
         &CancellationToken::new(),
     )
     .await
@@ -697,6 +761,7 @@ async fn a_missing_or_odd_origin_is_an_answer_not_a_failure() {
             &git_params(&program),
             &local(dir.path()),
             true,
+            None,
             &CancellationToken::new(),
         )
         .await
@@ -752,14 +817,154 @@ async fn an_origin_that_could_not_be_read_is_not_a_missing_one() {
         );
         let mut params = git_params(&program);
         params.timeout = Duration::from_millis(700);
-        let head = forge::head(&params, &local(dir.path()), true, &CancellationToken::new())
-            .await
-            .unwrap()
-            .unwrap();
+        let head = forge::head(
+            &params,
+            &local(dir.path()),
+            true,
+            None,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         let origin = head.origin.expect("asked").unwrap_err();
         assert!(origin.contains(want), "{remote}: {origin}");
         assert!(!origin.contains(not), "{remote}: {origin}");
     }
+}
+
+/// Hardening round, N1: git's own text in a reason is bounded, sanitised and kept from holding
+/// the token, for the remote and for the commands before it.
+#[tokio::test]
+async fn git_text_in_a_reason_is_bounded_sanitised_and_guarded() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let run = |rev_parse: String, remote: String| {
+        let t = &t;
+        async move {
+            let dir = tempdir();
+            let program = fake_git(t, dir.path(), &rev_parse, "printf '## main\\0'", &remote);
+            let secret = token();
+            forge::head(
+                &git_params(&program),
+                &local(dir.path()),
+                true,
+                Some(&secret),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let ok_rev = format!("printf '{SHA}\\n'");
+
+    // The remote's stderr holds the token.
+    let head = run(
+        ok_rev.clone(),
+        format!("echo 'fatal: bad url for {TOKEN} in config' >&2; exit 128"),
+    )
+    .await
+    .unwrap();
+    let origin = head.origin.unwrap().unwrap_err();
+    assert!(
+        origin.contains("could not read the origin remote"),
+        "{origin}"
+    );
+    assert!(!origin.contains(TOKEN), "{origin}");
+
+    // An upper-case copy too.
+    let head = run(
+        ok_rev.clone(),
+        format!("echo 'fatal: {}' >&2; exit 128", TOKEN.to_ascii_uppercase()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !head
+            .origin
+            .unwrap()
+            .unwrap_err()
+            .to_ascii_lowercase()
+            .contains(TOKEN)
+    );
+
+    // A very long line with escape sequences: bounded and clean.
+    let head = run(
+        ok_rev.clone(),
+        "printf '\\033[31m%05000d\\033]0;title\\007\\n' 0 >&2; exit 128".to_owned(),
+    )
+    .await
+    .unwrap();
+    let origin = head.origin.unwrap().unwrap_err();
+    assert!(
+        origin.chars().count() <= 400,
+        "{} characters",
+        origin.chars().count()
+    );
+    assert!(!origin.chars().any(char::is_control), "{origin:?}");
+    assert!(
+        origin.contains("could not read the origin remote"),
+        "{origin}"
+    );
+
+    // The commands before it: a failing rev-parse whose stderr holds the token.
+    let why = run(
+        format!("echo 'fatal: {TOKEN}' >&2; exit 128"),
+        "exit 2".to_owned(),
+    )
+    .await
+    .unwrap_err();
+    // Replaced whole: what git said held the token.
+    assert!(why.contains("not shown"), "{why}");
+    assert!(!why.contains(TOKEN), "{why}");
+    // And a rev-parse failure that does not hold it keeps git's words.
+    let plain = run(
+        "echo 'fatal: not a git repository' >&2; exit 128".to_owned(),
+        "exit 2".to_owned(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        plain.contains("git rev-parse") && plain.contains("not a git repository"),
+        "{plain}"
+    );
+}
+
+/// Hardening round, N1: `git status`, the second command, gets the same guard as the others.
+#[tokio::test]
+async fn git_status_text_in_a_reason_is_guarded() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let run_status = |status: String| {
+        let t = &t;
+        async move {
+            let dir = tempdir();
+            let program = fake_git(
+                t,
+                dir.path(),
+                &format!("printf '{SHA}\\n'"),
+                &status,
+                "exit 2",
+            );
+            let secret = token();
+            forge::head(
+                &git_params(&program),
+                &local(dir.path()),
+                true,
+                Some(&secret),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let why = run_status(format!("echo 'fatal: {TOKEN}' >&2; exit 128"))
+        .await
+        .unwrap_err();
+    assert!(why.contains("not shown"), "{why}");
+    assert!(!why.contains(TOKEN), "{why}");
+    let plain = run_status("echo 'fatal: not a git repository' >&2; exit 128".to_owned())
+        .await
+        .unwrap_err();
+    assert!(plain.contains("not a git repository"), "{plain}");
 }
 
 #[tokio::test]
@@ -778,6 +983,7 @@ async fn head_failures_are_reasons() {
         &git_params(&program),
         &local(dir.path()),
         true,
+        None,
         &CancellationToken::new(),
     )
     .await
@@ -797,6 +1003,7 @@ async fn head_failures_are_reasons() {
         &git_params(&program),
         &local(dir.path()),
         true,
+        None,
         &CancellationToken::new(),
     )
     .await
@@ -816,6 +1023,7 @@ async fn head_failures_are_reasons() {
         &git_params(&program),
         &local(dir.path()),
         true,
+        None,
         &CancellationToken::new(),
     )
     .await
@@ -828,6 +1036,7 @@ async fn head_failures_are_reasons() {
         &git_params(&program),
         &remote,
         true,
+        None,
         &CancellationToken::new(),
     )
     .await
@@ -878,6 +1087,7 @@ async fn head_of_a_real_repository() {
         &git_params(&program),
         &local(&repo),
         true,
+        None,
         &CancellationToken::new(),
     )
     .await
@@ -898,6 +1108,7 @@ async fn head_of_a_real_repository() {
         &git_params(&program),
         &local(&repo),
         true,
+        None,
         &CancellationToken::new(),
     )
     .await
@@ -926,6 +1137,7 @@ async fn a_real_repository_without_an_origin_says_so() {
         &git_params(&program),
         &local(&repo),
         true,
+        None,
         &CancellationToken::new(),
     )
     .await

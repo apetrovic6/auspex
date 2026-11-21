@@ -250,6 +250,8 @@ struct Scene {
     probe: Option<u64>,
     /// `git rev-parse` never answers.
     slow_git: bool,
+    /// `git rev-parse` fails and its stderr holds the token.
+    git_leaks_token: bool,
 }
 
 impl Scene {
@@ -263,6 +265,7 @@ impl Scene {
             tools,
             probe: None,
             slow_git: false,
+            git_leaks_token: false,
         })
     }
 
@@ -282,6 +285,8 @@ impl Scene {
         );
         let rev_parse = if self.slow_git {
             "@sleep@ 30".to_owned()
+        } else if self.git_leaks_token {
+            format!("echo 'fatal: bad object {TOKEN}' >&2; exit 128")
         } else {
             format!("printf '{SHA}\\n'; exit 0")
         };
@@ -445,6 +450,30 @@ fn the_git_commands_for_head_are_bounded_by_timeouts_probe() {
     assert_eq!(ci["state"], "unknown", "{out}");
     let reason = ci["reason"].as_str().unwrap();
     assert!(reason.contains("timed out after 1s"), "{reason}");
+    assert!(forge.seen.lock().unwrap().is_empty());
+}
+
+/// Hardening round, N1: what git says is checked for the token the shell holds, so a repository
+/// that makes git print it (the child's `Real` passes the token to `head`) cannot put it in the
+/// badge, the log or `--json`.
+#[test]
+fn git_text_holding_the_token_is_withheld_from_the_badge() {
+    let Some(mut scene) = Scene::new() else {
+        return;
+    };
+    scene.git_leaks_token = true;
+    let Some(forge) = forge(200, success_body()) else {
+        return;
+    };
+    let token = scene.token(0o600);
+    // `run` already fails if the token is in anything the child printed.
+    let out = scene.run(&forge, Some(&token), "## main...origin/main\\0");
+    let ci = &json_of(&out)["fleet_ci"];
+    assert_eq!(ci["state"], "unknown", "{out}");
+    assert!(
+        ci["reason"].as_str().unwrap().contains("not shown"),
+        "{out}"
+    );
     assert!(forge.seen.lock().unwrap().is_empty());
 }
 

@@ -32,6 +32,7 @@ use std::time::Duration;
 use auspex_domain::ci::{
     CiState, CiStatus, HeadFacts, clean_url, forge_state, is_commit_id, parse_remote,
 };
+use auspex_domain::text::sanitize_line;
 use http::header::HeaderValue;
 use http::{Method, StatusCode};
 use rustix::fs::{Mode, OFlags};
@@ -55,6 +56,43 @@ pub const BODY_CAP: usize = 1024 * 1024;
 /// The exit status of `git remote get-url <name>` for a name that is not a remote.
 const NO_SUCH_REMOTE: i32 = 2;
 
+/// How many times the guard decodes a link's percent-encoding looking for the token: a forge can
+/// encode as deeply as it likes, so this is a bound on the work, not a promise about depth. A copy
+/// encoded more times than this is not seen (nothing that is not an attack encodes a token even
+/// once: it is unreserved characters).
+pub(crate) const MAX_DECODE_PASSES: usize = 8;
+
+/// The longest reason line from git or the transport, in characters (then `…`): enough for any
+/// message of git's, short enough for a status line and for `--json`.
+pub(crate) const MAX_REASON_CHARS: usize = 300;
+
+/// What a reason is replaced with when it held the token.
+const WITHHELD: &str = "forge: the error text held the token, so it is not shown";
+
+/// `reason`, unless it holds the token ([`Token::appears_in`]): then fixed text.
+///
+/// **Every reason this module returns goes through here** (the forge's transport errors, git's
+/// stderr), because text that comes from outside is where a reflected credential would come back
+/// out: a TLS certificate whose names include it, a repository whose config does. With no token
+/// sent there is nothing to guard.
+pub(crate) fn guard(token: Option<&Token>, reason: String) -> String {
+    if token.is_some_and(|t| t.appears_in(&reason)) {
+        WITHHELD.to_owned()
+    } else {
+        reason
+    }
+}
+
+/// A line of outside text made safe for a reason: sanitised (no escape sequences or control
+/// characters), guarded, and cut to [`MAX_REASON_CHARS`].
+pub(crate) fn reason_line(token: Option<&Token>, text: &str) -> String {
+    let line = guard(token, sanitize_line(text));
+    match line.char_indices().nth(MAX_REASON_CHARS) {
+        Some((cut, _)) => format!("{}…", &line[..cut]),
+        None => line,
+    }
+}
+
 /// The revision `git rev-parse` is asked for: `HEAD`, peeled to a commit.
 const HEAD_COMMIT: &str = "HEAD^{commit}";
 
@@ -76,14 +114,29 @@ impl std::fmt::Debug for Token {
 
 impl Token {
     /// Whether `text` holds the token: bare (which is also what the header's `token <value>`
-    /// carries), or with the percent-encoding a URL may have applied to it.
+    /// carries), in any case, or percent-encoded however many times (up to
+    /// [`MAX_DECODE_PASSES`]; decoding stops as soon as nothing changes).
     ///
-    /// This is how text that came from the forge is checked before it can reach output, without
+    /// This is how text that came from outside is checked before it can reach output, without
     /// the secret having an accessor: a forge that reflects the credential must not be able to
     /// put it in the badge. A token this short is not told apart from ordinary text by chance
-    /// (the shortest a forge issues is dozens of characters).
+    /// (the shortest a forge issues is dozens of characters). Not caught, by nature: a copy the
+    /// forge splits or re-encodes in a way it invents (base64, say); no guard can be complete
+    /// against a forge that already holds the token and wants it shown.
     fn appears_in(&self, text: &str) -> bool {
-        text.contains(self.0.as_str()) || percent_decoded(text).contains(self.0.as_str())
+        let needle = self.0.to_ascii_lowercase();
+        let mut current = text.to_owned();
+        for _ in 0..=MAX_DECODE_PASSES {
+            if current.to_ascii_lowercase().contains(&needle) {
+                return true;
+            }
+            let decoded = percent_decoded(&current);
+            if decoded == current {
+                return false;
+            }
+            current = decoded;
+        }
+        false
     }
 
     /// The `Authorization` header value, `token <the token>`, marked sensitive.
@@ -271,12 +324,31 @@ fn is_loopback(url: &Url) -> bool {
 /// | anything else | "answered HTTP n" |
 ///
 /// A body that is not JSON, is not what Forgejo sends, is longer than [`BODY_CAP`] or holds more
-/// than [`MAX_STATUSES`] statuses is an error. **No error quotes the answer.**
+/// than [`MAX_STATUSES`] statuses is an error. **No error quotes the answer**, and every reason,
+/// the transport's included (a TLS error names the certificate's names), goes through [`guard`]:
+/// one that holds the token is replaced.
 ///
 /// # Errors
 ///
 /// [`Cancelled`] when `cancel` fired; every other failure is the inner `Err`.
 pub async fn combined_status(
+    client: &HttpClient,
+    url: &str,
+    repo: &str,
+    commit: &str,
+    token: Option<&Token>,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> Result<Result<CiStatus, String>, Cancelled> {
+    Ok(
+        combined_status_unguarded(client, url, repo, commit, token, timeout, cancel)
+            .await?
+            .map_err(|reason| guard(token, reason)),
+    )
+}
+
+/// [`combined_status`] before every reason goes through [`guard`].
+async fn combined_status_unguarded(
     client: &HttpClient,
     url: &str,
     repo: &str,
@@ -404,8 +476,11 @@ fn capped_statuses<'de, D: serde::Deserializer<'de>>(
 /// Reads a 200 answer.
 ///
 /// `token` is the one that was sent, if any: a link that holds it (a forge that reflects the
-/// credential) is dropped, so it cannot reach `--json`. The state is a fixed vocabulary and every
-/// error is fixed text, so the link is the only forge text that reaches output.
+/// credential) is dropped, so it cannot reach `--json`. Of what the *body* holds, the link is the
+/// only text that reaches output: the state is mapped to a fixed vocabulary, every error built
+/// here is fixed text, and the other fields are not read. Text from outside the body (the
+/// transport's errors, git's stderr) does not come through here; [`combined_status`] and [`head`]
+/// send every reason they return through [`guard`].
 pub(crate) fn parse(body: &[u8], token: Option<&Token>) -> Result<CiStatus, String> {
     let doc: Answer = serde_json::from_slice(body)
         .map_err(|_| "forge: the answer is not a combined commit status".to_owned())?;
@@ -449,12 +524,15 @@ pub(crate) fn parse(body: &[u8], token: Option<&Token>) -> Result<CiStatus, Stri
 ///
 /// [`Cancelled`] when `cancel` fired (the process group is killed and reaped). Anything else is
 /// the inner `Err`, one line: not a repository, no commit yet, git failed, or `git status` did.
+/// What git said is sanitised, cut to [`MAX_REASON_CHARS`] and, when a `token` is given, replaced
+/// if it holds it ([`guard`]): a repository's own config can put anything in git's stderr.
 /// A missing or unreadable `origin` is not an error here: it is [`HeadFacts::origin`], because
 /// it only matters when `forge.repo` is not set.
 pub async fn head(
     params: &GitParams<'_>,
     flake: &FlakeRef,
     want_origin: bool,
+    token: Option<&Token>,
     cancel: &CancellationToken,
 ) -> Result<Result<HeadFacts, String>, Cancelled> {
     let Some(dir) = flake.local_dir() else {
@@ -473,7 +551,7 @@ pub async fn head(
     .await?
     {
         Ok(out) => out,
-        Err(why) => return Ok(Err(why)),
+        Err(why) => return Ok(Err(reason_line(token, &why))),
     };
     let commit = String::from_utf8_lossy(&out).trim().to_owned();
     if !is_commit_id(&commit) {
@@ -484,7 +562,7 @@ pub async fn head(
     }
     let tree = match fleet_tree(params, flake, cancel).await? {
         Ok(t) => t,
-        Err(why) => return Ok(Err(why)),
+        Err(why) => return Ok(Err(reason_line(token, &why))),
     };
     let origin = if want_origin {
         let asked = git_typed(params, &dir, &["remote", "get-url", "origin"], 4096, cancel).await?;
@@ -496,9 +574,11 @@ pub async fn head(
                 code: Some(NO_SUCH_REMOTE),
                 ..
             }) => Err("the fleet repository has no origin remote".to_owned()),
+            // git's own words, which a repository's config can shape: bounded, clean, and kept
+            // from holding the token.
             Err(other) => Err(format!(
                 "could not read the origin remote: {}",
-                other.into_message()
+                reason_line(token, &other.into_message())
             )),
         })
     } else {
@@ -643,6 +723,84 @@ mod tests {
                 .unwrap_err()
                 .contains("owned by")
         );
+    }
+
+    #[test]
+    fn the_guard_sees_a_copy_in_any_case_and_through_repeated_encoding() {
+        let t = Token("0a1b2c3d4e5f60718293a4b5c6d7e8f901234567".to_owned());
+        let bare = "0a1b2c3d4e5f60718293a4b5c6d7e8f901234567";
+        assert!(t.appears_in(bare));
+        assert!(t.appears_in(&bare.to_ascii_uppercase()));
+        assert!(t.appears_in("x=0A1b2C3d4e5F60718293a4b5c6d7e8f901234567&y"));
+        let once = bare.replacen('a', "%61", 1);
+        assert!(t.appears_in(&once));
+        let twice = once.replace('%', "%25");
+        assert!(t.appears_in(&twice));
+        let mut deep = once;
+        for _ in 0..MAX_DECODE_PASSES {
+            deep = deep.replace('%', "%25");
+        }
+        assert!(
+            !t.appears_in(&deep),
+            "more levels than the bound are not followed (a forge can always out-encode a guard)"
+        );
+        assert!(!t.appears_in("https://ci.example.org/owner/fleet/actions/runs/12"));
+        assert!(!t.appears_in(""));
+    }
+
+    #[test]
+    fn decoding_until_stable_is_bounded() {
+        let t = Token("secret-value-0123".to_owned());
+        // `%25` repeated decodes to `%` repeated, one level per pass: it must stop, and cheaply.
+        let hostile = "%25".repeat(200_000);
+        let began = std::time::Instant::now();
+        assert!(!t.appears_in(&hostile));
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            began.elapsed()
+        );
+    }
+
+    #[test]
+    fn the_guard_replaces_a_reason_that_holds_the_token() {
+        let t = Token("0a1b2c3d4e5f60718293a4b5c6d7e8f901234567".to_owned());
+        // What rustls writes for a certificate whose names include the token.
+        let tls = "forge: error trying to connect: certificate not valid for name \"forge.example.org\"; \
+                   certificate is only valid for 0A1B2C3D4E5F60718293A4B5C6D7E8F901234567.anything.example";
+        let shown = guard(Some(&t), tls.to_owned());
+        assert!(!shown.to_ascii_lowercase().contains("0a1b2c3d"), "{shown}");
+        assert!(
+            shown.starts_with("forge: ") && shown.contains("not shown"),
+            "{shown}"
+        );
+        // Anything else is untouched, and with no token there is nothing to guard.
+        let fine = "forge: no answer within 10000 ms".to_owned();
+        assert_eq!(guard(Some(&t), fine.clone()), fine);
+        assert_eq!(guard(None, tls.to_owned()), tls);
+    }
+
+    #[test]
+    fn a_reason_line_is_clean_short_and_guarded() {
+        let t = Token("0a1b2c3d4e5f60718293a4b5c6d7e8f901234567".to_owned());
+        let long = format!(
+            "git remote exited 128: \u{1b}[31m{}\u{1b}]0;x\u{7}",
+            "9".repeat(5000)
+        );
+        let shown = reason_line(None, &long);
+        assert!(
+            shown.chars().count() <= MAX_REASON_CHARS + 1,
+            "{}",
+            shown.chars().count()
+        );
+        assert!(!shown.chars().any(char::is_control), "{shown:?}");
+        assert!(shown.ends_with('…'), "{shown}");
+        assert_eq!(reason_line(None, "short line"), "short line");
+        let held = reason_line(Some(&t), "fatal: 0A1B2C3D4E5F60718293A4B5C6D7E8F901234567");
+        assert!(!held.to_ascii_lowercase().contains("0a1b2c3d"), "{held}");
+        // The cut is on a character boundary.
+        let wide = "é".repeat(MAX_REASON_CHARS + 50);
+        assert!(reason_line(None, &wide).chars().count() <= MAX_REASON_CHARS + 1);
     }
 
     #[test]

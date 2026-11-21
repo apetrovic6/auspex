@@ -80,7 +80,10 @@ pub struct FleetReport {
     /// tree is not a state: `HEAD`'s status is shown as it is. `commit` is the full commit id, or
     /// `null` when it was not read; `url` links to the check, or is `null`; `reason` is one line
     /// for `unknown` and `not_pushed`, `null` otherwise. The forge's token never appears in any
-    /// of them. Added to version 1; a report without it reads as `off`.
+    /// of them: text from outside (a link, a transport error, git's words) is checked for it, in
+    /// any case and percent-encoded, and replaced when it holds it. A copy a forge disguises in a
+    /// way of its own invention (base64, a split) cannot be recognised by any such check. Added to
+    /// version 1; a report without it reads as `off`.
     #[serde(default)]
     pub fleet_ci: FleetCi,
 }

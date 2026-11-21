@@ -756,7 +756,12 @@ impl Real {
         let mut git = GitParams::new();
         git.program = &self.git;
         git.timeout = self.http_timeout;
-        forge::head(&git, &flake, op.want_origin, cancel).await
+        let token = self
+            .forge
+            .as_ref()
+            .and_then(|f| f.token.as_ref().ok())
+            .and_then(Option::as_ref);
+        forge::head(&git, &flake, op.want_origin, token, cancel).await
     }
 
     /// `Effect::ForgeStatus`: one request, with the token when there is one.

@@ -501,7 +501,11 @@ makes the badge `unknown` and **no request is made**: asking anonymously instead
 your token is not in use. Without `token_file` the forge is asked anonymously, which is how a
 public repository is read. The token is held in a type whose `Debug` is `Token(<redacted>)`, with
 no `Display` or `Serialize`; no error quotes the forge's answer (a forge can echo a credential);
-the `Authorization` header is marked sensitive; redirects are not followed, so a forge cannot
+every link, transport error (a TLS error names the certificate's names) and line of git's stderr
+that reaches the badge is checked for the token, in any case and percent-encoded (repeatedly, up
+to a bound), and replaced when it holds it, and git's lines are also sanitised and cut to 300
+characters (a copy a forge disguises in a way of its own invention, base64 or a split, cannot be
+recognised by any such check); the `Authorization` header is marked sensitive; redirects are not followed, so a forge cannot
 send the token on to another host; and a token is sent only over `https` (or to a loopback
 address, which only a test uses: `forge.url` itself must be `https`). The token never reaches
 `config.toml` through Home Manager either: `programs.auspex.settings.forge.token_file` is a path,
