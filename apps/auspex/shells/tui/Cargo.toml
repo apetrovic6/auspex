@@ -53,6 +53,9 @@ unicode-width = "0.2"
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process", "termios", "stdio"] }
 
 [dev-dependencies]
+# The one way to poison crux's model lock through a real update (`tests/task_panic.rs`): the core's
+# own fault switch, on for this crate's test build only.
+auspex-core = { path = "../../core", features = ["fault-injection"] }
 tempfile = "3"
 # Holding the action log's write lock from a second connection, to show that a freeze never waits
 # for the log (`tests/freeze.rs`). The version `auspex-effects` has; already in the graph.

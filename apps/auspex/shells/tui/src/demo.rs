@@ -444,6 +444,9 @@ pub enum Fault {
     /// The update call, right after `clan` was started: the machine may be half updated, so the
     /// node must stay cordoned and be named, never given back.
     AfterClanStarted,
+    /// Reading the freeze file (an update of all reads it only at the last look before each
+    /// update): the update must be refused, not let through.
+    FreezeGate,
 }
 
 /// The script. `Demo::default()` is what `--demo` runs; the two fields exist for the shell's

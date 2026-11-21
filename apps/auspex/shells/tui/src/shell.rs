@@ -1137,6 +1137,11 @@ impl Shell {
     /// run froze in memory.
     async fn read_freezes(&self) -> LoadFreezesAnswer {
         self.freeze_reads.fetch_add(1, Ordering::SeqCst);
+        // A test's fault: reading the file panics (an update of all reads it only at the last look).
+        assert!(
+            self.backend.fault() != Some(&crate::demo::Fault::FreezeGate),
+            "fault injected by a test: reading the freeze file panics"
+        );
         let store = lock(&self.freeze_store).clone();
         match store {
             Some(store) => store.load().await.map_err(|e| e.to_string()),

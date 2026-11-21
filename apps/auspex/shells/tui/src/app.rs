@@ -448,7 +448,11 @@ async fn tui(
     loop {
         // Before anything looks at the core: a panic in a task is recorded by the hook before it
         // unwinds, and the core's lock it may hold is poisoned only after that.
-        if let Some(message) = hooks.task_panic() {
+        let panicked = hooks.task_panic();
+        // The hook marks the core failed before it records the message: a loop that passes between
+        // the two sees the flag first, and that is the panic too.
+        if panicked.is_some() || shell.core_failed() {
+            let message = panicked.unwrap_or_else(|| "a call into the core panicked".to_owned());
             // The wind-down below can take a while and draws nothing: say why, once, now.
             let status = "a task panicked, so auspex is stopping the run";
             shell.log.line(&format!("{status}: {message}"));
@@ -467,7 +471,7 @@ async fn tui(
             code = USAGE;
             break;
         }
-        if shell.core_failed() || shell.view().quit {
+        if shell.view().quit {
             break;
         }
         tokio::select! {

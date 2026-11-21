@@ -189,8 +189,14 @@ impl Hooks {
             }
             return;
         }
-        // Inside a call into the core: the core is down from this moment (the lock is poisoned a
-        // moment later, by the unwind), so the loop must not look at it. Before the loop is told.
+        // Inside a call into the core: mark the core failed **before** recording and waking the
+        // loop (below). The order is load-bearing. The loop acts on the record: it goes to
+        // `terminate_with`, which calls into the core. If the record were visible while the flag
+        // is not yet set, that call would pass the check, block on crux's lock (held by the
+        // panicking update) and panic on it when the unwind poisons it: a loop-thread panic, no
+        // orderly stop. The other way round, a loop that sees the flag before the record is
+        // harmless (it treats the flag as the panic: see the loop in `app`). The lock itself is
+        // poisoned a moment after both, by the unwind.
         IN_CORE.with(|c| {
             if let Some(failed) = c.borrow().as_ref() {
                 failed.store(true, Ordering::SeqCst);

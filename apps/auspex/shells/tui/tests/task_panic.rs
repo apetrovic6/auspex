@@ -964,3 +964,139 @@ async fn a_task_panic_after_the_wind_down_is_printed_and_fails_the_exit() {
         "the hook did not restore the terminal again"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2 (re-review of PR #41)
+// ---------------------------------------------------------------------------------------
+
+/// R2a. A panic inside a **real** `update` (the core's `fault-injection` switch) poisons crux's model
+/// lock, as a bug in the core reached from a task would. Nothing looks at the core again: `view()`
+/// and `send` return at once on the failed core. Without `core_call`'s early return, `view()` here
+/// panics on the poisoned lock, on the loop's thread. (`Shell::fault_next_core_call` panics before
+/// the lock is taken, so it cannot show this.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panic_in_a_real_update_poisons_the_lock_and_the_failed_core_is_never_called_again() {
+    let shell = Shell::new(
+        Backend::Demo(Demo::default()),
+        Log::memory(),
+        Duration::from_secs(120),
+    );
+    shell.set_loop_thread(std::thread::current().id());
+    let installed = install(&shell).await;
+    // The loop's own updates are spared; the first answer a task delivers is not.
+    let mut config = demo::config();
+    config.flake = "poison-the-core-of-this-test".to_owned();
+    auspex_core::fault::arm_except_this_thread(&config.flake);
+    shell.send(Event::Start(config));
+    let message = tokio::time::timeout(Duration::from_secs(10), installed.hooks.task_panicked())
+        .await
+        .expect("the loop is told of the panic");
+    assert!(message.contains("the core's update panics"), "{message}");
+    assert!(shell.core_failed());
+    // Let the unwind finish: the lock is poisoned for good from here.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // What the loop does on every turn and in `terminate_with`: none of it may touch crux.
+    let _ = shell.view();
+    shell.send(Event::Refresh);
+    assert_eq!(
+        installed.calls.counts(),
+        (0, 0),
+        "no loop-thread panic: the terminal was left alone"
+    );
+    let (code, lines) = wind_down(
+        &shell,
+        &installed.hooks,
+        leaving(true),
+        std::future::pending(),
+    )
+    .await;
+    assert_ne!(code, 0);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("took the core down") || l.contains("the core's update panics")),
+        "{lines:?}"
+    );
+    assert_eq!(installed.calls.counts(), (1, 1));
+}
+
+/// RR3. A panic on the loop thread **while the run is being wound down** (here in the `interrupt`
+/// future, which `terminate_with` polls on the loop) still gives the terminal back: the hook is not
+/// told the loop is done until the wait is over. With `finish()` before the wait it would skip the
+/// restore and leave raw mode and the alternate screen on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_loop_thread_panic_during_the_wind_down_still_restores_the_terminal() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let w = world_with(
+        &t,
+        &Opts {
+            slow_uncordon: 2,
+            ..Opts::default()
+        },
+    );
+    let installed = install(&w.shell).await;
+    draining_luna(&w).await;
+    let (_, _) = wind_down(&w.shell, &installed.hooks, leaving(false), async {
+        let _ = std::panic::catch_unwind(|| panic!("in the interrupt future"));
+    })
+    .await;
+    assert_eq!(
+        installed.calls.counts(),
+        (2, 2),
+        "the hook restored (1, 1) during the wait, and the loop restored again on the way out"
+    );
+    assert!(
+        installed
+            .calls
+            .said()
+            .iter()
+            .all(|l| !l.contains("a panic in a task")),
+        "a loop-thread panic is not a task panic"
+    );
+    drop(installed);
+}
+
+/// R2c. A panic while reading the freeze file for the last look before an update refuses the
+/// update (a freeze holds, and a file that cannot be read means the machine may be frozen). Mapped
+/// to "go ahead", `clan` would be started here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panic_in_the_freeze_gate_refuses_the_update() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let _serial = SERIAL.lock().await;
+    let w = world_with(
+        &t,
+        &Opts {
+            quick_drain: true,
+            fault: Some(Fault::FreezeGate),
+            ..Opts::default()
+        },
+    );
+    start_roll(&w).await;
+    until(&w.shell, "the roll to end", |v| {
+        v.roll
+            .as_ref()
+            .is_some_and(|r| r.status == RollStatus::Ended)
+    })
+    .await;
+    let roll = w.shell.view().roll.expect("there was a roll");
+    for name in ["luna", "cypramundi"] {
+        let m = roll.machines.iter().find(|m| m.name == name).unwrap();
+        assert!(
+            matches!(&m.state, RollState::Refused(why) if why.contains("internal error")),
+            "{name}: {:?}",
+            m.state
+        );
+    }
+    for name in ["luna", "sol", "cypramundi"] {
+        assert!(
+            !w.clan_started_for(name),
+            "clan was started for {name} although the freeze file could not be read"
+        );
+    }
+    assert_eq!(w.shell.cordons().held(), Vec::<String>::new());
+}
