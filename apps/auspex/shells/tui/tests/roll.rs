@@ -113,10 +113,11 @@ const NODES_SICK: &str = r#"{"items":[
   {"metadata":{"name":"terra"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}
 ]}"#;
 
-/// Ready, with a heartbeat from long before any update.
+/// Ready, with a heartbeat from long before any update. sol's is nine minutes newer than luna's: with
+/// no lease to go by, that is not silence (the condition is rewritten only every few minutes).
 const NODES_STALE: &str = r#"{"items":[
   {"metadata":{"name":"luna"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2020-01-01T00:00:00Z"}]}},
-  {"metadata":{"name":"sol"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2020-01-01T00:00:00Z"}]}}
+  {"metadata":{"name":"sol"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2020-01-01T00:09:00Z"}]}}
 ]}"#;
 
 const VIEW: &str = r#"{"current-context":"rke2","contexts":[{"name":"rke2","context":{"cluster":"c1"}}],"clusters":[{"name":"c1","cluster":{"server":"https://10.0.0.1:6443"}}]}"#;
@@ -1226,13 +1227,31 @@ async fn a_ready_from_before_the_update_does_not_end_the_wait() {
     match state(&w.shell, "luna") {
         RollState::Failed(why) => assert!(
             why.contains(
-                "node luna is Ready, but its kubelet has not been heard from since the update"
+                "node luna is Ready, but its kubelet has not been heard from since the wait began"
             ),
             "{why}"
         ),
         other => panic!("{other:?}"),
     }
     assert!(matches!(state(&w.shell, "sol"), RollState::Skipped(_)));
+    // N2: with no lease at all, silence is not judged (luna's condition heartbeat is nine minutes
+    // older than sol's, and luna was let through to its update), and the machine's Log line says so.
+    assert!(
+        w.clan_events().contains(&"start luna".to_owned()),
+        "{:?}",
+        w.clan_events()
+    );
+    let out = w.shell.output();
+    let log: Vec<String> = out
+        .window(0, out.rows())
+        .into_iter()
+        .map(|l| l.text)
+        .collect();
+    assert!(
+        log.iter()
+            .any(|l| l.contains("luna: the node leases could not be read")),
+        "{log:#?}"
+    );
     w.shell.shutdown().await;
 }
 
@@ -1787,47 +1806,6 @@ async fn a_kubelet_that_went_silent_after_the_plan_stops_the_group_before_the_ne
     w.shell.shutdown().await;
 }
 
-/// N2: leases that cannot be read leave the check as it was (a kubelet's silence is not judged on
-/// the `Ready` condition's own heartbeat, which is rewritten only every few minutes), and the
-/// machine's Log line says so.
-#[tokio::test]
-async fn without_the_leases_the_silence_is_not_judged_and_the_log_says_so() {
-    let Some(t) = tools(&["sleep", "cat", "date"]) else {
-        return;
-    };
-    // luna's condition heartbeat is minutes older than mars's, and there are no leases.
-    let nodes = r#"{"items":[
-      {"metadata":{"name":"luna"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:00:00Z"}]}},
-      {"metadata":{"name":"mars"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:09:00Z"}]}},
-      {"metadata":{"name":"sol"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:09:00Z"}]}}
-    ]}"#;
-    let kubectl = kubectl_with(&cat(nodes), "echo drained", "echo uncordoned", "exit 1");
-    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(false), 1);
-    settled(&w.shell).await;
-    act_on(&w.shell);
-    roll(&w.shell).await;
-    until_over(&w.shell).await;
-    // luna started: the read let it through (the wait then fails it, with no lease to show a
-    // new heartbeat; that is the wait's rule, not this one's).
-    assert!(
-        w.clan_events().contains(&"start luna".to_owned()),
-        "{:?}",
-        w.clan_events()
-    );
-    let out = w.shell.output();
-    let log: Vec<String> = out
-        .window(0, out.rows())
-        .into_iter()
-        .map(|l| l.text)
-        .collect();
-    assert!(
-        log.iter()
-            .any(|l| l.contains("luna: the node leases could not be read")),
-        "{log:#?}"
-    );
-    w.shell.shutdown().await;
-}
-
 /// The reviewer's RR3 lease list (frozen, and ahead of this machine's clock): every lease says one fixed time, in
 /// 2030, and no kubelet renews after the plan.
 fn leases_frozen() -> String {
@@ -1864,9 +1842,125 @@ async fn a_node_clock_ahead_of_auspex_does_not_pass_the_wait_on_a_heartbeat_from
     w.shell.shutdown().await;
     match luna {
         RollState::Failed(why) => assert!(
-            why.contains("its kubelet has not been heard from since the update"),
+            why.contains("its kubelet has not been heard from since the wait began"),
             "{why}"
         ),
         other => panic!("no kubelet renewed after the update, yet: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// the record of a wait taken from a partial read (R1, R7 of the review of PR #38)
+// ---------------------------------------------------------------------------------------
+
+/// The lease list of [`leases_frozen`], except that read number `fails_on` (counting every lease
+/// read, the plan's first) exits 1: `kubectl get nodes` answers and `get leases` does not.
+fn leases_frozen_failing_on(fails_on: u32) -> String {
+    let item = |n: &str| {
+        format!(r#"{{"metadata":{{"name":"{n}"}},"spec":{{"renewTime":"2030-01-01T00:01:00Z"}}}}"#)
+    };
+    format!(
+        "f='@dir@/lease.reads'; r=$(@cat@ \"$f\" 2>/dev/null || echo 0); r=$((r+1)); echo $r > \"$f\"; \
+         if [ \"$r\" -eq {fails_on} ]; then echo 'leases are down' >&2; exit 1; fi; \
+         printf '%s\\n' '{{\"items\":[{}]}}'",
+        ["luna", "mars", "sol", "terra"].map(item).join(",")
+    )
+}
+
+/// Every node `Ready` with a condition heartbeat from before the leases' fixed time, which no
+/// kubelet renews after the plan.
+const NODES_READY_WITH_HEARTBEAT: &str = r#"{"items":[
+  {"metadata":{"name":"luna"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:00:00Z"}]}},
+  {"metadata":{"name":"mars"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:00:00Z"}]}},
+  {"metadata":{"name":"sol"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:00:00Z"}]}},
+  {"metadata":{"name":"terra"},"status":{"conditions":[{"type":"Ready","status":"True","lastHeartbeatTime":"2030-01-01T00:00:00Z"}]}}
+]}"#;
+
+/// luna's wait ends at its deadline, as sol's would: no kubelet renewed anything since the update.
+async fn assert_luna_fails_at_the_deadline(w: &World) {
+    until_over(&w.shell).await;
+    let luna = state(&w.shell, "luna");
+    let events = w.clan_events();
+    assert!(
+        matches!(luna, RollState::Failed(ref why) if why.contains("has not been heard from since the wait began")),
+        "no kubelet renewed after the update, yet luna is {luna:?}; clan {events:?}"
+    );
+    assert!(
+        !events.contains(&"start sol".to_owned()),
+        "the group went on to sol: {events:?}"
+    );
+}
+
+/// R1 (the review's zz1). `get leases` fails at the moment the wait takes its record, so the record
+/// holds only the `Ready` condition's heartbeat, which a kubelet rewrites every few minutes. The next
+/// read has the leases: a lease renewed before the switch is newer than that condition, but it is a
+/// different kind of heartbeat, so it proves nothing. The record and the proof must be of one kind.
+#[tokio::test]
+async fn a_lease_read_that_failed_at_the_record_does_not_let_an_old_lease_pass_the_wait() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    // Lease reads: the plan's (1), luna's read before it (2), the wait's record (3).
+    let kubectl = kubectl_with(
+        &cat(NODES_READY_WITH_HEARTBEAT),
+        "echo drained",
+        "echo uncordoned",
+        &leases_frozen_failing_on(3),
+    );
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(false), 3);
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    assert_luna_fails_at_the_deadline(&w).await;
+    w.shell.shutdown().await;
+}
+
+/// R1 (the review's zz2): the same, with a node list that has no condition heartbeat, so the record
+/// is empty and "any heartbeat counts" would let the first lease through.
+#[tokio::test]
+async fn a_lease_read_that_failed_at_the_record_with_no_condition_heartbeat_does_not_pass_the_wait()
+{
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let kubectl = kubectl_with(
+        &cat(NODES_READY),
+        "echo drained",
+        "echo uncordoned",
+        &leases_frozen_failing_on(3),
+    );
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(false), 3);
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    assert_luna_fails_at_the_deadline(&w).await;
+    w.shell.shutdown().await;
+}
+
+/// R7 (mutation B1). `get nodes` itself fails at the record. The first read that has the node takes
+/// the record instead, and a heartbeat after that is the proof; with no fallback the wait would
+/// accept the first `Ready` it sees.
+#[tokio::test]
+async fn a_node_read_that_failed_at_the_record_is_recorded_by_the_next_one() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    // Node reads: the plan's (1), luna's read before it (2), the wait's record (3).
+    let get_nodes = format!(
+        "f='@dir@/nodes.reads'; r=$(@cat@ \"$f\" 2>/dev/null || echo 0); r=$((r+1)); echo $r > \"$f\"; \
+         if [ \"$r\" -eq 3 ]; then echo 'Unable to connect to the server' >&2; exit 1; fi; {}",
+        cat(NODES_READY)
+    );
+    let kubectl = kubectl_with(
+        &get_nodes,
+        "echo drained",
+        "echo uncordoned",
+        &leases_frozen(),
+    );
+    let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(false), 3);
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    assert_luna_fails_at_the_deadline(&w).await;
+    w.shell.shutdown().await;
 }

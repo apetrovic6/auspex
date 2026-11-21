@@ -240,8 +240,13 @@ pub struct Node {
     pub cordoned: bool,
     /// The newest sign of life the cluster has from the node's kubelet, in seconds since the
     /// epoch: the `Ready` condition's `lastHeartbeatTime`, or its lease's `renewTime` when that is
-    /// later ([`merge_leases`]). `None` when the cluster said neither.
+    /// later ([`merge_leases`]). `None` when the cluster said neither. The two kinds are kept apart
+    /// too ([`Node::condition`], [`Node::lease`]): they are rewritten at very different rates, so
+    /// only like can be compared with like ([`Beats`]).
     pub heartbeat: Option<i64>,
+    /// The `Ready` condition's `lastHeartbeatTime` alone, in seconds since the epoch. A kubelet
+    /// rewrites it when the status changes or every few minutes.
+    pub condition: Option<i64>,
     /// The node's lease `renewTime`, in seconds since the epoch, when its lease was read and has one
     /// ([`merge_leases`]): the kubelet's own renewal, not just the condition's heartbeat (which is
     /// rewritten only every few minutes). Without any, how long a kubelet has been silent cannot be
@@ -374,6 +379,7 @@ pub fn parse_nodes(json: &str) -> Result<Vec<Node>, String> {
                 ready,
                 cordoned,
                 heartbeat,
+                condition: heartbeat,
                 lease: None,
                 etcd,
             })
@@ -503,36 +509,62 @@ pub fn leases_read(nodes: &[Node]) -> bool {
 /// The `Ready` nodes whose kubelet has been silent for more than [`KUBELET_SILENCE_SECONDS`], one
 /// sentence each.
 ///
-/// The age is measured against the newest heartbeat of any node **in the same read**: the kubelets'
-/// clocks against each other, never against this machine's, so a skew between the operator's
-/// machine and the cluster does not matter. With no lease read at all (see [`leases_read`]) the
-/// condition's own heartbeat, rewritten only every few minutes, would call every node silent, so
-/// nothing is judged. A `Ready` node with no heartbeat while the others have one is silent too:
-/// what cannot be told is not healthy.
+/// Age is by the node's **lease** (the condition's own heartbeat is rewritten only every few minutes
+/// and says nothing about a kubelet that is alive), measured against the newest lease of any node
+/// **in the same read**: the kubelets' clocks against each other, never against this machine's, so a
+/// skew between the operator's machine and the cluster does not matter. The sentence names that
+/// node, because the age is only as good as its clock: a node whose clock runs ahead makes every
+/// other node look silent, and when more than one node is flagged a further sentence says so. What
+/// the rule cannot see: a node whose own clock runs ahead can be silent for that much longer
+/// before it is flagged, and a cluster whose every kubelet went quiet together looks healthy
+/// (nodes with clocks that agree within a few seconds are assumed).
+///
+/// With no lease read at all (see [`leases_read`]) nothing is judged. A `Ready` node with no lease
+/// while others have one is not vouched for.
 #[must_use]
 pub fn silent_kubelets(nodes: &[Node]) -> Vec<String> {
     if !leases_read(nodes) {
         return Vec::new();
     }
-    let Some(newest) = nodes.iter().filter_map(|n| n.heartbeat).max() else {
+    // The first of the nodes with the newest lease: the reference the sentences name.
+    let mut newest: Option<(&str, i64)> = None;
+    for n in nodes {
+        if let Some(l) = n.lease
+            && newest.is_none_or(|(_, best)| l > best)
+        {
+            newest = Some((n.name.as_str(), l));
+        }
+    }
+    let Some((reference, newest)) = newest else {
         return Vec::new();
     };
-    nodes
-        .iter()
-        .filter(|n| n.ready)
-        .filter_map(|n| match n.heartbeat {
-            Some(h) if newest - h > KUBELET_SILENCE_SECONDS => Some(format!(
-                "node {} is Ready, but its kubelet has been silent for {} s",
-                n.name,
-                newest - h
-            )),
-            Some(_) => None,
-            None => Some(format!(
-                "node {} is Ready, but nothing is known of its kubelet's heartbeat",
+    let mut why = Vec::new();
+    let mut behind = 0;
+    for n in nodes.iter().filter(|n| n.ready) {
+        match n.lease {
+            Some(l) if newest - l > KUBELET_SILENCE_SECONDS => {
+                behind += 1;
+                why.push(format!(
+                    "node {} is Ready, but its kubelet has been silent for {} s by {reference}'s \
+                     clock (the newest lease in this read)",
+                    n.name,
+                    newest - l
+                ));
+            }
+            Some(_) => {}
+            None => why.push(format!(
+                "node {} is Ready, but it has no lease, so its kubelet cannot be vouched for",
                 n.name
             )),
-        })
-        .collect()
+        }
+    }
+    if behind > 1 {
+        why.push(format!(
+            "{behind} nodes are behind {reference}'s lease: if {reference}'s clock runs ahead of \
+             theirs they are not silent (the nodes' clocks must agree within a few seconds)"
+        ));
+    }
+    why
 }
 
 /// Why the cluster is not fit for the next node to go out of service, one sentence each; empty
@@ -705,37 +737,70 @@ pub enum NodeState {
     Missing,
 }
 
+/// A node's two kinds of heartbeat at one look: the `Ready` condition's and its lease's.
+///
+/// They are rewritten at very different rates (the lease every 10 s, the condition every few
+/// minutes), so a lease is never compared with a condition: that would let a lease renewed before
+/// the switch beat a condition recorded minutes earlier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Beats {
+    /// The `Ready` condition's `lastHeartbeatTime`.
+    pub condition: Option<i64>,
+    /// The node lease's `renewTime`.
+    pub lease: Option<i64>,
+}
+
+impl Beats {
+    /// The beats `node` shows now.
+    #[must_use]
+    pub const fn of(node: &Node) -> Self {
+        Self {
+            condition: node.condition,
+            lease: node.lease,
+        }
+    }
+
+    /// Whether `node` shows a heartbeat newer than this record, of the **same kind**: a lease newer
+    /// than a recorded lease, or a condition heartbeat newer than a recorded condition heartbeat.
+    /// A beat with no recorded beat of its kind proves nothing: it may have been there all along.
+    #[must_use]
+    pub fn beaten_by(&self, node: &Node) -> bool {
+        let newer = |now: Option<i64>, before: Option<i64>| matches!((now, before), (Some(a), Some(b)) if a > b);
+        newer(node.lease, self.lease) || newer(node.condition, self.condition)
+    }
+}
+
 /// What a node must have shown for [`node_state`] to call it back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Since {
     /// Nothing: `Ready` is enough.
     Unasked,
-    /// A heartbeat newer than this one, the node's own heartbeat when the wait began (`None`: it
-    /// had none, so any will do). Two readings of the **same node's** clock: the kubelets' clocks
-    /// are never compared with this machine's.
-    Heartbeat(Option<i64>),
+    /// A heartbeat newer than the node's own when the wait began, of the same kind
+    /// ([`Beats::beaten_by`]). Two readings of the **same node's** clock: the kubelets' clocks are
+    /// never compared with this machine's.
+    Beats(Beats),
 }
 
 /// The state of node `name`.
 ///
-/// With [`Since::Heartbeat`], a `Ready` node counts only once its heartbeat is newer than the one
+/// With [`Since::Beats`], a `Ready` node counts only once it shows a heartbeat newer than the one
 /// recorded when the wait began: `Ready=True` stays true for the node controller's grace period
 /// (about 40 s) after the kubelet's last report, so a node restarted for less than that would
 /// otherwise pass on the condition it had before the switch.
 #[must_use]
 pub fn node_state(nodes: &[Node], name: &str, since: Since) -> NodeState {
     match nodes.iter().find(|n| n.name == name) {
-        Some(n) if n.ready => match (since, n.heartbeat) {
-            (Since::Unasked, _) | (Since::Heartbeat(None), Some(_)) => NodeState::Ready,
-            (Since::Heartbeat(Some(before)), Some(h)) if h > before => NodeState::Ready,
-            _ => NodeState::Stale,
+        Some(n) if n.ready => match since {
+            Since::Unasked => NodeState::Ready,
+            Since::Beats(record) if record.beaten_by(n) => NodeState::Ready,
+            Since::Beats(_) => NodeState::Stale,
         },
         Some(_) => NodeState::NotReady,
         None => NodeState::Missing,
     }
 }
 
-/// The heartbeat node `name` has now, for [`Since::Heartbeat`]: what to record when a wait begins.
+/// The beats node `name` has now, for [`Since::Beats`]: what to record when a wait begins.
 ///
 /// `None` when the node is not in the list (nothing is recorded then, and the first look that has
 /// it records instead).
@@ -744,7 +809,21 @@ pub fn heartbeat_of(nodes: &[Node], name: &str) -> Option<Since> {
     nodes
         .iter()
         .find(|n| n.name == name)
-        .map(|n| Since::Heartbeat(n.heartbeat))
+        .map(|n| Since::Beats(Beats::of(n)))
+}
+
+/// Fills in what the record of a wait lacks from this look.
+///
+/// A kind of heartbeat that was not there when the record was taken (its read failed, or the node
+/// had none) is recorded now, to be beaten by a later one; it proves nothing itself. Call it after
+/// judging the look with [`node_state`].
+pub fn note_heartbeat(record: &mut Option<Since>, nodes: &[Node], name: &str) {
+    let (Some(Since::Beats(beats)), Some(node)) = (record, nodes.iter().find(|n| n.name == name))
+    else {
+        return;
+    };
+    beats.condition = beats.condition.or(node.condition);
+    beats.lease = beats.lease.or(node.lease);
 }
 
 /// The names of the failed units of a probe, when it observed the machine and could read them.
@@ -1188,26 +1267,28 @@ mod tests {
         {"type":"Ready","status":"Unknown","lastHeartbeatTime":"2026-11-20T15:00:00Z"}]}}]}"#;
 
     /// `Ready` from before the switch is not `Ready` after it: the wait wants a heartbeat that is
-    /// newer than the node's own when the wait began, from the condition or (newer, every ten
-    /// seconds) the node's lease. `Unknown`, which a node gets when its kubelet stops reporting, is
-    /// not ready.
+    /// newer than the node's own when the wait began, of the same kind (the condition's, or the
+    /// lease's, which a kubelet renews every ten seconds). `Unknown`, which a node gets when its
+    /// kubelet stops reporting, is not ready.
     #[test]
     fn a_ready_that_is_older_than_the_update_does_not_count() {
         let mut nodes = parse_nodes(LUNA_READY_AT).unwrap();
         let before = parse_rfc3339("2026-11-20T15:00:00Z").unwrap();
         assert_eq!(nodes[0].heartbeat, Some(before));
+        assert_eq!(nodes[0].condition, Some(before));
+        let beats = |condition, lease| Since::Beats(Beats { condition, lease });
         assert_eq!(node_state(&nodes, "luna", Since::Unasked), NodeState::Ready);
         assert_eq!(
-            node_state(&nodes, "luna", Since::Heartbeat(Some(before))),
+            node_state(&nodes, "luna", beats(Some(before), None)),
             NodeState::Stale,
             "the same heartbeat is not a new one"
         );
         assert_eq!(
-            node_state(&nodes, "luna", Since::Heartbeat(Some(before - 1))),
+            node_state(&nodes, "luna", beats(Some(before - 1), None)),
             NodeState::Ready
         );
         assert_eq!(
-            node_state(&nodes, "luna", Since::Heartbeat(Some(before + 1))),
+            node_state(&nodes, "luna", beats(Some(before + 1), None)),
             NodeState::Stale,
             "nothing is compared with a clock: a record from the future is simply not beaten"
         );
@@ -1218,7 +1299,7 @@ mod tests {
         );
         assert_eq!(
             heartbeat_of(&nodes, "luna"),
-            Some(Since::Heartbeat(Some(before)))
+            Some(beats(Some(before), None))
         );
         assert_eq!(heartbeat_of(&nodes, "nobody"), None);
         // Its lease says the kubelet is alive after the update ended.
@@ -1231,15 +1312,17 @@ mod tests {
         assert_eq!(leases.len(), 2, "an unreadable time is no time");
         merge_leases(&mut nodes, &leases);
         assert_eq!(nodes[0].heartbeat, Some(before + 30));
+        assert_eq!(nodes[0].condition, Some(before), "the kinds stay apart");
         assert!(nodes[0].lease.is_some() && nodes[1].lease.is_none());
+        // A lease newer than a recorded lease, or a condition newer than a recorded condition.
         assert_eq!(
-            node_state(&nodes, "luna", Since::Heartbeat(Some(before))),
+            node_state(&nodes, "luna", beats(None, Some(before))),
             NodeState::Ready
         );
-        // A node that had no heartbeat when the wait began is back for any.
         assert_eq!(
-            node_state(&nodes, "luna", Since::Heartbeat(None)),
-            NodeState::Ready
+            node_state(&nodes, "luna", beats(Some(before - 1), Some(before + 31))),
+            NodeState::Ready,
+            "the condition beats its record even though the lease does not"
         );
         // A node with no heartbeat at all is stale when asked, never Ready by default.
         let silent = parse_nodes(
@@ -1247,18 +1330,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            node_state(&silent, "luna", Since::Heartbeat(None)),
+            node_state(&silent, "luna", beats(None, None)),
             NodeState::Stale
         );
         assert_eq!(
-            node_state(&silent, "luna", Since::Heartbeat(Some(1))),
-            NodeState::Stale
-        );
-        assert_eq!(
-            node_state(&nodes, "nobody", Since::Heartbeat(Some(1))),
+            node_state(&nodes, "nobody", beats(Some(1), Some(1))),
             NodeState::Missing
         );
         assert!(parse_leases("[]").is_err());
+    }
+
+    /// R1. The record and the proof must be of one kind. The record was taken with the leases
+    /// unread (so it holds the condition's heartbeat only); the next look has a lease from before
+    /// the switch, which is newer than that *condition* but proves nothing: it is recorded, and only
+    /// a later lease beats it. Same for a node list with no condition heartbeat at all.
+    #[test]
+    fn a_lease_with_no_recorded_lease_proves_nothing_and_is_recorded() {
+        let base = parse_rfc3339("2026-11-20T15:00:00Z").unwrap();
+        let node = |condition: Option<i64>, lease: Option<i64>| Node {
+            name: "luna".to_owned(),
+            ready: true,
+            cordoned: false,
+            heartbeat: condition.max(lease),
+            condition,
+            lease,
+            etcd: false,
+        };
+        for condition in [Some(base), None] {
+            // The record: leases unread.
+            let mut record = heartbeat_of(&[node(condition, None)], "luna");
+            // A lease from before the switch, newer than the condition: not a proof.
+            let look = [node(condition, Some(base + 60))];
+            let state = node_state(&look, "luna", record.unwrap_or(Since::Unasked));
+            assert_eq!(state, NodeState::Stale, "condition {condition:?}");
+            note_heartbeat(&mut record, &look, "luna");
+            // The same lease again: still nothing.
+            assert_eq!(
+                node_state(&look, "luna", record.unwrap()),
+                NodeState::Stale,
+                "condition {condition:?}"
+            );
+            // A renewal: the proof.
+            let renewed = [node(condition, Some(base + 70))];
+            assert_eq!(
+                node_state(&renewed, "luna", record.unwrap()),
+                NodeState::Ready,
+                "condition {condition:?}"
+            );
+        }
+        // A record is only ever filled in, never lowered or replaced: a later look without a lease
+        // (the read failed again) leaves it as it was.
+        let mut record = heartbeat_of(&[node(Some(base), Some(base + 5))], "luna");
+        note_heartbeat(&mut record, &[node(Some(base + 9), None)], "luna");
+        assert_eq!(
+            record,
+            Some(Since::Beats(Beats {
+                condition: Some(base),
+                lease: Some(base + 5)
+            }))
+        );
     }
 
     /// Four nodes, `Ready`, each with the lease time given (seconds after a fixed minute); `None`
@@ -1304,13 +1434,17 @@ mod tests {
         );
         assert_eq!(
             cluster_unhealthy(&at(26)),
-            ["node mars is Ready, but its kubelet has been silent for 26 s"]
+            [
+                "node mars is Ready, but its kubelet has been silent for 26 s by luna's clock (the newest lease in this read)"
+            ]
         );
         // The review's RR2: three missed renewals. The plan says the same, naming node and age.
         let (luna, sol) = (member("luna", true), member("sol", true));
         assert_eq!(
             cluster_refusals(&at(30), &[&luna, &sol]),
-            ["node mars is Ready, but its kubelet has been silent for 30 s"]
+            [
+                "node mars is Ready, but its kubelet has been silent for 30 s by luna's clock (the newest lease in this read)"
+            ]
         );
         // The newest heartbeat is the reference, not a clock: the same ages at any date.
         let far = leased(&[("luna", Some(1_000_000)), ("mars", Some(1_000_000 - 26))]);
@@ -1361,9 +1495,49 @@ mod tests {
         assert!(leases_read(&some));
         assert_eq!(
             cluster_unhealthy(&some),
-            ["node mars is Ready, but nothing is known of its kubelet's heartbeat"]
+            ["node mars is Ready, but it has no lease, so its kubelet cannot be vouched for"]
+        );
+        // R4. Not aged by its condition heartbeat: that is rewritten only every few minutes, so
+        // "silent for 240 s" would be a wrong reason for a kubelet that may be fine.
+        let mut condition_only = leased(&[("luna", Some(500)), ("mars", None)]);
+        condition_only[1].heartbeat = Some(100);
+        condition_only[1].condition = Some(100);
+        assert_eq!(
+            cluster_unhealthy(&condition_only),
+            ["node mars is Ready, but it has no lease, so its kubelet cannot be vouched for"]
         );
         assert_eq!(cluster_unhealthy(&[]), Vec::<String>::new());
+    }
+
+    /// R3. The age is only as good as the reference clock, so the sentence names the reference. A
+    /// node whose clock runs 2 min ahead makes every other node look silent: each sentence points
+    /// at luna, and a last one says that luna's clock may be the wrong one. One node behind gets
+    /// no such remark.
+    #[test]
+    fn the_sentences_name_the_reference_clock_and_say_when_it_may_be_the_wrong_one() {
+        let ahead = leased(&[
+            ("luna", Some(120)),
+            ("mars", Some(0)),
+            ("sol", Some(1)),
+            ("terra", Some(0)),
+        ]);
+        let why = cluster_unhealthy(&ahead);
+        assert_eq!(why.len(), 4, "{why:?}");
+        assert_eq!(
+            why[0],
+            "node mars is Ready, but its kubelet has been silent for 120 s by luna's clock (the newest lease in this read)"
+        );
+        assert!(
+            why[1].starts_with("node sol is Ready") && why[1].contains("119 s by luna's clock")
+        );
+        assert!(why[2].starts_with("node terra is Ready"));
+        assert_eq!(
+            why[3],
+            "3 nodes are behind luna's lease: if luna's clock runs ahead of theirs they are not silent (the nodes' clocks must agree within a few seconds)"
+        );
+        // One node behind: its own sentence, no remark about the reference.
+        let one = leased(&[("luna", Some(100)), ("mars", Some(50)), ("sol", Some(100))]);
+        assert_eq!(cluster_unhealthy(&one).len(), 1);
     }
 
     #[test]

@@ -851,11 +851,16 @@ impl Real {
                             if since.is_none() {
                                 since = auspex_domain::roll::heartbeat_of(&nodes, node);
                             }
-                            match auspex_domain::roll::node_state(
+                            let state = auspex_domain::roll::node_state(
                                 &nodes,
                                 node,
                                 since.unwrap_or(Since::Unasked),
-                            ) {
+                            );
+                            // A kind of heartbeat the record lacked (its lease read failed, say)
+                            // is recorded by this look, after it was judged: it proves nothing
+                            // itself, a later one of the same kind does.
+                            auspex_domain::roll::note_heartbeat(&mut since, &nodes, node);
+                            match state {
                                 NodeState::Ready => {
                                     match self.etcd_back(op, &nodes, node, cancel, sink).await? {
                                         None => return Ok(Ok(())),
@@ -865,7 +870,7 @@ impl Real {
                                 NodeState::NotReady => format!("node {node} is NotReady"),
                                 NodeState::Stale => format!(
                                     "node {node} is Ready, but its kubelet has not been heard from \
-                                     since the update"
+                                     since the wait began"
                                 ),
                                 NodeState::Missing => format!("node {node} is not in the cluster"),
                             }
