@@ -6,18 +6,18 @@
 │ ?    deimos               not installed            ││host      root@192.168.1.11 (inventory deploy.targetHost)       │
 │ ✓    europa               in sync                  ││build     localhost                                             │
 │ ✓⟳   ganymede             in sync                  ││class     nixos  tags: k8s, k8s-server                          │
-│ ✓    genetor              in sync                  ││lints     none                                                  │
-│ ✓    io            ┌ confirm ───────────────────────────────────────────────────────────────────┐0261019.b81e2d4     │
-│›↑◆   luna          │warning: the fleet repository has uncommitted changes to 2 tracked files:   │0261101.6a2f1c0     │
-│ ✗    mars          │  the update deploys them, and no commit says what was deployed             │                    │
-│ ✓    mechanicus-for│warning: the fleet repository's HEAD is 1 commit ahead of origin/main:      │                    │
-│ ✓    phobos        │  what is deployed has not been pushed                                      │                    │
-│ ↑◆   sol           │                                                                            │                    │
-│ ✓    terra         │update luna to g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0? y/N       │GiB free            │
-│ ✓    titan         │                                                                            │                    │
-│ ✗    triton        │y confirms; any other key cancels                                           │                    │
-│ !    vulcan        └────────────────────────────────────────────────────────────────────────────┘eus)                │
-│                                                    ││diff      linux 6.12.38 → 6.12.41, +3 −2 ~12                    │
+│ ✓    genetor       ┌ confirm ───────────────────────────────────────────────────────────────────┐                    │
+│ ✓    io            │fleet repository: HEAD 1a2b3c4d5e6f, dirty (9f8e7d6c)                       │0261019.b81e2d4     │
+│›↑◆   luna          │                                                                            │0261101.6a2f1c0     │
+│ ✗    mars          │warning: the fleet repository has uncommitted changes to 2 tracked files:   │                    │
+│ ✓    mechanicus-for│  the update deploys them, and no commit says what was deployed             │                    │
+│ ✓    phobos        │warning: the fleet repository's HEAD is 1 commit ahead of origin/main:      │                    │
+│ ↑◆   sol           │  what is deployed has not been pushed                                      │                    │
+│ ✓    terra         │                                                                            │GiB free            │
+│ ✓    titan         │update luna to g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0? y/N       │                    │
+│ ✗    triton        │                                                                            │                    │
+│ !    vulcan        │y confirms; any other key cancels                                           │eus)                │
+│                    └────────────────────────────────────────────────────────────────────────────┘                    │
 │                                                    ││critical  linux 6.12.38 → 6.12.41, systemd 256.10 → 257.2, glibc│
 │                                                    ││          2.40-66 → 2.40-77, nix rebuilt                        │
 │                                                    ││counts    4 other major-version changes; +3 −2 ~12  1 rebuilt … │

@@ -2,10 +2,9 @@
 │›✓    alfrost         in sync         │
 │ ✓    callisto        in sync         │
 │ ✓⚠   cerberus        in sync         │
-│ ↑    cypramundi      update pending  │
-│ ?    deimos          not installed   │
 ┌ confirm ─────────────────────────────┐
 │update 2 machines:                    │
+│fleet repository: HEAD 5e1f0c9a47b3   │
 │in parallel, at most 2 at a time:     │
 │  luna, sol                           │
 │at most 2 machines updating at once:  │
@@ -15,16 +14,17 @@
 │  it with u                           │
 │each machine is checked at its turn:  │
 │  a refusal skips it, a failure stops │
-│  its rolling group, and a new warning│
-│  about the fleet repository refuses  │
-│  it                                  │
+│  its rolling group, and a fleet      │
+│  repository that is not as it was at │
+│  the y (a new warning, another       │
+│  commit, other uncommitted changes)  │
+│  refuses it                          │
 │                                      │
 │update 2 machines as listed above?    │
 │y/N                                   │
 │                                      │
 │y confirms; any other key cancels     │
 └──────────────────────────────────────┘
-│                                      │
 │                                      │
 │                                      │
 │                                      │

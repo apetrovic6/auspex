@@ -18,7 +18,7 @@ use auspex_core::{
     ActionStatus, ConfirmKind, ConfirmView, Mode, PreflightAnswer, TypedView, ViewModel,
 };
 use auspex_domain::observe::StorePath;
-use auspex_domain::preflight::{TreeState, Upstream};
+use auspex_domain::preflight::{Edits, TreeState, Upstream};
 use auspex_effects::CancellationToken;
 use auspex_tui::backend::{Backend, Real};
 use auspex_tui::demo::{Demo, PUBLIC_MACHINE};
@@ -47,6 +47,8 @@ fn dirty_and_unpushed() -> PreflightAnswer {
                 ahead: 1,
                 behind: 0,
             },
+            head: Some(HEAD.to_owned()),
+            edits: Edits::Digest(DIGEST.to_owned()),
         }),
         closure: Ok(vec![(StorePath::new(GLIBC).unwrap(), 2_469_606_195)]),
     }
@@ -233,6 +235,10 @@ async fn the_public_machine_asks_for_its_name_and_only_the_name_runs_the_update(
 const SYSTEM: &str = "/nix/store/2123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.11";
 const GLIBC: &str = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-glibc-2.40-66";
 
+/// The commit the fake git says `HEAD` is, and a digest for tests that need one.
+const HEAD: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+const DIGEST: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0";
+
 fn request(flake: &str) -> PreflightRequest {
     PreflightRequest {
         id: RequestId(1),
@@ -253,7 +259,14 @@ fn backend(
     let git = t.script(
         dir,
         "git",
-        &format!("printf '%s\\n' \"$@\" > '@dir@/git-argv'\npwd > '@dir@/git-cwd'\n{git_body}"),
+        // `rev-parse` is answered before anything is recorded, so the record is still of the
+        // status: `HEAD`'s id, and a failure for the one question the fingerprint of a dirty tree
+        // asks (the fake has no repository).
+        &format!(
+            "case \" $* \" in *\" rev-parse --verify \"*) printf '{HEAD}\\n'; exit 0;; \
+             *\" rev-parse \"*) exit 1;; esac\n\
+             printf '%s\\n' \"$@\" > '@dir@/git-argv'\npwd > '@dir@/git-cwd'\n{git_body}"
+        ),
     );
     let nix = t.script(
         dir,
@@ -278,13 +291,19 @@ async fn the_real_backend_answers_both_checks_from_git_and_nix_and_runs_exactly_
         &format!("printf '%s\\t%s\\n' '{GLIBC}' 1000 '{SYSTEM}' 2000"),
         None,
     );
-    let answer = b
+    let mut answer = b
         .preflight(
             &request(fleet.path().to_str().unwrap()),
             &CancellationToken::new(),
         )
         .await
         .unwrap();
+    // The fake has no repository to fingerprint: the reason is git's own text.
+    if let Ok(t) = &mut answer.tree
+        && matches!(t.edits, Edits::Unavailable(_))
+    {
+        t.edits = Edits::Unavailable(String::new());
+    }
     assert_eq!(
         answer,
         PreflightAnswer {
@@ -295,6 +314,8 @@ async fn the_real_backend_answers_both_checks_from_git_and_nix_and_runs_exactly_
                     ahead: 3,
                     behind: 0,
                 },
+                head: Some(HEAD.to_owned()),
+                edits: Edits::Unavailable(String::new()),
             }),
             closure: Ok(vec![
                 (StorePath::new(GLIBC).unwrap(), 1000),

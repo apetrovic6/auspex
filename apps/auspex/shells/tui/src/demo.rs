@@ -28,7 +28,7 @@ use auspex_domain::fleet::parse_inventory;
 use auspex_domain::observe::{
     DiskUsage, Load, Memory, ProbeExit, ProbeOutcome, PromSample, StorePath, parse_probe,
 };
-use auspex_domain::preflight::{TreeState, Upstream};
+use auspex_domain::preflight::{Edits, TreeState, Upstream};
 use auspex_domain::status::NarCache;
 use auspex_effects::clan::{ClanRun, RunEnd};
 use auspex_effects::nix::EvalItem;
@@ -36,6 +36,9 @@ use auspex_effects::{CancellationToken, Cancelled};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::output::Stream;
+
+/// The commit the demo's fleet repository stands on.
+pub const DEMO_HEAD: &str = "5e1f0c9a47b3d2860fa1c3e9b7d4a5086c2e1f39";
 
 /// The system the demo pretends to run on: `b` refuses the darwin host (`genetor`).
 pub const LOCAL_SYSTEM: &str = "x86_64-linux";
@@ -616,6 +619,8 @@ impl Demo {
                         ahead: 0,
                         behind: 0,
                     },
+                    head: Some(DEMO_HEAD.to_owned()),
+                    edits: Edits::None,
                 }),
                 // The pending closure of the preview, 32 MiB a path: with the machine's own
                 // closure known the estimate counts only the paths it does not have.
@@ -754,6 +759,8 @@ impl Demo {
                         ahead: 0,
                         behind: 0,
                     },
+                    head: Some(DEMO_HEAD.to_owned()),
+                    edits: Edits::None,
                 })
             },
             |a| a.tree,

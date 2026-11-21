@@ -73,12 +73,12 @@ colour, and `A` turns it off again at once. In observe mode `u` and `s` only say
 `u` does not ask at once. It first looks at what the update is about to do, and then shows
 **one dialog** with everything it found: what **refuses** the update first (there is no way to
 proceed; any key closes the dialog), then the **warnings**, then the question. While it looks
-(a `git status` and a size query, at most `timeouts.diff`) the dialog says so, and any key
+(the tree look, one git status, `HEAD` and a fingerprint of the changes, and a size query, each at most `timeouts.diff`) the dialog says so, and any key
 cancels the look.
 
 | Check | Refuses | Warns |
 |---|---|---|
-| **The fleet repository** (`git status` in the fleet directory, read-only: no hooks, no filters, no index rewrite) | never | uncommitted changes to tracked files (untracked files do not count: nix ignores them); `HEAD` ahead of its upstream; no upstream (or a deleted one, or a detached `HEAD`); the check could not run |
+| **The fleet repository** (`git status` in the fleet directory, read-only: no hooks, no filters, no index rewrite) | never | uncommitted changes to tracked files (untracked files do not count: nix ignores them); `HEAD` ahead of its upstream; no upstream (or a deleted one, or a detached `HEAD`); the check could not run; the uncommitted changes could not be fingerprinted (see "What 'the same uncommitted changes' means") |
 | **Free disk on the target's `/nix/store`** (the probe's `df -Pk /nix/store`, not `/`: with impermanence `/` is a tmpfs) | free is less than what the update adds plus 1 GiB. What it adds is the NAR size of the pending closure's paths that are **not** in the machine's own closure (the package preview fetches that one), or, when the machine's closure is not known, the whole pending closure; the dialog says which was counted. Sizes come from `nix path-info --recursive --size`, against the local store first and then the binary cache. **Refused too while the machine's probe is still out** (a refresh clears the probes): "not here yet" is not "not known" | the free space or the closure's size is not known (the probe answered without the field, or the size could not be had) |
 | **Duplicate address** (the shared-IP lint) | the machine's target resolves to an address another machine's does too (the dialog names which), **or its address is not known** (the rule fails closed: a hostname that did not resolve cannot be told apart from another machine), **or address resolution is still out** (after a refresh, until it answers no collision can be ruled out) | other machines' addresses are not known because their resolution finished and failed |
 
@@ -88,6 +88,33 @@ store holds older generations, and paths are shared between them), which is the 
 `u` itself is refused ("still probing luna", "still resolving addresses") while either is out, and
 the same rules decide again at `y`: a typed name that became required, or a warning that was not in
 the dialog, asks again instead of deploying.
+
+**The fleet tree at the `y`** is read once more, under the update lock, and the update starts only
+on the same `HEAD` commit and the same uncommitted changes the dialog was answered about; otherwise
+nothing is deployed and the notice names both commits (or says the uncommitted changes changed).
+
+**What "the same uncommitted changes" means.** For a tree with changes to tracked files, auspex
+hashes (SHA-256) what nix would evaluate: auspex evaluates the fleet as a `git+file` flake, which
+reads the tracked files as they are in the **worktree**, so the digest covers each tracked
+file's bytes and executable bit (a symlink's target) and which paths are tracked (the index's
+paths, stages and assume-unchanged tags), and not the index's blob ids: `git add` of a file that
+is already edited, a stash popped back, or the staging of a deletion (`git add -A`, `git add -u`, `git rm`: a tracked file that is missing is absent for nix either way) changes nothing nix reads and is not a change; a
+further edit is, staged or not. It is bounded to 1 GiB read and 30 s, as the evaluation cache
+key is, and the whole tree look (the status, `HEAD`, and this) to `timeouts.diff`. Untracked
+files, ignored or not, are **not** in it: nix does not see them, so they cannot change what is
+deployed. It is not `git diff HEAD`: that would run git's diff machinery (textconv, external
+diff drivers, filters) which the checks never run in a repository they do not trust. The plan
+(and `u`'s dialog) shows `HEAD`'s first 12 digits and, for a dirty tree, `dirty` with the
+digest's first 8.
+
+When the digest cannot be computed (too big, too slow, not readable) the plan says so in a
+warning. If the **plan** had none, a turn compares the commit only and says so (in the machine's
+log for `U`, in the status bar for `u`). If the plan **had** one and a turn cannot make one, the
+changes are not known to be the ones confirmed, so that machine is refused ("could not be
+checked"). Not covered, as for the status check itself: a tracked file marked assume-unchanged or
+skip-worktree (git reports the tree clean, so there is no digest). A `clan` run that commits to
+the fleet repository itself (generated vars) moves `HEAD` too: the next machine is then refused,
+and running `U` again is the answer.
 
 The question is `update luna to 0a1b2c3d nixos-system-luna-…? y/N` for a machine that is not **public**.
 For a machine marked public (`machines.<m>.public = true`, see Configuration) it is `type luna,
@@ -128,12 +155,13 @@ nodes) and at the fleet repository (one `git status`), and the question carries 
 ```
 update 4 machines:
 cluster: context rke2 (https://10.0.0.1:6443); every kubectl call is pinned to it
+fleet repository: HEAD 1a2b3c4d5e6f
 rolling taghmata (one at a time; each node must be Ready before the next): luna → mars → sol → terra
 in parallel, at most 2 at a time: alfrost, cerberus
 at most 3 machines updating at once: one of the cluster's group + 2 of the machines in parallel
 skipped genetor: frozen
 warning: the fleet repository has uncommitted changes to 2 tracked files: the update deploys them, …
-each machine is checked at its turn: a refusal skips it, a failure stops its rolling group, and a new warning about the fleet repository refuses it
+each machine is checked at its turn: a refusal skips it, a failure stops its rolling group, and a fleet repository that is not as it was at the y (a new warning, another commit, other uncommitted changes) refuses it
 update 6 machines as listed above? y/N
 ```
 
@@ -193,6 +221,7 @@ before `clan` starts), and then:
 |---|---|
 | the checks, or the freeze, refuse it | **skipped; the roll goes on** with the next machine |
 | a warning about the fleet repository that was not in the plan the operator confirmed (someone edited the tree, or its upstream, after the `y`) | **refused**, the roll goes on |
+| the fleet repository stands on another commit than the plan showed (a `git pull`, or a commit then pushed: no warning changes), or its uncommitted changes are not the ones it showed (the same files saved again), or the changes cannot be fingerprinted now though they could be at the plan | **refused**, with a sentence naming both commits, saying the uncommitted changes changed, or saying they could not be checked; the roll goes on (and the next machine is held to the same plan, so is refused the same way) |
 | the checks warn about the machine itself (unknown closure size or free disk) | written into the machine's part of the Log tab; it goes on |
 | it is marked `public` (its name has to be typed) | left out of the plan: update it with `u` |
 | it does not answer a probe at its turn | refused: its health afterwards could not be told from before |

@@ -8,13 +8,13 @@
 │ ✓⟳   ganymede             in sync                  ││class     nixos  tags: k8s, k8s-server                          │
 │ ✓    genetor              in sync                  ││lints     none                                                  │
 │ ✓    io                   in sync                  ││current   0357acgi nixos-system-luna-25.11.20261019.b81e2d4     │
-│›↑◆   luna                 update pending           ││pending   g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0     │
-│ ✗    mars          ┌ confirm ───────────────────────────────────────────────────────────────────┐                    │
-│ ✓    mechanicus-for│update luna to g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0? y/N       │                    │
-│ ✓    phobos        │                                                                            │                    │
-│ ↑◆   sol           │y confirms; any other key cancels                                           │                    │
-│ ✓    terra         └────────────────────────────────────────────────────────────────────────────┘GiB free            │
-│ ✓    titan                in sync                  ││          (prometheus)                                          │
+│›↑◆   luna          ┌ confirm ───────────────────────────────────────────────────────────────────┐0261101.6a2f1c0     │
+│ ✗    mars          │fleet repository: HEAD 5e1f0c9a47b3                                         │                    │
+│ ✓    mechanicus-for│                                                                            │                    │
+│ ✓    phobos        │update luna to g1j4m7qa nixos-system-luna-25.11.20261101.6a2f1c0? y/N       │                    │
+│ ↑◆   sol           │                                                                            │                    │
+│ ✓    terra         │y confirms; any other key cancels                                           │GiB free            │
+│ ✓    titan         └────────────────────────────────────────────────────────────────────────────┘                    │
 │ ✗    triton               unreachable              ││load      0.40 0.35 0.30 (prometheus)                           │
 │ !    vulcan               eval error               ││memory    20.0 GiB of 32.0 GiB free (prometheus)                │
 │                                                    ││diff      linux 6.12.38 → 6.12.41, +3 −2 ~12                    │

@@ -11,12 +11,13 @@ use std::collections::BTreeSet;
 
 use auspex_core::effects::{
     ActionEnd, ActionRequest, ActionResult, AwaitRequest, EndResult, EvalAnswer, KubeOp, KubeReply,
-    KubeRequest, LogOp, PreflightRequest,
+    KubeRequest, LogOp, PreflightAnswer, PreflightRequest,
 };
 use auspex_core::{
     Config, ConfirmKind, Event, FreezeConfig, Mode, Phase, RollState, RollStatus, RollingConfig,
     SavedFreezes,
 };
+use auspex_domain::preflight::{Edits, TreeState};
 use auspex_domain::roll::{ClusterId, EtcdPod, Node, RollRule};
 use auspex_domain::status::Badge;
 use crux_core::Request;
@@ -288,6 +289,7 @@ fn the_plan_is_one_question_listing_the_order_the_parallelism_and_what_is_skippe
         [
             "update 4 machines:",
             "cluster: context rke2 (https://10.0.0.1:6443); every kubectl call is pinned to it",
+            "fleet repository: HEAD 1a2b3c4d5e6f",
             "rolling taghmata (one at a time; each node must be Ready before the next; drains \
              and uncordons luna (600s), mars (600s), sol (600s), terra (600s)): \
              luna → mars → sol → terra",
@@ -295,7 +297,7 @@ fn the_plan_is_one_question_listing_the_order_the_parallelism_and_what_is_skippe
             "skipped alfrost: marked public: its name has to be typed, so update it with u",
             "skipped cerberus: frozen",
             "each machine is checked at its turn: a refusal skips it, a failure stops its \
-             rolling group, and a new warning about the fleet repository refuses it",
+             rolling group, and a fleet repository that is not as it was at the y (a new warning, another commit, other uncommitted changes) refuses it",
         ]
     );
     assert_eq!(q.question, "update 4 machines as listed above? y/N");
@@ -313,16 +315,16 @@ fn free_machines_are_listed_with_their_parallel_limit() {
     answer_nodes(&mut s, healthy_cluster());
     let lines = s.view().confirm.unwrap().lines;
     assert_eq!(
-        lines[2],
+        lines[3],
         "rolling taghmata (one at a time; each node must be Ready before the next): \
          luna → mars → sol → terra"
     );
     assert_eq!(
-        lines[3],
+        lines[4],
         "in parallel, at most 2 at a time: alfrost, cerberus"
     );
     assert_eq!(
-        lines[4],
+        lines[5],
         "at most 3 machines updating at once: one of the cluster's group + 2 of the machines in \
          parallel"
     );
@@ -903,6 +905,8 @@ fn a_tree_edited_after_the_y_refuses_the_machine_it_reaches() {
     dirty.tree = Ok(auspex_domain::preflight::TreeState {
         changed_files: 3,
         upstream: auspex_domain::preflight::Upstream::None,
+        head: Some(support::HEAD_A.to_owned()),
+        edits: auspex_domain::preflight::Edits::Digest(support::DIGEST_A.to_owned()),
     });
     s.resolve(&mut p, dirty);
     match state(&s, "luna") {
@@ -917,6 +921,168 @@ fn a_tree_edited_after_the_y_refuses_the_machine_it_reaches() {
         "never updated"
     );
     assert!(preflights(&s).contains("mars"), "the group goes on");
+}
+
+// ---------------------------------------------------------------------------------------
+// The fleet repository's commit and changes (AUS-42)
+// ---------------------------------------------------------------------------------------
+
+/// The fleet repository on `head` with `changed` tracked files changed, fingerprinted as
+/// `edits`, and an upstream it is level with: so the warnings say the same whatever `head` and
+/// the digest are.
+fn tree_at(head: &str, changed: usize, edits: Edits) -> TreeState {
+    TreeState {
+        changed_files: changed,
+        upstream: auspex_domain::preflight::Upstream::Tracking {
+            name: "origin/main".to_owned(),
+            ahead: 0,
+            behind: 0,
+        },
+        head: Some(head.to_owned()),
+        edits,
+    }
+}
+
+fn digest(d: &str) -> Edits {
+    Edits::Digest(d.to_owned())
+}
+
+/// The answer of a machine's checks when the repository is `tree`.
+fn checks_of(tree: TreeState) -> PreflightAnswer {
+    let mut answer = clean_preflight();
+    answer.tree = Ok(tree);
+    answer
+}
+
+#[test]
+fn the_plan_names_the_commit_the_tree_stands_on_and_whether_it_is_dirty() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    let lines = s.view().confirm.unwrap().lines;
+    assert!(
+        lines.contains(&"fleet repository: HEAD 1a2b3c4d5e6f".to_owned()),
+        "{lines:?}"
+    );
+
+    let mut s = settled(config_with(k8s(), 2));
+    s.tree_answer = Ok(tree_at(support::HEAD_A, 2, digest(support::DIGEST_A)));
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    let lines = s.view().confirm.unwrap().lines;
+    assert!(
+        lines.contains(&"fleet repository: HEAD 1a2b3c4d5e6f, dirty (9f8e7d6c)".to_owned()),
+        "{lines:?}"
+    );
+}
+
+/// A pull, or a commit then pushed, after the `y`: the tree is as clean and as pushed as it was,
+/// so no warning changed, and only the commit tells.
+#[test]
+fn a_head_that_moved_after_the_y_refuses_the_machines_it_reaches() {
+    let mut s = settled(config_with(k8s(), 2));
+    start(&mut s, healthy_cluster());
+    let moved = checks_of(tree_at(support::HEAD_B, 0, Edits::None));
+    let mut p = take_preflight(&mut s, "luna");
+    s.resolve(&mut p, moved.clone());
+    match state(&s, "luna") {
+        RollState::Refused(why) => {
+            assert!(why.contains("1a2b3c4d5e6f"), "the commit it was: {why}");
+            assert!(why.contains("ffeeddccbbaa"), "the commit it is: {why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(actions(&s).is_empty(), "nothing was updated");
+    // The next machine of the group is held to the same plan, and refused the same way: the tree
+    // is still not the one that was confirmed, so no machine of the roll is updated.
+    let mut p = take_preflight(&mut s, "mars");
+    s.resolve(&mut p, moved);
+    assert!(matches!(state(&s, "mars"), RollState::Refused(_)));
+    assert!(actions(&s).is_empty(), "nothing was updated");
+}
+
+/// The same files saved again: the same count, the same warning text; only the digest differs.
+#[test]
+fn a_dirty_file_edited_again_after_the_y_refuses_the_machine() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.tree_answer = Ok(tree_at(support::HEAD_A, 2, digest(support::DIGEST_A)));
+    start(&mut s, healthy_cluster());
+    let mut p = take_preflight(&mut s, "luna");
+    s.resolve(
+        &mut p,
+        checks_of(tree_at(support::HEAD_A, 2, digest(support::DIGEST_B))),
+    );
+    match state(&s, "luna") {
+        RollState::Refused(why) => {
+            assert!(why.contains("uncommitted changes changed"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(actions(&s).is_empty(), "nothing was updated");
+}
+
+/// The control of the two above: the same commit and the same digest go on.
+#[test]
+fn the_same_commit_and_the_same_changes_at_a_machines_turn_go_on() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.tree_answer = Ok(tree_at(support::HEAD_A, 2, digest(support::DIGEST_A)));
+    start(&mut s, healthy_cluster());
+    let mut p = take_preflight(&mut s, "luna");
+    s.resolve(
+        &mut p,
+        checks_of(tree_at(support::HEAD_A, 2, digest(support::DIGEST_A))),
+    );
+    assert_eq!(state(&s, "luna"), RollState::Checking);
+    assert!(
+        s.probes.iter().any(|p| p.operation.machine == "luna"),
+        "its baseline is next"
+    );
+}
+
+#[test]
+fn changes_that_could_not_be_fingerprinted_are_said_in_the_plan_and_compared_by_commit_only() {
+    let mut s = settled(config_with(k8s(), 2));
+    let unknown = |why: &str| tree_at(support::HEAD_A, 1, Edits::Unavailable(why.to_owned()));
+    s.tree_answer = Ok(unknown("git timed out after 2s"));
+    s.send(Event::UpdateAll);
+    answer_nodes(&mut s, healthy_cluster());
+    let lines = s.view().confirm.unwrap().lines;
+    assert!(
+        lines.iter().any(|l| l.starts_with("warning: ")
+            && l.contains("could not be fingerprinted")
+            && l.contains("compares the commit only")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(
+            &"fleet repository: HEAD 1a2b3c4d5e6f, dirty (changes not fingerprinted)".to_owned()
+        ),
+        "{lines:?}"
+    );
+    s.send(Event::ConfirmAnswer(true));
+    // At the turn the reason differs (it is a timing), which is not news: the commit is the same,
+    // so the machine goes on, and its log says that only the commit was compared.
+    let mut p = take_preflight(&mut s, "luna");
+    s.resolve(&mut p, checks_of(unknown("git timed out after 3s")));
+    assert_eq!(state(&s, "luna"), RollState::Checking);
+    assert!(
+        log_lines(&s)
+            .iter()
+            .any(|l| l.starts_with("warning: ") && l.contains("only the commit was compared")),
+        "{:?}",
+        log_lines(&s)
+    );
+    // A moved commit is still refused.
+    let mut p = take_preflight(&mut s, "alfrost");
+    s.resolve(
+        &mut p,
+        checks_of(tree_at(
+            support::HEAD_B,
+            1,
+            Edits::Unavailable("x".to_owned()),
+        )),
+    );
+    assert!(matches!(state(&s, "alfrost"), RollState::Refused(_)));
 }
 
 /// The shell's own last look at the freeze file refuses: a refusal, not a failure.
@@ -2066,4 +2232,27 @@ fn a_node_of_the_cluster_that_rolls_with_no_group_is_warned_about_in_the_plan() 
         "the roll started: {:?}",
         s.view().notice
     );
+}
+
+/// The plan fingerprinted the changes and a machine's turn cannot: they are not known to be the
+/// ones confirmed, so the machine is refused (and the sentence says they could not be checked).
+#[test]
+fn a_turn_that_cannot_fingerprint_the_changes_the_plan_could_refuses_the_machine() {
+    let mut s = settled(config_with(k8s(), 2));
+    s.tree_answer = Ok(tree_at(support::HEAD_A, 1, digest(support::DIGEST_A)));
+    start(&mut s, healthy_cluster());
+    let mut p = take_preflight(&mut s, "luna");
+    s.resolve(
+        &mut p,
+        checks_of(tree_at(
+            support::HEAD_A,
+            1,
+            Edits::Unavailable("timed out".to_owned()),
+        )),
+    );
+    match state(&s, "luna") {
+        RollState::Refused(why) => assert!(why.contains("could not be checked"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(actions(&s).is_empty(), "nothing was updated");
 }

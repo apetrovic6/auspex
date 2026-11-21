@@ -11,6 +11,12 @@
 //!   that would point git at another repository removed), plus the hardening that command
 //!   needs because, unlike those, it can read file contents. A fleet that is not a local
 //!   directory, or not a git repository, is an answer ("cannot be checked"), not a failure.
+//!   The state also names `HEAD`'s commit (`rev-parse --verify HEAD`, none for a branch with no
+//!   commit yet) and, for a tree with changes to tracked files, carries a fingerprint of what nix
+//!   would evaluate ([`worktree_fingerprint`]: the cache key's own bounded worktree digest,
+//!   which reads no file through git and runs no filter), so a machine's turn can tell a tree
+//!   that was pulled, or edited again, from the one the operator confirmed. A fingerprint that
+//!   cannot be had is [`Edits::Unavailable`] with the reason, not a failed check.
 //! - [`closure_size`]: the NAR size of every path of the pending toplevel's closure, from
 //!   `nix path-info --recursive --size`: against the local store first (valid there when this
 //!   machine built it), then against the binary cache. The package preview's pending-closure
@@ -26,14 +32,15 @@ use std::time::Duration;
 
 use auspex_domain::observe::StorePath;
 use auspex_domain::preflight::{
-    LIST_CONFIG_ARGS, TreeState, parse_closure_sizes, parse_filter_names, parse_tree_status,
-    status_args,
+    Edits, LIST_CONFIG_ARGS, TreeState, branch_is_unborn, parse_closure_sizes, parse_commit_id,
+    parse_filter_names, parse_tree_status, status_args,
 };
+use auspex_domain::text::sanitize_line;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::Cancelled;
-use crate::cache::{GitParams, git};
+use crate::cache::{GitParams, git, worktree_fingerprint};
 use crate::closure::{Failure, PendingParams, limits, text_of};
 use crate::http::base_url;
 use crate::nix::FlakeRef;
@@ -47,13 +54,91 @@ const STATUS_CAP: usize = 4 * 1024 * 1024;
 /// list of filters with some missing.
 const CONFIG_CAP: usize = 1024 * 1024;
 
-/// The fleet repository's state, read from `dir`.
+/// The most `rev-parse HEAD` output kept: a commit id is 65 bytes; anything past this is not one.
+const HEAD_CAP: usize = 4096;
+
+/// The fleet repository's state, read from `dir`, in at most `params.timeout` in all.
+///
+/// That is `timeouts.diff` for the shell: the one budget covers the config listing, the status,
+/// `HEAD`'s id and the fingerprint together, and each git command alone is also held to it.
+///
+/// A look that runs out of time before it has the status and `HEAD` is the inner `Err`; one that
+/// runs out of time in the fingerprint keeps what it has and says why the changes are
+/// [`Edits::Unavailable`].
 ///
 /// # Errors
 ///
 /// [`Cancelled`] when `cancel` fired. Anything else (no git, not a repository, a timeout,
 /// output that is not `git status`'s) is the inner `Err` line.
 pub async fn tree_state(
+    params: &GitParams<'_>,
+    dir: &Path,
+    cancel: &CancellationToken,
+) -> Result<Result<TreeState, String>, Cancelled> {
+    let started = Instant::now();
+    let budget = params.timeout;
+    let child = cancel.child_token();
+    let found = within(budget, &child, status_and_head(params, dir, &child), cancel).await?;
+    let mut state = match found {
+        None => {
+            return Ok(Err(format!(
+                "looking at the fleet repository timed out after {budget:?}"
+            )));
+        }
+        Some(Err(why)) => return Ok(Err(why)),
+        Some(Ok(state)) => state,
+    };
+    // What a deploy would evaluate, for a tree that has changes: nothing to fingerprint when
+    // it has none. The fingerprint is bounded as the cache key's worktree read is, and by what
+    // is left of the look's budget; when it cannot be had the state says why instead of failing
+    // the whole check, and the turn compares commits only.
+    if state.changed_files > 0 {
+        let child = cancel.child_token();
+        let left = budget.saturating_sub(started.elapsed());
+        state.edits = match within(
+            left,
+            &child,
+            worktree_fingerprint(dir, params, &child),
+            cancel,
+        )
+        .await?
+        {
+            Some(Ok(digest)) => Edits::Digest(digest),
+            Some(Err(why)) => Edits::Unavailable(sanitize_line(&why)),
+            None => Edits::Unavailable(format!(
+                "reading the worktree timed out (the whole look is held to {budget:?})"
+            )),
+        };
+    }
+    Ok(Ok(state))
+}
+
+/// Runs `work` for at most `budget`: `None` when the time ran out first (after `child`, the token
+/// `work` was built with, was cancelled and `work` had killed and reaped its processes).
+/// `outer` is the caller's token: when it fires `work` ends with [`Cancelled`], which is
+/// returned as such.
+async fn within<T>(
+    budget: Duration,
+    child: &CancellationToken,
+    work: impl std::future::Future<Output = Result<T, Cancelled>>,
+    outer: &CancellationToken,
+) -> Result<Option<T>, Cancelled> {
+    tokio::pin!(work);
+    tokio::select! {
+        r = &mut work => r.map(Some),
+        () = tokio::time::sleep(budget) => {
+            child.cancel();
+            match work.await {
+                Ok(done) => Ok(Some(done)),
+                Err(Cancelled) if outer.is_cancelled() => Err(Cancelled),
+                Err(Cancelled) => Ok(None),
+            }
+        }
+    }
+}
+
+/// The config listing, the status and `HEAD`'s id: what the look needs before anything else.
+async fn status_and_head(
     params: &GitParams<'_>,
     dir: &Path,
     cancel: &CancellationToken,
@@ -76,7 +161,25 @@ pub async fn tree_state(
         Ok(out) => out,
         Err(why) => return Ok(Err(why)),
     };
-    Ok(parse_tree_status(&String::from_utf8_lossy(&out)))
+    let text = String::from_utf8_lossy(&out);
+    let mut state = match parse_tree_status(&text) {
+        Ok(s) => s,
+        Err(why) => return Ok(Err(why)),
+    };
+    // HEAD's commit id: `status` does not print it. A branch with no commit yet has none, and
+    // asking would fail; every other failure is the check not running.
+    if !branch_is_unborn(&text) {
+        let args = ["rev-parse", "--verify", "HEAD"];
+        let id = match git(params, dir, &args, HEAD_CAP, cancel).await? {
+            Ok(out) => out,
+            Err(why) => return Ok(Err(why)),
+        };
+        state.head = match parse_commit_id(&id) {
+            Ok(id) => Some(id),
+            Err(why) => return Ok(Err(why)),
+        };
+    }
+    Ok(Ok(state))
 }
 
 /// The exact argv (after the program) of the local size query. `path` is a validated

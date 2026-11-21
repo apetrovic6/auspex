@@ -4,15 +4,15 @@
 │ ✓⚠   cerberus        in sync         │
 │ ↑    cypramundi      update pending  │
 │ ?    deimos          not installed   │
-│ ✓    europa          in sync         │
 ┌ confirm ─────────────────────────────┐
+│fleet repository: HEAD 5e1f0c9a47b3   │
+│                                      │
 │update luna to g1j4m7qa               │
 │nixos-system-luna-25.11.20261101.6a2  │
 │f1c0? y/N                             │
 │                                      │
 │y confirms; any other key cancels     │
 └──────────────────────────────────────┘
-│ ↑◆   sol             update pending  │
 │ ✓    terra           in sync         │
 │ ✓    titan           in sync         │
 │ ✗    triton          unreachable     │

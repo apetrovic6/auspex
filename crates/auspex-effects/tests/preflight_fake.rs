@@ -17,7 +17,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use auspex_domain::observe::StorePath;
-use auspex_domain::preflight::{TreeState, Upstream, status_args};
+use auspex_domain::preflight::{Edits, TreeState, Upstream, status_args};
 use auspex_effects::cache::GitParams;
 use auspex_effects::closure::PendingParams;
 use auspex_effects::nix::FlakeRef;
@@ -33,6 +33,20 @@ const A: &str = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-glibc-2.40-66";
 const B: &str = "/nix/store/1123456789abcdfghijklmnpqrsvwxyz-systemd-256.10";
 const SYSTEM: &str = "/nix/store/2123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.11";
 
+/// The commit the fake git says `HEAD` is.
+const FAKE_HEAD: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+
+/// `answer` with the reason of an unavailable fingerprint blanked: the fake has no repository to
+/// fingerprint, and the reason is git's own text.
+fn blank_why(mut answer: Result<TreeState, String>) -> Result<TreeState, String> {
+    if let Ok(t) = &mut answer
+        && matches!(t.edits, Edits::Unavailable(_))
+    {
+        t.edits = Edits::Unavailable(String::new());
+    }
+    answer
+}
+
 fn store_path() -> StorePath {
     StorePath::new(SYSTEM).unwrap()
 }
@@ -42,8 +56,10 @@ fn store_path() -> StorePath {
 // ---------------------------------------------------------------------------------------
 
 /// A fake git: records every call's argv (each followed by a `--` line), its working directory
-/// and two environment variables; answers the config listing with `listing` (a `printf` format)
-/// and runs `body` for anything else (the status).
+/// and two environment variables; answers the config listing with `listing` (a `printf` format),
+/// answers `rev-parse --verify HEAD` with [`FAKE_HEAD`] and fails any other `rev-parse` (so the
+/// fingerprint of a dirty tree, which needs the real thing, is unavailable here), and runs `body`
+/// for anything else (the status).
 fn fake_git_listing(t: &Tools, dir: &Path, listing: &str, body: &str) -> PathBuf {
     t.script(
         dir,
@@ -54,6 +70,7 @@ fn fake_git_listing(t: &Tools, dir: &Path, listing: &str, body: &str) -> PathBuf
              pwd > '@dir@/git-cwd'\n\
              printf '%s|%s\\n' \"$GIT_OPTIONAL_LOCKS\" \"${{GIT_DIR-unset}}\" > '@dir@/git-env'\n\
              case \" $* \" in *\" config \"*) printf '{listing}'; exit 0;; esac\n\
+             case \" $* \" in *\" rev-parse --verify \"*) printf '{FAKE_HEAD}\\n'; exit 0;; *\" rev-parse \"*) exit 1;; esac\n\
              {body}"
         ),
     )
@@ -99,14 +116,18 @@ async fn the_tree_check_lists_the_config_then_runs_one_read_only_hardened_git_st
     .await
     .unwrap();
     assert_eq!(
-        answer,
+        blank_why(answer),
         Ok(TreeState {
             changed_files: 2,
             upstream: tracking(2, 0),
+            head: Some(FAKE_HEAD.to_owned()),
+            edits: Edits::Unavailable(String::new()),
         })
     );
-    // Two commands, both with the cache module's hardening first: the read-only listing of
-    // config keys, then the status with every filter driver the listing named blanked.
+    // The cache module's hardening first on every command: the read-only listing of config
+    // keys, the status with every filter driver the listing named blanked, `HEAD`'s id, and (the
+    // tree is dirty) the first thing the fingerprint asks: where the repository is. The fake has
+    // none, so it stops there.
     let argv = fs::read_to_string(dir.path().join("git-argv")).unwrap();
     assert_eq!(
         argv,
@@ -118,7 +139,9 @@ async fn the_tree_check_lists_the_config_then_runs_one_read_only_hardened_git_st
          -c\nfilter.my.driver.clean=\n-c\nfilter.my.driver.smudge=\n\
          -c\nfilter.my.driver.process=\n-c\nfilter.my.driver.required=false\n\
          status\n--porcelain=v1\n-b\n-z\n--untracked-files=no\n--ignore-submodules=all\n\
-         --no-renames\n--\n"
+         --no-renames\n--\n\
+         -c\ncore.fsmonitor=false\nrev-parse\n--verify\nHEAD\n--\n\
+         -c\ncore.fsmonitor=false\nrev-parse\n--show-toplevel\n--\n"
     );
     // The same, from the domain's own function.
     let mut want = vec!["-c".to_owned(), "core.fsmonitor=false".to_owned()];
@@ -148,6 +171,8 @@ async fn clean_dirty_ahead_and_no_upstream_are_read_from_the_branch_line_and_the
             TreeState {
                 changed_files: 0,
                 upstream: tracking(0, 0),
+                head: Some(FAKE_HEAD.to_owned()),
+                edits: Edits::None,
             },
         ),
         (
@@ -155,6 +180,8 @@ async fn clean_dirty_ahead_and_no_upstream_are_read_from_the_branch_line_and_the
             TreeState {
                 changed_files: 0,
                 upstream: tracking(1, 3),
+                head: Some(FAKE_HEAD.to_owned()),
+                edits: Edits::None,
             },
         ),
         (
@@ -162,6 +189,8 @@ async fn clean_dirty_ahead_and_no_upstream_are_read_from_the_branch_line_and_the
             TreeState {
                 changed_files: 2,
                 upstream: Upstream::None,
+                head: Some(FAKE_HEAD.to_owned()),
+                edits: Edits::Unavailable(String::new()),
             },
         ),
         (
@@ -169,6 +198,8 @@ async fn clean_dirty_ahead_and_no_upstream_are_read_from_the_branch_line_and_the
             TreeState {
                 changed_files: 0,
                 upstream: Upstream::Gone("origin/main".to_owned()),
+                head: Some(FAKE_HEAD.to_owned()),
+                edits: Edits::None,
             },
         ),
     ];
@@ -182,7 +213,7 @@ async fn clean_dirty_ahead_and_no_upstream_are_read_from_the_branch_line_and_the
         )
         .await
         .unwrap();
-        assert_eq!(answer, Ok(want), "{output}");
+        assert_eq!(blank_why(answer), Ok(want), "{output}");
     }
 }
 
@@ -345,6 +376,12 @@ fn real_params(timeout: Duration) -> GitParams<'static> {
     p
 }
 
+/// What the older tests of the real repository look at: the count and the upstream (the commit
+/// and the fingerprint have tests of their own).
+fn shape(tree: Result<TreeState, String>) -> Result<(usize, Upstream), String> {
+    tree.map(|t| (t.changed_files, t.upstream))
+}
+
 async fn real_tree(dir: &Path) -> Result<TreeState, String> {
     tree_state(
         &real_params(Duration::from_secs(20)),
@@ -369,26 +406,14 @@ async fn a_real_repository_is_clean_dirty_ahead_and_untracked_files_do_not_count
     real_git(r, &["commit", "-q", "-m", "one"]);
 
     // No upstream yet.
-    assert_eq!(
-        real_tree(r).await,
-        Ok(TreeState {
-            changed_files: 0,
-            upstream: Upstream::None
-        })
-    );
+    assert_eq!(shape(real_tree(r).await), Ok((0, Upstream::None)));
 
     real_git(
         r,
         &["remote", "add", "origin", remote.path().to_str().unwrap()],
     );
     real_git(r, &["push", "-q", "-u", "origin", "main"]);
-    assert_eq!(
-        real_tree(r).await,
-        Ok(TreeState {
-            changed_files: 0,
-            upstream: tracking(0, 0)
-        })
-    );
+    assert_eq!(shape(real_tree(r).await), Ok((0, tracking(0, 0))));
 
     // An untracked file is not a change to a tracked one.
     fs::write(r.join("untracked.nix"), "x\n").unwrap();
@@ -402,13 +427,7 @@ async fn a_real_repository_is_clean_dirty_ahead_and_untracked_files_do_not_count
 
     // A local commit the upstream does not have.
     real_git(r, &["commit", "-q", "-a", "-m", "two"]);
-    assert_eq!(
-        real_tree(r).await,
-        Ok(TreeState {
-            changed_files: 0,
-            upstream: tracking(1, 0)
-        })
-    );
+    assert_eq!(shape(real_tree(r).await), Ok((0, tracking(1, 0))));
 
     // Detached: no branch, no upstream.
     real_git(r, &["checkout", "-q", "--detach"]);
@@ -956,23 +975,11 @@ async fn a_sha256_repository_is_checked_like_any_other() {
         &["remote", "add", "origin", remote.path().to_str().unwrap()],
     );
     real_git(r, &["push", "-q", "-u", "origin", "main"]);
-    assert_eq!(
-        real_tree(r).await,
-        Ok(TreeState {
-            changed_files: 0,
-            upstream: tracking(0, 0)
-        })
-    );
+    assert_eq!(shape(real_tree(r).await), Ok((0, tracking(0, 0))));
     fs::write(r.join("host.nix"), "2\n").unwrap();
     real_git(r, &["commit", "-q", "-a", "-m", "two"]);
     fs::write(r.join("host.nix"), "3\n").unwrap();
-    assert_eq!(
-        real_tree(r).await,
-        Ok(TreeState {
-            changed_files: 1,
-            upstream: tracking(1, 0)
-        })
-    );
+    assert_eq!(shape(real_tree(r).await), Ok((1, tracking(1, 0))));
 }
 
 #[tokio::test]
@@ -1082,4 +1089,436 @@ async fn a_required_filter_is_turned_off_and_the_check_still_answers() {
     // And a real change is seen.
     fs::write(r.join("host.nix"), "2\n").unwrap();
     assert_eq!(real_tree(&r).await.unwrap().changed_files, 1);
+}
+
+// ---------------------------------------------------------------------------------------
+// A real git: the commit and the fingerprint of the changes (AUS-42)
+// ---------------------------------------------------------------------------------------
+
+fn real_git_out(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+fn digest_of(tree: &TreeState) -> String {
+    match &tree.edits {
+        Edits::Digest(d) => d.clone(),
+        other => panic!("expected a digest, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_tree_state_has_heads_commit_id_and_none_before_the_first_commit() {
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    real_git(r, &["init", "-q", "-b", "main"]);
+    // No commit yet: no id, and no failure.
+    let unborn = real_tree(r).await.unwrap();
+    assert_eq!(unborn.head, None);
+    assert_eq!(unborn.edits, Edits::None);
+
+    fs::write(r.join("flake.nix"), "{ }\n").unwrap();
+    real_git(r, &["add", "flake.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    let first = real_tree(r).await.unwrap();
+    assert_eq!(
+        first.head.as_deref(),
+        Some(real_git_out(r, &["rev-parse", "HEAD"]).as_str()),
+        "the full id"
+    );
+    assert_eq!(first.edits, Edits::None, "clean: nothing to fingerprint");
+
+    // Another commit, even with the same tree, is another id.
+    real_git(r, &["commit", "-q", "--allow-empty", "-m", "two"]);
+    let second = real_tree(r).await.unwrap();
+    assert_ne!(first.head, second.head);
+    assert_eq!(second.edits, Edits::None);
+
+    // Detached HEAD has one too.
+    real_git(r, &["checkout", "-q", "--detach", "HEAD~1"]);
+    assert_eq!(real_tree(r).await.unwrap().head, first.head);
+}
+
+#[tokio::test]
+async fn the_fingerprint_of_changes_moves_with_the_files_and_not_with_what_nix_does_not_see() {
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    real_git(r, &["init", "-q", "-b", "main"]);
+    fs::write(r.join(".gitignore"), "ignored.nix\n").unwrap();
+    fs::write(r.join("flake.nix"), "{ }\n").unwrap();
+    fs::write(r.join("host.nix"), "1\n").unwrap();
+    real_git(r, &["add", ".gitignore", "flake.nix", "host.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    assert_eq!(real_tree(r).await.unwrap().edits, Edits::None);
+
+    // Dirty: a digest, and the same one while nothing changes.
+    fs::write(r.join("host.nix"), "2\n").unwrap();
+    fs::write(r.join("flake.nix"), "{ a = 1; }\n").unwrap();
+    let first = real_tree(r).await.unwrap();
+    assert_eq!(first.changed_files, 2);
+    let digest = digest_of(&first);
+    assert_eq!(digest.len(), 64);
+    assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+    assert_eq!(digest_of(&real_tree(r).await.unwrap()), digest, "unchanged");
+
+    // The same files saved with the same bytes (a new mtime): not a change.
+    std::thread::sleep(Duration::from_millis(50));
+    fs::write(r.join("host.nix"), "2\n").unwrap();
+    assert_eq!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "same bytes"
+    );
+
+    // The same two files edited again: the same count and warning text, another digest.
+    fs::write(r.join("host.nix"), "3\n").unwrap();
+    let again = real_tree(r).await.unwrap();
+    assert_eq!(again.changed_files, 2, "the count cannot tell");
+    assert_ne!(digest_of(&again), digest, "the digest can");
+    assert_eq!(again.head, first.head);
+
+    // Untracked files and ignored ones are not what nix evaluates, so not in it.
+    let digest = digest_of(&again);
+    fs::write(r.join("untracked.nix"), "x\n").unwrap();
+    fs::write(r.join("ignored.nix"), "y\n").unwrap();
+    assert_eq!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "untracked, ignored"
+    );
+    fs::write(r.join("untracked.nix"), "changed\n").unwrap();
+    fs::write(r.join("ignored.nix"), "changed\n").unwrap();
+    assert_eq!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "edited again"
+    );
+
+    // Staging what is already in the worktree changes nothing nix evaluates: a dirty `git+file`
+    // tree is read from the worktree, not the index. `git add` of an edited file, and a stash
+    // popped back (which comes back unstaged), are not changes.
+    real_git(r, &["add", "host.nix"]);
+    assert_eq!(digest_of(&real_tree(r).await.unwrap()), digest, "staged");
+    real_git(r, &["stash", "push", "-q"]);
+    real_git(r, &["stash", "pop", "-q"]);
+    assert_eq!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "stashed and back"
+    );
+    // A further edit of the staged file is one.
+    fs::write(r.join("host.nix"), "4\n").unwrap();
+    assert_ne!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "edited after staging"
+    );
+    // Staging a file that was not tracked changes which files nix sees.
+    let digest = digest_of(&real_tree(r).await.unwrap());
+    fs::write(r.join("new.nix"), "n\n").unwrap();
+    real_git(r, &["add", "new.nix"]);
+    assert_ne!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest,
+        "a new tracked file"
+    );
+}
+
+#[tokio::test]
+async fn a_commit_of_the_changes_is_a_new_head_and_a_clean_tree() {
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    real_git(r, &["init", "-q", "-b", "main"]);
+    fs::write(r.join("host.nix"), "1\n").unwrap();
+    real_git(r, &["add", "host.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    fs::write(r.join("host.nix"), "2\n").unwrap();
+    let dirty = real_tree(r).await.unwrap();
+    real_git(r, &["commit", "-q", "-a", "-m", "two"]);
+    let clean = real_tree(r).await.unwrap();
+    assert_ne!(dirty.head, clean.head);
+    assert_eq!((dirty.changed_files, clean.changed_files), (1, 0));
+    assert_eq!(clean.edits, Edits::None);
+}
+
+#[tokio::test]
+async fn a_fingerprint_out_of_time_is_unavailable_and_the_commit_is_still_read() {
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    real_git(r, &["init", "-q", "-b", "main"]);
+    fs::write(r.join("host.nix"), "1\n").unwrap();
+    real_git(r, &["add", "host.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    fs::write(r.join("host.nix"), "2\n").unwrap();
+    let mut params = real_params(Duration::from_secs(20));
+    params.read_timeout = Duration::ZERO;
+    let started = Instant::now();
+    let tree = tree_state(&params, r, &CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10), "bounded");
+    assert_eq!(tree.changed_files, 1);
+    assert_eq!(
+        tree.head.as_deref(),
+        Some(real_git_out(r, &["rev-parse", "HEAD"]).as_str())
+    );
+    match tree.edits {
+        Edits::Unavailable(why) => assert!(why.contains("timed out"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1 (PR #40 review)
+// ---------------------------------------------------------------------------------------
+
+/// `rev-parse --verify HEAD` failing after a good `status` is the check not running, never "no
+/// commit yet" (that is only for a branch the status line says has none).
+#[tokio::test]
+async fn a_head_that_cannot_be_read_after_a_good_status_fails_the_check() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "git",
+        "case \" $* \" in\n\
+         *\" config \"*) printf 'core.bare\\0'; exit 0;;\n\
+         *\" rev-parse --verify \"*) echo 'fatal: bad object HEAD' >&2; exit 128;;\n\
+         esac\n\
+         printf '## main...origin/main\\0'\n",
+    );
+    let why = tree_state(
+        &git_params(&program, Duration::from_secs(10)),
+        dir.path(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        why.contains("rev-parse") && why.contains("bad object"),
+        "{why}"
+    );
+    // Output that is not an id is the same.
+    let program = t.script(
+        dir.path(),
+        "git2",
+        "case \" $* \" in\n\
+         *\" config \"*) printf 'core.bare\\0'; exit 0;;\n\
+         *\" rev-parse --verify \"*) echo 'not an id'; exit 0;;\n\
+         esac\n\
+         printf '## main...origin/main\\0'\n",
+    );
+    let why = tree_state(
+        &git_params(&program, Duration::from_secs(10)),
+        dir.path(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(why.contains("commit id"), "{why}");
+}
+
+/// The whole look is bounded by the one timeout it is given, not by that timeout per git command:
+/// four commands of 0.6 s each are 2.4 s against a 1 s bound, and none of them is slow alone.
+#[tokio::test]
+async fn the_whole_tree_look_is_bounded_by_the_timeout_not_each_command() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "git",
+        "@sleep@ 0.6\n\
+         case \" $* \" in\n\
+         *\" config \"*) printf 'core.bare\\0'; exit 0;;\n\
+         *\" rev-parse --verify \"*) printf '1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d\\n'; exit 0;;\n\
+         esac\n\
+         printf '## main...origin/main\\0'\n",
+    );
+    let started = Instant::now();
+    let why = tree_state(
+        &git_params(&program, Duration::from_secs(1)),
+        dir.path(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(why.contains("timed out"), "{why}");
+    assert!(
+        started.elapsed() < Duration::from_millis(1800),
+        "bounded by 1 s in all, took {:?}",
+        started.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2 (PR #40 re-review)
+// ---------------------------------------------------------------------------------------
+
+/// A repository with `dirty.nix` edited (so every state is fingerprinted) and `gone.nix` tracked.
+fn repo_with_a_tracked_file_to_delete(r: &Path) {
+    real_git(r, &["init", "-q", "-b", "main"]);
+    fs::write(r.join("dirty.nix"), "1\n").unwrap();
+    fs::write(r.join("gone.nix"), "g\n").unwrap();
+    real_git(r, &["add", "dirty.nix", "gone.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    fs::write(r.join("dirty.nix"), "2\n").unwrap();
+}
+
+/// Staging the deletion of a tracked file changes nothing nix reads (a tracked file that is
+/// missing is absent either way), whichever command stages it; a deleted file is not a present
+/// one, and a further change of content is still a change.
+#[tokio::test]
+async fn staging_a_deletion_is_not_a_change_whichever_command_does_it() {
+    let Some(_t) = with_real_git() else { return };
+    let commands: [&[&str]; 3] = [
+        &["add", "-A"],
+        &["add", "-u"],
+        &["rm", "-q", "--cached", "gone.nix"],
+    ];
+    for staging in commands {
+        let dir = tempdir();
+        let r = dir.path();
+        repo_with_a_tracked_file_to_delete(r);
+        let present = digest_of(&real_tree(r).await.unwrap());
+
+        fs::remove_file(r.join("gone.nix")).unwrap();
+        let deleted = digest_of(&real_tree(r).await.unwrap());
+        assert_ne!(
+            deleted, present,
+            "{staging:?}: a deleted file is not a present one"
+        );
+
+        real_git(r, staging);
+        let tree = real_tree(r).await.unwrap();
+        assert_eq!(
+            tree.changed_files, 2,
+            "{staging:?}: dirty.nix and the deletion"
+        );
+        assert_eq!(
+            digest_of(&tree),
+            deleted,
+            "{staging:?}: staging the deletion"
+        );
+
+        // `git rm` of the file the worktree no longer has, the way the review ran it.
+        fs::write(r.join("dirty.nix"), "3\n").unwrap();
+        assert_ne!(
+            digest_of(&real_tree(r).await.unwrap()),
+            deleted,
+            "{staging:?}: a further change of content"
+        );
+    }
+    // `git rm <file>` of a file already deleted from the worktree.
+    let dir = tempdir();
+    let r = dir.path();
+    repo_with_a_tracked_file_to_delete(r);
+    fs::remove_file(r.join("gone.nix")).unwrap();
+    let deleted = digest_of(&real_tree(r).await.unwrap());
+    real_git(r, &["rm", "-q", "gone.nix"]);
+    assert_eq!(digest_of(&real_tree(r).await.unwrap()), deleted, "git rm");
+    fs::write(r.join("dirty.nix"), "3\n").unwrap();
+    assert_ne!(
+        digest_of(&real_tree(r).await.unwrap()),
+        deleted,
+        "git rm, then an edit"
+    );
+}
+
+/// A file that is already edited (so the status count cannot tell) and then made executable: nix
+/// sees the exec bit, so the fingerprint must.
+#[tokio::test]
+async fn the_exec_bit_of_an_already_edited_file_is_in_the_fingerprint() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    repo_with_a_tracked_file_to_delete(r);
+    let before = real_tree(r).await.unwrap();
+    fs::set_permissions(r.join("dirty.nix"), fs::Permissions::from_mode(0o755)).unwrap();
+    let after = real_tree(r).await.unwrap();
+    assert_eq!(
+        after.changed_files, before.changed_files,
+        "the count cannot tell"
+    );
+    assert_ne!(digest_of(&after), digest_of(&before), "chmod u+x");
+    // Only the owner's bit is what nix reads.
+    fs::set_permissions(r.join("dirty.nix"), fs::Permissions::from_mode(0o645)).unwrap();
+    assert_eq!(
+        digest_of(&real_tree(r).await.unwrap()),
+        digest_of(&before),
+        "go+x only"
+    );
+}
+
+/// A tracked symlink that is already changed and is retargeted again: same count, and only the
+/// target tells.
+#[tokio::test]
+async fn the_target_of_an_already_changed_symlink_is_in_the_fingerprint() {
+    use std::os::unix::fs::symlink;
+    let Some(_t) = with_real_git() else { return };
+    let dir = tempdir();
+    let r = dir.path();
+    real_git(r, &["init", "-q", "-b", "main"]);
+    symlink("a.nix", r.join("link.nix")).unwrap();
+    fs::write(r.join("a.nix"), "a\n").unwrap();
+    real_git(r, &["add", "link.nix", "a.nix"]);
+    real_git(r, &["commit", "-q", "-m", "one"]);
+    fs::remove_file(r.join("link.nix")).unwrap();
+    symlink("b.nix", r.join("link.nix")).unwrap();
+    let first = real_tree(r).await.unwrap();
+    assert_eq!(first.changed_files, 1);
+    fs::remove_file(r.join("link.nix")).unwrap();
+    symlink("c.nix", r.join("link.nix")).unwrap();
+    let second = real_tree(r).await.unwrap();
+    assert_eq!(second.changed_files, 1, "the count cannot tell");
+    assert_ne!(digest_of(&second), digest_of(&first), "retargeted again");
+}
+
+/// The fingerprint gets what is left of the look's budget, not a budget of its own, and running out
+/// of it is `Unavailable`, never "no changes": the config, status and `HEAD` take 0.9 s of a 2 s
+/// budget, the fingerprint's first command would take 1.5 s (well inside 2 s) and is cut at 1.1 s.
+#[tokio::test]
+async fn the_fingerprint_gets_what_is_left_of_the_budget_and_running_out_is_unavailable() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let dir = tempdir();
+    let program = t.script(
+        dir.path(),
+        "git",
+        "case \" $* \" in\n\
+         *\" config \"*) @sleep@ 0.3; printf 'core.bare\\0'; exit 0;;\n\
+         *\" rev-parse --verify \"*) @sleep@ 0.3; printf '1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d\\n'; exit 0;;\n\
+         *\" rev-parse \"*) @sleep@ 1.5; exit 1;;\n\
+         esac\n\
+         @sleep@ 0.3\n\
+         printf '## main...origin/main\\0 M a\\0'\n",
+    );
+    let tree = tree_state(
+        &git_params(&program, Duration::from_secs(2)),
+        dir.path(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(tree.changed_files, 1);
+    assert!(tree.head.is_some(), "status and HEAD were read");
+    match tree.edits {
+        Edits::Unavailable(why) => assert!(why.contains("timed out"), "{why}"),
+        other => panic!("a fingerprint out of time is unavailable, not {other:?}"),
+    }
 }

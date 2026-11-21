@@ -16,9 +16,12 @@ use std::net::IpAddr;
 
 use auspex_core::effects::{ActionRequest, EvalAnswer};
 use auspex_core::{Config, ConfirmKind, ConfirmView, Event, Mode, PreflightAnswer};
-use auspex_domain::preflight::{TreeState, Upstream};
+use auspex_domain::preflight::{Edits, TreeState, Upstream};
 use crux_core::Request;
-use support::{Shell, clean_preflight, evaluated, inventory, observed, path, sized};
+use support::{
+    DIGEST_A, DIGEST_B, HEAD_A, HEAD_B, Shell, clean_preflight, evaluated, inventory, observed,
+    path, sized,
+};
 
 const GIB_KIB: u64 = 1 << 20;
 
@@ -93,6 +96,9 @@ fn ready(config: Config, json: &str, free_gib: Option<u64>) -> Shell {
 
 fn answer(s: &mut Shell, answer: PreflightAnswer) {
     let mut r = s.take_preflight();
+    // The fake shell reads the tree again at the `y` and finds it as it answered now: a test that
+    // wants it to have changed says so.
+    s.tree_answer.clone_from(&answer.tree);
     s.resolve(&mut r, answer);
 }
 
@@ -108,6 +114,12 @@ fn tree(changed: usize, upstream: Upstream) -> PreflightAnswer {
         tree: Ok(TreeState {
             changed_files: changed,
             upstream,
+            head: Some(HEAD_A.to_owned()),
+            edits: if changed == 0 {
+                Edits::None
+            } else {
+                Edits::Digest(DIGEST_A.to_owned())
+            },
         }),
         ..clean_preflight()
     }
@@ -1740,4 +1752,205 @@ fn a_refresh_that_started_while_the_freeze_state_was_read_stops_the_update() {
     let mut load = s.loads.remove(0);
     s.resolve(&mut load, Ok(std::collections::BTreeSet::new()));
     nothing_runs(&s);
+}
+
+// ---------------------------------------------------------------------------------------
+// The tree at the `y` (AUS-42)
+// ---------------------------------------------------------------------------------------
+
+/// A dialog about a tree on `head` with `changed` files changed and `edits`, then the tree the
+/// shell finds at the `y`; the `y`.
+fn y_with_tree_then(
+    shown: (&str, usize, Edits),
+    at_the_y: Result<TreeState, String>,
+) -> (Shell, Option<Request<ActionRequest>>) {
+    let mut s = ready(config(), FLEET, Some(100));
+    let (head, changed, edits) = shown;
+    let mut answer_of_shell = tree(changed, tracking(0));
+    answer_of_shell.tree = Ok(TreeState {
+        head: Some(head.to_owned()),
+        edits,
+        ..answer_of_shell.tree.unwrap()
+    });
+    dialog(&mut s, answer_of_shell);
+    s.tree_answer = at_the_y;
+    s.send(Event::ConfirmAnswer(true));
+    let action = (!s.actions.is_empty()).then(|| s.take_action());
+    (s, action)
+}
+
+fn tree_on(head: &str, changed: usize, edits: Edits) -> TreeState {
+    TreeState {
+        head: Some(head.to_owned()),
+        edits,
+        ..tree(changed, tracking(0)).tree.unwrap()
+    }
+}
+
+#[test]
+fn a_head_that_moved_between_the_dialog_and_the_y_refuses_the_update() {
+    let (s, action) = y_with_tree_then(
+        (HEAD_A, 0, Edits::None),
+        Ok(tree_on(HEAD_B, 0, Edits::None)),
+    );
+    assert!(action.is_none(), "nothing was started");
+    let said = notice(&s);
+    assert!(said.contains("not updating luna"), "{said}");
+    assert!(
+        said.contains("1a2b3c4d5e6f") && said.contains("ffeeddccbbaa"),
+        "{said}"
+    );
+    // The lock taken for it is let go of.
+    assert_eq!(s.lock_requests.len(), 1);
+    assert_eq!(s.unlocks, [s.lock_requests[0].id]);
+}
+
+#[test]
+fn the_same_files_edited_again_between_the_dialog_and_the_y_refuse_the_update() {
+    let (s, action) = y_with_tree_then(
+        (HEAD_A, 2, Edits::Digest(DIGEST_A.to_owned())),
+        Ok(tree_on(HEAD_A, 2, Edits::Digest(DIGEST_B.to_owned()))),
+    );
+    assert!(action.is_none(), "nothing was started");
+    assert!(
+        notice(&s).contains("uncommitted changes changed"),
+        "{}",
+        notice(&s)
+    );
+    assert_eq!(s.unlocks.len(), 1, "the lock is let go of");
+}
+
+#[test]
+fn a_tree_that_cannot_be_read_at_the_y_refuses_an_update_the_dialog_could_read() {
+    let (s, action) = y_with_tree_then(
+        (HEAD_A, 0, Edits::None),
+        Err("git timed out after 2s".to_owned()),
+    );
+    assert!(action.is_none());
+    assert!(
+        notice(&s).contains("could not be read again"),
+        "{}",
+        notice(&s)
+    );
+    assert_eq!(s.unlocks.len(), 1);
+}
+
+#[test]
+fn the_same_tree_at_the_y_starts_the_update_and_the_lock_stays_with_it() {
+    let (s, action) = y_with_tree_then(
+        (HEAD_A, 2, Edits::Digest(DIGEST_A.to_owned())),
+        Ok(tree_on(HEAD_A, 2, Edits::Digest(DIGEST_A.to_owned()))),
+    );
+    assert_eq!(action.expect("started").operation.machine, "luna");
+    assert_eq!(s.unlocks.len(), 0, "the lock stays with the update");
+}
+
+#[test]
+fn changes_that_could_not_be_fingerprinted_are_compared_by_commit_only_at_the_y() {
+    let unknown = |why: &str| Edits::Unavailable(why.to_owned());
+    // The same commit: the update starts, and the status bar says what was compared.
+    let (s, action) = y_with_tree_then(
+        (HEAD_A, 1, unknown("timed out")),
+        Ok(tree_on(HEAD_A, 1, unknown("timed out again"))),
+    );
+    assert!(action.is_some());
+    assert!(
+        notice(&s).contains("only the commit was compared"),
+        "{}",
+        notice(&s)
+    );
+    // Another commit: refused.
+    let (_s, action) = y_with_tree_then(
+        (HEAD_A, 1, unknown("timed out")),
+        Ok(tree_on(HEAD_B, 1, unknown("timed out"))),
+    );
+    assert!(action.is_none());
+}
+
+// ---------------------------------------------------------------------------------------
+// The tree at the `y`, fix round 1 (PR #40 review)
+// ---------------------------------------------------------------------------------------
+
+/// A dialog about a clean tree on `HEAD_A`, then the `y` with the shell holding back its answer
+/// about the tree: the update waits for the look at the fleet repository.
+fn waiting_for_the_tree_at_the_y() -> Shell {
+    let mut s = ready(config(), FLEET, Some(100));
+    dialog(&mut s, clean_preflight());
+    s.hold_tree = true;
+    s.send(Event::ConfirmAnswer(true));
+    assert_eq!(s.trees.len(), 1, "the tree is read once more at the y");
+    assert!(s.actions.is_empty(), "nothing starts before the answer");
+    s
+}
+
+/// The look at the tree is of the fleet the dialog was about, bounded as the checks are.
+#[test]
+fn the_look_at_the_y_asks_about_the_fleet_and_is_bounded_like_the_checks() {
+    let s = waiting_for_the_tree_at_the_y();
+    let ask = &s.trees[0].operation;
+    assert_eq!(ask.flake, "/fleet");
+    assert_eq!(ask.timeout_seconds, 90);
+}
+
+/// Act mode turned off while the tree is being read: nothing starts, the lock is let go of.
+#[test]
+fn act_mode_turned_off_while_the_tree_is_read_starts_nothing_and_lets_the_lock_go() {
+    let mut s = waiting_for_the_tree_at_the_y();
+    s.send(Event::ToggleAct);
+    assert_eq!(s.view().mode, Mode::Observe, "act mode is off");
+    let mut look = s.trees.remove(0);
+    s.resolve(&mut look, clean_preflight().tree);
+    assert!(s.actions.is_empty(), "no update after act mode went off");
+    assert_eq!(s.unlocks, [s.lock_requests[0].id], "the lock is let go of");
+}
+
+/// Quit while the tree is being read: nothing starts, the lock is let go of.
+#[test]
+fn quitting_while_the_tree_is_read_starts_nothing_and_lets_the_lock_go() {
+    let mut s = waiting_for_the_tree_at_the_y();
+    s.send(Event::Quit);
+    s.send(Event::ConfirmAnswer(true));
+    let mut look = s.trees.remove(0);
+    s.resolve(&mut look, clean_preflight().tree);
+    assert!(s.actions.is_empty(), "no update on the way out");
+    assert_eq!(s.unlocks, [s.lock_requests[0].id], "the lock is let go of");
+}
+
+/// The dialog says what the update will be held to.
+#[test]
+fn the_dialog_shows_the_commit_the_update_is_held_to() {
+    let mut s = ready(config(), FLEET, Some(100));
+    let confirm = dialog(&mut s, clean_preflight());
+    assert_eq!(confirm.lines, ["fleet repository: HEAD 1a2b3c4d5e6f"]);
+    let mut s = ready(config(), FLEET, Some(100));
+    let mut dirty = tree(2, tracking(0));
+    dirty.tree = Ok(tree_on(HEAD_A, 2, Edits::Digest(DIGEST_A.to_owned())));
+    let confirm = dialog(&mut s, dirty);
+    assert_eq!(
+        confirm.lines,
+        ["fleet repository: HEAD 1a2b3c4d5e6f, dirty (9f8e7d6c)"]
+    );
+    // A tree that could not be read has nothing to show (the warning says so).
+    let mut s = ready(config(), FLEET, Some(100));
+    let mut unreadable = clean_preflight();
+    unreadable.tree = Err("not a repository".to_owned());
+    assert_eq!(dialog(&mut s, unreadable).lines, Vec::<String>::new());
+}
+
+/// The plan could fingerprint the changes and the `y` cannot: they are not known to be the ones
+/// the dialog showed, so nothing starts.
+#[test]
+fn changes_that_cannot_be_fingerprinted_at_the_y_refuse_when_the_dialog_could() {
+    let (s, action) = y_with_tree_then(
+        (HEAD_A, 1, Edits::Digest(DIGEST_A.to_owned())),
+        Ok(tree_on(
+            HEAD_A,
+            1,
+            Edits::Unavailable("timed out".to_owned()),
+        )),
+    );
+    assert!(action.is_none(), "nothing was started");
+    let said = notice(&s);
+    assert!(said.contains("could not be checked"), "{said}");
+    assert_eq!(s.unlocks.len(), 1, "the lock is let go of");
 }

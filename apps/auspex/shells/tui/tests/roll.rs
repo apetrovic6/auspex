@@ -1966,3 +1966,101 @@ async fn a_node_read_that_failed_at_the_record_is_recorded_by_the_next_one() {
     assert_luna_fails_at_the_deadline(&w).await;
     w.shell.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------
+// The fleet repository's commit (AUS-42)
+// ---------------------------------------------------------------------------------------
+
+/// The commit the fake `git` names for the plan's look at the fleet repository.
+const PLAN_HEAD: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+/// The commit it names for every look after that: someone pulled while the plan was open.
+const MOVED_HEAD: &str = "ffeeddccbbaa99887766554433221100ffeeddcc";
+
+/// [`world`] with the checks before each update run for real, against a fake `git` that says the
+/// tree is clean and pushed and that `HEAD` is [`PLAN_HEAD`] the first time it is asked (the plan's
+/// look) and [`MOVED_HEAD`] every time after, and a fake `nix` that cannot size anything (a
+/// warning, never a refusal).
+fn world_whose_head_moves_after_the_plan(t: &Tools, rule: RollRule) -> World {
+    let dir = tempdir();
+    let fleet = tempdir();
+    let clan = t.script(dir.path(), "clan", &clan_body("0.1"));
+    let nix = t.script(dir.path(), "nix", "exit 1");
+    // `mkdir` is atomic: exactly one look, the first, makes the directory and is the plan's. A
+    // counter in a file, read and rewritten by looks that run at once, is not.
+    let git = t.script(
+        dir.path(),
+        "git",
+        &format!(
+            "case \" $* \" in\n\
+             *\" config \"*) exit 0;;\n\
+             *\" rev-parse --verify \"*)\n\
+               if @mkdir@ '@dir@/planned' 2>/dev/null; then printf '{PLAN_HEAD}\\n'; else printf '{MOVED_HEAD}\\n'; fi;;\n\
+             *\" status \"*) printf '## main...origin/main\\0';;\n\
+             *) exit 1;;\n\
+             esac\n"
+        ),
+    );
+    let kubectl = t.script(dir.path(), "kubectl", &kubectl_body(NODES_READY, 0));
+    let real = Real::for_actions(nix.into_os_string(), Some(clan))
+        .with_git_and_cache(git.into_os_string(), None)
+        .with_kubectl(kubectl.into_os_string(), dir.path().join(KUBECONFIG));
+    let backend = Backend::Demo(Demo {
+        real_actions: Some(Box::new(real)),
+        real_preflight: true,
+        ..Demo::default()
+    });
+    let shell = Shell::new(backend, Log::memory(), Duration::from_secs(120));
+    let db = dir.path().join("state").join("log.sqlite");
+    shell.set_action_log(OpenParams::new(
+        db.clone(),
+        identity(),
+        fleet.path().to_path_buf(),
+    ));
+    let mut config = demo::config();
+    fleet.path().to_str().unwrap().clone_into(&mut config.flake);
+    config.public_machines.clear();
+    config.rolling.rules = [("k8s-server".to_owned(), rule)].into();
+    config.rolling.parallel = 2;
+    config.rolling.ready_timeout_seconds = 20;
+    shell.send(Event::Start(config));
+    World {
+        dir,
+        fleet,
+        shell,
+        db,
+    }
+}
+
+/// The plan names the commit; then a `HEAD` that moved after the `y` refuses every machine the roll
+/// reaches, with a sentence naming both commits, and `clan` never runs. The shell's own `git` and
+/// `U`'s whole path are the real ones, over fake programs.
+#[tokio::test]
+async fn a_head_that_moves_after_the_y_refuses_each_machine_and_clan_never_runs() {
+    let Some(t) = tools(&["sleep", "cat", "date", "mkdir"]) else {
+        return;
+    };
+    let w = world_whose_head_moves_after_the_plan(&t, kube_rule(false));
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    plan(&w.shell).await;
+    let lines = w.shell.view().confirm.unwrap().lines;
+    assert!(
+        lines.contains(&"fleet repository: HEAD 1a2b3c4d5e6f".to_owned()),
+        "{lines:?}"
+    );
+    w.shell.send(Event::ConfirmAnswer(true));
+    until_over(&w.shell).await;
+    for m in ["luna", "sol", "cypramundi"] {
+        match state(&w.shell, m) {
+            RollState::Refused(why) => {
+                assert!(
+                    why.contains("1a2b3c4d5e6f") && why.contains("ffeeddccbbaa"),
+                    "{m}: {why}"
+                );
+            }
+            other => panic!("{m}: {other:?}"),
+        }
+    }
+    assert_eq!(w.clan_events(), Vec::<String>::new(), "clan never ran");
+    w.shell.shutdown().await;
+}

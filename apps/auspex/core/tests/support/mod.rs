@@ -546,6 +546,14 @@ pub fn act_config() -> Config {
     }
 }
 
+/// The commit [`clean_preflight`]'s tree stands on.
+pub const HEAD_A: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+/// Another commit.
+pub const HEAD_B: &str = "ffeeddccbbaa99887766554433221100ffeeddcc";
+/// A digest of some uncommitted changes, and of others.
+pub const DIGEST_A: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0";
+pub const DIGEST_B: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
 /// What the shell finds when the fleet repository is clean and pushed and the closure is
 /// 2 GiB: nothing for the checks to say about either (the probe of [`observed`] reports no
 /// `/nix/store` disk, so the disk check, which needs it, says it is unknown).
@@ -558,6 +566,8 @@ pub fn clean_preflight() -> auspex_core::PreflightAnswer {
                 ahead: 0,
                 behind: 0,
             },
+            head: Some(HEAD_A.to_owned()),
+            edits: auspex_domain::preflight::Edits::None,
         }),
         closure: sized(2 << 30),
     }
