@@ -575,7 +575,7 @@ async fn tui(
 /// Why and how the loop is leaving.
 #[derive(Debug)]
 pub struct Leaving {
-    /// The exit code so far: 0 for a quit, 128 + n for a signal, [`USAGE`] for auspex's own failure.
+    /// The exit code so far: 0 for a quit, 128 + n for a signal, `USAGE` for auspex's own failure.
     pub code: u8,
     /// A panic in a task ended the loop.
     pub ended_by_panic: bool,

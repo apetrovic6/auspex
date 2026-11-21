@@ -282,7 +282,7 @@ pub fn payload_text(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "a panic with no message".to_owned())
 }
 
-/// `text` on one line, sanitised, cut at [`MESSAGE_BOUND`] characters.
+/// `text` on one line, sanitised, cut at 240 characters.
 #[must_use]
 pub fn bounded(text: &str) -> String {
     let one_line = text
