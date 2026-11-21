@@ -112,6 +112,7 @@ in {
             kubernetes = optional types.bool "The tag's machines are nodes of a Kubernetes cluster (default false): before the roll starts, refuse it if any node is NotReady or cordoned, and between machines wait until the updated machine's node is Ready. Needs a kubeconfig (kubernetes.kubeconfig).";
             drain = optional types.bool "Cordon and drain the node before its machine is updated and uncordon it after (default false: a NixOS switch does not reboot the node, and RKE2's containers survive a restart of the service). A failed or timed-out drain stops the roll and leaves the node uncordoned.";
             drain_timeout = timeout "kubectl drain's --timeout, in seconds (default 600).";
+            etcd = optional types.bool "The tag's machines are the control plane of an RKE2 cluster (default false; implies kubernetes): before the roll and before every machine, refuse unless every etcd member (a node labelled node-role.kubernetes.io/etcd) has a Ready etcd pod in kube-system, and wait for the updated machine's etcd pod to be Ready again. Anything that cannot be read counts as unhealthy, and an unhealthy etcd stops the tag's roll. Leave it off for a cluster with no etcd pods (k3s with sqlite, managed, external etcd). Verify RKE2's etcd readinessProbe on your cluster before relying on it (see the auspex README).";
           });
         };
         update = section {

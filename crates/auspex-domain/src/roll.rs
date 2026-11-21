@@ -39,6 +39,11 @@ pub struct RollRule {
     pub drain: bool,
     /// How long `kubectl drain` may take, in seconds.
     pub drain_timeout_seconds: u64,
+    /// The cluster's etcd is checked before every machine of the group goes out of service, and
+    /// after its update the machine's etcd pod must be `Ready` again ([`etcd_unhealthy`]). Implies
+    /// `kubernetes`. Off by default: a cluster with no etcd pods in `kube-system` (k3s with
+    /// sqlite, a managed control plane, external etcd) could never pass it.
+    pub etcd: bool,
 }
 
 /// The drain timeout when the configuration names none: ten minutes.
@@ -50,6 +55,7 @@ impl Default for RollRule {
             kubernetes: false,
             drain: false,
             drain_timeout_seconds: DEFAULT_DRAIN_TIMEOUT_SECONDS,
+            etcd: false,
         }
     }
 }
@@ -76,6 +82,8 @@ pub struct Member {
     /// One of its rolling tags says `drain = true`: the drain's timeout in seconds (the
     /// smallest of those tags', so the strictest rule wins), else `None`.
     pub drain: Option<u64>,
+    /// One of its rolling tags says `etcd = true`.
+    pub etcd: bool,
 }
 
 impl Member {
@@ -101,6 +109,12 @@ impl Group {
     #[must_use]
     pub fn kubernetes(&self) -> bool {
         self.members.iter().any(|m| m.kubernetes)
+    }
+
+    /// A machine of the group asks for the etcd check.
+    #[must_use]
+    pub fn etcd(&self) -> bool {
+        self.members.iter().any(|m| m.etcd)
     }
 
     /// A machine of the group is waited for or drained in the cluster, so the group is one of the
@@ -197,7 +211,8 @@ pub fn plan<'a>(candidates: &[Candidate<'a>], rules: &RollRules) -> Plan {
                     let applying = || own.iter().filter_map(|t| rules.get(*t));
                     Member {
                         name: c.name.to_owned(),
-                        kubernetes: applying().any(|r| r.kubernetes),
+                        kubernetes: applying().any(|r| r.kubernetes || r.etcd),
+                        etcd: applying().any(|r| r.etcd),
                         drain: applying()
                             .filter(|r| r.drain)
                             .map(|r| r.drain_timeout_seconds)
@@ -227,7 +242,13 @@ pub struct Node {
     /// epoch: the `Ready` condition's `lastHeartbeatTime`, or its lease's `renewTime` when that is
     /// later ([`merge_leases`]). `None` when the cluster said neither.
     pub heartbeat: Option<i64>,
+    /// It carries the label `node-role.kubernetes.io/etcd` (RKE2's mark of an etcd member), with
+    /// any value but `false`.
+    pub etcd: bool,
 }
+
+/// The label RKE2 puts on a node that runs etcd.
+pub const ETCD_LABEL: &str = "node-role.kubernetes.io/etcd";
 
 #[derive(Deserialize)]
 struct RawList {
@@ -244,6 +265,7 @@ struct RawNode {
 #[derive(Deserialize)]
 struct RawMeta {
     name: Option<String>,
+    labels: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -325,9 +347,11 @@ pub fn parse_nodes(json: &str) -> Result<Vec<Node>, String> {
     items
         .into_iter()
         .map(|n| {
-            let name = n
-                .metadata
-                .and_then(|m| m.name)
+            let (name, labels) = n.metadata.map_or((None, None), |m| (m.name, m.labels));
+            let etcd = labels
+                .and_then(|l| l.get(ETCD_LABEL).cloned())
+                .is_some_and(|v| v != "false");
+            let name = name
                 .map(|n| sanitize_line(&n))
                 .filter(|n| !n.is_empty())
                 .ok_or_else(|| "kubectl's node list has a node with no name".to_owned())?;
@@ -345,6 +369,7 @@ pub fn parse_nodes(json: &str) -> Result<Vec<Node>, String> {
                 ready,
                 cordoned,
                 heartbeat,
+                etcd,
             })
         })
         .collect()
@@ -483,6 +508,125 @@ pub fn cluster_refusals(nodes: &[Node], members: &[&Member]) -> Vec<String> {
         }
     }
     why
+}
+
+/// One etcd static pod (`kube-system`, `component=etcd`), as the etcd check sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtcdPod {
+    /// `spec.nodeName`: the node, which is the member.
+    pub node: String,
+    /// The pod is `Running` and its `Ready` condition is `True` (the kubelet's view of etcd's
+    /// readiness probe).
+    pub ready: bool,
+}
+
+#[derive(Deserialize)]
+struct RawPodList {
+    items: Option<Vec<RawPod>>,
+}
+
+#[derive(Deserialize)]
+struct RawPod {
+    spec: Option<RawPodSpec>,
+    status: Option<RawPodStatus>,
+}
+
+#[derive(Deserialize)]
+struct RawPodSpec {
+    #[serde(rename = "nodeName")]
+    node_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawPodStatus {
+    phase: Option<String>,
+    conditions: Option<Vec<RawCondition>>,
+}
+
+/// Parses `kubectl get pods -n kube-system -l component=etcd -o json`. A pod not yet scheduled
+/// (no `nodeName`) is no member's and is left out; a pod with no `Ready` condition is not ready.
+///
+/// # Errors
+///
+/// Not the JSON of a pod list.
+pub fn parse_etcd_pods(json: &str) -> Result<Vec<EtcdPod>, String> {
+    let list: RawPodList = serde_json::from_str(json)
+        .map_err(|e| format!("kubectl's pod list is not the expected JSON: {e}"))?;
+    let items = list
+        .items
+        .ok_or_else(|| "kubectl's pod list has no `items`".to_owned())?;
+    Ok(items
+        .into_iter()
+        .filter_map(|p| {
+            let node = p
+                .spec
+                .and_then(|s| s.node_name)
+                .map(|n| sanitize_line(&n))
+                .filter(|n| !n.is_empty())?;
+            let status = p.status;
+            let running = status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running");
+            let ready = status
+                .and_then(|s| s.conditions)
+                .unwrap_or_default()
+                .iter()
+                .any(|c| c.kind.as_deref() == Some("Ready") && c.status.as_deref() == Some("True"));
+            Some(EtcdPod {
+                node,
+                ready: running && ready,
+            })
+        })
+        .collect())
+}
+
+/// Why etcd is not fit for the next member to go out of service, one sentence each; empty when
+/// every etcd member has a ready etcd pod.
+///
+/// Members are the nodes labelled [`ETCD_LABEL`]. Every one of them must have a ready pod (the
+/// rule is stricter than the quorum on purpose: no counting, no assumption about the size or
+/// about learners), and what cannot be told is not healthy: no labelled node at all, or a pod on a
+/// node that is not labelled, means which nodes are members is not known.
+#[must_use]
+pub fn etcd_unhealthy(nodes: &[Node], pods: &[EtcdPod]) -> Vec<String> {
+    let members: Vec<&Node> = nodes.iter().filter(|n| n.etcd).collect();
+    if members.is_empty() {
+        return vec![format!(
+            "cannot tell which nodes are etcd members (no node has the label {ETCD_LABEL})"
+        )];
+    }
+    let mut why = Vec::new();
+    for m in &members {
+        match pods.iter().find(|p| p.node == m.name) {
+            None => why.push(format!("etcd member {} has no etcd pod", m.name)),
+            Some(p) if !p.ready => why.push(format!("etcd on {} is not ready", m.name)),
+            Some(_) => {}
+        }
+    }
+    for p in pods {
+        if !members.iter().any(|m| m.name == p.node) {
+            why.push(format!(
+                "there is an etcd pod on {} but the node is not labelled {ETCD_LABEL}, so which \
+                 nodes are etcd members is not certain",
+                p.node
+            ));
+        }
+    }
+    why
+}
+
+/// Whether the etcd of `node` is back after its update: `Ok` when it is no member (no label and no
+/// pod: nothing to wait for), or its pod is ready; otherwise why not.
+///
+/// # Errors
+///
+/// The node is a member, or has an etcd pod, and the pod is missing or not ready.
+pub fn etcd_member_ready(nodes: &[Node], pods: &[EtcdPod], node: &str) -> Result<(), String> {
+    let labelled = nodes.iter().any(|n| n.name == node && n.etcd);
+    match pods.iter().find(|p| p.node == node) {
+        Some(p) if p.ready => Ok(()),
+        Some(_) => Err(format!("etcd on {node} is not ready")),
+        None if labelled => Err(format!("etcd member {node} has no etcd pod")),
+        None => Ok(()),
+    }
 }
 
 /// A node, as the wait between machines sees it.
@@ -686,6 +830,7 @@ mod tests {
             kubernetes: true,
             drain: true,
             drain_timeout_seconds: 90,
+            etcd: false,
         };
         let slow = RollRule {
             drain: true,
@@ -706,7 +851,8 @@ mod tests {
             Member {
                 name: "luna".to_owned(),
                 kubernetes: true,
-                drain: Some(90)
+                drain: Some(90),
+                etcd: false
             },
             "the strictest (smallest) timeout wins"
         );
@@ -782,6 +928,7 @@ mod tests {
             name: name.to_owned(),
             kubernetes,
             drain: None,
+            etcd: false,
         }
     }
 
@@ -1013,5 +1160,132 @@ mod tests {
         assert!(parse_cluster_id(r#"{"contexts":[]}"#, "/k").is_err());
         assert!(parse_cluster_id(r#"{"current-context":""}"#, "/k").is_err());
         assert!(parse_cluster_id("nope", "/k").is_err());
+    }
+
+    fn etcd_nodes(spec: &[(&str, bool)]) -> Vec<Node> {
+        let items: Vec<String> = spec
+            .iter()
+            .map(|(n, etcd)| {
+                let labels = if *etcd {
+                    r#","labels":{"node-role.kubernetes.io/etcd":"true"}"#
+                } else {
+                    ""
+                };
+                format!(r#"{{"metadata":{{"name":"{n}"{labels}}}}}"#)
+            })
+            .collect();
+        parse_nodes(&format!(r#"{{"items":[{}]}}"#, items.join(","))).unwrap()
+    }
+
+    fn pod(node: &str, ready: bool) -> EtcdPod {
+        EtcdPod {
+            node: node.to_owned(),
+            ready,
+        }
+    }
+
+    #[test]
+    fn the_etcd_label_marks_a_member_unless_it_says_false() {
+        let n = parse_nodes(
+            r#"{"items":[
+              {"metadata":{"name":"a","labels":{"node-role.kubernetes.io/etcd":"true"}}},
+              {"metadata":{"name":"b","labels":{"node-role.kubernetes.io/etcd":""}}},
+              {"metadata":{"name":"c","labels":{"node-role.kubernetes.io/etcd":"false"}}},
+              {"metadata":{"name":"d","labels":{"other":"true"}}},
+              {"metadata":{"name":"e"}}]}"#,
+        )
+        .unwrap();
+        let flags: Vec<bool> = n.iter().map(|n| n.etcd).collect();
+        assert_eq!(flags, [true, true, false, false, false]);
+    }
+
+    #[test]
+    fn etcd_pods_are_ready_only_when_running_and_ready() {
+        let pods = parse_etcd_pods(
+            r#"{"items":[
+              {"spec":{"nodeName":"a"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}},
+              {"spec":{"nodeName":"b"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"False"}]}},
+              {"spec":{"nodeName":"c"},"status":{"phase":"Pending","conditions":[{"type":"Ready","status":"True"}]}},
+              {"spec":{"nodeName":"d"},"status":{"phase":"Running"}},
+              {"spec":{"nodeName":"e"}},
+              {"spec":{},"status":{"phase":"Pending"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pods,
+            [
+                pod("a", true),
+                pod("b", false),
+                pod("c", false),
+                pod("d", false),
+                pod("e", false)
+            ]
+        );
+        for bad in ["", "nope", "[]", r#"{"kind":"List"}"#] {
+            assert!(parse_etcd_pods(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(parse_etcd_pods(r#"{"items":[]}"#).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn etcd_is_healthy_when_every_member_has_a_ready_pod() {
+        let nodes = etcd_nodes(&[("a", true), ("b", true), ("w", false)]);
+        let pods = [pod("a", true), pod("b", true)];
+        assert_eq!(etcd_unhealthy(&nodes, &pods), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_member_whose_etcd_is_not_ready_or_missing_makes_etcd_unhealthy() {
+        let nodes = etcd_nodes(&[("a", true), ("b", true), ("c", true)]);
+        let why = etcd_unhealthy(&nodes, &[pod("a", true), pod("b", false)]);
+        assert_eq!(
+            why,
+            ["etcd on b is not ready", "etcd member c has no etcd pod"]
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_told_is_not_healthy() {
+        // No node says it is a member.
+        let none = etcd_nodes(&[("a", false)]);
+        assert_eq!(etcd_unhealthy(&none, &[pod("a", true)]).len(), 1);
+        assert!(
+            etcd_unhealthy(&[], &[])
+                .iter()
+                .any(|w| w.contains("cannot tell"))
+        );
+        // A pod on a node that is not labelled.
+        let nodes = etcd_nodes(&[("a", true), ("b", false)]);
+        let why = etcd_unhealthy(&nodes, &[pod("a", true), pod("b", true)]);
+        assert_eq!(why.len(), 1);
+        assert!(why[0].contains("etcd pod on b"), "{why:?}");
+    }
+
+    #[test]
+    fn a_member_is_back_when_its_pod_is_ready_and_a_non_member_has_nothing_to_wait_for() {
+        let nodes = etcd_nodes(&[("a", true), ("w", false)]);
+        assert!(etcd_member_ready(&nodes, &[pod("a", true)], "a").is_ok());
+        assert!(etcd_member_ready(&nodes, &[pod("a", false)], "a").is_err());
+        assert!(etcd_member_ready(&nodes, &[], "a").is_err());
+        assert!(etcd_member_ready(&nodes, &[pod("a", true)], "w").is_ok());
+        // An etcd pod on an unlabelled node still has to be ready.
+        assert!(etcd_member_ready(&nodes, &[pod("w", false)], "w").is_err());
+    }
+
+    #[test]
+    fn etcd_implies_kubernetes_in_the_plan_and_is_off_by_default() {
+        assert!(!RollRule::default().etcd);
+        let on = RollRule {
+            etcd: true,
+            ..RollRule::default()
+        };
+        let p = plan_of(
+            &[("a", &["cp"]), ("b", &["cp"]), ("c", &["other"])],
+            &rules(&[("cp", on), ("other", k8s())]),
+        );
+        assert!(p.groups[0].members.iter().all(|m| m.etcd && m.kubernetes));
+        assert!(p.groups[0].etcd());
+        assert!(!p.groups[1].members[0].etcd);
+        assert!(!p.groups[1].etcd());
     }
 }

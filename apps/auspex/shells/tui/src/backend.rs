@@ -848,7 +848,12 @@ impl Real {
                         Ok(KubeReply::Nodes(nodes)) => {
                             use auspex_domain::roll::NodeState;
                             match auspex_domain::roll::node_state(&nodes, node, since) {
-                                NodeState::Ready => return Ok(Ok(())),
+                                NodeState::Ready => {
+                                    match self.etcd_back(op, &nodes, node, cancel, sink).await? {
+                                        None => return Ok(Ok(())),
+                                        Some(why) => why,
+                                    }
+                                }
                                 NodeState::NotReady => format!("node {node} is NotReady"),
                                 NodeState::Stale => format!(
                                     "node {node} is Ready, but its kubelet has not been heard from \
@@ -874,6 +879,34 @@ impl Real {
         }
     }
 
+    /// For an etcd group, whether the node's etcd pod is `Ready` again: `None` when it is (or the
+    /// group does not ask), else why not. What cannot be read is not ready.
+    async fn etcd_back(
+        &self,
+        op: &AwaitRequest,
+        nodes: &[auspex_domain::roll::Node],
+        node: &str,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<Option<String>, Cancelled> {
+        if !op.etcd {
+            return Ok(None);
+        }
+        let ask = KubeRequest {
+            id: op.id,
+            log: op.log,
+            context: op.context.clone(),
+            op: KubeOp::EtcdPods,
+        };
+        Ok(match self.kube(&ask, cancel, sink).await? {
+            Ok(KubeReply::EtcdPods(pods)) => {
+                auspex_domain::roll::etcd_member_ready(nodes, &pods, node).err()
+            }
+            Ok(other) => Some(format!("kubectl answered {other:?} to a pod list")),
+            Err(why) => Some(format!("cannot read etcd: {why}")),
+        })
+    }
+
     /// `Effect::Kube` with the real `kubectl`.
     ///
     /// # Errors
@@ -896,6 +929,9 @@ impl Real {
                 .await?
                 .map(KubeReply::Cluster),
             KubeOp::Nodes => kube::nodes(&params, cancel).await?.map(KubeReply::Nodes),
+            KubeOp::EtcdPods => kube::etcd_pods(&params, cancel)
+                .await?
+                .map(KubeReply::EtcdPods),
             KubeOp::Uncordon { node } => {
                 sink(Stream::Note, &format!("kubectl uncordon {node}"));
                 kube::set_cordon(&params, node, false, cancel)

@@ -594,6 +594,8 @@ pub enum KubeOp {
     Context,
     /// `kubectl get nodes -o json`.
     Nodes,
+    /// `kubectl get pods -n kube-system -l component=etcd -o json`: the etcd member pods.
+    EtcdPods,
     /// `kubectl uncordon <node>`.
     Uncordon {
         /// The node, named like its machine.
@@ -616,6 +618,8 @@ pub enum KubeReply {
     Cluster(auspex_domain::roll::ClusterId),
     /// The cluster's nodes.
     Nodes(Vec<auspex_domain::roll::Node>),
+    /// The etcd pods, one per member.
+    EtcdPods(Vec<auspex_domain::roll::EtcdPod>),
     /// The node was drained or uncordoned.
     Done,
     /// The request was cancelled; `kubectl` is gone.
@@ -653,6 +657,9 @@ pub struct AwaitRequest {
     pub expect: StorePath,
     /// The Kubernetes node to wait for, when the machine's rolling group asks for it.
     pub node: Option<String>,
+    /// The machine's etcd pod must be `Ready` too before it counts as back (its rolling group asks
+    /// for the etcd check). Only with `node`.
+    pub etcd: bool,
     /// The kubeconfig context the node is read in (`--context`).
     pub context: Option<String>,
     /// The machine's failed units when its turn began: what was already wrong is not the update's

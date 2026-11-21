@@ -262,6 +262,7 @@ const fn kube_rule(drain: bool) -> RollRule {
         kubernetes: true,
         drain,
         drain_timeout_seconds: 60,
+        etcd: false,
     }
 }
 
@@ -1200,4 +1201,238 @@ async fn a_node_is_committed_when_clan_is_spawned_and_not_before() {
         report.len() == 1 && report[0].starts_with("node luna was left cordoned"),
         "clan was spawned: left on purpose: {report:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// etcd
+// ---------------------------------------------------------------------------------------
+
+const fn etcd_rule() -> RollRule {
+    RollRule {
+        kubernetes: true,
+        etcd: true,
+        drain: false,
+        drain_timeout_seconds: 60,
+    }
+}
+
+/// luna and sol, both etcd members, Ready.
+const NODES_ETCD: &str = r#"{"items":[
+  {"metadata":{"name":"luna","labels":{"node-role.kubernetes.io/etcd":"true"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}},
+  {"metadata":{"name":"sol","labels":{"node-role.kubernetes.io/etcd":"true"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}
+]}"#;
+
+fn etcd_pods_json(luna: bool, sol: bool) -> String {
+    let pod = |n: &str, r: bool| {
+        format!(
+            r#"{{"spec":{{"nodeName":"{n}"}},"status":{{"phase":"Running","conditions":[{{"type":"Ready","status":"{}"}}]}}}}"#,
+            if r { "True" } else { "False" }
+        )
+    };
+    format!(r#"{{"items":[{},{}]}}"#, pod("luna", luna), pod("sol", sol))
+}
+
+/// A fake `kubectl` over [`NODES_ETCD`] whose `get pods` answers `pods` for its first
+/// `healthy_calls` calls and `later` after that (`ERROR`: a failing kubectl).
+fn kubectl_etcd(healthy_calls: u32, pods: &str, later: &str) -> String {
+    let later = if later == "ERROR" {
+        "echo 'Unable to connect to the server' >&2; exit 1".to_owned()
+    } else {
+        cat(later)
+    };
+    let get_pods = format!(
+        "n=$(@cat@ '@dir@/pcount' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '@dir@/pcount'; \
+         if [ $n -le {healthy_calls} ]; then {ok}; else {later}; fi",
+        ok = cat(pods)
+    );
+    format!(
+        "printf '%s\\n' \"$*\" >> '@dir@/kubectl.log'\n\
+         case \" $* \" in\n\
+         *\" config view \"*) {view}\n;;\n\
+         *\" get leases \"*) {leases}\n;;\n\
+         *\" get pods \"*) {get_pods}\n;;\n\
+         *\" get nodes \"*) {nodes}\n;;\n\
+         *) echo 'ok (fake)';;\n\
+         esac\n",
+        view = cat(VIEW),
+        leases = LEASES_NOW,
+        nodes = cat(NODES_ETCD),
+    )
+}
+
+const ETCD_POD_CALL: &str = "get pods -n kube-system -l component=etcd -o json";
+
+fn started(w: &World) -> Vec<String> {
+    w.clan_events()
+        .into_iter()
+        .filter(|e| e.starts_with("start "))
+        .collect()
+}
+
+/// All members ready all along: the group rolls luna then sol, and etcd is read in the plan, before
+/// each machine and in each wait.
+#[tokio::test]
+async fn with_etcd_healthy_the_group_rolls_and_etcd_is_read_at_every_step() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let ok = etcd_pods_json(true, true);
+    let w = world(
+        &t,
+        &clan_body("0.1"),
+        &kubectl_etcd(1000, &ok, &ok),
+        etcd_rule(),
+        20,
+    );
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_over(&w.shell).await;
+    for m in ["luna", "sol"] {
+        assert_eq!(state(&w.shell, m), RollState::Done, "{m}");
+    }
+    let pods = w
+        .kubectl_calls()
+        .iter()
+        .filter(|c| c.contains(ETCD_POD_CALL))
+        .count();
+    assert!(
+        pods >= 5,
+        "plan, luna's read and wait, sol's read and wait: {pods}"
+    );
+    assert!(
+        w.kubectl_calls()
+            .iter()
+            .all(|c| c.contains("--context=rke2") || c.contains("config view")),
+        "{:#?}",
+        w.kubectl_calls()
+    );
+    w.shell.shutdown().await;
+}
+
+/// Sol's etcd goes down while luna is being updated: luna is done, and sol is not taken out.
+#[tokio::test]
+async fn a_member_whose_etcd_went_down_during_the_roll_stops_the_group_before_it_is_touched() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let ok = etcd_pods_json(true, true);
+    let sol_down = etcd_pods_json(true, false);
+    // The plan's look and luna's read are healthy; luna's wait and sol's read see sol down. (luna
+    // itself is fine, so luna's own wait passes.)
+    let w = world(
+        &t,
+        &clan_body("0.1"),
+        &kubectl_etcd(2, &ok, &sol_down),
+        etcd_rule(),
+        20,
+    );
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_over(&w.shell).await;
+    assert_eq!(state(&w.shell, "luna"), RollState::Done);
+    match state(&w.shell, "sol") {
+        RollState::Failed(why) => {
+            assert_eq!(why, "etcd is not healthy: etcd on sol is not ready");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        !started(&w).contains(&"start sol".to_owned()),
+        "{:?}",
+        w.clan_events()
+    );
+    w.shell.shutdown().await;
+}
+
+/// The machine just updated is not done until its own etcd pod is Ready again.
+#[tokio::test]
+async fn a_machine_whose_etcd_does_not_come_back_fails_its_wait_and_stops_the_group() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let ok = etcd_pods_json(true, true);
+    let luna_down = etcd_pods_json(false, true);
+    let w = world(
+        &t,
+        &clan_body("0.1"),
+        &kubectl_etcd(2, &ok, &luna_down),
+        etcd_rule(),
+        1,
+    );
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_over(&w.shell).await;
+    match state(&w.shell, "luna") {
+        RollState::Failed(why) => {
+            assert_eq!(
+                why,
+                "not healthy after the update: etcd on luna is not ready"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(state(&w.shell, "sol"), RollState::Skipped(_)));
+    assert!(!started(&w).contains(&"start sol".to_owned()));
+    w.shell.shutdown().await;
+}
+
+/// A kubectl that cannot list the etcd pods is not permission: the group is refused in the plan.
+#[tokio::test]
+async fn an_etcd_that_cannot_be_read_refuses_the_group_and_clan_never_runs_for_it() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let w = world(
+        &t,
+        &clan_body("0.1"),
+        &kubectl_etcd(0, "{}", "ERROR"),
+        etcd_rule(),
+        20,
+    );
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    plan(&w.shell).await;
+    let lines = w.shell.view().confirm.unwrap().lines;
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("skipped luna:") && l.contains("cannot read etcd")),
+        "{lines:?}"
+    );
+    w.shell.send(Event::ConfirmAnswer(true));
+    until_over(&w.shell).await;
+    assert_eq!(w.clan_events(), ["start cypramundi", "end cypramundi"]);
+    w.shell.shutdown().await;
+}
+
+/// Without `etcd = true` the same unhealthy etcd is not looked at: the roll is as before.
+#[tokio::test]
+async fn without_the_etcd_key_etcd_is_never_asked_about() {
+    let Some(t) = tools(&["sleep", "cat", "date"]) else {
+        return;
+    };
+    let down = etcd_pods_json(false, false);
+    let w = world(
+        &t,
+        &clan_body("0.1"),
+        &kubectl_etcd(1000, &down, &down),
+        kube_rule(false),
+        20,
+    );
+    settled(&w.shell).await;
+    act_on(&w.shell);
+    roll(&w.shell).await;
+    until_over(&w.shell).await;
+    for m in ["luna", "sol"] {
+        assert_eq!(state(&w.shell, m), RollState::Done, "{m}");
+    }
+    assert!(
+        w.kubectl_calls().iter().all(|c| !c.contains(ETCD_POD_CALL)),
+        "{:#?}",
+        w.kubectl_calls()
+    );
+    w.shell.shutdown().await;
 }

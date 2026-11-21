@@ -418,6 +418,7 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                         match k.as_str() {
                             "kubernetes" => rule.kubernetes = w.boolean(v, &name)?,
                             "drain" => rule.drain = w.boolean(v, &name)?,
+                            "etcd" => rule.etcd = w.boolean(v, &name)?,
                             "drain_timeout" => rule.drain_timeout_seconds = w.timeout(v, &name)?,
                             _ => w.unknown(&name),
                         }
@@ -868,7 +869,17 @@ mod tests {
         assert_eq!(s.rolling["taghmata"], RollRule::default());
         assert!(!RollRule::default().drain, "drain is opt-in");
         assert!(!RollRule::default().kubernetes);
+        assert!(!RollRule::default().etcd, "etcd is opt-in");
         assert_eq!(RollRule::default().drain_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn etcd_is_read_per_rolling_tag() {
+        let (s, w) =
+            parse("[rolling.cp]\netcd = true\n[rolling.workers]\nkubernetes = true\n").unwrap();
+        assert_eq!(w, Vec::<String>::new());
+        assert!(s.rolling["cp"].etcd);
+        assert!(!s.rolling["workers"].etcd);
     }
 
     #[test]
@@ -879,6 +890,7 @@ mod tests {
                 "rolling.a.kubernetes",
             ),
             ("[rolling.a]\ndrain = 1\n", "rolling.a.drain"),
+            ("[rolling.a]\netcd = 1\n", "rolling.a.etcd"),
             (
                 "[rolling.a]\ndrain_timeout = 0\n",
                 "rolling.a.drain_timeout",

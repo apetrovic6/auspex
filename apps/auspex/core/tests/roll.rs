@@ -17,7 +17,7 @@ use auspex_core::{
     Config, ConfirmKind, Event, FreezeConfig, Mode, Phase, RollState, RollStatus, RollingConfig,
     SavedFreezes,
 };
-use auspex_domain::roll::{ClusterId, Node, RollRule};
+use auspex_domain::roll::{ClusterId, EtcdPod, Node, RollRule};
 use auspex_domain::status::Badge;
 use crux_core::Request;
 use support::{Shell, clean_preflight, evaluated, observed, path};
@@ -68,6 +68,7 @@ const fn draining() -> RollRule {
         kubernetes: true,
         drain: true,
         drain_timeout_seconds: 600,
+        etcd: false,
     }
 }
 
@@ -102,6 +103,7 @@ fn node(name: &str, ready: bool, cordoned: bool) -> Node {
         ready,
         cordoned,
         heartbeat: None,
+        etcd: false,
     }
 }
 
@@ -1789,4 +1791,203 @@ fn the_by_hand_command_quotes_a_kubeconfig_and_a_context_that_need_it() {
             .iter()
             .any(|l| matches!(&l.op, LogOp::End { text, .. } if text.contains(by_hand)))
     );
+}
+
+// ---------------------------------------------------------------------------------------
+// etcd
+// ---------------------------------------------------------------------------------------
+
+fn etcd_rule() -> RollRule {
+    RollRule {
+        kubernetes: true,
+        etcd: true,
+        ..RollRule::default()
+    }
+}
+
+/// The cluster's four nodes, all labelled etcd members, all Ready.
+fn etcd_cluster() -> Vec<Node> {
+    CLUSTER
+        .iter()
+        .map(|n| Node {
+            etcd: true,
+            ..node(n, true, false)
+        })
+        .collect()
+}
+
+fn pods(ready: &[(&str, bool)]) -> Vec<EtcdPod> {
+    ready
+        .iter()
+        .map(|(n, r)| EtcdPod {
+            node: (*n).to_owned(),
+            ready: *r,
+        })
+        .collect()
+}
+
+fn all_ready() -> Vec<EtcdPod> {
+    pods(&[
+        ("luna", true),
+        ("mars", true),
+        ("sol", true),
+        ("terra", true),
+    ])
+}
+
+/// `U` for an etcd group: the context, the nodes, then the etcd pods, answered; returns the dialog.
+fn plan_with_etcd(s: &mut Shell, nodes: Vec<Node>, etcd: Result<KubeReply, String>) -> Vec<String> {
+    s.send(Event::UpdateAll);
+    let mut k = take_kube(s);
+    assert_eq!(k.operation.op, KubeOp::Context);
+    s.resolve(&mut k, Ok(KubeReply::Cluster(cluster())));
+    let mut k = take_kube(s);
+    assert_eq!(k.operation.op, KubeOp::Nodes);
+    s.resolve(&mut k, Ok(KubeReply::Nodes(nodes)));
+    let mut k = take_kube(s);
+    assert_eq!(k.operation.op, KubeOp::EtcdPods);
+    assert_eq!(k.operation.context.as_deref(), Some("rke2"));
+    s.resolve(&mut k, etcd);
+    s.view().confirm.expect("the plan is asked about").lines
+}
+
+/// A machine's turn up to the point where its etcd is read, which is answered with `etcd`.
+fn etcd_turn(s: &mut Shell, machine: &str, nodes: Vec<Node>, etcd: Result<KubeReply, String>) {
+    pass_checks_without_read(s, machine);
+    let mut read = take_kube(s);
+    assert_eq!(read.operation.op, KubeOp::Nodes);
+    s.resolve(&mut read, Ok(KubeReply::Nodes(nodes)));
+    let mut read = take_kube(s);
+    assert_eq!(read.operation.op, KubeOp::EtcdPods);
+    assert_eq!(read.operation.context.as_deref(), Some("rke2"));
+    s.resolve(&mut read, etcd);
+}
+
+#[test]
+fn an_etcd_group_with_every_member_ready_is_planned_and_says_what_it_checks() {
+    let mut s = settled(config_with(etcd_rule(), 2));
+    let lines = plan_with_etcd(&mut s, etcd_cluster(), Ok(KubeReply::EtcdPods(all_ready())));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("rolling taghmata (") && l.contains("every etcd member")),
+        "{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("skipped luna")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn an_etcd_that_is_unhealthy_unreadable_or_unlabelled_refuses_the_group_in_the_plan() {
+    for (nodes, etcd, expect) in [
+        (
+            etcd_cluster(),
+            Ok(KubeReply::EtcdPods(pods(&[
+                ("luna", true),
+                ("mars", false),
+                ("sol", true),
+                ("terra", true),
+            ]))),
+            "etcd on mars is not ready",
+        ),
+        (
+            etcd_cluster(),
+            Err("Unable to connect to the server".to_owned()),
+            "cannot read etcd: Unable to connect",
+        ),
+        (
+            healthy_cluster(),
+            Ok(KubeReply::EtcdPods(all_ready())),
+            "cannot tell which nodes are etcd members",
+        ),
+    ] {
+        let mut s = settled(config_with(etcd_rule(), 2));
+        let lines = plan_with_etcd(&mut s, nodes, etcd);
+        let line = lines
+            .iter()
+            .find(|l| l.starts_with("skipped luna:"))
+            .unwrap_or_else(|| panic!("luna is skipped: {lines:?}"));
+        assert!(line.contains(expect), "{line}");
+        s.send(Event::ConfirmAnswer(true));
+        assert!(!preflights(&s).contains("luna"));
+    }
+}
+
+#[test]
+fn a_group_without_etcd_never_asks_for_the_pods() {
+    let mut s = settled(config_with(k8s(), 2));
+    start(&mut s, etcd_cluster());
+    pass_checks(&mut s, "luna");
+    assert!(s.kubes.is_empty(), "no pod list is asked for");
+}
+
+#[test]
+fn a_member_whose_etcd_is_not_ready_at_its_turn_stops_the_group_before_it_goes_out() {
+    let mut s = settled(config_with(etcd_rule(), 2));
+    plan_with_etcd(&mut s, etcd_cluster(), Ok(KubeReply::EtcdPods(all_ready())));
+    s.send(Event::ConfirmAnswer(true));
+    // luna: all ready, so it is updated.
+    etcd_turn(
+        &mut s,
+        "luna",
+        etcd_cluster(),
+        Ok(KubeReply::EtcdPods(all_ready())),
+    );
+    let mut a = take_action(&mut s, "luna");
+    s.resolve(&mut a, ended(ActionResult::Succeeded));
+    let mut w = take_await(&mut s, "luna");
+    assert!(w.operation.etcd, "the wait asks for the member's etcd too");
+    s.resolve(&mut w, Ok(()));
+    // mars's turn: sol's etcd is down.
+    etcd_turn(
+        &mut s,
+        "mars",
+        etcd_cluster(),
+        Ok(KubeReply::EtcdPods(pods(&[
+            ("luna", true),
+            ("mars", true),
+            ("sol", false),
+            ("terra", true),
+        ]))),
+    );
+    match state(&s, "mars") {
+        RollState::Failed(why) => assert_eq!(why, "etcd is not healthy: etcd on sol is not ready"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(state(&s, "sol"), RollState::Skipped(_)));
+    assert!(matches!(state(&s, "terra"), RollState::Skipped(_)));
+    assert!(s.actions.iter().all(|a| a.operation.machine != "mars"));
+    assert!(s.kubes.is_empty(), "nothing is drained or cordoned");
+}
+
+#[test]
+fn an_etcd_that_cannot_be_read_at_a_machines_turn_stops_the_group() {
+    for etcd in [
+        Err("Unable to connect to the server".to_owned()),
+        Ok(KubeReply::Done),
+        Ok(KubeReply::EtcdPods(Vec::new())),
+    ] {
+        let mut s = settled(config_with(etcd_rule(), 2));
+        plan_with_etcd(&mut s, etcd_cluster(), Ok(KubeReply::EtcdPods(all_ready())));
+        s.send(Event::ConfirmAnswer(true));
+        etcd_turn(&mut s, "luna", etcd_cluster(), etcd);
+        match state(&s, "luna") {
+            RollState::Failed(why) => assert!(why.contains("etcd"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(state(&s, "mars"), RollState::Skipped(_)));
+        assert!(s.actions.iter().all(|a| a.operation.machine != "luna"));
+    }
+}
+
+#[test]
+fn the_wait_asks_for_etcd_only_when_the_group_does() {
+    let mut s = settled(config_with(k8s(), 2));
+    start(&mut s, healthy_cluster());
+    pass_checks(&mut s, "luna");
+    let mut a = take_action(&mut s, "luna");
+    s.resolve(&mut a, ended(ActionResult::Succeeded));
+    assert!(!take_await(&mut s, "luna").operation.etcd);
 }
