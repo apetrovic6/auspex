@@ -1,0 +1,24 @@
+┌ machines (18) ─────────────────────────────────────┐┌ alfrost ───────────────────────────────────────────────────────┐
+│┌ runners: 7/8 online, 2 busy, 3 queued ─────────────────────────────────────────────────────────────────────────────┐│
+││forge.example.org (admin): 3 queued                                                                                 ││
+││alpha              idle                                  -          -                                           v9.…││
+││alpha-docker       busy                                  -          -                                           v9.…││
+││beta               idle                                  -          -                                           v9.…││
+││beta-nix           busy                                  -          -                                           v9.…││
+││ci.example.org (org:acme): 0 queued                                                                                 ││
+││delta              idle                                  -          -                                           v9.…││
+││delta-old          offline  [offline]                    -          -                                           v9.…││
+││gamma              idle                                  -          -                                           v9.…││
+││gamma-2            idle                                  -          -                                           v9.…││
+││busy: the forge does not say which job a runner runs                                                                ││
+││queued is a count of waiting jobs: the API gives no time to age them by                                             ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+│└q/esc close ────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ runners: 7/8 online, 2 busy, 3 queued │ settled │ 0 pending │ prom: ok                                  ? help

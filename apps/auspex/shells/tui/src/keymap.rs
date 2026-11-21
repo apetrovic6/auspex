@@ -55,6 +55,9 @@ pub enum Action {
     Log,
     /// The selected machine's package diff, in full (changed, added, removed).
     Diff,
+    /// The CI runners tab: every runner the forges list, with its machine's unit, memory and
+    /// the queue (read-only).
+    Runners,
     /// Toggle act mode (asks first; off again at once).
     Act,
     /// Update the selected machine (act mode only).
@@ -74,7 +77,7 @@ pub enum Action {
 
 impl Action {
     /// Every action, in the order the help overlay lists them.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Down,
         Self::Up,
         Self::HalfPageDown,
@@ -87,6 +90,7 @@ impl Action {
         Self::Detail,
         Self::Log,
         Self::Diff,
+        Self::Runners,
         Self::Act,
         Self::Update,
         Self::UpdateAll,
@@ -118,6 +122,7 @@ impl Action {
             Self::Detail => "detail",
             Self::Log => "log",
             Self::Diff => "diff",
+            Self::Runners => "runners",
             Self::Act => "act",
             Self::Update => "update",
             Self::UpdateAll => "update_all",
@@ -147,6 +152,7 @@ impl Action {
             Self::Detail => "machine detail (narrow)",
             Self::Log => "log tab: action output (Tab: notes)",
             Self::Diff => "package diff (q closes)",
+            Self::Runners => "CI runners tab (q closes)",
             Self::Act => "toggle act mode (asks first)",
             Self::Update => "update the machine (act mode)",
             Self::UpdateAll => "update all that are pending (act mode)",
@@ -176,6 +182,7 @@ impl Action {
             Self::Detail => &["enter", "tab"],
             Self::Log => &["L"],
             Self::Diff => &["d"],
+            Self::Runners => &["R"],
             Self::Act => &["A"],
             Self::Update => &["u"],
             Self::UpdateAll => &["U"],

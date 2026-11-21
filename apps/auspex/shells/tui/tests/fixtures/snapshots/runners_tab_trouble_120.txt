@@ -1,0 +1,24 @@
+┌ machines (18) ─────────────────────────────────────┐┌ alfrost ───────────────────────────────────────────────────────┐
+│┌ runners: … ────────────────────────────────────────────────────────────────────────────────────────────────────────┐│
+││forge.example.org (admin): queue unknown, forge: the forge refused the token (HTTP 403)                             ││
+││alpha              idle     [unit down] [memory]         alpha      unit failed            mem 95%  load 1.5/2  v9.…││
+││beta               offline  [offline] [unit up]          beta       unit active/running                         v9.…││
+││gamma              busy                                  -          -                                           v9.…││
+││ci.example.org (repo:acme/fleet): forge: the forge refused the token (HTTP 403)                                     ││
+││  [forge error]                                                                                                     ││
+││asking.example.org (user): asking…                                                                                  ││
+││busy: the forge does not say which job a runner runs                                                                ││
+││queued is a count of waiting jobs: the API gives no time to age them by                                             ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+││                                                                                                                    ││
+│└q/esc close ────────────────────────────────────────────────────────────────────────────────────────────────────────┘│
+└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ runners: … │ settled │ 0 pending │ prom: ok                                                             ? help

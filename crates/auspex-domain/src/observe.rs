@@ -30,6 +30,11 @@ use crate::text::{sanitize_line, sanitized_tail};
 //   PATH, which has no `darwin-version`.
 // - The `auspex_probe` and `auspex_end` markers bracket the output, so a login banner before
 //   it is skipped and a cut-off run is told apart from a machine that lacks a key.
+// - The runner units (AUS-19) are listed only when the script is given a glob (`probe_script_with`
+//   prefixes `auspex_runner_glob='…'`, a value `valid_unit_glob` has checked, so quoting it is
+//   safe). The glob is quoted at its use, so the shell never expands it against the local
+//   directory. At most 64 units, only loaded ones (`not-found` is a name something referred to),
+//   and a failing `systemctl` prints no key at all: "could not be read" is not "no runner units".
 // - Uptime, disk and load are always collected; whether to use them or Prometheus's is the
 //   caller's decision (`merge_health`), and costs nothing extra in the same round trip.
 //
@@ -56,6 +61,11 @@ kv uptime_seconds "$(cut -d' ' -f1 /proc/uptime 2>/dev/null)"
 kv load "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
 kv root_disk_kb "$(df -Pk / 2>/dev/null | awk 'NR==2 {print $2 " " $3 " " $4}')"
 kv store_disk_kb "$(df -Pk /nix/store 2>/dev/null | awk 'NR==2 {print $2 " " $3 " " $4}')"
+if [ -n "${auspex_runner_glob:-}" ]; then
+  if units=$(systemctl list-units --type=service --all --plain --no-legend --no-pager "$auspex_runner_glob" 2>/dev/null); then
+    kv runner_units "$(printf '%s\n' "$units" | awk 'BEGIN {sep = ""; n = 0} { i = ($1 ~ /\.service$/) ? 1 : 2; if (n < 64 && $(i + 1) == "loaded") { printf "%s%s %s %s", sep, $i, $(i + 2), $(i + 3); sep = ";"; n++ } }')"
+  fi
+fi
 printf 'auspex_end=1\n'
 "#;
 
@@ -83,6 +93,56 @@ pub const fn probe_script(class: MachineClass) -> &'static str {
         MachineClass::Nixos => NIXOS_PROBE,
         MachineClass::Darwin => DARWIN_PROBE,
     }
+}
+
+/// The glob the runner units are listed by when none is configured: what the NixOS module
+/// `services.gitea-actions-runner` names its units (`gitea-runner-<name>.service`).
+pub const DEFAULT_RUNNER_GLOB: &str = "gitea-runner-*";
+
+/// The longest unit glob accepted.
+pub const MAX_UNIT_GLOB: usize = 64;
+
+/// Whether `glob` can be handed to the probe.
+///
+/// 1 to [`MAX_UNIT_GLOB`] characters of systemd's
+/// unit-name set (letters, digits, `:` `_` `.` `@` `-`) and the glob characters `*` `?` `[` `]`.
+/// No quote, no backslash, no space, no `$`: it is written into a shell script inside single
+/// quotes, so this is what keeps a configured value from being a command.
+///
+/// # Errors
+///
+/// One line, which does not quote the glob.
+pub fn valid_unit_glob(glob: &str) -> Result<(), String> {
+    if glob.is_empty() || glob.len() > MAX_UNIT_GLOB {
+        return Err(format!("must be 1 to {MAX_UNIT_GLOB} characters"));
+    }
+    if !glob.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b':' | b'_' | b'.' | b'@' | b'-' | b'*' | b'?' | b'[' | b']'
+            )
+    }) {
+        return Err(
+            "may hold only letters, digits and : _ . @ - * ? [ ] (it is part of a shell script)"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// The probe script for a machine class that also lists the systemd units matching `glob`
+/// (NixOS; darwin has no units and prints nothing).
+///
+/// # Errors
+///
+/// [`valid_unit_glob`]'s reason.
+pub fn probe_script_with(class: MachineClass, runner_glob: &str) -> Result<String, String> {
+    valid_unit_glob(runner_glob)?;
+    Ok(format!(
+        "auspex_runner_glob='{runner_glob}'\n{}",
+        probe_script(class)
+    ))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -232,6 +292,74 @@ pub struct Memory {
     pub available_bytes: u64,
 }
 
+/// systemd's `ActiveState`, as `systemctl list-units` prints it (`systemd.unit(5)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitActive {
+    /// Running.
+    Active,
+    /// Running, and reloading its configuration.
+    Reloading,
+    /// Stopped (cleanly, or never started).
+    Inactive,
+    /// Stopped by a failure.
+    Failed,
+    /// Starting, or waiting to restart (a crash loop looks like this).
+    Activating,
+    /// Stopping.
+    Deactivating,
+    /// Under maintenance.
+    Maintenance,
+}
+
+impl UnitActive {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "active" => Self::Active,
+            "reloading" => Self::Reloading,
+            "inactive" => Self::Inactive,
+            "failed" => Self::Failed,
+            "activating" => Self::Activating,
+            "deactivating" => Self::Deactivating,
+            "maintenance" => Self::Maintenance,
+            _ => return None,
+        })
+    }
+
+    /// systemd's word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Reloading => "reloading",
+            Self::Inactive => "inactive",
+            Self::Failed => "failed",
+            Self::Activating => "activating",
+            Self::Deactivating => "deactivating",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+/// One systemd service the runner glob matched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerUnit {
+    /// The unit's name as systemd prints it, escapes (`\x2d`) kept, `.service` included: in
+    /// systemd's unit-name set and at most 255 characters.
+    pub unit: String,
+    /// `ActiveState`.
+    pub active: UnitActive,
+    /// `SubState` (`running`, `dead`, `failed`, `auto-restart`, …): lowercase letters and `-`, at
+    /// most [`MAX_SUB_STATE`] characters.
+    pub sub: String,
+}
+
+/// The most units a probe reports, and the most the parser accepts.
+pub const MAX_RUNNER_UNITS: usize = 64;
+
+/// The longest `SubState` accepted.
+pub const MAX_SUB_STATE: usize = 32;
+
 /// The health values the probe collects, before merging with Prometheus.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct SshHealth {
@@ -280,6 +408,13 @@ pub struct Observation {
     pub failed_units: Option<Vec<String>>,
     /// Uptime, disk and load as the probe saw them.
     pub ssh_health: SshHealth,
+    /// The systemd services the configured runner glob matched, at most [`MAX_RUNNER_UNITS`]. `None`
+    /// when unknown: not asked (no `[runners]`), darwin, `systemctl` failed, or any entry was
+    /// malformed (one forged name makes the whole list unreadable, as for `failed_units`).
+    /// `Some(vec![])` is "asked, systemd answered, nothing matched". Left out of the JSON when
+    /// unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_units: Option<Vec<RunnerUnit>>,
 }
 
 impl Observation {
@@ -403,6 +538,35 @@ fn parse_failed_units(v: &str) -> Option<Vec<String>> {
         .collect()
 }
 
+/// The runner units: `unit active sub` entries joined by `;`, or `None` when there are more than
+/// [`MAX_RUNNER_UNITS`] or any is malformed. An empty value is an empty list.
+fn parse_runner_units(v: &str) -> Option<Vec<RunnerUnit>> {
+    let v = v.trim();
+    if v.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut units = Vec::new();
+    for entry in v.split(';') {
+        let mut it = entry.split_whitespace();
+        let (unit, active, sub) = (it.next()?, it.next()?, it.next()?);
+        if it.next().is_some()
+            || units.len() == MAX_RUNNER_UNITS
+            || !is_unit_name(unit)
+            || !unit.ends_with(".service")
+            || sub.len() > MAX_SUB_STATE
+            || !sub.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+        {
+            return None;
+        }
+        units.push(RunnerUnit {
+            unit: unit.to_owned(),
+            active: UnitActive::parse(active)?,
+            sub: sub.to_owned(),
+        });
+    }
+    Some(units)
+}
+
 fn parse_uptime(v: &str) -> Option<u64> {
     let v = v.trim();
     let int = v.split_once('.').map_or(v, |(i, _)| i);
@@ -481,6 +645,7 @@ pub fn parse_probe(stdout: &str, stderr: &str, exit: ProbeExit) -> ProbeOutcome 
         system_state: None,
         failed_units: None,
         ssh_health: SshHealth::default(),
+        runner_units: None,
     };
     let mut started = false;
     let mut ended = false;
@@ -519,6 +684,7 @@ pub fn parse_probe(stdout: &str, stderr: &str, exit: ProbeExit) -> ProbeOutcome 
             "configuration_revision" => obs.configuration_revision = text_value(value),
             "system_state" => obs.system_state = parse_system_state(value),
             "failed_units" => obs.failed_units = parse_failed_units(value),
+            "runner_units" => obs.runner_units = parse_runner_units(value),
             "uptime_seconds" => obs.ssh_health.uptime_seconds = parse_uptime(value),
             "load" => obs.ssh_health.load = parse_load(value),
             "root_disk_kb" => obs.ssh_health.root_disk = parse_disk(value),
@@ -1094,6 +1260,91 @@ mod tests {
         assert_eq!(
             observed(parse_probe(&out, "", ProbeExit::Code(0))).current_system,
             None
+        );
+    }
+
+    fn with_units(value: &str) -> Option<Vec<RunnerUnit>> {
+        let out = format!("auspex_probe=1\nrunner_units={value}\nauspex_end=1\n");
+        observed(parse_probe(&out, "", ProbeExit::Code(0))).runner_units
+    }
+
+    #[test]
+    fn runner_units_are_parsed_and_one_bad_entry_spoils_the_list() {
+        let ok = with_units(
+            r"gitea-runner-a.service active running;gitea-runner-b\x2dc.service failed failed",
+        )
+        .unwrap();
+        assert_eq!(ok.len(), 2);
+        assert_eq!(ok[0].active, UnitActive::Active);
+        assert_eq!(ok[1].unit, r"gitea-runner-b\x2dc.service");
+        assert_eq!(ok[1].active, UnitActive::Failed);
+        // Asked and nothing matched is a fact; not asked is not.
+        assert_eq!(with_units(""), Some(vec![]));
+        let out = "auspex_probe=1\nauspex_end=1\n";
+        assert_eq!(
+            observed(parse_probe(out, "", ProbeExit::Code(0))).runner_units,
+            None
+        );
+        for bad in [
+            "a.service active",               // a field short
+            "a.service active running extra", // a field over
+            "a.timer active running",         // not a service
+            "a.service sideways running",     // not systemd's ActiveState
+            "a.service active RUNNING",       // not a SubState
+            "a.service active run_ning",
+            "bad name.service active running",
+            "a\u{1b}[31m.service active running",
+            "ok.service active running;;ok2.service active running",
+            "ok.service active running;evil;ok2.service active running",
+        ] {
+            assert_eq!(with_units(bad), None, "{bad:?}");
+        }
+        // The sub state is at most 32 characters.
+        assert!(with_units(&format!("a.service active {}", "x".repeat(32))).is_some());
+        assert_eq!(
+            with_units(&format!("a.service active {}", "x".repeat(33))),
+            None
+        );
+        // At most 64 units; a 65th is not believed.
+        let many = |n: usize| {
+            (0..n)
+                .map(|i| format!("a{i}.service active running"))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        assert_eq!(with_units(&many(64)).unwrap().len(), 64);
+        assert_eq!(with_units(&many(65)), None);
+    }
+
+    #[test]
+    fn the_unit_glob_is_a_value_that_cannot_be_a_command() {
+        for ok in ["gitea-runner-*", "ci-?", "a[bc]-*.x", "r_1@:y", "x"] {
+            assert!(valid_unit_glob(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "a b",
+            "a'b",
+            "a;b",
+            "a\"b",
+            "a`b",
+            "$(x)",
+            "a\\b",
+            "a/b",
+            "a\nb",
+            "é",
+            &"x".repeat(65),
+        ] {
+            assert!(valid_unit_glob(bad).is_err(), "{bad:?}");
+            assert!(probe_script_with(MachineClass::Nixos, bad).is_err());
+        }
+        let s = probe_script_with(MachineClass::Nixos, "gitea-runner-*").unwrap();
+        assert!(s.starts_with("auspex_runner_glob='gitea-runner-*'\n"));
+        assert!(s.ends_with(NIXOS_PROBE));
+        assert_eq!(
+            probe_script(MachineClass::Nixos),
+            NIXOS_PROBE,
+            "the plain script asks for no units"
         );
     }
 }

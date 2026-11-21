@@ -1,3 +1,4 @@
+| `R` | The Runners tab (see *CI runners* below): every runner the configured forges list, with its machine's unit, memory against its cap and badges, and what each forge's queue holds. Read-only; `q` or `Esc` closes it. |
 # auspex
 
 The Crux app: one core holding the decisions, one terminal shell drawing them.
@@ -8,7 +9,7 @@ shells/tui      terminal (ratatui): rendering, keys, and fulfilling the core's e
 ```
 
 The core never performs an effect; it asks for one, and the shell fulfils it by calling
-`crates/auspex-effects` (ssh, nix, Prometheus, the binary cache, the forge's CI status). The rules both sides apply
+`crates/auspex-effects` (ssh, nix, Prometheus, the binary cache, the forge's CI status, the CI runners). The rules both sides apply
 live in `crates/auspex-domain`. Dependencies point inward: the core never sees the effects
 crate.
 
@@ -507,6 +508,22 @@ kubeconfig = "~/.kube/config"
 url = "https://forge.example.org"   # https only, no credentials
 repo = "owner/name"                 # optional; default: from the fleet checkout's `origin` remote
 token_file = "~/.config/auspex/forge-token"   # optional; a read-only API token, never inline
+
+[runners]           # the CI runners tab and status line (see CI runners); omit [[runners.forge]] for none
+unit_glob = "gitea-runner-*"
+memory_warn_percent = 90
+
+[[runners.forge]]
+url = "https://forge.example.org"
+scope = "admin"                   # admin | user | org:<name> | repo:<owner>/<name>
+token_file = "~/.config/auspex/forge-admin-token"
+
+[runners.hosts.alpha]             # optional caps for the Prometheus figures
+cpus = 2
+memory = "4GiB"
+
+[runners.machines]                # optional: runner name -> machine name
+"alpha-docker" = "alpha"
 ```
 
 The config file's `flake` and `CLAN_DIR` take a leading `~/` (your `$HOME`; `~user/` is refused);
@@ -608,6 +625,91 @@ send the token on to another host; and a token is sent only over `https` (or to 
 address, which only a test uses: `forge.url` itself must be `https`). The token never reaches
 `config.toml` through Home Manager either: `programs.auspex.settings.forge.token_file` is a path,
 and one inside the Nix store (world-readable) is refused at evaluation.
+
+## CI runners
+
+With a `[[runners.forge]]` configured, `R` opens the **Runners tab** and the status bar says
+`runners: 7/8 online, 2 busy, 3 queued`. The tab is read-only: nothing in it acts on a runner (`q`
+or `Esc` closes it, the scroll keys move it, every other key does nothing until it is closed).
+`--json` carries the same data as `runners` (one entry per runner) and `runner_forges` (what each
+forge gave beside rows: its queue, or why it failed).
+
+```toml
+[runners]
+unit_glob = "gitea-runner-*"   # which systemd units are runner units (NixOS: the default)
+memory_warn_percent = 90       # badge a row from this share of its host's memory cap
+
+[[runners.forge]]
+url = "https://forge.example.org"
+scope = "admin"                # admin | user | org:<name> | repo:<owner>/<name>
+token_file = "~/.config/auspex/forge-admin-token"   # read-only; `admin` needs read:admin
+
+[runners.hosts.alpha]          # optional caps for the Prometheus figures
+cpus = 2
+memory = "4GiB"
+
+[runners.machines]             # optional: runner name -> machine name
+"alpha-docker" = "alpha"
+```
+
+**Three sources, joined.** A row is `(forge, runner name)`.
+
+1. **The forge** (Forgejo 15 / gitea 1.22): `GET /api/v1/{admin,user,orgs/<org>,repos/<owner>/<repo>}/actions/runners`
+   (paged: 50 a page, until an empty page) for each runner's `name`, `status` (`offline`, `idle`,
+   `active`), `labels` and `version`, and `…/actions/runners/jobs` for the jobs that are waiting.
+2. **ssh**, NixOS only: the probe lists the systemd services matching `unit_glob`
+   (`systemctl list-units --type=service --all`, loaded units only, at most 64) in the round trip
+   it makes anyway. The glob is checked (letters, digits and `: _ . @ - * ? [ ]`: it is written into
+   a shell script) and the unit names and states are checked like the failed-unit list's: one
+   malformed entry makes the whole list unreadable, never half-believed. darwin reports nothing.
+   The default matches what the NixOS module `services.gitea-actions-runner` names its units,
+   `gitea-runner-<name>.service`; without a `[[runners.forge]]` the probe lists no units.
+3. **Prometheus**, when `[prometheus]` is configured: the host's memory in use (total less
+   available) against `[runners.hosts.<machine>] memory`, and its one-minute load against `cpus`.
+   **No cap is assumed**: a host with no entry shows no figure and no badge, however full it is.
+   The load average is a stand-in for CPU use (it is what the fleet-wide query already carries).
+
+**Joining.** A runner is on the machine `[runners.machines]` names for it, else the machine whose
+name it equals or begins with `<machine>-` (the longest such machine). Its unit is that machine's
+runner unit whose instance name (`gitea-runner-<instance>.service`, the glob's literal prefix and
+systemd's `\x2d` escapes removed) equals the runner's name or its name without `<machine>-`. A
+machine whose probe did not report units has no unit facts and is never called "unit down".
+
+**Badges**, per row (the first three make it red; in `--json`, `badges`):
+
+| badge | when |
+|---|---|
+| `offline` | the forge says the runner is offline |
+| `unit down` (`forge_up_unit_down`) | the forge says online (idle or busy) and its unit is inactive, failed, deactivating or in maintenance |
+| `unit up` (`forge_down_unit_up`) | the forge says offline and its unit is active or reloading |
+| `memory` (`memory_near_cap`) | the host's memory in use is at or above `memory_warn_percent` of its cap (not red) |
+| `forge error` | the forge could not be asked: one row for the whole entry, with the reason |
+
+A unit that is `activating` (starting, or waiting to restart) is neither up nor down, so it earns
+no mismatch badge. A forge status the API does not define is `unknown`: not online, not offline.
+
+**What the forge's API does not say, and so the tab does not.** `ActionRunner` has no field for the
+job a runner is running, and the waiting-jobs payload has no time at all, so:
+
+- a busy runner is **busy**; which job it runs is not known and is not guessed;
+- the queue is a **count** of waiting jobs (those with status `waiting`, or none); there is no
+  "oldest has waited 12 minutes";
+- there is **no "job running too long" badge**: the API does not say when a job began. It will be
+  added when the API does.
+
+**A failing forge** shows on its own row, with the reason, and never delays a machine row or the
+refresh: every request is bounded (one timeout, `timeouts.probe`, for the whole listing and one
+for the queue, side by side; 1 MiB a page; at most 1,000 runners over 20 pages and 10,000 jobs,
+counted while the body is read, and past a bound the answer is an error, never a truncated list
+that would read as the truth). The runners and the queue fail independently: a token that may list
+runners and not jobs still shows the runners, with the queue `?`. The forge's reason is written to
+the Log tab once.
+
+**The token** is read and guarded exactly as the CI badge's (see above): per entry, from its
+`token_file`, refused with the reason when others can read it, never quoted, sent only over
+`https`, never followed through a redirect. Every reason and every runner name, label and version
+the forge sent is checked for it and replaced when it holds it. A refused token makes that entry
+a `forge error` row and sends nothing to it.
 
 ## Package preview
 

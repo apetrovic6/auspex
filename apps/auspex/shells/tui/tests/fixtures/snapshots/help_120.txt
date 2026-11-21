@@ -11,12 +11,13 @@
 │ ↑◆   luna                 upda│enter tab     machine detail (narrow)                 │                               │
 │ ✗    mars                 unre│L             log tab: action output (Tab: notes)     │                               │
 │ ✓    mechanicus-forge-wo… in s│d             package diff (q closes)                 │                               │
-│ ✓    phobos               in s│A             toggle act mode (asks first)            │sed, 128.3 GiB free            │
-│ ↑◆   sol                  upda│u             update the machine (act mode)           │                               │
-│ ✓    terra                in s│U             update all that are pending (act mode)  │eus)                           │
-│ ✓    titan                in s│b             build its pending system here           │ee (prometheus)                │
-│ ✗    triton               unre│s             ssh to the machine (act mode)           │                               │
-│ !    vulcan               eval│f             freeze the machine (asks to unfreeze)   │                               │
+│ ✓    phobos               in s│R             CI runners tab (q closes)               │sed, 128.3 GiB free            │
+│ ↑◆   sol                  upda│A             toggle act mode (asks first)            │                               │
+│ ✓    terra                in s│u             update the machine (act mode)           │eus)                           │
+│ ✓    titan                in s│U             update all that are pending (act mode)  │ee (prometheus)                │
+│ ✗    triton               unre│b             build its pending system here           │                               │
+│ !    vulcan               eval│s             ssh to the machine (act mode)           │                               │
+│                               │f             freeze the machine (asks to unfreeze)   │                               │
 │                               │r             scan again                              │                               │
 │                               │:             command (:q, :refresh)                  │                               │
 │                               │?             this help                               │                               │
@@ -34,7 +35,6 @@
 │                               │✗ unreachable                                         │                               │
 │                               │! eval error                                          │                               │
 │                               │❄ frozen                                              │                               │
-│                               └──────────────────────────────────────────────────────┘                               │
-└────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+└───────────────────────────────└──────────────────────────────────────────────────────┘───────────────────────────────┘
 log: eval results stored in the cache: cypramundi, deimos, luna
 OBSERVE │ settled │ 0 pending │ prom: ok                                                                          ? help

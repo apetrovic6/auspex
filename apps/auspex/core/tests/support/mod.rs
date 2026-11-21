@@ -13,7 +13,8 @@ use auspex_core::effects::{
     ActionRequest, AwaitRequest, CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest,
     FleetLockRequest, ForgeHeadRequest, ForgeStatusRequest, InventoryRequest, KubeRequest,
     LoadFreezesRequest, LogRequest, PendingClosureRequest, PreflightRequest, ProbeRequest,
-    PrometheusRequest, ResolveRequest, SaveFreezeRequest, ShellRequest, TreeRequest,
+    PrometheusRequest, ResolveRequest, RunnersRequest, SaveFreezeRequest, ShellRequest,
+    TreeRequest,
 };
 use auspex_core::{
     Auspex, Config, Core, DiffConfig, Effect, Event, FreezeConfig, PrometheusConfig, RequestId,
@@ -117,6 +118,7 @@ pub fn full_config() -> Config {
             max_age_seconds: 60,
         }),
         forge: None,
+        runners: None,
         binary_cache: true,
         diff: None,
         allow_act: false,
@@ -156,6 +158,8 @@ pub struct Shell {
     /// The CI badge's reads of `HEAD`, and its questions to the forge.
     pub forge_heads: Vec<Request<ForgeHeadRequest>>,
     pub forge_statuses: Vec<Request<ForgeStatusRequest>>,
+    /// The runners view's questions to the forges, one per `[[runners.forge]]` entry.
+    pub runner_requests: Vec<Request<RunnersRequest>>,
     pub caches: Vec<Request<CacheRequest>>,
     pub resolves: Vec<Request<ResolveRequest>>,
     pub deployed: Vec<Request<DeployedClosureRequest>>,
@@ -215,6 +219,7 @@ impl Shell {
             prometheus: Vec::new(),
             forge_heads: Vec::new(),
             forge_statuses: Vec::new(),
+            runner_requests: Vec::new(),
             caches: Vec::new(),
             resolves: Vec::new(),
             deployed: Vec::new(),
@@ -283,6 +288,10 @@ impl Shell {
                 Effect::ForgeStatus(r) => {
                     self.issued.push(r.operation.id);
                     self.forge_statuses.push(r);
+                }
+                Effect::Runners(r) => {
+                    self.issued.push(r.operation.id);
+                    self.runner_requests.push(r);
                 }
                 Effect::CacheLookup(r) => {
                     self.issued.push(r.operation.id);
@@ -458,6 +467,15 @@ impl Shell {
             "one status request outstanding"
         );
         self.forge_statuses.remove(0)
+    }
+
+    pub fn take_runners(&mut self, forge: usize) -> Request<RunnersRequest> {
+        let i = self
+            .runner_requests
+            .iter()
+            .position(|r| r.operation.forge == forge)
+            .unwrap_or_else(|| panic!("no runners request for forge {forge}"));
+        self.runner_requests.remove(i)
     }
 
     pub fn take_cache(&mut self, machine: &str) -> Request<CacheRequest> {

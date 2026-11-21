@@ -1,0 +1,24 @@
+┌ machines (18) ───────────────────────┐
+│┌ runners: 7/8 online, 2 busy, 3 q…──┐│
+││forge.example.org (admin): 3 queued ││
+││alpha idle                          ││
+││alpha-docker busy                   ││
+││beta idle                           ││
+││beta-nix busy                       ││
+││ci.example.org (org:acme): 0 queued ││
+││delta idle                          ││
+││delta-old offline                   ││
+││  [offline]                         ││
+││gamma idle                          ││
+││gamma-2 idle                        ││
+││busy: the forge does not say which  ││
+││job a runner runs                   ││
+││queued is a count of waiting jobs:  ││
+││the API gives no time to age them by││
+││                                    ││
+││                                    ││
+││                                    ││
+│└q/esc close ────────────────────────┘│
+└──────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ runners: 7/8 online, 2 busy, …

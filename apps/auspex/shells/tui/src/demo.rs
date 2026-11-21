@@ -64,6 +64,7 @@ pub fn config() -> Config {
             max_age_seconds: 60,
         }),
         forge: None,
+        runners: None,
         binary_cache: true,
         diff: Some(DiffConfig {
             timeout_seconds: 120,

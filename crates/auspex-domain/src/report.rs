@@ -29,6 +29,7 @@ use crate::fleet::{
     lint_hostname, shared_ip_lints,
 };
 use crate::observe::{Health, ProbeOutcome};
+use crate::runners::{ForgeFacts, RunnerRow, RunnersReport};
 use crate::status::{Badge, MachineFacts, machine_status};
 use crate::text::sanitize_line;
 
@@ -86,6 +87,24 @@ pub struct FleetReport {
     /// version 1; a report without it reads as `off`.
     #[serde(default)]
     pub fleet_ci: FleetCi,
+    /// The CI runners (`[runners]`), one entry per (forge, runner name), forge order then name:
+    /// `{"forge", "name", "status", "labels", "version", "machine", "unit", "memory", "load",
+    /// "badges", "error"}`. `status` is `"offline"`, `"idle"`, `"active"` (busy: the API does not
+    /// say which job) or `"unknown"`. `machine` and `unit` (`{"unit", "active", "sub"}`) are `null`
+    /// when the runner could not be joined; `memory` (`{"used_bytes", "cap_bytes", "percent"}`) and
+    /// `load` (`{"one", "cpus"}`) are `null` without a cap in `[runners.hosts.<machine>]` or a
+    /// Prometheus figure. `badges` are any of `"offline"`, `"forge_up_unit_down"`,
+    /// `"forge_down_unit_up"`, `"memory_near_cap"` and `"forge_error"`. A forge entry that failed
+    /// (or is still being asked) is one row with `name: null` and its reason in `error`. Empty
+    /// when `[runners]` is not configured. The token never appears. Added to version 1; a report
+    /// without it reads as empty.
+    #[serde(default)]
+    pub runners: Vec<RunnerRow>,
+    /// What each `[[runners.forge]]` entry gave besides rows: `{"forge", "scope", "checking",
+    /// "error", "queued", "queue_error"}`. `queued` is the number of waiting jobs (a count: the
+    /// API gives no time) or `null` with `queue_error` saying why. Added to version 1.
+    #[serde(default)]
+    pub runner_forges: Vec<ForgeFacts>,
 }
 
 /// What went wrong for the whole fleet; see [`FleetReport::errors`].
@@ -129,7 +148,7 @@ impl FleetError {
 /// The default is "still in progress, no deadline, no fleet errors": a caller has to say the
 /// scan is complete before a report can read as settled, so forgetting to cannot produce a
 /// settled, empty fleet.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FleetFacts {
     /// Every fleet-wide request is back: the machine list, the evaluator's final answer
     /// (the process exited, so no more lines are coming), and any query for the whole fleet
@@ -143,6 +162,9 @@ pub struct FleetFacts {
     /// The CI badge as it stands ([`FleetCi::off`] when `[forge]` is not configured). While its
     /// request is out it is an `unknown` that says so, and `scan_complete` stays `false`.
     pub fleet_ci: FleetCi,
+    /// The runners view as it stands (empty without `[runners]`). While a forge entry is still
+    /// being asked `scan_complete` stays `false`.
+    pub runners: RunnersReport,
 }
 
 /// One machine.
@@ -425,5 +447,7 @@ pub fn fleet_report(
         machines,
         shared_ips,
         fleet_ci: fleet.fleet_ci,
+        runners: fleet.runners.rows,
+        runner_forges: fleet.runners.forges,
     }
 }

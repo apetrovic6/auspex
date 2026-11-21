@@ -2,7 +2,7 @@
 
 auspex's pure rules: the inventory parser, ssh targets and their resolution, the ssh
 argument vector, the probe scripts and their parser, Prometheus merging, `nix-eval-jobs`
-lines, the eval cache key, package closure diffs, the status badges, the CI badge's rules (`ci`: remote parsing, which repository to ask, what the forge's states mean), and the versioned `--json` contract.
+lines, the eval cache key, package closure diffs, the status badges, the CI badge's rules (`ci`: remote parsing, which repository to ask, what the forge's states mean), the CI runners view's (`runners`: scopes, joining a runner to its machine and unit, the badges and the summary line), and the versioned `--json` contract.
 
 **Admission rule:** a function belongs here when it takes values and returns values. No I/O,
 no async, no process spawning, no filesystem, no clock, no environment. Whatever *obtains* an

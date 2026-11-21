@@ -14,11 +14,12 @@ use auspex_core::effects::{
     DeployedClosureRequest, EvalRequest, ForgeHeadAnswer, ForgeHeadRequest, ForgeStatusAnswer,
     ForgeStatusRequest, InventoryAnswer, InventoryRequest, KubeAnswer, KubeOp, KubeReply,
     KubeRequest, PendingClosureRequest, PreflightAnswer, PreflightRequest, ProbeRequest,
-    PrometheusAnswer, PrometheusRequest, ResolveRequest, ShellRequest, TreeRequest,
+    PrometheusAnswer, PrometheusRequest, ResolveRequest, RunnersRequest, ShellRequest, TreeRequest,
 };
 use auspex_domain::fleet::ConnectTimeout;
 use auspex_domain::observe::ProbeOutcome;
 use auspex_domain::preflight::TreeState;
+use auspex_domain::runners::{ForgeAnswer, Scope};
 use auspex_domain::status::NarCache;
 use auspex_effects::cache::{self, CacheParams, GitParams};
 use auspex_effects::clan::{self, ClanLine, ClanLocator, ClanRun, ResolveParams, RunParams};
@@ -28,7 +29,10 @@ use auspex_effects::http::HttpClient;
 use auspex_effects::kube::{self, KubeParams};
 use auspex_effects::nix::{self, EvalItem, EvalMachine, EvalParams, FlakeRef};
 use auspex_effects::ssh::{self, ControlDir, ProbeParams};
-use auspex_effects::{CancellationToken, Cancelled, act, dns, narinfo, preflight, prometheus};
+use auspex_effects::{
+    CancellationToken, Cancelled, act, dns, narinfo, preflight, prometheus,
+    runners as forge_runners,
+};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::config::{FlakeSource, Settings};
@@ -182,6 +186,23 @@ impl Backend {
         match self {
             Self::Real(r) => r.forge_status(op, cancel).await,
             Self::Demo(_) => Ok(Err("the demo has no forge".to_owned())),
+        }
+    }
+
+    /// `Effect::Runners`: one forge entry's runners and queue.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn runners(
+        &self,
+        op: &RunnersRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ForgeAnswer, Cancelled> {
+        match self {
+            Self::Real(r) => r.runners(op, cancel).await,
+            // The demo configures no forge, so the core never asks; if it did, say so.
+            Self::Demo(_) => Ok(forge_failure("the demo has no forge")),
         }
     }
 
@@ -428,6 +449,22 @@ struct ForgeAdapter {
     token: Result<Option<Token>, String>,
 }
 
+/// Both reads of a forge entry failed, for the same reason.
+fn forge_failure(why: &str) -> ForgeAnswer {
+    ForgeAnswer {
+        runners: Err(why.to_owned()),
+        queued: Err(why.to_owned()),
+    }
+}
+
+/// One `[[runners.forge]]` entry as the adapter needs it: where, whose runners, and the token
+/// read at start (or why it could not be: then no request is made, as for the CI badge).
+struct RunnerAdapter {
+    url: String,
+    scope: Scope,
+    token: Result<Option<Token>, String>,
+}
+
 /// The real adapters, with everything they need from the config.
 pub struct Real {
     ssh: OsString,
@@ -453,6 +490,10 @@ pub struct Real {
     cache_url: Option<String>,
     /// The CI badge's forge, when `[forge]` is configured.
     forge: Option<ForgeAdapter>,
+    /// The runners view's forges, in config order (a request names one by its index).
+    runner_forges: Vec<RunnerAdapter>,
+    /// `[runners] unit_glob`, when `[runners]` is configured: the probe lists the units it matches.
+    runner_glob: Option<String>,
     cache_dir: Option<PathBuf>,
     flake_source: FlakeSource,
     /// Which `clan` each fleet pins, found once and kept for the run.
@@ -518,6 +559,21 @@ impl Real {
                     .map(forge::read_token_file)
                     .transpose(),
             }),
+            runner_forges: settings.runners.as_ref().map_or_else(Vec::new, |r| {
+                r.forges
+                    .iter()
+                    .map(|f| RunnerAdapter {
+                        url: f.url.clone(),
+                        scope: f.scope.clone(),
+                        token: f
+                            .token_file
+                            .as_deref()
+                            .map(forge::read_token_file)
+                            .transpose(),
+                    })
+                    .collect()
+            }),
+            runner_glob: settings.runners.as_ref().map(|r| r.unit_glob.clone()),
             cache_dir: cache::default_dir(),
             flake_source,
             clan: ClanLocator::new(),
@@ -581,6 +637,8 @@ impl Real {
             explicit_instances: BTreeSet::new(),
             cache_url: None,
             forge: None,
+            runner_forges: Vec::new(),
+            runner_glob: None,
             cache_dir: None,
             flake_source: FlakeSource::Default,
             clan: ClanLocator::new(),
@@ -640,6 +698,20 @@ impl Real {
                 notes.push(format!("no HTTP client, so the CI badge is unknown: {why}"));
             }
         }
+        for f in &self.runner_forges {
+            if let Err(why) = &f.token {
+                notes.push(format!(
+                    "the runners of a forge are unknown, and no request is made: {why}"
+                ));
+            }
+        }
+        if !self.runner_forges.is_empty()
+            && let Err(why) = &self.http
+        {
+            notes.push(format!(
+                "no HTTP client, so the runners of every forge are unknown: {why}"
+            ));
+        }
         notes
     }
 
@@ -685,6 +757,7 @@ impl Real {
         params.approval_deadline = self.approval_deadline;
         params.on_approval = Some(on_approval);
         params.deadline = self.probe_deadline;
+        params.runner_glob = self.runner_glob.as_deref();
         ssh::probe(&op.target, op.class, &params, cancel).await
     }
 
@@ -771,6 +844,26 @@ impl Real {
             .and_then(|f| f.token.as_ref().ok())
             .and_then(Option::as_ref);
         forge::head(&git, &flake, op.want_origin, token, cancel).await
+    }
+
+    /// `Effect::Runners`: the runners and the queue of one forge entry, with its token.
+    async fn runners(
+        &self,
+        op: &RunnersRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ForgeAnswer, Cancelled> {
+        let Some(f) = self.runner_forges.get(op.forge) else {
+            return Ok(forge_failure("no such forge entry"));
+        };
+        let client = match &self.http {
+            Ok(c) => c,
+            Err(why) => return Ok(forge_failure(&format!("forge: {why}"))),
+        };
+        let token = match &f.token {
+            Ok(t) => t.as_ref(),
+            Err(why) => return Ok(forge_failure(why)),
+        };
+        forge_runners::list(client, &f.url, &f.scope, token, self.http_timeout, cancel).await
     }
 
     /// `Effect::ForgeStatus`: one request, with the token when there is one.

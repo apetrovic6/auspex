@@ -123,6 +123,8 @@ fn expected_report(
         "settled": true,
         "errors": [],
         "fleet_ci": {"commit": null, "state": "off", "url": null, "reason": null},
+        "runners": [],
+        "runner_forges": [],
         "machines": [
             {
                 "name": "cerberus",

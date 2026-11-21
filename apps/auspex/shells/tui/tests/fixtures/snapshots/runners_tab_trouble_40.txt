@@ -1,0 +1,24 @@
+┌ machines (18) ───────────────────────┐
+│┌ runners: … ────────────────────────┐│
+││forge.example.org (admin): queue    ││
+││  unknown, forge: the forge refused ││
+││  the token (HTTP 403)              ││
+││alpha idle on alpha                 ││
+││  [unit down] [memory]              ││
+││  unit failed mem 95% load 1.5/2    ││
+││beta offline on beta                ││
+││  [offline] [unit up]               ││
+││  unit active/running               ││
+││gamma busy                          ││
+││ci.example.org (repo:acme/fleet):   ││
+││  forge: the forge refused the token││
+││  (HTTP 403)                        ││
+││  [forge error]                     ││
+││asking.example.org (user): asking…  ││
+││busy: the forge does not say which  ││
+││job a runner runs                   ││
+││queued is a count of waiting jobs:  ││
+│└ 1–18/19 q/esc close ───────────────┘│
+└──────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ runners: … │ settled │ 0 pend…

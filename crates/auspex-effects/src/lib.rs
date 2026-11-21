@@ -36,6 +36,8 @@
 //!   fleet at a time.
 //! - [`forge`]: the CI badge: `HEAD` of the fleet checkout, the forge's combined commit status for it,
 //!   and the API token (read from a file that only its owner can reach).
+//! - [`runners`]: the CI runners view: a forge entry's runners (paged) and its waiting jobs, bounded and
+//!   guarded for the token as the badge is.
 //! - [`dns`]: hostname resolution for the shared-IP lint.
 //! - [`http`]: the one HTTP client the HTTP adapters share.
 //!
@@ -126,6 +128,7 @@ pub mod narinfo;
 pub mod nix;
 pub mod preflight;
 pub mod prometheus;
+pub mod runners;
 pub mod ssh;
 
 mod process;

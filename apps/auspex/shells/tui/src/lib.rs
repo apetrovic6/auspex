@@ -31,6 +31,7 @@ pub mod log;
 pub mod output;
 pub mod packages;
 pub mod panics;
+pub mod runners;
 pub mod shell;
 pub mod theme;
 pub mod ui;

@@ -23,7 +23,9 @@ use std::{fmt, fs, io};
 use auspex_domain::fleet::{
     ConnectTimeout, MachineClass, PROBE_REMOTE_COMMAND, SshOptions, Target, ssh_args,
 };
-use auspex_domain::observe::{ProbeExit, ProbeOutcome, parse_probe, probe_script};
+use auspex_domain::observe::{
+    ProbeExit, ProbeOutcome, parse_probe, probe_script, probe_script_with,
+};
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -193,6 +195,10 @@ pub struct ProbeParams<'a> {
     /// The script deadline after authentication ([`DEFAULT_PROBE_DEADLINE`] by default).
     /// Past it, ssh's process group is killed and the probe is `ProbeExit::TimedOut`.
     pub deadline: Duration,
+    /// The glob the runner systemd units are listed by (`[runners] unit_glob`), or `None` to list
+    /// none (the default: a fleet without `[runners]` runs the plain script). The probe is
+    /// `Failed` for a glob [`auspex_domain::observe::valid_unit_glob`] refuses.
+    pub runner_glob: Option<&'a str>,
 }
 
 impl<'a> ProbeParams<'a> {
@@ -207,6 +213,7 @@ impl<'a> ProbeParams<'a> {
             approval_deadline: Duration::from_secs(60),
             on_approval: None,
             deadline: DEFAULT_PROBE_DEADLINE,
+            runner_glob: None,
         }
     }
 }
@@ -660,7 +667,17 @@ pub async fn probe(
     // environment; BatchMode (in `ssh_args`) covers the destination itself.
     cmd.env_remove("SSH_ASKPASS")
         .env("SSH_ASKPASS_REQUIRE", "never");
-    let script = probe_script(class).as_bytes().to_vec();
+    let script = match params.runner_glob {
+        None => probe_script(class).as_bytes().to_vec(),
+        Some(glob) => match probe_script_with(class, glob) {
+            Ok(s) => s.into_bytes(),
+            Err(why) => {
+                return Ok(ProbeOutcome::Failed {
+                    reason: format!("the runner unit glob {why}"),
+                });
+            }
+        },
+    };
     let limits = Limits {
         stdout: STDOUT_CAP,
         stderr: STDERR_CAP,
