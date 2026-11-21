@@ -57,6 +57,7 @@ use crate::cordon::{Cordons, LAST_RESORT_BOUND};
 use crate::handoff::Handoff;
 use crate::log::Log;
 use crate::output::{Output, Stream};
+use crate::panics::{Internal, Panicked, guarded, internal_error};
 
 /// How many per-machine calls (probes, cache lookups) may run at once.
 ///
@@ -626,11 +627,16 @@ impl Shell {
         work: impl Future<Output = Result<Op::Output, Cancelled>> + Send + 'static,
     ) where
         Op: Operation,
-        Op::Output: Send,
+        Op::Output: Send + Internal,
     {
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {
-            let answer = work.await;
+            // A panic in the adapter's call is answered as a failure: the request is held here,
+            // outside the call, so it survives, and the core is not left waiting for it.
+            let answer = match guarded(work).await {
+                Ok(answer) => answer,
+                Err(Panicked(why)) => Ok(Op::Output::internal(&why)),
+            };
             shell.forget(id);
             if let Ok(answer) = answer {
                 shell.resolve(&mut request, answer);
@@ -646,7 +652,7 @@ impl Shell {
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {
             let (tx, mut rx) = unbounded_channel();
-            let work = shell.backend.evaluate(&op, &token, tx);
+            let work = guarded(shell.backend.evaluate(&op, &token, tx));
             tokio::pin!(work);
             let mut outcome = None;
             let mut finished = false;
@@ -675,13 +681,22 @@ impl Shell {
                 None => work.await,
             };
             shell.forget(id);
-            if outcome.is_ok() && !finished {
-                shell.resolve(
+            match outcome {
+                // The evaluator's call panicked: the stream is finished with the reason, so the
+                // machines still waiting for a result get their error now.
+                Err(Panicked(why)) if !finished => shell.resolve(
+                    &mut request,
+                    EvalAnswer::Finished {
+                        error: Some(internal_error(&why)),
+                    },
+                ),
+                Ok(Ok(())) if !finished => shell.resolve(
                     &mut request,
                     EvalAnswer::Finished {
                         error: Some("the evaluator stopped without a final answer".to_owned()),
                     },
-                );
+                ),
+                _ => {}
             }
             // The stream is over (or cancelled): the request is dropped here.
         });
@@ -1004,10 +1019,10 @@ impl Shell {
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {
             let answer: SaveFreezeAnswer = if let Some(store) = store {
-                store
-                    .set_with(&op.machine, op.frozen, &op.also_frozen)
-                    .await
-                    .map_err(|e| e.to_string())
+                match guarded(store.set_with(&op.machine, op.frozen, &op.also_frozen)).await {
+                    Ok(saved) => saved.map_err(|e| e.to_string()),
+                    Err(Panicked(why)) => Err(internal_error(&why)),
+                }
             } else {
                 let mut set = lock(&shell.frozen_in_memory);
                 set.extend(op.also_frozen.iter().cloned());
@@ -1052,7 +1067,10 @@ impl Shell {
     ) {
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {
-            let answer = shell.read_freezes().await;
+            let answer = match guarded(shell.read_freezes()).await {
+                Ok(answer) => answer,
+                Err(Panicked(why)) => Err(internal_error(&why)),
+            };
             shell.resolve(&mut request, answer);
         });
     }
@@ -1097,13 +1115,16 @@ impl Shell {
             }
         }
         self.tasks.spawn(async move {
-            let answer = shell
-                .backend
-                .kube(&op, &token, &|stream, text| {
-                    shell.output.push_to(key, stream, text);
-                })
-                .await
-                .unwrap_or(Ok(KubeReply::Cancelled));
+            // A panic in the call is a failed call: a drain's node was registered above, so the
+            // core's answer to the failure (an uncordon) and the last resort both have it.
+            let answer = match guarded(shell.backend.kube(&op, &token, &|stream, text| {
+                shell.output.push_to(key, stream, text);
+            }))
+            .await
+            {
+                Ok(answer) => answer.unwrap_or(Ok(KubeReply::Cancelled)),
+                Err(Panicked(why)) => Err(internal_error(&why)),
+            };
             shell.forget(op.id);
             if let (KubeOp::Uncordon { node }, Ok(KubeReply::Done)) = (&op.op, &answer) {
                 shell.cordons.release(node);
@@ -1228,7 +1249,7 @@ impl Shell {
             let gate_refused = gate.is_err();
             let started = AtomicBool::new(false);
             let (logged, ran) = if let Err(reason) = gate {
-                (None, Ok(Err(reason)))
+                (None, Ok(Ok(Err(reason))))
             } else {
                 // A machine of an update of all has its row open already when it was drained, and
                 // closes it when its run ends (with the wait, the uncordon); a lone `u` or `b` has
@@ -1243,31 +1264,43 @@ impl Shell {
                 // minutes, and a quit then has done nothing to the machine): a node drained for
                 // it is not auspex's to put back if auspex goes away (the machine may be half
                 // updated), only to say.
-                let ran = shell
-                    .backend
-                    .run_action(
-                        &op,
-                        &token,
-                        &|stream, text| {
-                            shell.output.push_to(key, stream, text);
-                        },
-                        &|| {
-                            started.store(true, Ordering::SeqCst);
-                            shell.cordons.commit(&op.machine);
-                        },
-                    )
-                    .await;
+                let ran = guarded(shell.backend.run_action(
+                    &op,
+                    &token,
+                    &|stream, text| {
+                        shell.output.push_to(key, stream, text);
+                    },
+                    &|| {
+                        started.store(true, Ordering::SeqCst);
+                        shell.cordons.commit(&op.machine);
+                    },
+                ))
+                .await;
                 (logged, ran)
             };
             shell.forget(op.id);
-            let end = action_end(
-                &shell.output,
-                key,
-                &op,
-                gate_refused,
-                started.load(Ordering::SeqCst),
-                ran,
-            );
+            // A panic in the call: before `clan` was started it is a refusal like any other (nothing
+            // was done to the machine); after, the machine may be half updated, so it is a failure,
+            // whatever kind of action it was, and the node stays cordoned.
+            let started = started.load(Ordering::SeqCst);
+            let end = match ran {
+                Ok(ran) => action_end(&shell.output, key, &op, gate_refused, started, ran),
+                Err(Panicked(why)) if started => {
+                    let end = ActionEnd::internal(&why);
+                    shell
+                        .output
+                        .push_to(key, Stream::Note, &end.summary.join(" "));
+                    end
+                }
+                Err(Panicked(why)) => action_end(
+                    &shell.output,
+                    key,
+                    &op,
+                    gate_refused,
+                    started,
+                    Ok(Err(internal_error(&why))),
+                ),
+            };
             if key.is_none() {
                 shell.output.finish(&ended_line(&end));
             }

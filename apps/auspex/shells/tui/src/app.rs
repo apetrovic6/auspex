@@ -13,9 +13,13 @@
 //!
 //! # The terminal
 //!
-//! `ratatui::try_init` installs a panic hook that restores the terminal before the panic
-//! message is printed; every other exit path calls `ratatui::restore` itself.
+//! Every exit path calls `ratatui::restore` itself. The panic hook is ours ([`crate::panics`]),
+//! not the one `ratatui::try_init` installs: that one restores the terminal on whatever thread
+//! panicked, and a panic in a task does not end the loop that is drawing on it. A panic on the loop
+//! thread restores the terminal and uncordons; a panic in a task ends the run in order, through
+//! the same path as a signal.
 
+use std::future::Future;
 use std::io::{IsTerminal as _, Write as _};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -38,6 +42,7 @@ use crate::handoff::{self, TerminalEvents};
 use crate::headless;
 use crate::keymap::{Key, Keymap};
 use crate::log::{Log, say};
+use crate::panics::{self, Hooks};
 use crate::shell::Shell;
 use crate::theme::{self, Theme};
 use crate::ui::{Context, Ui};
@@ -398,7 +403,13 @@ async fn tui(
     flake: &str,
     term: &mut Termination,
 ) -> ExitCode {
-    let mut terminal = match ratatui::try_init() {
+    // ratatui's own panic hook restores the terminal on whatever thread panicked, which under a
+    // loop that goes on drawing leaves cooked mode and bracketed paste off. It is not kept: ours
+    // (below) does it for the loop thread only.
+    let original_hook = std::panic::take_hook();
+    let init = ratatui::try_init();
+    std::panic::set_hook(original_hook);
+    let mut terminal = match init {
         Ok(t) => t,
         Err(e) => {
             say(&format!(
@@ -407,21 +418,15 @@ async fn tui(
             return ExitCode::from(USAGE);
         }
     };
+    // A panic on this thread ends auspex: the terminal is given back and what was cordoned for an
+    // update that had not started is uncordoned. A panic anywhere else touches neither; it ends
+    // the run through the loop, in order (see `panics`).
+    let hooks = Hooks::install(
+        std::thread::current().id(),
+        shell.cordons(),
+        Arc::new(panics::Real),
+    );
     enter_bracketed_paste();
-    // A panic must not leave a node cordoned either: the hook says so after the panic message, and
-    // uncordons what was cordoned for an update that had not started.
-    {
-        let cordons = shell.cordons();
-        // Only a panic on this thread ends auspex; one in an adapter's task does not.
-        let loop_thread = std::thread::current().id();
-        let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            previous(info);
-            for line in cordons.on_panic(loop_thread, Duration::from_secs(10)) {
-                say(&line);
-            }
-        }));
-    }
     // Where `s` asks for the terminal; before the first key, so a request always has an answer.
     let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel();
     shell.set_handoff(handoff_tx);
@@ -435,7 +440,8 @@ async fn tui(
     // When the current refresh started, so a second `r` can tell a list that is merely
     // starting from one that hangs.
     let mut refresh = (shell.view().refresh.generation, std::time::Instant::now());
-    let mut code = ExitCode::SUCCESS;
+    let mut code: u8 = 0;
+    let mut ended_by_panic = false;
     while !shell.view().quit {
         tokio::select! {
             _ = frames.tick() => {
@@ -444,7 +450,7 @@ async fn tui(
                 let ctx = Context { theme, keymap, flake, log: &log, output: shell.output(), now: std::time::Instant::now() };
                 if let Err(e) = terminal.draw(|f| shell.draw(f, &mut ui, &ctx)) {
                     failure = Some(format!("cannot draw: {e}"));
-                    code = ExitCode::from(USAGE);
+                    code = USAGE;
                     break;
                 }
             }
@@ -474,7 +480,7 @@ async fn tui(
                 Some(Err(e)) => {
                     // Said after the terminal is restored, so it is readable (review finding 6).
                     failure = Some(format!("cannot read the terminal: {e}"));
-                    code = ExitCode::from(USAGE);
+                    code = USAGE;
                     break;
                 }
                 None => shell.send(Event::Terminate),
@@ -484,71 +490,119 @@ async fn tui(
             Some(request) = handoff_rx.recv() => {
                 // The reader is stopped before ssh starts, or it would take ssh's keys.
                 events.stop();
+                // The terminal is ssh's from here: no panic writes an escape sequence into it.
+                hooks.lend();
                 handoff::leave_terminal();
                 let session = handoff::run(&request.program, &request.args, term).await;
                 if let Some(signal) = session.stopped_by {
                     // ssh is gone and the terminal is already the shell's: leave it so.
                     terminal_left = true;
-                    code = ExitCode::from(signal_exit(signal));
+                    code = signal_exit(signal);
                     let _ = request.reply.send(session.end);
                     break;
                 }
                 if let Err(e) = handoff::enter_terminal(&mut terminal) {
                     terminal_left = true;
                     failure = Some(format!("cannot take the terminal back from ssh: {e}"));
-                    code = ExitCode::from(USAGE);
+                    code = USAGE;
                     let _ = request.reply.send(session.end);
                     break;
                 }
+                hooks.take_back();
                 events = TerminalEvents::start();
                 // The frames that were due while ssh ran are not owed.
                 frames.reset();
                 let _ = request.reply.send(session.end);
             }
             signal = term.recv() => {
-                code = ExitCode::from(signal_exit(signal));
+                code = signal_exit(signal);
+                break;
+            }
+            // A panic outside this thread: auspex ends in order, as for a signal.
+            message = hooks.task_panicked() => {
+                shell.log.line(&format!("a task panicked, so auspex is stopping: {message}"));
+                ended_by_panic = true;
+                code = USAGE;
                 break;
             }
         }
     }
-    // Cancel and reap first, then give the terminal back.
-    // Stop whatever an action runs (its process group killed and reaped, its row logged
-    // `cancelled`) and cancel the rest, then give the terminal back.
-    // A second signal ends the wait for the roll to stop, but not the uncordon after it.
-    shell
-        .terminate_with(async {
+    // Cancel and reap first, then give the terminal back. A second signal ends the wait for the
+    // roll to stop, but not the uncordon after it.
+    let (code, lines) = wind_down(
+        shell,
+        &hooks,
+        Leaving {
+            code,
+            ended_by_panic,
+            terminal_left,
+            failure,
+        },
+        async {
             let _ = term.recv().await;
-        })
-        .await;
-    leave_bracketed_paste();
-    if !terminal_left {
-        ratatui::restore();
-    }
-    if let Some(f) = failure {
-        say(&f);
-    }
-    // Nodes auspex cordoned and could not give back, or left cordoned on purpose: after the terminal
-    // is back, where it is read, with the command for each.
-    for line in shell.exit_report() {
+        },
+    )
+    .await;
+    for line in lines {
         say(&line);
     }
-    code
+    ExitCode::from(code)
+}
+
+/// Why and how the loop is leaving.
+#[derive(Debug)]
+pub struct Leaving {
+    /// The exit code so far: 0 for a quit, 128 + n for a signal, [`USAGE`] for auspex's own failure.
+    pub code: u8,
+    /// A panic in a task ended the loop.
+    pub ended_by_panic: bool,
+    /// The terminal is the shell's already (ssh was stopped by a signal, or could not be taken back).
+    pub terminal_left: bool,
+    /// What went wrong in the loop itself, to say once the terminal is back.
+    pub failure: Option<String>,
+}
+
+/// The way out, in order, the same for a `q`, a signal and a panic in a task.
+///
+/// The roll is stopped (what an action runs is killed and reaped, its row logged `cancelled`, a
+/// drained node uncordoned: [`Shell::terminate_with`]), then **the loop gives the terminal back**
+/// (the panic hook does not, for a panic in a task). Returns the exit code, and the lines to say
+/// now that the terminal can show them: what went wrong in the loop, a panic in a task if there
+/// was one (said whether it ended the run or happened while a `q` or a signal was ending it,
+/// and never a success), and the nodes auspex cordoned and could not give back or left cordoned
+/// on purpose, each with its command.
+pub async fn wind_down(
+    shell: &Arc<Shell>,
+    hooks: &Hooks,
+    leaving: Leaving,
+    interrupt: impl Future<Output = ()>,
+) -> (u8, Vec<String>) {
+    shell.terminate_with(interrupt).await;
+    hooks.terminal().paste_off();
+    if !leaving.terminal_left {
+        hooks.terminal().restore();
+    }
+    let mut code = leaving.code;
+    let mut lines: Vec<String> = leaving.failure.into_iter().collect();
+    if let Some(message) = hooks.task_panic() {
+        lines.push(if leaving.ended_by_panic {
+            format!("a panic in a task ended the run: {message}")
+        } else {
+            format!("a task panicked during the run: {message}")
+        });
+        if code == 0 {
+            code = USAGE;
+        }
+    }
+    lines.extend(shell.exit_report());
+    (code, lines)
 }
 
 /// Asks the terminal to deliver a paste as one `Event::Paste` instead of typed keys.
 ///
 /// Without it a paste arrives as keystrokes: pasted `Ayuy` would turn on act mode and start an
-/// update. See [`Ui::paste`] for what a paste may do. Also undone by a panic, which would
-/// otherwise leave the operator's shell with bracketed paste on.
+/// update. See [`Ui::paste`] for what a paste may do. Undone at exit, and by a panic on the loop
+/// thread (see [`panics`]), which would otherwise leave the operator's shell with bracketed paste on.
 fn enter_bracketed_paste() {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        leave_bracketed_paste();
-        previous(info);
-    }));
-}
-
-fn leave_bracketed_paste() {
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
 }

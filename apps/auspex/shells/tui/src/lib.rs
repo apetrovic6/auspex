@@ -10,6 +10,7 @@
 //! - [`keymap`] and [`input`]: keys to core events; [`ui`] and [`theme`]: drawing.
 //! - [`output`]: the streamed output of updates and builds, which the Log tab draws.
 //! - [`handoff`]: `s`, lending the terminal to ssh and taking it back.
+//! - [`panics`]: what a panic does by where it happens, and the answer a panicked task still gives.
 //! - [`packages`]: the package preview as text, for the detail panel and the `d` view.
 //! - [`headless`]: `--plain` and `--json`.
 //! - [`app`]: putting it together, signals included.
@@ -29,6 +30,7 @@ pub mod keymap;
 pub mod log;
 pub mod output;
 pub mod packages;
+pub mod panics;
 pub mod shell;
 pub mod theme;
 pub mod ui;

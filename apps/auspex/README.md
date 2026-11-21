@@ -342,9 +342,24 @@ an update that had not started**, one at a time, each bounded at 15 s, with a pl
 runs after the 20 s and before auspex cancels what is still in flight, so the core's own uncordon
 of the same node may be running beside it: two uncordons of one node do no harm, and a node the
 core's one gave back is not reported as still cordoned. The action-log rows still open are closed
-after that, naming only the nodes really left cordoned. A panic does not take that path. A panic
-on the loop thread (the one that runs the interface) runs the bounded last-resort uncordon from the
-panic hook, each node bounded at 10 s, and auspex ends. A panic in a task does nothing to the roll.
+after that, naming only the nodes really left cordoned. What a panic does depends on the thread it
+happens on. **On the loop thread** (the one that runs the interface) auspex is gone: the panic hook
+gives the terminal back (bracketed paste off, raw mode off, the main screen), the message is
+printed, and the hook runs the same last-resort uncordon, each node bounded at 10 s, with no wait
+for the roll. **On any other thread** (an adapter's task or a helper) the hook touches neither the
+terminal nor a node: the interface keeps drawing and the roll is not cut off by the hook. It
+records the message and the run ends **in order, as for a signal**: the roll is stopped within the
+same 20 s, a drained node is uncordoned, the last resort runs as above, auspex gives the terminal
+back, and it prints `a panic in a task ended the run: <message>` (one line, escape sequences
+removed, at most 240 characters; the default panic output is not printed over the screen) and exits
+2, whatever else happened. A panic that arrives while a `q` or a signal is already ending the run
+is printed too (`a task panicked during the run`) and makes the exit 2. The request of a task that
+panicked is answered as a failure (`internal error: …`), so the core is not left waiting for it:
+a cancelled drain gets its answer and its node is uncordoned. **While `s` has the terminal**,
+neither kind writes an escape sequence into your ssh session; a panic on the loop thread still
+runs the last-resort uncordon and prints its message as plain text, and one in a task is recorded
+and ends the run when ssh ends (ssh is never killed for it). `--plain` and `--json` have no
+terminal and no cordon: a panicked task there answers its request as a failure, and that is all.
 What could not be given back, and what is left cordoned on purpose, is printed with the commands.
 While a roll runs, `u`, `b`, `r` and `A` say so and do nothing.
 
