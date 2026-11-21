@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime};
 
 use auspex_core::effects::{
     ActionKind, ActionRequest, AwaitAnswer, AwaitRequest, CacheRequest, ClosureAnswer,
-    DeployedClosureRequest, EvalRequest, InventoryAnswer, InventoryRequest, KubeAnswer, KubeOp,
-    KubeReply, KubeRequest, PendingClosureRequest, PreflightAnswer, PreflightRequest, ProbeRequest,
+    DeployedClosureRequest, EvalRequest, ForgeHeadAnswer, ForgeHeadRequest, ForgeStatusAnswer,
+    ForgeStatusRequest, InventoryAnswer, InventoryRequest, KubeAnswer, KubeOp, KubeReply,
+    KubeRequest, PendingClosureRequest, PreflightAnswer, PreflightRequest, ProbeRequest,
     PrometheusAnswer, PrometheusRequest, ResolveRequest, ShellRequest, TreeRequest,
 };
 use auspex_domain::fleet::ConnectTimeout;
@@ -22,6 +23,7 @@ use auspex_domain::status::NarCache;
 use auspex_effects::cache::{self, CacheParams, GitParams};
 use auspex_effects::clan::{self, ClanLine, ClanLocator, ClanRun, ResolveParams, RunParams};
 use auspex_effects::closure::{self, PendingParams};
+use auspex_effects::forge::{self, Token};
 use auspex_effects::http::HttpClient;
 use auspex_effects::kube::{self, KubeParams};
 use auspex_effects::nix::{self, EvalItem, EvalMachine, EvalParams, FlakeRef};
@@ -147,6 +149,39 @@ impl Backend {
         match self {
             Self::Real(r) => r.prometheus(op, cancel).await,
             Self::Demo(d) => d.prometheus(op, cancel).await,
+        }
+    }
+
+    /// `Effect::ForgeHead`: `HEAD` of the fleet checkout, for the CI badge.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn forge_head(
+        &self,
+        op: &ForgeHeadRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ForgeHeadAnswer, Cancelled> {
+        match self {
+            Self::Real(r) => r.forge_head(op, cancel).await,
+            // The demo configures no forge, so the core never asks; if it did, say so.
+            Self::Demo(_) => Ok(Err("the demo has no forge".to_owned())),
+        }
+    }
+
+    /// `Effect::ForgeStatus`: the forge's combined status of that commit.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn forge_status(
+        &self,
+        op: &ForgeStatusRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ForgeStatusAnswer, Cancelled> {
+        match self {
+            Self::Real(r) => r.forge_status(op, cancel).await,
+            Self::Demo(_) => Ok(Err("the demo has no forge".to_owned())),
         }
     }
 
@@ -374,6 +409,16 @@ fn program(variable: &str, default: OsString) -> OsString {
         .unwrap_or(default)
 }
 
+/// What the CI badge needs of the shell: the forge's URL, and the token read at start (or why
+/// it could not be). The token is a [`Token`]: it does not print.
+struct ForgeAdapter {
+    url: String,
+    /// `Ok(None)`: no `forge.token_file`, ask anonymously. `Err`: the file was refused (group- or
+    /// world-accessible, not yours, unreadable, not a token): no request is made, because
+    /// asking anonymously instead would hide that the operator's token is not in use.
+    token: Result<Option<Token>, String>,
+}
+
 /// The real adapters, with everything they need from the config.
 pub struct Real {
     ssh: OsString,
@@ -397,6 +442,8 @@ pub struct Real {
     /// and is looked up as `<name>:9100`.
     explicit_instances: BTreeSet<String>,
     cache_url: Option<String>,
+    /// The CI badge's forge, when `[forge]` is configured.
+    forge: Option<ForgeAdapter>,
     cache_dir: Option<PathBuf>,
     flake_source: FlakeSource,
     /// Which `clan` each fleet pins, found once and kept for the run.
@@ -453,6 +500,15 @@ impl Real {
             prometheus_url: settings.prometheus.as_ref().map(|p| p.url.clone()),
             explicit_instances,
             cache_url: settings.cache_url.clone(),
+            // The token file is read here, once, at start.
+            forge: settings.forge.as_ref().map(|f| ForgeAdapter {
+                url: f.url.clone(),
+                token: f
+                    .token_file
+                    .as_deref()
+                    .map(forge::read_token_file)
+                    .transpose(),
+            }),
             cache_dir: cache::default_dir(),
             flake_source,
             clan: ClanLocator::new(),
@@ -515,6 +571,7 @@ impl Real {
             prometheus_url: None,
             explicit_instances: BTreeSet::new(),
             cache_url: None,
+            forge: None,
             cache_dir: None,
             flake_source: FlakeSource::Default,
             clan: ClanLocator::new(),
@@ -563,6 +620,16 @@ impl Real {
             notes.push(format!(
                 "no HTTP client, so Prometheus and the cache badge are off: {why}"
             ));
+        }
+        if let Some(f) = &self.forge {
+            if let Err(why) = &f.token {
+                notes.push(format!(
+                    "the CI badge is unknown, and no request is made: {why}"
+                ));
+            }
+            if let Err(why) = &self.http {
+                notes.push(format!("no HTTP client, so the CI badge is unknown: {why}"));
+            }
         }
         notes
     }
@@ -674,6 +741,56 @@ impl Real {
         )
         .await?;
         Ok(answer.map(|samples| rekey(samples, &asked)))
+    }
+
+    /// `Effect::ForgeHead` with the real `git`, each command bounded by the HTTP timeout.
+    async fn forge_head(
+        &self,
+        op: &ForgeHeadRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ForgeHeadAnswer, Cancelled> {
+        let flake = match FlakeRef::new(&op.flake) {
+            Ok(f) => f,
+            Err(e) => return Ok(Err(self.fleet_error(&op.flake, &e.0))),
+        };
+        let mut git = GitParams::new();
+        git.program = &self.git;
+        git.timeout = self.http_timeout;
+        let token = self
+            .forge
+            .as_ref()
+            .and_then(|f| f.token.as_ref().ok())
+            .and_then(Option::as_ref);
+        forge::head(&git, &flake, op.want_origin, token, cancel).await
+    }
+
+    /// `Effect::ForgeStatus`: one request, with the token when there is one.
+    async fn forge_status(
+        &self,
+        op: &ForgeStatusRequest,
+        cancel: &CancellationToken,
+    ) -> Result<ForgeStatusAnswer, Cancelled> {
+        let Some(f) = &self.forge else {
+            return Ok(Err("forge is not configured".to_owned()));
+        };
+        let client = match &self.http {
+            Ok(c) => c,
+            Err(why) => return Ok(Err(format!("forge: {why}"))),
+        };
+        let token = match &f.token {
+            Ok(t) => t.as_ref(),
+            Err(why) => return Ok(Err(why.clone())),
+        };
+        forge::combined_status(
+            client,
+            &f.url,
+            &op.repo,
+            &op.commit,
+            token,
+            self.http_timeout,
+            cancel,
+        )
+        .await
     }
 
     async fn cache_lookup(

@@ -11,9 +11,9 @@ use std::collections::BTreeMap;
 
 use auspex_core::effects::{
     ActionRequest, AwaitRequest, CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest,
-    FleetLockRequest, InventoryRequest, KubeRequest, LoadFreezesRequest, LogRequest,
-    PendingClosureRequest, PreflightRequest, ProbeRequest, PrometheusRequest, ResolveRequest,
-    SaveFreezeRequest, ShellRequest, TreeRequest,
+    FleetLockRequest, ForgeHeadRequest, ForgeStatusRequest, InventoryRequest, KubeRequest,
+    LoadFreezesRequest, LogRequest, PendingClosureRequest, PreflightRequest, ProbeRequest,
+    PrometheusRequest, ResolveRequest, SaveFreezeRequest, ShellRequest, TreeRequest,
 };
 use auspex_core::{
     Auspex, Config, Core, DiffConfig, Effect, Event, FreezeConfig, PrometheusConfig, RequestId,
@@ -116,6 +116,7 @@ pub fn full_config() -> Config {
             instances: BTreeMap::new(),
             max_age_seconds: 60,
         }),
+        forge: None,
         binary_cache: true,
         diff: None,
         allow_act: false,
@@ -152,6 +153,9 @@ pub struct Shell {
     pub probes: Vec<Request<ProbeRequest>>,
     pub evals: Vec<Request<EvalRequest>>,
     pub prometheus: Vec<Request<PrometheusRequest>>,
+    /// The CI badge's reads of `HEAD`, and its questions to the forge.
+    pub forge_heads: Vec<Request<ForgeHeadRequest>>,
+    pub forge_statuses: Vec<Request<ForgeStatusRequest>>,
     pub caches: Vec<Request<CacheRequest>>,
     pub resolves: Vec<Request<ResolveRequest>>,
     pub deployed: Vec<Request<DeployedClosureRequest>>,
@@ -209,6 +213,8 @@ impl Shell {
             probes: Vec::new(),
             evals: Vec::new(),
             prometheus: Vec::new(),
+            forge_heads: Vec::new(),
+            forge_statuses: Vec::new(),
             caches: Vec::new(),
             resolves: Vec::new(),
             deployed: Vec::new(),
@@ -269,6 +275,14 @@ impl Shell {
                 Effect::Prometheus(r) => {
                     self.issued.push(r.operation.id);
                     self.prometheus.push(r);
+                }
+                Effect::ForgeHead(r) => {
+                    self.issued.push(r.operation.id);
+                    self.forge_heads.push(r);
+                }
+                Effect::ForgeStatus(r) => {
+                    self.issued.push(r.operation.id);
+                    self.forge_statuses.push(r);
                 }
                 Effect::CacheLookup(r) => {
                     self.issued.push(r.operation.id);
@@ -374,6 +388,8 @@ impl Shell {
         self.probes.retain(|r| live(&r.operation.id));
         self.evals.retain(|r| live(&r.operation.id));
         self.prometheus.retain(|r| live(&r.operation.id));
+        self.forge_heads.retain(|r| live(&r.operation.id));
+        self.forge_statuses.retain(|r| live(&r.operation.id));
         self.caches.retain(|r| live(&r.operation.id));
         self.resolves.retain(|r| live(&r.operation.id));
         self.deployed.retain(|r| live(&r.operation.id));
@@ -387,6 +403,8 @@ impl Shell {
             + self.probes.len()
             + self.evals.len()
             + self.prometheus.len()
+            + self.forge_heads.len()
+            + self.forge_statuses.len()
             + self.caches.len()
             + self.resolves.len()
             + self.deployed.len()
@@ -426,6 +444,20 @@ impl Shell {
             "one Prometheus request outstanding"
         );
         self.prometheus.remove(0)
+    }
+
+    pub fn take_forge_head(&mut self) -> Request<ForgeHeadRequest> {
+        assert_eq!(self.forge_heads.len(), 1, "one head request outstanding");
+        self.forge_heads.remove(0)
+    }
+
+    pub fn take_forge_status(&mut self) -> Request<ForgeStatusRequest> {
+        assert_eq!(
+            self.forge_statuses.len(),
+            1,
+            "one status request outstanding"
+        );
+        self.forge_statuses.remove(0)
     }
 
     pub fn take_cache(&mut self, machine: &str) -> Request<CacheRequest> {

@@ -21,6 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ci::FleetCi;
 use crate::diff::{DiffState, PackageDiff};
 use crate::eval::EvalOutcome;
 use crate::fleet::{
@@ -42,7 +43,8 @@ pub struct FleetReport {
     /// `true` exactly when the scan is over and its result is final, which is all of:
     ///
     /// - every fleet-wide request is back: the machine list, the evaluator's final answer,
-    ///   any query for the whole fleet (Prometheus, Alertmanager), and address resolution;
+    ///   any query for the whole fleet (Prometheus, Alertmanager), address resolution and the
+    ///   CI badge's look at the forge;
     /// - the global deadline did not cut the scan short;
     /// - `errors` is empty;
     /// - every machine's `settled` is `true`.
@@ -69,6 +71,21 @@ pub struct FleetReport {
     /// these machines is refused. Empty when there are none or resolution was not
     /// attempted.
     pub shared_ips: Vec<SharedIp>,
+    /// The CI badge for the fleet flake's current commit (`HEAD` of the fleet checkout):
+    /// `{"commit": …, "state": …, "url": …, "reason": …}`. `state` is one of `"success"`,
+    /// `"failure"`, `"pending"` (the forge's combined commit status; `error` is a `failure`),
+    /// `"none"` (the forge has no status for the commit), `"not_pushed"` (`HEAD` is ahead of its
+    /// upstream, so nothing was asked), `"unknown"` (it could not be found out; `reason` says
+    /// why) or `"off"` (`[forge]` is not configured, and nothing was read or asked). A dirty
+    /// tree is not a state: `HEAD`'s status is shown as it is. `commit` is the full commit id, or
+    /// `null` when it was not read; `url` links to the check, or is `null`; `reason` is one line
+    /// for `unknown` and `not_pushed`, `null` otherwise. The forge's token never appears in any
+    /// of them: text from outside (a link, a transport error, git's words) is checked for it, in
+    /// any case and percent-encoded, and replaced when it holds it. A copy a forge disguises in a
+    /// way of its own invention (base64, a split) cannot be recognised by any such check. Added to
+    /// version 1; a report without it reads as `off`.
+    #[serde(default)]
+    pub fleet_ci: FleetCi,
 }
 
 /// What went wrong for the whole fleet; see [`FleetReport::errors`].
@@ -123,6 +140,9 @@ pub struct FleetFacts {
     pub timed_out: bool,
     /// Fleet-level failures.
     pub errors: Vec<FleetError>,
+    /// The CI badge as it stands ([`FleetCi::off`] when `[forge]` is not configured). While its
+    /// request is out it is an `unknown` that says so, and `scan_complete` stays `false`.
+    pub fleet_ci: FleetCi,
 }
 
 /// One machine.
@@ -404,5 +424,6 @@ pub fn fleet_report(
         errors,
         machines,
         shared_ips,
+        fleet_ci: fleet.fleet_ci,
     }
 }

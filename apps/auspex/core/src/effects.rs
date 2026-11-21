@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::IpAddr;
 
+use auspex_domain::ci::{CiStatus, HeadFacts};
 use auspex_domain::closure::ClosurePaths;
 use auspex_domain::eval::EvalOutcome;
 use auspex_domain::fleet::{Machine, MachineClass, Target};
@@ -183,6 +184,56 @@ pub type PrometheusAnswer = Result<BTreeMap<String, PromSample>, String>;
 
 impl Operation for PrometheusRequest {
     type Output = PrometheusAnswer;
+}
+
+/// Read `HEAD` of the fleet checkout for the CI badge: its commit, where it stands against its
+/// upstream and, when `want_origin`, the `origin` remote (parsed, with any credentials dropped).
+///
+/// Only asked when `[forge]` is configured. Independent of the machine list: the badge never
+/// waits for a row and no row waits for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeHeadRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The refresh it belongs to.
+    pub generation: Generation,
+    /// The fleet flake, as configured.
+    pub flake: String,
+    /// Whether the repository is to be read from the `origin` remote (`forge.repo` is not set).
+    pub want_origin: bool,
+}
+
+/// What `HEAD` is, or why it could not be read. An `origin` that is missing or unusable is not a
+/// failure here: it is [`HeadFacts::origin`], because it only matters without `forge.repo`.
+pub type ForgeHeadAnswer = Result<HeadFacts, String>;
+
+impl Operation for ForgeHeadRequest {
+    type Output = ForgeHeadAnswer;
+}
+
+/// Ask the forge for the combined commit status of `commit` in `repo` (one request).
+///
+/// Only asked after [`ForgeHeadRequest`] answered and [`auspex_domain::ci::plan`] decided the
+/// forge is to be asked: the commit is pushed and the repository is known. The URL and the token
+/// are the shell's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeStatusRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The refresh it belongs to.
+    pub generation: Generation,
+    /// `owner/name`, validated by the domain.
+    pub repo: String,
+    /// The full commit id, validated by the domain.
+    pub commit: String,
+}
+
+/// What the forge says about the commit, or why it could not be asked (a refused token, a
+/// timeout, a malformed answer: one line, which never holds the token).
+pub type ForgeStatusAnswer = Result<CiStatus, String>;
+
+impl Operation for ForgeStatusRequest {
+    type Output = ForgeStatusAnswer;
 }
 
 /// Ask the binary cache whether `store_path` is there (`HEAD <cache>/<hash>.narinfo`).
@@ -814,6 +865,10 @@ pub enum Effect {
     Evaluate(EvalRequest),
     /// [`PrometheusRequest`].
     Prometheus(PrometheusRequest),
+    /// [`ForgeHeadRequest`]: `HEAD` of the fleet checkout, for the CI badge.
+    ForgeHead(ForgeHeadRequest),
+    /// [`ForgeStatusRequest`]: the forge's combined status of that commit.
+    ForgeStatus(ForgeStatusRequest),
     /// [`CacheRequest`].
     CacheLookup(CacheRequest),
     /// [`ResolveRequest`].

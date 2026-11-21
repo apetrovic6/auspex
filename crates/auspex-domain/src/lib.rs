@@ -16,6 +16,8 @@
 //! Modules, one per concern:
 //!
 //! - [`act`]: how an action ended: its short summary and the plain words for an ssh failure.
+//! - [`ci`]: the CI badge for the fleet's current commit: the forge's combined status, the
+//!   `origin` remote's repository, and when not to ask.
 //! - [`fleet`]: machines, the inventory parser, ssh targets, their resolution and the
 //!   ssh argument vector, and the homelab-safety lints.
 //! - [`observe`]: the probe scripts, their parser, and merging Prometheus samples.
@@ -31,6 +33,7 @@
 //! - [`text`]: making remote-controlled text safe for a terminal, for adapters too.
 
 pub mod act;
+pub mod ci;
 pub mod closure;
 pub mod diff;
 pub mod eval;

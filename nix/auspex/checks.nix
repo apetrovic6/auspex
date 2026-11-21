@@ -41,6 +41,7 @@ let
     };
     update = { parallel = 3; ready_timeout = 300; poll_interval = 10; };
     kubernetes.kubeconfig = "/home/me/.kube/fleet";
+    forge = { url = "https://forge.example.org"; repo = "owner/fleet"; token_file = "/home/me/.config/auspex/forge-token"; };
     keymap = { quit = [ "q" "esc" ]; down = "j"; };
     theme.file = "~/.config/auspex/theme.toml";
   };
@@ -223,6 +224,44 @@ let
     && builtins.any (a: !a.assertion && lib.hasInfix "store" a.message) storeKubeconfig.assertions;
   updateWith = update: (evaluate { programs.auspex.settings.update = update; }).config;
   assertionsHold = c: builtins.all (a: a.assertion) c.assertions;
+  # The forge token is a path on this machine, expanded as `flake` and the kubeconfig are, and one
+  # in the store (world-readable) is refused.
+  withTokenFile = token_file: (evaluate {
+    programs.auspex.settings.forge = { inherit token_file; };
+  }).config;
+  tildeTokenFile = withTokenFile "~/.config/auspex/forge-token";
+  pathTokenFile = withTokenFile /home/me/.config/auspex/forge-token;
+  storeTokenFile = withTokenFile "${pkgs.hello}/forge-token";
+  storeTokenFileRejected =
+    !(builtins.tryEval (builtins.deepSeq (checked storeTokenFile).assertions true)).success
+    && builtins.any (a: !a.assertion && lib.hasInfix "world-readable" a.message) storeTokenFile.assertions;
+  # `forge.url` is https without credentials and `forge.repo` is owner/name: anything else is
+  # refused at evaluation, so a home-manager switch fails rather than auspex.
+  forgeOK =
+    let
+      option = name: lib.foldl' (type: n: (type.getSubOptions [ ]).${n}.type) settingsType [ "forge" name ];
+      probe = name: value: (evaluate {
+        programs.auspex.settings.forge = { ${name} = value; };
+      }).config.programs.auspex.settings.forge.${name};
+      rejected = name: value: !(builtins.tryEval (builtins.deepSeq (probe name value) true)).success;
+    in probe "url" "https://forge.example.org" == "https://forge.example.org"
+      && probe "url" "https://forge.example.org:8443/forgejo" == "https://forge.example.org:8443/forgejo"
+      && (option "url").check "https://forge.example.org" && !(option "url").check "http://forge.example.org"
+      && builtins.all (rejected "url") [ "http://forge.example.org" "https://user:pw@forge.example.org" "forge.example.org" "https://" "ftp://forge.example.org" 1 ]
+      && probe "repo" "owner/fleet" == "owner/fleet"
+      && (option "repo").check "owner/fleet" && !(option "repo").check "fleet"
+      && builtins.all (rejected "repo") [ "fleet" "a/b/c" "a/b c" "/a/b" "" 1 ]
+      # What the binary refuses (`auspex_domain::ci::parse_repo`): a `.` or `..` segment and a
+      # segment over 100 bytes, so a switch fails here instead of auspex failing at start.
+      && builtins.all (rejected "repo") [ "owner/.." "../fleet" "./fleet" "owner/." "../.."
+        "${lib.fixedWidthString 101 "a" ""}/name" "owner/${lib.fixedWidthString 101 "a" ""}" ]
+      && builtins.all (name: probe "repo" name == name) [ "owner/.fleet" "owner/..fleet" "o/a.b" "owner/..." "a/b"
+        "${lib.fixedWidthString 100 "a" ""}/${lib.fixedWidthString 100 "a" ""}" ]
+      # And a URL the parser refuses: whitespace or a forbidden host character.
+      && builtins.all (rejected "url") [ "https://a b" "https://a b.example.org/x" "https://forge.example.org/a b"
+        "https://forge.example.org/\n" "https://a<b>.example.org" "https://a|b.example.org" "https://a%b.example.org" ]
+      && builtins.all (url: probe "url" url == url) [ "https://[fd00::1]:3000/forgejo" "https://forge.example.org:8443/x?y#z"
+        "https://forge.example.org/a%20b" ];
 in {
   auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;
@@ -307,6 +346,21 @@ in {
     && assertionsHold (updateWith { poll_interval = 60; })
     && !assertionsHold (updateWith { poll_interval = 5; ready_timeout = 4; })
   );
+  auspex-forge-token-path = pkgs.linkFarm "auspex-forge-token-path" [
+    {
+      name = "tilde";
+      path = compareToml "forge-token-tilde" tildeTokenFile.xdg.configFile."auspex/config.toml".source
+        { forge.token_file = "/home/test/.config/auspex/forge-token"; };
+    }
+    {
+      name = "path-value";
+      path = compareToml "forge-token-path" pathTokenFile.xdg.configFile."auspex/config.toml".source
+        { forge.token_file = "/home/me/.config/auspex/forge-token"; };
+    }
+  ];
+  auspex-forge-token-store-path = check "forge-token-store-path" (storeTokenFileRejected
+    && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeTokenFile pathTokenFile ]);
+  auspex-forge-types = check "forge-types" forgeOK;
   auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision

@@ -124,6 +124,10 @@ pub struct RefreshView {
     /// The global deadline passed with something still outstanding, which was then marked as
     /// timed out.
     pub timed_out: bool,
+    /// The CI badge's request is still out: the status bar shows `ci …`. The badge itself (what
+    /// the forge says, or why not) is [`FleetReport::fleet_ci`], the same value `--json` prints;
+    /// while this is `true` it is an `unknown` that says it is still being checked.
+    pub ci_checking: bool,
 }
 
 /// The stage of a refresh.

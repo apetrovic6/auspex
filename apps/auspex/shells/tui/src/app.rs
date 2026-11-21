@@ -22,7 +22,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use auspex_core::{
-    Config, DiffConfig, Event, FreezeConfig, PrometheusConfig, PrometheusStatus, SavedFreezes,
+    Config, DiffConfig, Event, ForgeConfig, FreezeConfig, PrometheusConfig, PrometheusStatus,
+    SavedFreezes,
 };
 use auspex_effects::Termination;
 use auspex_effects::deploylog::{self, Identity, OpenParams};
@@ -69,6 +70,10 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
                 .filter_map(|(name, m)| m.prometheus_instance.clone().map(|i| (name.clone(), i)))
                 .collect(),
             max_age_seconds: p.stale_after,
+        }),
+        forge: settings.forge.as_ref().map(|f| ForgeConfig {
+            host: f.host.clone(),
+            repo: f.repo.clone(),
         }),
         binary_cache: settings.cache_url.is_some(),
         // What `f` saved is read where the run is built (it is I/O): see `load_freezes`.
@@ -353,6 +358,9 @@ async fn headless(
     }
     let view = shell.view();
     shell.shutdown().await;
+    // Likewise the CI badge's reason: `--json` has it in `fleet_ci.reason`, `--plain` has no line
+    // for it, and neither has a status bar.
+    shell.note_ci(&view);
     // The TUI shows "prom: down"; headless output would otherwise not say it at all (C3).
     if let PrometheusStatus::Unavailable { reason } = &view.prometheus {
         shell.log.line(&format!(

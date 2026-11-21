@@ -122,6 +122,7 @@ fn expected_report(
         "version": 1,
         "settled": true,
         "errors": [],
+        "fleet_ci": {"commit": null, "state": "off", "url": null, "reason": null},
         "machines": [
             {
                 "name": "cerberus",

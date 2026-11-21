@@ -35,6 +35,9 @@ pub struct Settings {
     pub prometheus: Option<PrometheusSettings>,
     /// `[cache] url`: the binary cache for the "cached" badge, or `None` for no badge.
     pub cache_url: Option<String>,
+    /// `[forge]`, or `None` when there is no `url` (then the CI badge is off and nothing is read
+    /// or asked).
+    pub forge: Option<ForgeSettings>,
     /// `[machines.<name>]`, by machine name.
     pub machines: BTreeMap<String, MachineSettings>,
     /// `[keymap]`: action name to its keys, exactly as written (parsed by `keymap`). An
@@ -166,6 +169,23 @@ pub struct PrometheusSettings {
     pub url: String,
     /// Seconds; an older sample falls back to ssh.
     pub stale_after: u64,
+}
+
+/// `[forge]`: the forge whose combined commit status is the fleet's CI badge.
+///
+/// Debug-printing it is safe: it holds the *path* of the token, never the token (that is read
+/// at start by the shell and kept in a type that does not print).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeSettings {
+    /// `forge.url`, normalised (`https` only, no credentials).
+    pub url: String,
+    /// The host of `url`, which the `origin` remote must be on for the repository to be read
+    /// from it.
+    pub host: String,
+    /// `forge.repo` (`owner/name`), or `None` to read it from the fleet's `origin` remote.
+    pub repo: Option<String>,
+    /// `forge.token_file`, `~/` expanded and absolute, or `None` to ask anonymously.
+    pub token_file: Option<PathBuf>,
 }
 
 /// `[machines.<name>]`.
@@ -391,6 +411,59 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                     match k.as_str() {
                         "url" => s.cache_url = Some(w.string(v, &name)?),
                         _ => w.unknown(&name),
+                    }
+                }
+            }
+            "forge" => {
+                let t = w.table(value, "forge")?;
+                let (mut url, mut repo, mut token_file) = (None, None, None);
+                for (k, v) in t {
+                    let name = format!("forge.{k}");
+                    match k.as_str() {
+                        "url" => url = Some(w.string(v, &name)?),
+                        "repo" => repo = Some(w.string(v, &name)?),
+                        "token_file" => {
+                            let path = expand_flake(&w.string(v, &name)?, &name)?;
+                            // Read at start, from wherever auspex was started: a relative path
+                            // would be a different file each time.
+                            if !Path::new(&path).is_absolute() {
+                                return Err(format!(
+                                    "`{name}` must be an absolute path (or start with `~/`), not `{path}`"
+                                ));
+                            }
+                            token_file = Some(PathBuf::from(path));
+                        }
+                        _ => w.unknown(&name),
+                    }
+                }
+                match url {
+                    None if !t.is_empty() => w.warnings.push(
+                        "`[forge]` has settings but no `forge.url`, so the CI badge is off and \
+                         they are ignored"
+                            .to_owned(),
+                    ),
+                    None => {}
+                    Some(url) => {
+                        // Neither error quotes the URL: it could carry a password.
+                        let url = auspex_effects::forge::forge_url(&url)
+                            .map_err(|e| format!("`forge.url`: {e}"))?;
+                        let repo = repo
+                            .map(|r| auspex_domain::ci::parse_repo(&r))
+                            .transpose()
+                            .map_err(|e| format!("`forge.repo` {e}"))?;
+                        s.forge = Some(ForgeSettings {
+                            // Without the brackets an IPv6 host is written in: the core compares
+                            // it with the host of the `origin` remote, which has none.
+                            host: url
+                                .host_str()
+                                .unwrap_or_default()
+                                .trim_start_matches('[')
+                                .trim_end_matches(']')
+                                .to_owned(),
+                            url: url.to_string(),
+                            repo,
+                            token_file,
+                        });
                     }
                 }
             }

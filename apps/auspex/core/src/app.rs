@@ -12,6 +12,13 @@
 //!    probe and is unreachable with its reason, as the domain decides.
 //! 3. Each answer updates its own machine and nothing else. One dead or slow host never
 //!    delays or changes another row.
+//!
+//!    The CI badge (when `[forge]` is configured) is asked **with** step 1, not after it: it
+//!    reads `HEAD` of the fleet checkout and, if that is pushed, asks the forge once. It needs
+//!    nothing from the machine list and the list needs nothing from it, so a slow forge cannot
+//!    delay a row and a dead host cannot delay the badge. It does hold the refresh unsettled
+//!    (headless mode prints `fleet_ci` with its answer in it), bounded by the shell's own
+//!    timeouts and, past them, by the global deadline, which makes it `unknown`.
 //! 4. Once a machine's evaluated toplevel is known and differs from its current system, and
 //!    a binary cache is configured, the core asks whether that path is cached.
 //! 5. When the package preview is on ([`Config::diff`]) and the answer is
@@ -49,6 +56,7 @@ mod roll;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
+use auspex_domain::ci::{FleetCi, Plan, plan};
 use auspex_domain::closure::ClosurePaths;
 use auspex_domain::diff::{DiffState, PackageDiff, diff_closures};
 use auspex_domain::eval::{EvalFailure, EvalOutcome};
@@ -62,7 +70,8 @@ use crux_core::{App, Command};
 use crate::config::{Config, SavedFreezes};
 use crate::effects::{
     ActionEnd, AwaitAnswer, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest,
-    Effect, EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
+    Effect, EvalAnswer, EvalMachine, EvalRequest, ForgeHeadAnswer, ForgeHeadRequest,
+    ForgeStatusAnswer, ForgeStatusRequest, Generation, InventoryAnswer, InventoryRequest,
     KubeAnswer, LoadFreezesAnswer, PendingClosureRequest, PreflightAnswer, ProbeRequest,
     PrometheusAnswer, PrometheusRequest, RequestId, ResolveRequest, SaveFreezeAnswer, ShellEnd,
 };
@@ -87,6 +96,10 @@ pub const PREVIEW_NO_SLOT: &str =
 /// The reason a package preview still out at the backstop deadline is `failed` with.
 pub const PREVIEW_TIMED_OUT: &str =
     "timed out: the package preview did not finish before timeouts.settle + timeouts.diff";
+/// The CI badge's `reason` while its request is out.
+pub const CI_CHECKING: &str = "still being checked";
+/// The CI badge's `reason` when the deadline passed first.
+pub const CI_TIMED_OUT: &str = "no answer before the global deadline";
 /// The `inventory_timed_out` fleet error's reason.
 pub const INVENTORY_TIMED_OUT: &str = "the machine list did not arrive before the global deadline";
 
@@ -169,6 +182,24 @@ pub enum Event {
         id: RequestId,
         /// What it answered.
         answer: PrometheusAnswer,
+    },
+    /// [`ForgeHeadRequest`] answered.
+    ForgeHeadAnswered {
+        /// The request's generation.
+        generation: Generation,
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: ForgeHeadAnswer,
+    },
+    /// [`ForgeStatusRequest`] answered.
+    ForgeStatusAnswered {
+        /// The request's generation.
+        generation: Generation,
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: ForgeStatusAnswer,
     },
     /// [`CacheRequest`] answered.
     CacheAnswered {
@@ -358,6 +389,10 @@ enum Pending {
     /// its `Finished` can only mark that machine's row.
     EvalOne(String),
     Prometheus,
+    /// `HEAD` of the fleet checkout, for the CI badge.
+    ForgeHead,
+    /// The forge's combined status of this commit.
+    ForgeStatus(String),
     /// The cache lookup for this machine.
     Cache(String),
     /// Address resolution for exactly these machines: its answer may update no others, so
@@ -398,6 +433,33 @@ enum DiffSlot {
     },
     /// Settled: computed, or failed.
     Done(PackageDiff),
+}
+
+/// The CI badge of the current refresh.
+#[derive(Debug, Clone, Default)]
+enum CiSlot {
+    /// `[forge]` is not configured: nothing is read or asked.
+    #[default]
+    Off,
+    /// Asked, no answer yet; the commit when `HEAD` has been read.
+    Checking { commit: Option<String> },
+    /// Settled.
+    Done(FleetCi),
+}
+
+impl CiSlot {
+    /// What the report says now: while it is out, an `unknown` that says so.
+    fn report(&self) -> FleetCi {
+        match self {
+            Self::Off => FleetCi::off(),
+            Self::Checking { commit } => FleetCi::unknown(commit.as_deref(), CI_CHECKING),
+            Self::Done(ci) => ci.clone(),
+        }
+    }
+
+    const fn checking(&self) -> bool {
+        matches!(self, Self::Checking { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -468,6 +530,8 @@ pub struct Model {
     /// The current generation's machines, sorted by name.
     rows: Vec<Row>,
     prometheus: PrometheusStatus,
+    /// The CI badge (`[forge]`): `HEAD` of the fleet checkout and what the forge says of it.
+    ci: CiSlot,
     samples: BTreeMap<String, PromSample>,
     /// Each machine's known addresses: IP-literal targets at once, hostnames once resolved.
     addresses: BTreeMap<String, Vec<IpAddr>>,
@@ -527,11 +591,20 @@ impl Model {
         }
         match self.inventory {
             Inventory::NotStarted | Inventory::Pending => false,
-            Inventory::Failed => true,
+            // The machine list failed, but the badge is not the list's: `fleet_ci` is printed
+            // with its answer in it, so it is waited for (bounded, like everything else).
+            Inventory::Failed => !self.ci_outstanding(),
             Inventory::Loaded => {
                 self.outstanding.is_empty() && !self.rows.iter().any(Row::spinning)
             }
         }
+    }
+
+    /// The CI badge's request is out.
+    fn ci_outstanding(&self) -> bool {
+        self.outstanding
+            .values()
+            .any(|p| matches!(p, Pending::ForgeHead | Pending::ForgeStatus(_)))
     }
 
     /// A package-preview query is out.
@@ -584,7 +657,12 @@ impl Model {
             && !self.outstanding.values().any(|p| {
                 matches!(
                     p,
-                    Pending::Inventory | Pending::Eval | Pending::Prometheus | Pending::Resolve(_)
+                    Pending::Inventory
+                        | Pending::Eval
+                        | Pending::Prometheus
+                        | Pending::ForgeHead
+                        | Pending::ForgeStatus(_)
+                        | Pending::Resolve(_)
                 )
             })
     }
@@ -707,6 +785,16 @@ impl App for Auspex {
                 id,
                 answer,
             } => prometheus_answered(model, generation, id, answer),
+            Event::ForgeHeadAnswered {
+                generation,
+                id,
+                answer,
+            } => forge_head_answered(model, generation, id, answer),
+            Event::ForgeStatusAnswered {
+                generation,
+                id,
+                answer,
+            } => forge_status_answered(model, generation, id, answer),
             Event::CacheAnswered {
                 generation,
                 id,
@@ -832,6 +920,7 @@ impl App for Auspex {
                 scan_complete: model.scan_complete(),
                 timed_out: model.timed_out,
                 errors: errors.clone(),
+                fleet_ci: model.ci.report(),
             },
         );
         let settled = model.fleet_settled();
@@ -856,6 +945,7 @@ impl App for Auspex {
                     .count(),
                 settled,
                 timed_out: model.timed_out,
+                ci_checking: model.ci.checking(),
             },
             report,
             prometheus: model.prometheus.clone(),
@@ -908,6 +998,7 @@ fn refresh(model: &mut Model) -> Command<Effect, Event> {
     model.deadline_passed = false;
     model.started.clear();
     model.timed_out = false;
+    model.ci = CiSlot::Off;
     model.prometheus = if model
         .config
         .as_ref()
@@ -937,6 +1028,9 @@ fn refresh(model: &mut Model) -> Command<Effect, Event> {
             answer,
         }),
     );
+    // Beside the list, not after it: the badge reads `HEAD` and asks the forge, which no row
+    // depends on and which depends on no row.
+    commands.extend(ask_forge_head(model));
     commands.push(render());
     Command::all(commands)
 }
@@ -1086,6 +1180,96 @@ fn ask_prometheus(model: &mut Model, config: &Config) -> Option<Command<Effect, 
             answer,
         }),
     )
+}
+
+/// Asks for `HEAD` of the fleet checkout, when `[forge]` is configured.
+fn ask_forge_head(model: &mut Model) -> Option<Command<Effect, Event>> {
+    let config = model.config.as_ref()?;
+    let forge = config.forge.as_ref()?;
+    let (flake, want_origin) = (config.flake.clone(), forge.repo.is_none());
+    let generation = model.generation;
+    let id = model.issue(Pending::ForgeHead);
+    model.ci = CiSlot::Checking { commit: None };
+    Some(
+        Command::request_from_shell(ForgeHeadRequest {
+            id,
+            generation,
+            flake,
+            want_origin,
+        })
+        .then_send(move |answer| Event::ForgeHeadAnswered {
+            generation,
+            id,
+            answer,
+        }),
+    )
+}
+
+/// `HEAD` is read: the domain decides whether the forge is asked and about which repository, or
+/// that the badge is already known (`not_pushed`, or `unknown` with the way to fix it).
+fn forge_head_answered(
+    model: &mut Model,
+    generation: Generation,
+    id: RequestId,
+    answer: ForgeHeadAnswer,
+) -> Command<Effect, Event> {
+    if model
+        .accept(generation, id, |p| *p == Pending::ForgeHead)
+        .is_none()
+    {
+        return Command::done();
+    }
+    let Some(forge) = model.config.as_ref().and_then(|c| c.forge.clone()) else {
+        return Command::done();
+    };
+    let head = match answer {
+        Ok(head) => head,
+        Err(why) => {
+            model.ci = CiSlot::Done(FleetCi::unknown(None, &why));
+            return render();
+        }
+    };
+    match plan(&head, &forge.host, forge.repo.as_deref()) {
+        Plan::Settled(ci) => {
+            model.ci = CiSlot::Done(ci);
+            render()
+        }
+        Plan::Ask { commit, repo } => {
+            let id = model.issue(Pending::ForgeStatus(commit.clone()));
+            model.ci = CiSlot::Checking {
+                commit: Some(commit.clone()),
+            };
+            Command::all([
+                Command::request_from_shell(ForgeStatusRequest {
+                    id,
+                    generation,
+                    repo,
+                    commit,
+                })
+                .then_send(move |answer| Event::ForgeStatusAnswered {
+                    generation,
+                    id,
+                    answer,
+                }),
+                render(),
+            ])
+        }
+    }
+}
+
+fn forge_status_answered(
+    model: &mut Model,
+    generation: Generation,
+    id: RequestId,
+    answer: ForgeStatusAnswer,
+) -> Command<Effect, Event> {
+    match model.accept(generation, id, |p| matches!(p, Pending::ForgeStatus(_))) {
+        Some(Pending::ForgeStatus(commit)) => {
+            model.ci = CiSlot::Done(FleetCi::from_answer(&commit, answer));
+            render()
+        }
+        _ => Command::done(),
+    }
 }
 
 fn prometheus_answered(
@@ -1540,6 +1724,13 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
                     reason: PROMETHEUS_TIMED_OUT.to_owned(),
                 };
             }
+            // Not heard from in time: the badge says so, with the commit when `HEAD` was read.
+            Pending::ForgeHead => {
+                model.ci = CiSlot::Done(FleetCi::unknown(None, CI_TIMED_OUT));
+            }
+            Pending::ForgeStatus(commit) => {
+                model.ci = CiSlot::Done(FleetCi::unknown(Some(&commit), CI_TIMED_OUT));
+            }
             // A lookup that did not answer in time failed, as far as the badge goes.
             Pending::Cache(name) => {
                 if let Some(row) = model.row_mut(&name) {
@@ -1605,6 +1796,8 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::ProbeAnswered { .. }
         | Event::EvalAnswered { .. }
         | Event::PrometheusAnswered { .. }
+        | Event::ForgeHeadAnswered { .. }
+        | Event::ForgeStatusAnswered { .. }
         | Event::CacheAnswered { .. }
         | Event::DeployedClosureAnswered { .. }
         | Event::PendingClosureAnswered { .. }
