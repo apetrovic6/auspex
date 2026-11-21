@@ -461,6 +461,7 @@ fn question(kind: ConfirmKind, typed: bool) -> ConfirmView {
         serial: 1,
         refusals: Vec::new(),
         warnings: Vec::new(),
+        lines: Vec::new(),
         typed: typed.then(|| TypedView {
             expected: "cypramundi".to_owned(),
             text: "cypra".to_owned(),

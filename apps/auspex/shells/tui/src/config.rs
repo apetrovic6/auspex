@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use auspex_domain::roll::{RollRule, RollRules};
 use toml::{Table, Value};
 
 /// Everything `config.toml` can say, with the defaults filled in.
@@ -41,7 +42,36 @@ pub struct Settings {
     pub keymap: BTreeMap<String, Vec<String>>,
     /// `[theme] file`, with a leading `~/` expanded, or `None` for the terminal's ANSI 16.
     pub theme_file: Option<PathBuf>,
+    /// `[rolling.<tag>]`: machines carrying one of these tags update one at a time under `U`.
+    pub rolling: RollRules,
+    /// `[update]`.
+    pub update: UpdateSettings,
+    /// `kubernetes.kubeconfig`, `~/` already expanded: the kubeconfig `U` reads node state and
+    /// drains with. `None`: `$KUBECONFIG`, then `~/.kube/config` ([`resolve_kubeconfig`]).
+    pub kubeconfig: Option<String>,
 }
+
+/// `[update]`: how `U` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateSettings {
+    /// `update.parallel`: how many machines with no rolling tag update at once.
+    pub parallel: u64,
+    /// `update.ready_timeout`: seconds to wait for an updated machine to be healthy (and its node
+    /// Ready).
+    pub ready_timeout: u64,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            parallel: auspex_core::config::DEFAULT_PARALLEL as u64,
+            ready_timeout: auspex_core::config::DEFAULT_READY_TIMEOUT_SECONDS,
+        }
+    }
+}
+
+/// The most machines `update.parallel` may name: each is a local build and a copy.
+pub const MAX_PARALLEL: u64 = 16;
 
 /// `[diff]`: the package preview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +409,51 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                     s.machines.insert(machine.clone(), m);
                 }
             }
+            "rolling" => {
+                for (tag, v) in w.table(value, "rolling")? {
+                    let prefix = format!("rolling.{tag}");
+                    let mut rule = RollRule::default();
+                    for (k, v) in w.table(v, &prefix)? {
+                        let name = format!("{prefix}.{k}");
+                        match k.as_str() {
+                            "kubernetes" => rule.kubernetes = w.boolean(v, &name)?,
+                            "drain" => rule.drain = w.boolean(v, &name)?,
+                            "drain_timeout" => rule.drain_timeout_seconds = w.timeout(v, &name)?,
+                            _ => w.unknown(&name),
+                        }
+                    }
+                    s.rolling.insert(tag.clone(), rule);
+                }
+            }
+            "update" => {
+                for (k, v) in w.table(value, "update")? {
+                    let name = format!("update.{k}");
+                    match k.as_str() {
+                        "parallel" => s.update.parallel = w.counted(v, &name, MAX_PARALLEL)?,
+                        "ready_timeout" => s.update.ready_timeout = w.timeout(v, &name)?,
+                        _ => w.unknown(&name),
+                    }
+                }
+            }
+            "kubernetes" => {
+                for (k, v) in w.table(value, "kubernetes")? {
+                    let name = format!("kubernetes.{k}");
+                    match k.as_str() {
+                        "kubeconfig" => {
+                            let path = expand_flake(&w.string(v, &name)?, &name)?;
+                            // `kubectl --kubeconfig` is given exactly this: a relative path would
+                            // be read against wherever auspex happened to be started.
+                            if !Path::new(&path).is_absolute() {
+                                return Err(format!(
+                                    "`{name}` must be an absolute path (or start with `~/`), not `{path}`"
+                                ));
+                            }
+                            s.kubeconfig = Some(path);
+                        }
+                        _ => w.unknown(&name),
+                    }
+                }
+            }
             "keymap" => {
                 let t = w.table(value, "keymap")?;
                 for (action, v) in t {
@@ -409,6 +484,61 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
         }
     }
     Ok((s, w.warnings))
+}
+
+/// The kubeconfig `U` uses.
+///
+/// `kubernetes.kubeconfig` (`configured`), else `$KUBECONFIG`, else `~/.kube/config`. Only a path is chosen here: nothing is read, and nothing says the file exists
+/// (`kubectl` will say so, at the first use).
+///
+/// `$KUBECONFIG` may name several files, which `kubectl --kubeconfig` cannot take, and a relative
+/// one would be read against the directory auspex was started in: both are refused, saying how
+/// to fix it, rather than guessed at.
+///
+/// # Errors
+///
+/// Why no kubeconfig can be chosen.
+pub fn resolve_kubeconfig(configured: Option<&str>) -> Result<PathBuf, String> {
+    resolve_kubeconfig_in(
+        configured,
+        std::env::var_os("KUBECONFIG").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+fn resolve_kubeconfig_in(
+    configured: Option<&str>,
+    env: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    if let Some(path) = configured {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(env) = env.filter(|e| !e.is_empty()) {
+        let path = PathBuf::from(env);
+        if env.to_string_lossy().contains(':') {
+            return Err(
+                "`$KUBECONFIG` names several files, which `kubectl --kubeconfig` cannot take: set \
+                 `kubernetes.kubeconfig`"
+                    .to_owned(),
+            );
+        }
+        if !path.is_absolute() {
+            return Err(format!(
+                "`$KUBECONFIG` is `{}`, not an absolute path: set `kubernetes.kubeconfig`",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    home.map(Path::new)
+        .filter(|h| h.is_absolute())
+        .map(|h| h.join(".kube").join("config"))
+        .ok_or_else(|| {
+            "no kubeconfig: `kubernetes.kubeconfig` is not set, `$KUBECONFIG` is empty and `HOME` is \
+             not an absolute path"
+                .to_owned()
+        })
 }
 
 /// A leading `~/` becomes `$HOME/`; anything else is taken as written. The home-manager
@@ -537,6 +667,21 @@ impl Walk {
                 format!("`{key}` must be a whole number of seconds, 0 or more, not {i}")
             }),
             other => Err(wrong(key, "a whole number of seconds", other)),
+        }
+    }
+
+    /// A whole number from 1 to `max`.
+    #[expect(
+        clippy::unused_self,
+        reason = "kept beside `unknown` so every key reads alike"
+    )]
+    fn counted(&self, v: &Value, key: &str, max: u64) -> Result<u64, String> {
+        match v {
+            Value::Integer(i) => u64::try_from(*i)
+                .ok()
+                .filter(|n| (1..=max).contains(n))
+                .ok_or_else(|| format!("`{key}` must be a whole number from 1 to {max}, not {i}")),
+            other => Err(wrong(key, "a whole number", other)),
         }
     }
 
@@ -712,5 +857,109 @@ mod tests {
     fn a_prometheus_table_without_a_url_is_no_prometheus() {
         let (s, _) = parse("[prometheus]\nstale_after = 30\n").unwrap();
         assert_eq!(s.prometheus, None);
+    }
+
+    // --- `U`: rolling rules, `[update]` and the kubeconfig ---
+
+    #[test]
+    fn a_rolling_tag_with_no_keys_is_a_rolling_tag_with_the_defaults() {
+        let (s, w) = parse("[rolling.taghmata]\n").unwrap();
+        assert_eq!(w, Vec::<String>::new());
+        assert_eq!(s.rolling["taghmata"], RollRule::default());
+        assert!(!RollRule::default().drain, "drain is opt-in");
+        assert!(!RollRule::default().kubernetes);
+        assert_eq!(RollRule::default().drain_timeout_seconds, 600);
+    }
+
+    #[test]
+    fn rolling_and_update_keys_name_themselves_when_wrong() {
+        for (text, key) in [
+            (
+                "[rolling.a]\nkubernetes = \"yes\"\n",
+                "rolling.a.kubernetes",
+            ),
+            ("[rolling.a]\ndrain = 1\n", "rolling.a.drain"),
+            (
+                "[rolling.a]\ndrain_timeout = 0\n",
+                "rolling.a.drain_timeout",
+            ),
+            (
+                "[rolling.a]\ndrain_timeout = 86401\n",
+                "rolling.a.drain_timeout",
+            ),
+            ("rolling = 3\n", "rolling"),
+            ("[rolling]\na = 3\n", "rolling.a"),
+            ("[update]\nparallel = 0\n", "update.parallel"),
+            ("[update]\nparallel = 17\n", "update.parallel"),
+            ("[update]\nparallel = \"2\"\n", "update.parallel"),
+            ("[update]\nready_timeout = 0\n", "update.ready_timeout"),
+        ] {
+            let e = parse(text).unwrap_err();
+            assert!(e.contains(&format!("`{key}`")), "{text:?}: {e}");
+        }
+        let (s, _) = parse("[update]\nparallel = 16\nready_timeout = 86400\n").unwrap();
+        assert_eq!((s.update.parallel, s.update.ready_timeout), (16, 86_400));
+        let (s, w) = parse("[rolling.a]\nwarp = 1\n[update]\nwarp = 1\n").unwrap();
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert_eq!(s.update, UpdateSettings::default());
+    }
+
+    #[test]
+    fn the_kubeconfig_setting_expands_a_tilde_slash_like_flake_and_is_never_relative() {
+        let (s, _) = parse("[kubernetes]\nkubeconfig = \"/abs/kube\"\n").unwrap();
+        assert_eq!(s.kubeconfig.as_deref(), Some("/abs/kube"));
+        for bad in ["~user/kube", "~", "kube/config", "config"] {
+            let e = parse(&format!("[kubernetes]\nkubeconfig = \"{bad}\"\n")).unwrap_err();
+            assert!(e.contains("`kubernetes.kubeconfig`"), "{bad}: {e}");
+        }
+        let e = expand_flake_in("~/kube", "kubernetes.kubeconfig", None).unwrap_err();
+        assert!(
+            e.contains("`kubernetes.kubeconfig`") && e.contains("HOME"),
+            "{e}"
+        );
+        assert_eq!(
+            expand_flake_in(
+                "~/.kube/fleet",
+                "kubernetes.kubeconfig",
+                Some(home("/home/me"))
+            )
+            .unwrap(),
+            "/home/me/.kube/fleet"
+        );
+    }
+
+    #[test]
+    fn the_kubeconfig_is_the_setting_then_kubeconfig_then_the_home_default() {
+        let os = std::ffi::OsStr::new;
+        let me = Some(home("/home/me"));
+        assert_eq!(
+            resolve_kubeconfig_in(Some("/set/config"), Some(os("/env/config")), me).unwrap(),
+            PathBuf::from("/set/config"),
+            "the setting wins"
+        );
+        assert_eq!(
+            resolve_kubeconfig_in(None, Some(os("/env/config")), me).unwrap(),
+            PathBuf::from("/env/config")
+        );
+        for empty in [None, Some(os(""))] {
+            assert_eq!(
+                resolve_kubeconfig_in(None, empty, me).unwrap(),
+                PathBuf::from("/home/me/.kube/config")
+            );
+        }
+        // Several files cannot be given to `--kubeconfig`, a relative one means whatever
+        // directory auspex was started in, and no home means no default: each is said, naming
+        // the way out, and nothing is guessed.
+        let several = resolve_kubeconfig_in(None, Some(os("/a:/b")), me).unwrap_err();
+        assert!(
+            several.contains("several files") && several.contains("kubernetes.kubeconfig"),
+            "{several}"
+        );
+        let relative = resolve_kubeconfig_in(None, Some(os("kube/config")), me).unwrap_err();
+        assert!(relative.contains("not an absolute path"), "{relative}");
+        for bad_home in [None, Some(home("relative"))] {
+            let none = resolve_kubeconfig_in(None, None, bad_home).unwrap_err();
+            assert!(none.contains("no kubeconfig"), "{none}");
+        }
     }
 }

@@ -53,10 +53,12 @@ use auspex_domain::status::NarCache;
 use crux_core::Command;
 use crux_core::render::render;
 
+use super::roll::{self, Draft, Planned};
 use super::{Event, Model, Pending};
 use crate::effects::{
     ActionEnd, ActionKind, ActionRequest, CancelRequest, Effect, EvalMachine, EvalRequest,
-    PreflightAnswer, PreflightRequest, ProbeRequest, RequestId, ShellEnd, ShellRequest,
+    FleetUnlockRequest, PreflightAnswer, PreflightRequest, ProbeRequest, RequestId, ShellEnd,
+    ShellRequest,
 };
 use crate::view::{ActionStatus, ActionView, ConfirmKind, ConfirmView, Mode, TypedView};
 
@@ -101,6 +103,15 @@ pub(super) enum Confirm {
     },
     /// Unfreeze `machine` (`f` on a machine frozen with `f`).
     Unfreeze { machine: String },
+    /// The cluster is being read (request `id`) before an update of all is planned. Any key
+    /// cancels it.
+    CheckingCluster {
+        id: RequestId,
+        draft: Box<Draft>,
+        stage: roll::Stage,
+    },
+    /// Update everything the plan lists (`U`): one question for the whole roll.
+    UpdateAll(Box<Planned>),
     /// Quit while an action runs.
     Quit,
 }
@@ -125,15 +136,17 @@ enum Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Action {
     id: RequestId,
-    kind: ActionKind,
-    machine: String,
+    pub(super) kind: ActionKind,
+    pub(super) machine: String,
     phase: Phase,
     /// The operator chose to quit: when the shell answers that the process is over, quit.
     quit_when_ended: bool,
+    /// The fleet lock this action holds (a `u`), let go when it ends.
+    lock: Option<RequestId>,
 }
 
 impl Action {
-    const fn active(&self) -> bool {
+    pub(super) const fn active(&self) -> bool {
         matches!(self.phase, Phase::Running | Phase::Stopping)
     }
 }
@@ -141,6 +154,8 @@ impl Action {
 impl Model {
     fn action_active(&self) -> bool {
         self.action.as_ref().is_some_and(Action::active)
+            || self.roll_active()
+            || self.lock_wait.is_some()
     }
 
     pub(super) const fn fresh_id(&mut self) -> RequestId {
@@ -191,6 +206,10 @@ fn confirm_view(model: &Model, confirm: &Confirm) -> ConfirmView {
         Confirm::Checking { .. } => (ConfirmKind::Checking, Vec::new(), Vec::new(), None),
         Confirm::Quit => (ConfirmKind::Quit, Vec::new(), Vec::new(), None),
         Confirm::Unfreeze { .. } => (ConfirmKind::Unfreeze, Vec::new(), Vec::new(), None),
+        Confirm::CheckingCluster { .. } => {
+            (ConfirmKind::CheckingCluster, Vec::new(), Vec::new(), None)
+        }
+        Confirm::UpdateAll(_) => (ConfirmKind::UpdateAll, Vec::new(), Vec::new(), None),
         Confirm::Update {
             machine,
             review,
@@ -223,6 +242,10 @@ fn confirm_view(model: &Model, confirm: &Confirm) -> ConfirmView {
         refusals,
         warnings,
         typed,
+        lines: match confirm {
+            Confirm::UpdateAll(planned) => planned.lines(),
+            _ => Vec::new(),
+        },
     }
 }
 
@@ -253,7 +276,20 @@ fn question(model: &Model, confirm: &Confirm) -> String {
         Confirm::Unfreeze { machine } => {
             format!("unfreeze {machine}? updates to it will be possible again. y/N")
         }
+        Confirm::CheckingCluster { .. } => {
+            "looking at the cluster and the fleet repository before the update of all is planned… any key cancels".to_owned()
+        }
+        Confirm::UpdateAll(planned) => {
+            let n = planned.machines();
+            format!(
+                "update {n} machine{} as listed above? y/N",
+                if n == 1 { "" } else { "s" }
+            )
+        }
         Confirm::Quit => {
+            if let Some(roll) = model.roll.as_ref().filter(|r| r.active()) {
+                return roll::quit_question(roll);
+            }
             let what = model.action.as_ref().map_or_else(
                 || "an action".to_owned(),
                 |a| {
@@ -281,9 +317,9 @@ fn question(model: &Model, confirm: &Confirm) -> String {
 /// Forgets the open question. If it was the checks of an update still running in the shell,
 /// they are cancelled: the returned commands must be sent, or the shell keeps a `git` and a
 /// `nix` running for a dialog nobody is looking at.
-fn drop_confirm(model: &mut Model) -> Vec<Command<Effect, Event>> {
+pub(super) fn drop_confirm(model: &mut Model) -> Vec<Command<Effect, Event>> {
     match model.confirm.take() {
-        Some(Confirm::Checking { id, .. }) => {
+        Some(Confirm::Checking { id, .. } | Confirm::CheckingCluster { id, .. }) => {
             vec![Command::notify_shell(CancelRequest { id }).into()]
         }
         _ => Vec::new(),
@@ -295,6 +331,10 @@ pub(super) fn toggle_act(model: &mut Model) -> Command<Effect, Event> {
     model.view.notice = None;
     if !model.config.as_ref().is_some_and(|c| c.allow_act) {
         return model.notice("act mode is not available in this run");
+    }
+    if model.act && model.roll_active() {
+        return model
+            .notice("an update of all machines is running: act mode stays on until it ends");
     }
     if model.act {
         model.act = false;
@@ -313,6 +353,14 @@ pub(super) fn request(model: &mut Model, kind: ActionKind) -> Command<Effect, Ev
     model.view.notice = None;
     if kind == ActionKind::Update && !model.act {
         return model.notice(ACT_MODE_OFF);
+    }
+    // From the `y` of an update (of one machine or of all) to its start the fleet's lock is being
+    // taken: nothing else is asked for or started meanwhile.
+    if model.roll_active() {
+        return model.notice("an update of all machines is running");
+    }
+    if model.lock_wait.is_some() {
+        return model.notice("an update is starting: ask again in a moment");
     }
     if model.freeze.rechecking() {
         return model
@@ -341,7 +389,7 @@ pub(super) fn request(model: &mut Model, kind: ActionKind) -> Command<Effect, Ev
     }
 }
 
-fn article(kind: ActionKind) -> String {
+pub(super) fn article(kind: ActionKind) -> String {
     let a = if kind == ActionKind::Update {
         "an"
     } else {
@@ -351,20 +399,20 @@ fn article(kind: ActionKind) -> String {
 }
 
 /// The system a machine's evaluation produced: what an update would deploy.
-struct Shown {
+pub(super) struct Shown {
     /// As the question shows it, as the detail panel does: the hash's first 8 characters and
     /// the name (the name alone does not identify a system: two configurations on one nixpkgs
     /// share it).
-    label: String,
+    pub(super) label: String,
     /// The whole store path, to tell at `y` whether it is still the one that was asked about.
-    path: String,
+    pub(super) path: String,
     /// The same, as the value whose closure the checks size.
-    store_path: StorePath,
+    pub(super) store_path: StorePath,
 }
 
 /// Everything that must hold before an action on `machine` may be asked for. On success, the
 /// pending system the machine's evaluation produced.
-fn check(model: &Model, kind: ActionKind, machine: &str) -> Result<Shown, String> {
+pub(super) fn check(model: &Model, kind: ActionKind, machine: &str) -> Result<Shown, String> {
     if !is_plain_name(machine) {
         return Err(format!(
             "{machine:?} is not a plain machine name; not touching it"
@@ -484,7 +532,7 @@ fn resolution_timed_out(model: &Model) -> bool {
 /// Why an update of `machine` cannot be asked about yet, when what the checks need from the
 /// core is still on its way. Refused at `u` rather than shown as a warning: "not known yet"
 /// must not read as "not known".
-fn not_yet(model: &Model, machine: &str) -> Option<String> {
+pub(super) fn not_yet(model: &Model, machine: &str) -> Option<String> {
     if probing(model, machine) {
         return Some(format!("still probing {machine}; try again in a moment"));
     }
@@ -505,7 +553,7 @@ fn not_yet(model: &Model, machine: &str) -> Option<String> {
 /// Called when the answer comes in (what the dialog shows) and again when the operator
 /// confirms (what decides), so a refresh in between that changed an address or a probe's free
 /// space is seen by the second.
-fn review(model: &Model, machine: &str, answer: &PreflightAnswer) -> Preflight {
+pub(super) fn review(model: &Model, machine: &str, answer: &PreflightAnswer) -> Preflight {
     let free_bytes = model
         .rows
         .iter()
@@ -607,52 +655,82 @@ fn preflight_answered(
     render()
 }
 
-/// Issues the request. Called only after [`check`] and, for an update, the operator's
-/// confirmation.
-fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effect, Event> {
-    let (class, system, build_host, target) = {
-        let Some(row) = model.rows.iter().find(|r| r.machine.name == machine) else {
-            return model.notice(format!(
-                "{machine} is not in the inventory; not touching it"
-            ));
-        };
-        let system = match &row.eval {
-            Some(EvalOutcome::Success(e)) => e.system.clone(),
-            _ => None,
-        };
-        let target = row.target.as_ref().ok().map(|t| t.target.to_string());
-        (
-            row.machine.class,
-            system,
-            row.machine.build_host.clone(),
-            target,
-        )
+/// The request to run `kind` on `machine` as request `id`, writing into Log tab run `log` (an
+/// update of all) or its own (`None`). Called only after [`check`] and, for an update, the
+/// operator's confirmation.
+pub(super) fn action_request(
+    model: &Model,
+    kind: ActionKind,
+    machine: &str,
+    id: RequestId,
+    log: Option<RequestId>,
+) -> Result<ActionRequest, String> {
+    let Some(row) = model.rows.iter().find(|r| r.machine.name == machine) else {
+        return Err(format!(
+            "{machine} is not in the inventory; not touching it"
+        ));
+    };
+    let system = match &row.eval {
+        Some(EvalOutcome::Success(e)) => e.system.clone(),
+        _ => None,
     };
     let flake = model
         .config
         .as_ref()
         .map(|c| c.flake.clone())
         .unwrap_or_default();
+    Ok(ActionRequest {
+        id,
+        kind,
+        machine: machine.to_owned(),
+        class: row.machine.class,
+        system,
+        flake,
+        build_host: row.machine.build_host.clone(),
+        target: row.target.as_ref().ok().map(|t| t.target.to_string()),
+        log,
+    })
+}
+
+/// Issues the request. Called only after [`check`] and, for an update, the operator's
+/// confirmation.
+fn launch(model: &mut Model, kind: ActionKind, machine: String) -> Command<Effect, Event> {
+    launch_with(model, kind, machine, None)
+}
+
+/// [`launch`] of an update that holds the fleet's lock `lock`, which it lets go of when it ends.
+pub(super) fn launch_locked(
+    model: &mut Model,
+    machine: String,
+    lock: RequestId,
+) -> Command<Effect, Event> {
+    launch_with(model, ActionKind::Update, machine, Some(lock))
+}
+
+fn launch_with(
+    model: &mut Model,
+    kind: ActionKind,
+    machine: String,
+    lock: Option<RequestId>,
+) -> Command<Effect, Event> {
     let id = model.fresh_id();
+    let request = match action_request(model, kind, &machine, id, None) {
+        Ok(r) => r,
+        Err(why) => {
+            let release = lock.map(|id| Command::notify_shell(FleetUnlockRequest { id }).into());
+            return Command::all(release.into_iter().chain([model.notice(why)]));
+        }
+    };
     model.action = Some(Action {
         id,
         kind,
-        machine: machine.clone(),
+        machine,
         phase: Phase::Running,
         quit_when_ended: false,
+        lock,
     });
     Command::all([
-        Command::request_from_shell(ActionRequest {
-            id,
-            kind,
-            machine,
-            class,
-            system,
-            flake,
-            build_host,
-            target,
-        })
-        .then_send(move |end| Event::ActionEnded { id, end }),
+        Command::request_from_shell(request).then_send(move |end| Event::ActionEnded { id, end }),
         render(),
     ])
 }
@@ -738,7 +816,9 @@ fn confirm_update(model: &mut Model, asked: Asked, stage: Stage) -> Command<Effe
         return model.notice(note);
     }
     if stage == Stage::FreezesRead {
-        return launch(model, ActionKind::Update, machine);
+        // The last rule: one auspex updates a fleet at a time. The update is launched when the lock
+        // is held (`roll::lock_answered`).
+        return roll::lock_for_update(model, machine);
     }
     // Everything the core can know says yes. The last look is at the file, which another
     // running auspex may have changed since this one read it (`freeze.rs`); every rule above is
@@ -869,7 +949,7 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
     match confirm {
         // Anything cancels the checks: nothing was decided yet, so there is nothing to
         // confirm, and a `y` typed ahead of the dialog must not confirm what it never saw.
-        Confirm::Checking { id, .. } => {
+        Confirm::Checking { id, .. } | Confirm::CheckingCluster { id, .. } => {
             Command::all([Command::notify_shell(CancelRequest { id }).into(), render()])
         }
         // A refusal has no yes.
@@ -908,6 +988,7 @@ pub(super) fn answer(model: &mut Model, yes: bool) -> Command<Effect, Event> {
             Stage::Confirmed,
         ),
         Confirm::Unfreeze { machine } => super::freeze::unfreeze_confirmed(model, machine),
+        Confirm::UpdateAll(planned) => roll::confirmed(model, &planned),
         Confirm::Quit => stop_and_quit(model),
     }
 }
@@ -973,6 +1054,19 @@ pub(super) fn typed_submit(model: &mut Model) -> Command<Effect, Event> {
 /// The operator's request to quit (`q`, Esc, Ctrl-C, `:q`).
 pub(super) fn quit(model: &mut Model) -> Command<Effect, Event> {
     model.view.notice = None;
+    if let Some(roll) = model.roll.as_ref().filter(|r| r.active()) {
+        // The second quit while it is being stopped: the operator does not want to wait.
+        if roll.stopping() {
+            return force_quit(model);
+        }
+        let mut commands = Vec::new();
+        if model.confirm != Some(Confirm::Quit) {
+            commands.extend(drop_confirm(model));
+            model.ask(Confirm::Quit);
+        }
+        commands.push(render());
+        return Command::all(commands);
+    }
     match model.action.as_ref().map(|a| &a.phase) {
         Some(Phase::Running) => {
             let mut commands = Vec::new();
@@ -991,6 +1085,13 @@ pub(super) fn quit(model: &mut Model) -> Command<Effect, Event> {
 
 /// A termination signal: stop what runs and quit, without a question (nobody can answer one).
 pub(super) fn terminate(model: &mut Model) -> Command<Effect, Event> {
+    if let Some(roll) = model.roll.as_ref().filter(|r| r.active()) {
+        return if roll.stopping() {
+            force_quit(model)
+        } else {
+            stop_and_quit(model)
+        };
+    }
     match model.action.as_ref().map(|a| &a.phase) {
         Some(Phase::Running) => stop_and_quit(model),
         Some(Phase::Stopping) => force_quit(model),
@@ -1011,6 +1112,13 @@ fn finish_quit(model: &mut Model) -> Command<Effect, Event> {
 fn stop_and_quit(model: &mut Model) -> Command<Effect, Event> {
     let mut commands = drop_confirm(model);
     commands.extend(model.cancel_all());
+    if model.roll_active() {
+        // The roll ends machine by machine, uncordoning what it cordoned, and sets `quit` when
+        // the last one is over.
+        commands.extend(roll::stop(model, true));
+        commands.push(render());
+        return Command::all(commands);
+    }
     if let Some(a) = model.action.as_mut().filter(|a| a.active()) {
         a.phase = Phase::Stopping;
         a.quit_when_ended = true;
@@ -1027,6 +1135,7 @@ fn stop_and_quit(model: &mut Model) -> Command<Effect, Event> {
 /// when it shuts down.
 fn force_quit(model: &mut Model) -> Command<Effect, Event> {
     let mut commands = drop_confirm(model);
+    commands.extend(roll::force(model));
     model.view.quit = true;
     commands.extend(model.cancel_all());
     commands.push(render());
@@ -1035,16 +1144,24 @@ fn force_quit(model: &mut Model) -> Command<Effect, Event> {
 
 /// The shell's answer: the process is over (killed and reaped, if it was cancelled).
 pub(super) fn ended(model: &mut Model, id: RequestId, end: ActionEnd) -> Command<Effect, Event> {
+    if let Some(command) = roll::action_ended(model, id, &end) {
+        return command;
+    }
     let Some(action) = model.action.as_mut().filter(|a| a.id == id && a.active()) else {
         return Command::done();
     };
     let (kind, machine, quitting) = (action.kind, action.machine.clone(), action.quit_when_ended);
+    let lock = action.lock.take();
     action.phase = Phase::Ended(end);
+    let mut commands: Vec<Command<Effect, Event>> = lock
+        .map(|id| Command::notify_shell(FleetUnlockRequest { id }).into())
+        .into_iter()
+        .collect();
     if quitting {
         model.view.quit = true;
-        return render();
+        commands.push(render());
+        return Command::all(commands);
     }
-    let mut commands = Vec::new();
     if kind == ActionKind::Update {
         commands.extend(refresh_machine(model, &machine));
     }
@@ -1139,6 +1256,17 @@ pub(super) fn event(model: &mut Model, event: Event) -> Command<Effect, Event> {
         Event::Terminate => terminate(model),
         Event::ToggleAct => toggle_act(model),
         Event::UpdateSelected => request(model, ActionKind::Update),
+        Event::UpdateAll => roll::request(model),
+        Event::KubeAnswered { id, answer } => {
+            roll::kube_answered(model, id, &answer).unwrap_or_else(Command::done)
+        }
+        Event::AwaitAnswered { id, answer } => {
+            roll::awaited(model, id, &answer).unwrap_or_else(Command::done)
+        }
+        Event::TreeChecked { id, answer } => {
+            roll::tree_checked(model, id, &answer).unwrap_or_else(Command::done)
+        }
+        Event::FleetLockAnswered { id, answer } => roll::lock_answered(model, id, &answer),
         Event::BuildSelected => request(model, ActionKind::Build),
         Event::ShellSelected => open_shell(model),
         Event::ShellEnded { id, end } => shell_ended(model, id, &end),
@@ -1146,7 +1274,8 @@ pub(super) fn event(model: &mut Model, event: Event) -> Command<Effect, Event> {
         Event::ConfirmChar(c) => typed_char(model, c),
         Event::ConfirmBackspace => typed_backspace(model),
         Event::ConfirmSubmit => typed_submit(model),
-        Event::PreflightAnswered { id, answer } => preflight_answered(model, id, answer),
+        Event::PreflightAnswered { id, answer } => roll::preflight_answered(model, id, &answer)
+            .unwrap_or_else(|| preflight_answered(model, id, answer)),
         Event::ActionEnded { id, end } => ended(model, id, end),
         // Not an acting event: `update` never routes one here.
         _ => Command::done(),

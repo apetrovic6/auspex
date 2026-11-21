@@ -10,17 +10,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use auspex_core::effects::{
-    ActionKind, ActionRequest, CacheRequest, ClosureAnswer, DeployedClosureRequest, EvalRequest,
-    InventoryAnswer, InventoryRequest, PendingClosureRequest, PreflightAnswer, PreflightRequest,
-    ProbeRequest, PrometheusAnswer, PrometheusRequest, ResolveRequest, ShellRequest,
+    ActionKind, ActionRequest, AwaitAnswer, AwaitRequest, CacheRequest, ClosureAnswer,
+    DeployedClosureRequest, EvalRequest, InventoryAnswer, InventoryRequest, KubeAnswer, KubeOp,
+    KubeReply, KubeRequest, PendingClosureRequest, PreflightAnswer, PreflightRequest, ProbeRequest,
+    PrometheusAnswer, PrometheusRequest, ResolveRequest, ShellRequest, TreeRequest,
 };
 use auspex_domain::fleet::ConnectTimeout;
 use auspex_domain::observe::ProbeOutcome;
+use auspex_domain::preflight::TreeState;
 use auspex_domain::status::NarCache;
 use auspex_effects::cache::{self, CacheParams, GitParams};
 use auspex_effects::clan::{self, ClanLine, ClanLocator, ClanRun, ResolveParams, RunParams};
 use auspex_effects::closure::{self, PendingParams};
 use auspex_effects::http::HttpClient;
+use auspex_effects::kube::{self, KubeParams};
 use auspex_effects::nix::{self, EvalItem, EvalMachine, EvalParams, FlakeRef};
 use auspex_effects::ssh::{self, ControlDir, ProbeParams};
 use auspex_effects::{CancellationToken, Cancelled, act, dns, narinfo, preflight, prometheus};
@@ -71,6 +74,9 @@ pub fn rekey<T>(
         .filter_map(|(query, v)| queries.get(&query).map(|l| (l.clone(), v)))
         .collect()
 }
+
+/// How often the wait for an updated machine asks again: 5 seconds.
+pub const AWAIT_POLL: Duration = Duration::from_secs(5);
 
 /// The adapters or the demo.
 pub enum Backend {
@@ -229,8 +235,37 @@ impl Backend {
         }
     }
 
+    /// `Effect::Tree`: the state of the fleet repository, for the plan of an update of all.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn tree(
+        &self,
+        op: &TreeRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Result<TreeState, String>, Cancelled> {
+        match self {
+            Self::Real(r) => r.tree(op, cancel).await,
+            Self::Demo(d) => d.tree(op, cancel).await,
+        }
+    }
+
+    /// The `kubectl` and kubeconfig this run talks to the cluster with, when it has any: what the
+    /// shell's record of cordoned nodes needs to uncordon one at exit.
+    #[must_use]
+    pub fn kubectl_target(&self) -> Option<(OsString, PathBuf)> {
+        match self {
+            Self::Real(r) => r.kubectl_target(),
+            Self::Demo(d) => d.real_actions.as_ref().and_then(|r| r.kubectl_target()),
+        }
+    }
+
     /// `Effect::RunAction`: the process's lines go to `sink` as they are printed; the result is
     /// how it ended, or why it could not be started or was refused.
+    ///
+    /// `starting` is called once, right before an update's `clan` is spawned, and not at all when
+    /// it never is: from then on the machine may be changed.
     ///
     /// # Errors
     ///
@@ -240,10 +275,46 @@ impl Backend {
         op: &ActionRequest,
         cancel: &CancellationToken,
         sink: &(dyn Fn(Stream, &str) + Sync),
+        starting: &(dyn Fn() + Sync),
     ) -> Result<Result<ClanRun, String>, Cancelled> {
         match self {
-            Self::Real(r) => r.run_action(op, cancel, sink).await,
-            Self::Demo(d) => d.run_action(op, cancel, sink).await,
+            Self::Real(r) => r.run_action(op, cancel, sink, starting).await,
+            Self::Demo(d) => d.run_action(op, cancel, sink, starting).await,
+        }
+    }
+
+    /// `Effect::Kube`: one call to the cluster; a drain's output goes to `sink`.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired: `kubectl` has been killed and reaped.
+    pub async fn kube(
+        &self,
+        op: &KubeRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<KubeAnswer, Cancelled> {
+        match self {
+            Self::Real(r) => r.kube(op, cancel, sink).await,
+            Self::Demo(d) => d.kube(op, cancel, sink).await,
+        }
+    }
+
+    /// `Effect::Await`: probe the updated machine (and read its node) every few seconds until it
+    /// is healthy, or `op.timeout_seconds` has passed.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired.
+    pub async fn await_healthy(
+        &self,
+        op: &AwaitRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<AwaitAnswer, Cancelled> {
+        match self {
+            Self::Real(r) => r.await_loop(op, cancel, sink, true).await,
+            Self::Demo(d) => d.await_healthy(op, cancel, sink).await,
         }
     }
 
@@ -336,6 +407,10 @@ pub struct Real {
     /// An explicit path to `clan`, set only by [`Self::for_actions`] (the tests' fake): wins over
     /// resolution. A real run always resolves the fleet's pinned `clan` from its lock.
     clan_path: Option<PathBuf>,
+    /// `kubectl`, and the kubeconfig it is given (or why there is none): what `U` asks the
+    /// cluster with.
+    kubectl: OsString,
+    kubeconfig: Result<PathBuf, String>,
 }
 
 impl std::fmt::Debug for Real {
@@ -388,6 +463,8 @@ impl Real {
             // leftover from debugging) would change which binary deploys. Only the tests'
             // constructor, `for_actions`, sets it.
             clan_path: None,
+            kubectl: program("AUSPEX_KUBECTL", OsString::from(kube::DEFAULT_KUBECTL)),
+            kubeconfig: crate::config::resolve_kubeconfig(settings.kubeconfig.as_deref()),
         }
     }
 
@@ -445,6 +522,8 @@ impl Real {
             flake_source: FlakeSource::Default,
             clan: ClanLocator::new(),
             clan_path,
+            kubectl: OsString::from(kube::DEFAULT_KUBECTL),
+            kubeconfig: Err(off()),
         }
     }
 
@@ -454,6 +533,22 @@ impl Real {
     pub fn with_git_and_cache(mut self, git: OsString, cache_url: Option<String>) -> Self {
         self.git = git;
         self.cache_url = cache_url;
+        self
+    }
+
+    fn kubectl_target(&self) -> Option<(OsString, PathBuf)> {
+        self.kubeconfig
+            .as_ref()
+            .ok()
+            .map(|p| (self.kubectl.clone(), p.clone()))
+    }
+
+    /// These adapters with `kubectl` and the kubeconfig as given: for the shell's own tests, which
+    /// run `U` against a fake `kubectl`.
+    #[must_use]
+    pub fn with_kubectl(mut self, kubectl: OsString, kubeconfig: PathBuf) -> Self {
+        self.kubectl = kubectl;
+        self.kubeconfig = Ok(kubeconfig);
         self
     }
 
@@ -642,6 +737,41 @@ impl Real {
         closure::pending(&op.store_path, &params, cancel).await
     }
 
+    /// The fleet repository's state (one `git status`), bounded by `timeout`.
+    async fn tree_of(
+        &self,
+        flake: &str,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Result<Result<TreeState, String>, Cancelled> {
+        let flake_ref = match FlakeRef::new(flake) {
+            Ok(f) => f,
+            Err(e) => return Ok(Err(self.fleet_error(flake, &e.0))),
+        };
+        let mut git = GitParams::new();
+        git.program = &self.git;
+        git.timeout = timeout;
+        preflight::fleet_tree(&git, &flake_ref, cancel).await
+    }
+
+    /// `Effect::Tree` with the real `git`.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired: the process group has been killed and reaped.
+    pub async fn tree(
+        &self,
+        op: &TreeRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Result<TreeState, String>, Cancelled> {
+        self.tree_of(
+            &op.flake,
+            Duration::from_secs(op.timeout_seconds.max(1)),
+            cancel,
+        )
+        .await
+    }
+
     /// `Effect::Preflight` with the real adapters: `git` and `nix`, both bounded by
     /// `op.timeout_seconds` (at least a second).
     ///
@@ -655,16 +785,7 @@ impl Real {
     ) -> Result<PreflightAnswer, Cancelled> {
         // The same bound for both; never "none". Each adapter enforces it on its own children.
         let timeout = Duration::from_secs(op.timeout_seconds.max(1));
-        let tree = async {
-            let flake = match FlakeRef::new(&op.flake) {
-                Ok(f) => f,
-                Err(e) => return Ok(Err(self.fleet_error(&op.flake, &e.0))),
-            };
-            let mut git = GitParams::new();
-            git.program = &self.git;
-            git.timeout = timeout;
-            preflight::fleet_tree(&git, &flake, cancel).await
-        };
+        let tree = self.tree_of(&op.flake, timeout, cancel);
         let size = async {
             let params = PendingParams {
                 nix: &self.nix,
@@ -681,6 +802,133 @@ impl Real {
         })
     }
 
+    /// The wait behind `Effect::Await`. With `probe` off the machine's own health is taken as
+    /// given and only its node is waited for: the demo's scripted machines never change what they
+    /// run, so a test of the node wait against a fake `kubectl` cannot probe them.
+    pub(crate) async fn await_loop(
+        &self,
+        op: &AwaitRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+        probe: bool,
+    ) -> Result<AwaitAnswer, Cancelled> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(op.timeout_seconds);
+        // The update has just ended: a node counts as back only for a heartbeat from now on. (The
+        // clock is this machine's; the kubelets' are NTP's: a skew of seconds would only make the
+        // wait a little longer.)
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok());
+        loop {
+            let machine = if probe {
+                let request = ProbeRequest {
+                    id: op.id,
+                    generation: auspex_core::effects::Generation::default(),
+                    machine: op.machine.clone(),
+                    class: op.class,
+                    target: op.target.clone(),
+                };
+                let outcome = self.probe(&request, cancel, &|_| {}).await?;
+                auspex_domain::roll::healthy(&outcome, &op.expect, &op.baseline)
+            } else {
+                Ok(())
+            };
+            let last = match (machine, &op.node) {
+                (Err(why), _) => why,
+                (Ok(()), None) => return Ok(Ok(())),
+                (Ok(()), Some(node)) => {
+                    let ask = KubeRequest {
+                        id: op.id,
+                        log: op.log,
+                        context: op.context.clone(),
+                        op: KubeOp::Nodes,
+                    };
+                    match self.kube(&ask, cancel, sink).await? {
+                        Ok(KubeReply::Nodes(nodes)) => {
+                            use auspex_domain::roll::NodeState;
+                            match auspex_domain::roll::node_state(&nodes, node, since) {
+                                NodeState::Ready => return Ok(Ok(())),
+                                NodeState::NotReady => format!("node {node} is NotReady"),
+                                NodeState::Stale => format!(
+                                    "node {node} is Ready, but its kubelet has not been heard from \
+                                     since the update"
+                                ),
+                                NodeState::Missing => format!("node {node} is not in the cluster"),
+                            }
+                        }
+                        Ok(other) => format!("kubectl answered {other:?} to a node list"),
+                        Err(why) => format!("cannot read the cluster: {why}"),
+                    }
+                }
+            };
+            sink(Stream::Note, &format!("{}: not yet: {last}", op.machine));
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Ok(Err(last));
+            }
+            tokio::select! {
+                () = cancel.cancelled() => return Err(Cancelled),
+                () = tokio::time::sleep(left.min(AWAIT_POLL)) => {}
+            }
+        }
+    }
+
+    /// `Effect::Kube` with the real `kubectl`.
+    ///
+    /// # Errors
+    ///
+    /// [`Cancelled`] when `cancel` fired: `kubectl` has been killed and reaped.
+    pub async fn kube(
+        &self,
+        op: &KubeRequest,
+        cancel: &CancellationToken,
+        sink: &(dyn Fn(Stream, &str) + Sync),
+    ) -> Result<KubeAnswer, Cancelled> {
+        let kubeconfig = match &self.kubeconfig {
+            Ok(p) => p,
+            Err(why) => return Ok(Err(format!("no kubeconfig: {why}"))),
+        };
+        let mut params = KubeParams::new(&self.kubectl, kubeconfig);
+        params.context = op.context.as_deref();
+        Ok(match &op.op {
+            KubeOp::Context => kube::cluster_id(&params, cancel)
+                .await?
+                .map(KubeReply::Cluster),
+            KubeOp::Nodes => kube::nodes(&params, cancel).await?.map(KubeReply::Nodes),
+            KubeOp::Uncordon { node } => {
+                sink(Stream::Note, &format!("kubectl uncordon {node}"));
+                kube::set_cordon(&params, node, false, cancel)
+                    .await?
+                    .map(|()| KubeReply::Done)
+            }
+            KubeOp::Drain {
+                node,
+                timeout_seconds,
+            } => {
+                sink(
+                    Stream::Note,
+                    &format!(
+                        "kubectl drain {node} --ignore-daemonsets --delete-emptydir-data \
+                         --timeout {timeout_seconds}s"
+                    ),
+                );
+                let (tx, mut rx) = unbounded_channel::<ClanLine>();
+                let forward = |l: ClanLine| {
+                    let stream = match l.stream {
+                        clan::Stream::Stdout => Stream::Stdout,
+                        clan::Stream::Stderr => Stream::Stderr,
+                    };
+                    sink(stream, &l.text);
+                };
+                let work = kube::drain(&params, node, *timeout_seconds, cancel, tx);
+                pump(work, &mut rx, &forward)
+                    .await?
+                    .map(|()| KubeReply::Done)
+            }
+        })
+    }
+
     /// `Update`: resolve the fleet's pinned `clan` (a build of `clan-cli` the first time, which
     /// can take minutes and is said in the output), then run it. `Build`: `nix build` here.
     ///
@@ -693,6 +941,7 @@ impl Real {
         op: &ActionRequest,
         cancel: &CancellationToken,
         sink: &(dyn Fn(Stream, &str) + Sync),
+        starting: &(dyn Fn() + Sync),
     ) -> Result<Result<ClanRun, String>, Cancelled> {
         let flake = match FlakeRef::new(&op.flake) {
             Ok(f) => f,
@@ -733,6 +982,8 @@ impl Real {
                             .unwrap_or_default()
                     ),
                 );
+                // From here the machine may be changed: the shell is told before `clan` exists.
+                starting();
                 let work = act::update(&binary.path, &flake, &op.machine, &params, cancel, tx);
                 pump(work, &mut rx, &forward).await?
             }
@@ -761,7 +1012,31 @@ impl Real {
                 pump(work, &mut rx, &forward).await?
             }
         };
-        Ok(ran.map_err(|e| e.to_string()))
+        Ok(run_outcome(ran, sink))
+    }
+}
+
+/// What a `clan` run came to. An error is **nothing done**: no binary, a refused name, a spawn that
+/// failed. The one error after the process exists (it could not be waited for, and was killed)
+/// is a run that ended without a code: what it was doing may have happened, so it is a failure, not
+/// a refusal (a drained node is not put back in service on it).
+fn run_outcome(
+    ran: Result<ClanRun, auspex_effects::clan::ClanError>,
+    sink: &(dyn Fn(Stream, &str) + Sync),
+) -> Result<ClanRun, String> {
+    match ran {
+        Err(e) if e.started => {
+            sink(Stream::Note, &e.to_string());
+            Ok(ClanRun {
+                end: clan::RunEnd::Exited {
+                    code: None,
+                    signal: None,
+                },
+                lines_dropped: 0,
+                long_lines: 0,
+            })
+        }
+        other => other.map_err(|e| e.to_string()),
     }
 }
 
@@ -800,6 +1075,35 @@ async fn pump<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `clan` that never started is an error (nothing was done); one that was started and then
+    /// lost is a run that ended without a code, said in the output.
+    #[test]
+    fn only_a_clan_that_never_started_is_an_error() {
+        use auspex_effects::clan::{ClanError, ClanStep};
+        let said = std::sync::Mutex::new(Vec::<String>::new());
+        let sink = |_: Stream, t: &str| said.lock().unwrap().push(t.to_owned());
+        let never = ClanError {
+            step: ClanStep::Run,
+            reason: "not found".to_owned(),
+            started: false,
+        };
+        assert_eq!(
+            run_outcome(Err(never), &sink),
+            Err("running clan: not found".to_owned())
+        );
+        let lost = ClanError {
+            started: true,
+            reason: "waiting for clan failed: x".to_owned(),
+            step: ClanStep::Run,
+        };
+        let run = run_outcome(Err(lost), &sink).expect("it ran");
+        assert!(!run.end.success());
+        assert_eq!(
+            said.lock().unwrap().as_slice(),
+            ["running clan: waiting for clan failed: x"]
+        );
+    }
 
     /// `u` runs the fleet's pinned `clan`, found from its lock. An environment variable that
     /// named another binary would silently replace it in the release build, so none is read:

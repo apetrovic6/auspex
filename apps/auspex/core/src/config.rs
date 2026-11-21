@@ -41,6 +41,8 @@ pub struct Config {
     pub preflight_timeout_seconds: u64,
     /// Which machines are frozen: declared in `config.toml` and saved by `f` (see [`FreezeConfig`]).
     pub freeze: FreezeConfig,
+    /// How `U` rolls: which tags update one at a time, and how many other machines at once.
+    pub rolling: RollingConfig,
 }
 
 /// Prometheus settings the core decides with. The URL is the adapter's, not the core's.
@@ -98,5 +100,41 @@ pub enum SavedFreezes {
 impl Default for SavedFreezes {
     fn default() -> Self {
         Self::Known(BTreeSet::new())
+    }
+}
+
+/// How an update of all (`U`) is rolled: `[rolling.<tag>]`, `[update]` and `[kubernetes]` of
+/// `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollingConfig {
+    /// The rolling tags and what each one asks for. Machines that share any of these tags never
+    /// update at the same time ([`auspex_domain::roll::plan`]). Empty: every machine is free.
+    pub rules: auspex_domain::roll::RollRules,
+    /// How many machines with no rolling tag update at once (`update.parallel`). At least 1.
+    pub parallel: usize,
+    /// How long to wait for an updated machine to be healthy (and its node `Ready`) before the
+    /// roll gives up on it (`update.ready_timeout`), in seconds.
+    pub ready_timeout_seconds: u64,
+    /// Why the cluster cannot be used (no kubeconfig could be chosen, `KUBECONFIG` names several
+    /// files), or `None`. A Kubernetes rolling group is then refused with this reason; machines
+    /// outside it are not affected. The shell owns the kubeconfig and `kubectl`: the core only
+    /// needs to know whether asking is possible.
+    pub kubernetes_unavailable: Option<String>,
+}
+
+/// `update.parallel` when the config says nothing.
+pub const DEFAULT_PARALLEL: usize = 2;
+
+/// `update.ready_timeout` when the config says nothing: ten minutes.
+pub const DEFAULT_READY_TIMEOUT_SECONDS: u64 = 600;
+
+impl Default for RollingConfig {
+    fn default() -> Self {
+        Self {
+            rules: auspex_domain::roll::RollRules::new(),
+            parallel: DEFAULT_PARALLEL,
+            ready_timeout_seconds: DEFAULT_READY_TIMEOUT_SECONDS,
+            kubernetes_unavailable: None,
+        }
     }
 }

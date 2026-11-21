@@ -490,8 +490,21 @@ fn plural(n: u64, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// The warnings the fleet repository's state alone gives (dirty, unpushed, no upstream, or not
+/// readable): what `U` shows in its plan, and what a machine's turn is compared against.
+#[must_use]
+pub fn tree_warnings(tree: Result<&TreeState, &str>) -> Vec<String> {
+    let mut out = Preflight::default();
+    tree_check_of(tree, &mut out);
+    out.warnings
+}
+
 fn tree_check(facts: &Facts<'_>, out: &mut Preflight) {
-    let tree = match facts.tree {
+    tree_check_of(facts.tree, out);
+}
+
+fn tree_check_of(tree: Result<&TreeState, &str>, out: &mut Preflight) {
+    let tree = match tree {
         Ok(t) => t,
         Err(why) => {
             out.warnings.push(format!(

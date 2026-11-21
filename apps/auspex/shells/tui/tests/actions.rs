@@ -371,6 +371,7 @@ fn request(kind: ActionKind, machine: &str, system: Option<&str>, flake: &str) -
         flake: flake.to_owned(),
         build_host: None,
         target: None,
+        log: None,
     }
 }
 
@@ -400,6 +401,7 @@ async fn the_adapter_refuses_what_the_core_would_never_ask_for() {
                 &request(ActionKind::Update, name, Some("x86_64-linux"), fleet),
                 &cancel,
                 &sink,
+                &|| {},
             )
             .await
             .unwrap();
@@ -411,6 +413,7 @@ async fn the_adapter_refuses_what_the_core_would_never_ask_for() {
             &request(ActionKind::Build, "luna", Some("aarch64-darwin"), fleet),
             &cancel,
             &sink,
+            &|| {},
         )
         .await
         .unwrap();
@@ -423,6 +426,7 @@ async fn the_adapter_refuses_what_the_core_would_never_ask_for() {
             &request(ActionKind::Build, "luna", None, fleet),
             &cancel,
             &sink,
+            &|| {},
         )
         .await
         .unwrap();

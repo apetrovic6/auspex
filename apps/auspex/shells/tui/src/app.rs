@@ -94,6 +94,15 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
             .map(|(name, _)| name.clone())
             .collect(),
         preflight_timeout_seconds: settings.timeouts.diff,
+        rolling: auspex_core::RollingConfig {
+            rules: settings.rolling.clone(),
+            parallel: usize::try_from(settings.update.parallel).unwrap_or(usize::MAX),
+            ready_timeout_seconds: settings.update.ready_timeout,
+            // Only a Kubernetes group needs it, and the group is the one refused: the others
+            // are rolled whatever the kubeconfig says.
+            kubernetes_unavailable: config::resolve_kubeconfig(settings.kubeconfig.as_deref())
+                .err(),
+        },
     }
 }
 
@@ -368,6 +377,10 @@ async fn headless(
     ExitCode::from(headless::exit_status(&view))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the whole interactive run, in the order it happens: setup, the loop, the way out"
+)]
 async fn tui(
     shell: &Arc<Shell>,
     config: Config,
@@ -386,6 +399,20 @@ async fn tui(
         }
     };
     enter_bracketed_paste();
+    // A panic must not leave a node cordoned either: the hook says so after the panic message, and
+    // uncordons what was cordoned for an update that had not started.
+    {
+        let cordons = shell.cordons();
+        // Only a panic on this thread ends auspex; one in an adapter's task does not.
+        let loop_thread = std::thread::current().id();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            previous(info);
+            for line in cordons.on_panic(loop_thread, Duration::from_secs(10)) {
+                say(&line);
+            }
+        }));
+    }
     // Where `s` asks for the terminal; before the first key, so a request always has an answer.
     let (handoff_tx, mut handoff_rx) = tokio::sync::mpsc::unbounded_channel();
     shell.set_handoff(handoff_tx);
@@ -478,13 +505,23 @@ async fn tui(
     // Cancel and reap first, then give the terminal back.
     // Stop whatever an action runs (its process group killed and reaped, its row logged
     // `cancelled`) and cancel the rest, then give the terminal back.
-    shell.terminate().await;
+    // A second signal ends the wait for the roll to stop, but not the uncordon after it.
+    shell
+        .terminate_with(async {
+            let _ = term.recv().await;
+        })
+        .await;
     leave_bracketed_paste();
     if !terminal_left {
         ratatui::restore();
     }
     if let Some(f) = failure {
         say(&f);
+    }
+    // Nodes auspex cordoned and could not give back, or left cordoned on purpose: after the terminal
+    // is back, where it is read, with the command for each.
+    for line in shell.exit_report() {
+        say(&line);
     }
     code
 }

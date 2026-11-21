@@ -56,6 +56,7 @@ colour, and `A` turns it off again at once. In observe mode `u` and `s` only say
 | Key | What it does |
 |---|---|
 | `u` | Act mode only. Runs the checks below, then asks `update luna to 0a1b2c3d nixos-system-luna-…? y/N` (the pending system as the detail panel shows it, hash prefix first; the machine's name typed, for a public one), then runs exactly `clan machines update --host-key-check strict --flake <fleet> -- luna` with the fleet's pinned `clan` (found from its lock, never from `PATH`). One machine, named, validated against the inventory; one action at a time. |
+| `U` | Act mode only. Updates **every machine with an update pending**, rolling per tag (see *Updating everything* below): one question for the whole plan (the order, what runs in parallel, what is skipped and why), then each machine goes through the checks of `u` at its turn. Frozen machines are skipped, and while it is unknown which are frozen `U` refuses outright, as `u` does. TUI only: `--plain` and `--json` never have it. |
 | `b` | Builds the machine's pending system here (`nix build --no-link --print-out-paths --no-write-lock-file <fleet>#nixosConfigurations.luna.config.system.build.toplevel`; `darwinConfigurations.<m>.system` for darwin). Changes nothing on any machine, so it needs no act mode. Refused for a machine of another system than this one. |
 | `s` | Act mode only. Suspends the TUI and opens `ssh` to the selected machine (see below); when ssh ends the TUI is back, and the status bar says `ssh to luna exited (code N)`. |
 | `f` | Freezes the machine: `u` refuses it from then on (`luna is frozen; f to unfreeze`) and a later `U` will skip it. Shows `❄` in the list and `frozen` in the detail panel. **Needs no act mode**, because it only prevents changes. On a frozen machine `f` asks `unfreeze luna? updates to it will be possible again. y/N` (answered like every question: only once it could be read). A freeze is kept across restarts, per fleet, in `$XDG_STATE_HOME/auspex/state.toml` (see *Freezing* below), and every freeze and unfreeze is a row in the action log. |
@@ -117,6 +118,140 @@ second `Ctrl-C`) kills the whole process group, waits until it is gone, logs the
 `cancelled` and only then exits; a third `Ctrl-C` stops waiting for that answer (the shell still
 gives the kill up to 5 s to finish). `SIGTERM`, `SIGINT` and
 `SIGHUP` take the same path without the question.
+
+## Updating everything: `U`
+
+`U` updates every machine whose row says `↑` (an update pending), minus the frozen ones, and asks
+**one** question for all of it. Before it opens, auspex looks at the cluster (which one, and its
+nodes) and at the fleet repository (one `git status`), and the question carries what it found:
+
+```
+update 4 machines:
+cluster: context rke2 (https://10.0.0.1:6443); every kubectl call is pinned to it
+rolling taghmata (one at a time; each node must be Ready before the next): luna → mars → sol → terra
+in parallel, at most 2 at a time: alfrost, cerberus
+at most 3 machines updating at once: one of the cluster's group + 2 of the machines in parallel
+skipped genetor: frozen
+warning: the fleet repository has uncommitted changes to 2 tracked files: the update deploys them, …
+each machine is checked at its turn: a refusal skips it, a failure stops its rolling group, and a new warning about the fleet repository refuses it
+update 6 machines as listed above? y/N
+```
+
+The plan is shown whole or not asked: a pane too small for it says "terminal too small to ask".
+
+**One auspex updates a fleet at a time.** The `y` takes an exclusive lock on the fleet (an
+`flock` on a file of its own in the state directory, `update-<digest>.lock`, 0600), held for the
+whole roll and for each `u`. A second `U` or `u` from another auspex is refused, naming what the
+holder is doing (`not updating: another auspex is updating this fleet (…): pid 123: update
+all`). The kernel drops the lock when the process ends, so a crash cannot leave it behind. A run
+with no usable state directory has no lock to take, and then the freezes are unknown and nothing
+can be updated anyway.
+
+**Rolling is configuration, not tag names built into auspex.** Name the tags whose machines must
+never update together:
+
+```toml
+[rolling.taghmata]     # machines with this tag update one at a time
+kubernetes = true      # check node state in the cluster before and between machines
+drain = false          # cordon and drain before, uncordon after (default false)
+drain_timeout = 600    # kubectl drain's --timeout, seconds (default 600)
+
+[update]
+parallel = 2           # machines with no rolling tag, at once (1..16, default 2)
+ready_timeout = 600    # wait for an updated machine to be healthy, seconds (default 600)
+
+[kubernetes]
+kubeconfig = "~/.kube/config"   # default: $KUBECONFIG, then ~/.kube/config
+```
+
+A `[rolling.<tag>]` with no keys is a rolling tag with the defaults (home-manager writes an empty
+`rolling.<tag> = { };` as that table; it is not pruned like an empty section).
+
+Machines that share **any** rolling tag are one group and never update at the same time, and the
+relation chains: a machine tagged `a` and `b` joins everything tagged `a` with everything tagged
+`b`. (On the fleet this was written for, `taghmata` is the RKE2 cluster, `fabricator` its control
+plane and `skitarii` its workers; all four machines are etcd members, so two at once could cost
+the quorum.) A group is one machine after another in name order; machines with no rolling tag go
+`update.parallel` at a time, since `clan` builds locally and copies every closure. Groups run
+beside each other and beside the free machines, **except** that every group with a machine that
+is drained or waited for in the cluster shares it: at most one machine of all those groups is out
+of service at a time (they have one kubeconfig, and one etcd). The plan says what runs at once.
+
+**Each machine is checked at its turn, as `u` checks it** (the fleet tree as it is then, the
+closure's size and the free disk, the duplicate-address rule, the freeze file once more right
+before `clan` starts), and then:
+
+| What happens | Result |
+|---|---|
+| the checks, or the freeze, refuse it | **skipped; the roll goes on** with the next machine |
+| a warning about the fleet repository that was not in the plan the operator confirmed (someone edited the tree, or its upstream, after the `y`) | **refused**, the roll goes on |
+| the checks warn about the machine itself (unknown closure size or free disk) | written into the machine's part of the Log tab; it goes on |
+| it is marked `public` (its name has to be typed) | left out of the plan: update it with `u` |
+| it does not answer a probe at its turn | refused: its health afterwards could not be told from before |
+| the cluster is not healthy when its turn comes (see below) | **its rolling group stops** |
+| `clan` fails, a drain fails, or it does not become healthy | **its rolling group stops** (the rest is skipped); other groups carry on |
+
+**Kubernetes** (`kubernetes = true`, or `drain` set). auspex talks to the API with your `kubectl`
+(on `PATH`; a supervised child like every program it runs) and a kubeconfig on this machine, not a
+client of its own and not `kubectl` over ssh.
+
+- **One cluster, named.** Before the plan, `kubectl config view --minify` says which context the
+  kubeconfig points at; the plan shows it and its API server, and **every later call is pinned to it**
+  (`--context=<name>`): a `kubectl config use-context` in another terminal, or a shared kubeconfig
+  whose current context is another cluster, cannot send a drain elsewhere.
+- **Before the roll,** any node that is `NotReady` or cordoned refuses the group (listed as
+  skipped, with the reason), and so does a machine that is no node of the cluster (a node is named
+  like its machine).
+- **Before every machine** that uses the cluster, the nodes are read again (so also right after the
+  `y`, for the first of each group, however long the plan sat on screen): any node that is `NotReady`
+  or cordoned, **whoever cordoned it**, stops the group, and a node is drained only when it was
+  schedulable a moment ago, which is what makes it auspex's to uncordon. A node someone else
+  cordoned is never drained or uncordoned by auspex.
+- **Between machines** the roll waits until the updated machine runs the system that was deployed,
+  has **no failed unit that it did not already have** when its turn began (a baseline probe, compared
+  by unit name: a unit that was failed before is not the update's doing, a new one is, and
+  `degraded` is accepted only when every failed unit is in the baseline), systemd is past `starting`,
+  **and** its node is `Ready` **with a heartbeat newer than the end of the update** (the newer of the
+  `Ready` condition's `lastHeartbeatTime` and the node lease's `renewTime`, `kubectl get leases -n
+  kube-node-lease`): `Ready=True` stays true for about 40 s after a kubelet stops reporting, so a
+  switch that restarts rke2 for 20 s would otherwise pass on the condition it had before. `Unknown`
+  is not `Ready`. It polls every 5 s up to `update.ready_timeout`; a kubectl that fails or a node that
+  is not in the list is "not yet", never "healthy". (The comparison uses this machine's clock and the
+  kubelets'; a skew of seconds only makes the wait a little longer.)
+- **Drain** (`drain = true`): `kubectl drain --ignore-daemonsets --delete-emptydir-data --timeout
+  <t>s` before the update, uncordon after the wait. Off by default because a NixOS switch does not
+  reboot the node and RKE2's containers survive a restart of the service.
+- **When a node is put back and when it is not.** After a failed or timed-out drain, or a quit before
+  the update started (that is, before `clan` is spawned: resolving the fleet's pinned `clan` can take minutes and counts as before), the node is **uncordoned** (nothing was done to the machine). After a failed
+  update or a machine that never became healthy, and after a quit while its update or its wait was
+  under way, the node **stays cordoned**: the machine may be half updated or broken, and workloads
+  must not return to it unasked. That is said in the Log tab, the status bar (`LEFT CORDONED: luna`),
+  the machine's row of the action log, and, whenever auspex leaves, on stderr after the terminal is
+  restored, each with the command (`kubectl --kubeconfig … --context rke2 uncordon luna`). If an
+  uncordon that auspex owes cannot be made, the machine is failed and says the same.
+- `kubernetes.kubeconfig` takes a leading `~/` like `flake`; with no setting `$KUBECONFIG` is used
+  when it names exactly one absolute path, else `~/.kube/config`. auspex never reads the file:
+  `kubectl` does.
+
+**The Log tab (`L`)** has the roll's own run first (the plan, one line per machine as it ends: `luna:
+done`, `mars: refused: …`, `sol: skipped: …`, the totals) and one run for each machine (the checks'
+warnings, the drain, `clan`'s output, the wait, the uncordon). A machine that was **drained** or
+started has one row of the action log (kind `deploy`; there is no kind for a drain), opened at its
+drain, whose detail says it was drained, what `clan` said, and how the machine ended (`done [node
+drained first]`, `failed: … node luna is left cordoned …`); one that was refused or skipped before
+that was never tried and has none.
+
+**Quit, signal, panic.** `q` asks (`an update of all machines is running (1 of 6 over; now: luna,
+alfrost); quit and stop it? …`). On `y` nothing new starts, the running `clan` processes are
+cancelled (their process groups are killed and reaped), a drain in progress is cancelled and its
+node uncordoned, a node whose update was under way stays cordoned and is named; auspex exits when
+every machine has ended. A second `q`, a termination signal (SIGTERM, SIGHUP, SIGINT, SIGQUIT) and a
+panic do not wait for the question: the roll is stopped the same way within 20 s (a second signal
+cuts that wait short), and then **auspex itself runs `kubectl uncordon` for every node it cordoned
+for an update that had not started**, one at a time, each bounded at 15 s, with a plain process
+(the async machinery is gone by then, and a panic hook has none). What it could not give back, and
+what is left cordoned on purpose, is printed with the commands. While a roll runs, `u`, `b`, `r` and
+`A` say so and do nothing.
 
 ## Freezing
 
@@ -229,7 +364,17 @@ enabled = true      # false: never query a closure; package_diff stays null
 [machines.alfrost]
 public = true       # updating it asks for its name to be typed, not y (default false)
 [machines.luna]
-frozen = true       # freeze it declaratively: `u` refuses it, `f` cannot undo it (see Freezing)
+frozen = true       # freeze it declaratively: `u` refuses it, `U` skips it, `f` cannot undo it (see Freezing)
+
+[rolling.taghmata]  # `U`: machines with this tag update one at a time (see Updating everything)
+kubernetes = true
+drain = false
+
+[update]
+parallel = 2        # machines with no rolling tag updated at once by `U`
+
+[kubernetes]
+kubeconfig = "~/.kube/config"
 ```
 
 The config file's `flake` and `CLAN_DIR` take a leading `~/` (your `$HOME`; `~user/` is refused);

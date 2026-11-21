@@ -30,15 +30,31 @@ let
   prune = value: if builtins.isAttrs value then
     lib.filterAttrs (_: v: v != null && v != { }) (lib.mapAttrs (_: prune) value)
     else value;
-  pruned = prune cfg.settings;
+  # Except inside `rolling`: a tag with no keys is the rule "these machines update one at a time",
+  # with the defaults, and pruning it away (as an empty section is) silently made its machines
+  # free, updated `update.parallel` at a time. It is written as `[rolling.<tag>]`.
+  pruned = prune cfg.settings
+    // lib.optionalAttrs (cfg.settings.rolling != { }) {
+      rolling = lib.mapAttrs (_: prune) cfg.settings.rolling;
+    };
   # A path value is written as its string, never copied into the store: `toString`, not
   # interpolation of the path. `~/` is the home directory, as for `theme.file`.
   flakePath = toString pruned.flake;
-  settings = pruned // lib.optionalAttrs (pruned ? flake) {
-    flake = if lib.hasPrefix "~/" flakePath
-      then "${config.home.homeDirectory}/${lib.removePrefix "~/" flakePath}"
-      else flakePath;
-  };
+  # The kubeconfig is a path on this machine, written as its string and expanded exactly as `flake`
+  # is (`~/` is the home directory), for the same reason: a Nix path value would be copied into
+  # the store, and what `kubectl` would then read is a frozen copy of a credentials file.
+  hasKubeconfig = (pruned.kubernetes or { }) ? kubeconfig;
+  kubeconfigPath = if hasKubeconfig then toString pruned.kubernetes.kubeconfig else "";
+  expandHome = path: if lib.hasPrefix "~/" path
+    then "${config.home.homeDirectory}/${lib.removePrefix "~/" path}"
+    else path;
+  settings = pruned
+    // lib.optionalAttrs (pruned ? flake) {
+      flake = expandHome flakePath;
+    }
+    // lib.optionalAttrs hasKubeconfig {
+      kubernetes = pruned.kubernetes // { kubeconfig = expandHome kubeconfigPath; };
+    };
   themePath = "${config.xdg.configHome}/auspex/theme.toml";
   selectedThemePath =
     if cfg.settings.theme.file != null && lib.hasPrefix "~/" cfg.settings.theme.file
@@ -89,6 +105,22 @@ in {
             frozen = optional types.bool "Freeze the machine (default false): `u` refuses it and `U` skips it. Declarative: `f` in the TUI cannot unfreeze it, so remove it here (and switch) to let the machine be updated again. Freezes made with `f` are not kept in this file but in auspex's state file.";
           });
         };
+        rolling = mkOption {
+          default = { };
+          description = "Rolling tags for `U` (update every machine with an update pending), keyed by tag name. Machines that share any of these tags never update at the same time: one after another, in name order, however the tags overlap.";
+          type = types.attrsOf (table {
+            kubernetes = optional types.bool "The tag's machines are nodes of a Kubernetes cluster (default false): before the roll starts, refuse it if any node is NotReady or cordoned, and between machines wait until the updated machine's node is Ready. Needs a kubeconfig (kubernetes.kubeconfig).";
+            drain = optional types.bool "Cordon and drain the node before its machine is updated and uncordon it after (default false: a NixOS switch does not reboot the node, and RKE2's containers survive a restart of the service). A failed or timed-out drain stops the roll and leaves the node uncordoned.";
+            drain_timeout = timeout "kubectl drain's --timeout, in seconds (default 600).";
+          });
+        };
+        update = section {
+          parallel = optional (types.ints.between 1 16) "How many machines with no rolling tag `U` updates at once (default 2): clan builds locally and copies each closure.";
+          ready_timeout = timeout "How long `U` waits for an updated machine to be healthy (and its node Ready) before it gives the machine up, in seconds (default 600).";
+        };
+        kubernetes = section {
+          kubeconfig = optional (types.either types.str types.path) "The kubeconfig `U` reads node state and drains with (kubectl --kubeconfig); a leading ~/ is your home directory. Default: \$KUBECONFIG, then ~/.kube/config. A path value is written as its string, not copied into the store; a path inside the Nix store is refused as a stale copy of a credentials file.";
+        };
         keymap = mkOption {
           default = { };
           type = types.attrsOf (types.either types.str (types.listOf types.str));
@@ -112,6 +144,10 @@ in {
       {
         assertion = !(settings ? flake) || !lib.hasPrefix "${builtins.storeDir}/" settings.flake;
         message = "programs.auspex.settings.flake is a ${builtins.storeDir} path, a frozen copy of the fleet (a relative path literal in a flake is evaluated from the flake's store copy). Use an absolute path or a string such as \"~/clan/fleet\".";
+      }
+      {
+        assertion = !hasKubeconfig || !lib.hasPrefix "${builtins.storeDir}/" kubeconfigPath;
+        message = "programs.auspex.settings.kubernetes.kubeconfig is a ${builtins.storeDir} path, a frozen copy of a credentials file (a relative path literal in a flake is evaluated from the flake's store copy). Use an absolute path or a string such as \"~/.kube/config\".";
       }];
       xdg.configFile = lib.mkIf (settings != { }) {
         "auspex/config.toml".source = toml.generate "auspex-config.toml" settings;

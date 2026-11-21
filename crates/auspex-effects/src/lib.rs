@@ -30,6 +30,10 @@
 //! - [`freeze`]: which machines the operator froze with `f`, one small TOML file under
 //!   `$XDG_STATE_HOME/auspex/state.toml` (not `config.toml`, which home-manager makes read-only),
 //!   keyed by the fleet, written atomically.
+//! - [`kube`]: `kubectl` as a supervised child: the cluster's nodes, and cordon, drain and uncordon of
+//!   one node (the kubeconfig is the operator's own).
+//! - [`fleetlock`]: the per-fleet update lock (`flock` in the state directory): one auspex updates a
+//!   fleet at a time.
 //! - [`dns`]: hostname resolution for the shared-IP lint.
 //! - [`http`]: the one HTTP client the two HTTP adapters share.
 //!
@@ -111,8 +115,10 @@ pub mod clan;
 pub mod closure;
 pub mod deploylog;
 pub mod dns;
+pub mod fleetlock;
 pub mod freeze;
 pub mod http;
+pub mod kube;
 pub mod narinfo;
 pub mod nix;
 pub mod preflight;

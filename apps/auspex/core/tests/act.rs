@@ -869,3 +869,43 @@ fn a_build_always_says_this_machine() {
         "building on this machine"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// The fleet's update lock (one auspex updates a fleet at a time)
+// ---------------------------------------------------------------------------------------
+
+/// A `u` takes the fleet's lock after its last rule and before it launches, and lets it go when
+/// the action ends, whichever way.
+#[test]
+fn an_update_holds_the_fleets_lock_from_its_y_to_its_end() {
+    let mut s = settled(config());
+    act_on(&mut s);
+    let mut action = update(&mut s);
+    assert_eq!(s.lock_requests.len(), 1);
+    assert_eq!(s.lock_requests[0].what, "update luna");
+    assert_eq!(s.unlocks.len(), 0, "held while it runs");
+    s.resolve(&mut action, end(ActionResult::Failed, Some(1)));
+    assert_eq!(s.unlocks, [s.lock_requests[0].id]);
+}
+
+/// Another auspex holds it: the update is not launched, and the notice says who.
+#[test]
+fn an_update_is_refused_while_another_auspex_holds_the_lock() {
+    let mut s = settled(config());
+    act_on(&mut s);
+    s.lock_answer =
+        Err("another auspex is updating this fleet (/fleet): pid 9: update all".to_owned());
+    s.send(Event::UpdateSelected);
+    answer_checks(&mut s, clean_preflight());
+    s.send(Event::ConfirmAnswer(true));
+    assert!(s.actions.is_empty(), "nothing runs");
+    assert_eq!(
+        notice(&s),
+        "not updating: another auspex is updating this fleet (/fleet): pid 9: update all"
+    );
+    assert_eq!(s.unlocks.len(), 0);
+    // A build changes nothing on any machine and takes no lock.
+    s.lock_answer = Ok(());
+    s.send(Event::BuildSelected);
+    assert_eq!(s.lock_requests.len(), 1, "no second request for a build");
+}

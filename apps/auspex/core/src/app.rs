@@ -44,6 +44,7 @@
 
 mod act;
 mod freeze;
+mod roll;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -60,10 +61,10 @@ use crux_core::{App, Command};
 
 use crate::config::{Config, SavedFreezes};
 use crate::effects::{
-    ActionEnd, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest, Effect,
-    EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
-    LoadFreezesAnswer, PendingClosureRequest, PreflightAnswer, ProbeRequest, PrometheusAnswer,
-    PrometheusRequest, RequestId, ResolveRequest, SaveFreezeAnswer, ShellEnd,
+    ActionEnd, AwaitAnswer, CacheRequest, CancelRequest, ClosureAnswer, DeployedClosureRequest,
+    Effect, EvalAnswer, EvalMachine, EvalRequest, Generation, InventoryAnswer, InventoryRequest,
+    KubeAnswer, LoadFreezesAnswer, PendingClosureRequest, PreflightAnswer, ProbeRequest,
+    PrometheusAnswer, PrometheusRequest, RequestId, ResolveRequest, SaveFreezeAnswer, ShellEnd,
 };
 use crate::view::{
     FreezeView, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState,
@@ -235,6 +236,10 @@ pub enum Event {
     ToggleAct,
     /// Update the selected machine (`u`). Act mode only; asks "update luna to …? y/N" first.
     UpdateSelected,
+    /// Update every machine with an update pending, rolling per tag (`U`). Act mode only; asks
+    /// one question for the whole plan (the order, what runs in parallel, what is skipped), and
+    /// each machine is checked at its turn. See `app/roll.rs`.
+    UpdateAll,
     /// Build the selected machine's pending system here (`b`). Changes nothing on any machine,
     /// so it needs no act mode; refused for another system's machine.
     BuildSelected,
@@ -297,6 +302,37 @@ pub enum Event {
         id: RequestId,
         /// How it ended.
         end: ShellEnd,
+    },
+    /// [`KubeRequest`](crate::effects::KubeRequest) answered. Built by the core.
+    KubeAnswered {
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: KubeAnswer,
+    },
+    /// [`AwaitRequest`](crate::effects::AwaitRequest) answered: the updated machine is healthy, or
+    /// was not by the deadline. Built by the core.
+    AwaitAnswered {
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: AwaitAnswer,
+    },
+    /// [`TreeRequest`](crate::effects::TreeRequest) answered: the state of the fleet repository, for the
+    /// plan of an update of all. Built by the core.
+    TreeChecked {
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: Result<auspex_domain::preflight::TreeState, String>,
+    },
+    /// [`FleetLockRequest`](crate::effects::FleetLockRequest) answered: the update lock is held, or
+    /// why not. Built by the core.
+    FleetLockAnswered {
+        /// The request.
+        id: RequestId,
+        /// What it answered.
+        answer: Result<(), String>,
     },
 
     // --- the freeze's answer (built by the core) ----------------------------------------
@@ -450,6 +486,12 @@ pub struct Model {
     /// The action in progress, or the last one to end. Not in `outstanding`: a refresh must not
     /// cancel it, and it must not hold the fleet unsettled.
     action: Option<act::Action>,
+    /// The update of all (`U`) in progress, or the last one to end. Its requests are not in
+    /// `outstanding` either: a refresh must not cancel them (and a refresh is refused while it
+    /// runs).
+    roll: Option<roll::Roll>,
+    /// A `u` or a `U` that is waiting for the fleet's update lock (`app/roll.rs`).
+    lock_wait: Option<roll::LockWait>,
     /// The ssh session open now: the shell has the terminal until it answers. Not in
     /// `outstanding`: nothing may cancel it (see [`ShellRequest`](crate::effects::ShellRequest)).
     shell: Option<(RequestId, String)>,
@@ -619,12 +661,19 @@ impl App for Auspex {
     type ViewModel = ViewModel;
     type Effect = Effect;
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per event, in the order the events are declared; split, it stops reading as the routing table"
+    )]
     fn update(&self, event: Event, model: &mut Model) -> Command<Effect, Event> {
         match event {
             Event::Start(config) => {
                 model.freeze = freeze::Freezes::new(&config.freeze);
                 model.config = Some(config);
                 refresh(model)
+            }
+            Event::Refresh if model.roll_active() || model.lock_wait.is_some() => {
+                model.notice("an update of all machines is running: refresh when it has ended")
             }
             Event::Refresh if model.config.is_some() => refresh(model),
             Event::Refresh => Command::done(),
@@ -645,7 +694,8 @@ impl App for Auspex {
                 outcome,
             } => match model.accept(generation, id, |p| matches!(p, Pending::Probe(_))) {
                 Some(Pending::Probe(name)) => probe_answered(model, &name, outcome),
-                _ => Command::done(),
+                // The baseline probe of a machine of an update of all is not in `outstanding`.
+                _ => roll::probed(model, id, &outcome).unwrap_or_else(Command::done),
             },
             Event::EvalAnswered {
                 generation,
@@ -704,6 +754,11 @@ impl App for Auspex {
             | Event::Terminate
             | Event::ToggleAct
             | Event::UpdateSelected
+            | Event::UpdateAll
+            | Event::KubeAnswered { .. }
+            | Event::AwaitAnswered { .. }
+            | Event::TreeChecked { .. }
+            | Event::FleetLockAnswered { .. }
             | Event::BuildSelected
             | Event::ShellSelected
             | Event::ConfirmAnswer(_)
@@ -816,20 +871,26 @@ impl App for Auspex {
             action,
             confirm,
             notice: model.view.notice.clone(),
-            freeze: FreezeView {
-                declared: model.freeze.declared().clone(),
-                run_only: model.freeze.run_only().clone(),
-                saved: match model.freeze.saved() {
-                    SavedFreezes::Known(s) => s.clone(),
-                    SavedFreezes::Unknown(_) => BTreeSet::new(),
-                },
-                unknown: match model.freeze.saved() {
-                    SavedFreezes::Unknown(why) => Some(why.clone()),
-                    SavedFreezes::Known(_) => None,
-                },
-                saving: model.freeze.saving(),
-            },
+            freeze: view_freeze(model),
+            roll: model.roll.as_ref().map(roll::Roll::view),
         }
+    }
+}
+
+/// Which machines are frozen, as the view says it (and as `U` asks it: [`FreezeView::frozen`]).
+fn view_freeze(model: &Model) -> FreezeView {
+    FreezeView {
+        declared: model.freeze.declared().clone(),
+        run_only: model.freeze.run_only().clone(),
+        saved: match model.freeze.saved() {
+            SavedFreezes::Known(s) => s.clone(),
+            SavedFreezes::Unknown(_) => BTreeSet::new(),
+        },
+        unknown: match model.freeze.saved() {
+            SavedFreezes::Unknown(why) => Some(why.clone()),
+            SavedFreezes::Known(_) => None,
+        },
+        saving: model.freeze.saving(),
     }
 }
 
@@ -1549,6 +1610,11 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::PendingClosureAnswered { .. }
         | Event::AddressesResolved { .. }
         | Event::ToggleAct
+        | Event::UpdateAll
+        | Event::KubeAnswered { .. }
+        | Event::AwaitAnswered { .. }
+        | Event::TreeChecked { .. }
+        | Event::FleetLockAnswered { .. }
         | Event::UpdateSelected
         | Event::BuildSelected
         | Event::ShellSelected

@@ -9,6 +9,7 @@
 //! Widths are measured in terminal cells and everything is cut with an ellipsis, so a long
 //! or wide name never moves a column.
 
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use auspex_core::{
@@ -773,6 +774,9 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
     if let Some(a) = &view.action {
         parts.insert(1, action_text(a));
     }
+    if let Some(r) = &view.roll {
+        parts.insert(1, roll_text(r));
+    }
     // What the previews are doing: they are not "pending machines" (the status and badges are
     // final), but a settled-looking bar over a still-filling panel would say nothing.
     match view.refresh.diffs_pending {
@@ -810,7 +814,10 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
     }
     if let Some(a) = &view.action
         && let ActionStatus::Ended(end) = &a.status
-        && matches!(end.result, ActionResult::Failed | ActionResult::TimedOut)
+        && matches!(
+            end.result,
+            ActionResult::Failed | ActionResult::TimedOut | ActionResult::Refused
+        )
     {
         // Plainly where it failed, and the fix when it is ssh's: the explanation first.
         errors.push(
@@ -818,6 +825,15 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
                 .clone()
                 .unwrap_or_else(|| end.summary.join(" | ")),
         );
+    }
+    // Nodes auspex cordoned and did not give back: where it can not be missed, with the way out.
+    if let Some(r) = &view.roll
+        && !r.left_cordoned.is_empty()
+    {
+        errors.push(format!(
+            "LEFT CORDONED: {} (kubectl uncordon <node>; the Log tab has the command)",
+            r.left_cordoned.join(", ")
+        ));
     }
     if let Some(w) = &ui.warning {
         errors.push(format!("⚠ {w}"));
@@ -938,7 +954,11 @@ fn draw_help(frame: &mut Frame, area: Rect, ctx: &Context<'_>) {
             ])
         })
         .collect();
-    lines.push(Line::default());
+    // The blank line between the keys and the legend is the first thing to go when the keys
+    // have grown past what the pane holds: a help that loses its bottom border looks broken.
+    if lines.len() + LEGEND.len() + 4 <= usize::from(area.height) {
+        lines.push(Line::default());
+    }
     for b in LEGEND {
         let glyph = b.glyph().unwrap_or(SPINNER[0]);
         lines.push(Line::from(vec![
@@ -1122,7 +1142,7 @@ fn confirm_tail(confirm: &ConfirmView, cells: usize, theme: &Theme) -> Vec<Line<
     tail.push(Line::default());
     let hint = match confirm.kind {
         ConfirmKind::Refused => "any key closes",
-        ConfirmKind::Checking => "any key cancels",
+        ConfirmKind::Checking | ConfirmKind::CheckingCluster => "any key cancels",
         ConfirmKind::UpdateTyped => "Enter confirms the exact name; Esc cancels",
         _ => "y confirms; any other key cancels",
     };
@@ -1132,6 +1152,27 @@ fn confirm_tail(confirm: &ConfirmView, cells: usize, theme: &Theme) -> Vec<Line<
             .map(|l| Line::from(Span::styled(l, theme.style(Role::Dim)))),
     );
     tail
+}
+
+/// The plan of an update of all, one wrapped paragraph per line of [`ConfirmView::lines`].
+///
+/// Never cut: a plan that does not fit is not asked (see [`draw_confirm`]), because what it skips
+/// and what it rolls one at a time is what `y` agrees to.
+fn confirm_plan(confirm: &ConfirmView, cells: usize, theme: &Theme) -> Vec<Line<'static>> {
+    confirm
+        .lines
+        .iter()
+        .flat_map(|line| {
+            wrap(line, cells)
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| {
+                    let l = if i == 0 { l } else { format!("  {l}") };
+                    Line::from(Span::styled(l, theme.style(Role::Text)))
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// What the checks found, refusals first, in at most `room` lines.
@@ -1228,6 +1269,9 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
     let text_cells = usize::from(width.saturating_sub(4)).max(1);
     let tail = confirm_tail(confirm, text_cells, theme);
     let has_findings = !confirm.refusals.is_empty() || !confirm.warnings.is_empty();
+    let plan = confirm_plan(confirm, text_cells, theme);
+    // The plan is shown whole or the question is not asked: one blank line follows it.
+    let plan_rows = if plan.is_empty() { 0 } else { plan.len() + 1 };
     // What is left of the pane once the question, the typed name and the hint have theirs. The
     // question is "whole" only if what the checks found is shown too, or at least counted: a
     // dialog with findings and no line left for even "…and N more" would read as a clean y/N
@@ -1236,15 +1280,22 @@ fn draw_confirm(frame: &mut Frame, area: Rect, view: &ViewModel, ctx: &Context<'
     let spare = usize::from(area.height).saturating_sub(2 + tail.len());
     let whole = width >= MIN_CONFIRM_WIDTH
         && tail.len() + 2 <= usize::from(area.height)
-        && (!has_findings || spare >= 1);
+        && (!has_findings || spare >= 1)
+        && spare >= plan_rows;
     let lines: Vec<Line> = if whole {
+        let mut lines = plan;
+        if plan_rows > 0 {
+            lines.push(Line::default());
+        }
+        let spare = spare - plan_rows;
         // The findings get the spare lines, less one for the blank between the two parts; with
         // exactly one spare line that is the findings' (their count), and the blank goes.
         let room = if spare >= 2 { spare - 1 } else { spare };
-        let mut lines = confirm_found(confirm, text_cells, room, theme);
-        if !lines.is_empty() && spare >= 2 {
-            lines.push(Line::default());
+        let mut found = confirm_found(confirm, text_cells, room, theme);
+        if !found.is_empty() && spare >= 2 {
+            found.push(Line::default());
         }
+        lines.extend(found);
         lines.extend(tail);
         lines
     } else {
@@ -1351,6 +1402,44 @@ const fn mode_label(view: &ViewModel) -> &'static str {
     match view.mode {
         Mode::Observe => "OBSERVE",
         Mode::Act => "ACT",
+    }
+}
+
+/// What an update of all is doing, or how it ended: `update all: 2/6 over, luna updating`.
+fn roll_text(r: &auspex_core::RollView) -> String {
+    use auspex_core::{RollState, RollStatus};
+    let over = format!("{}/{}", r.finished(), r.machines.len());
+    match r.status {
+        RollStatus::Ended => {
+            let count =
+                |f: fn(&RollState) -> bool| r.machines.iter().filter(|m| f(&m.state)).count();
+            let bad = count(|s| matches!(s, RollState::Failed(_)));
+            let refused = count(|s| matches!(s, RollState::Refused(_)));
+            let mut text = format!(
+                "update all: ended, {} done",
+                count(|s| *s == RollState::Done)
+            );
+            for (n, what) in [(bad, "failed"), (refused, "refused")] {
+                if n > 0 {
+                    let _ = write!(text, ", {n} {what}");
+                }
+            }
+            text
+        }
+        status => {
+            let doing: Vec<String> = r
+                .machines
+                .iter()
+                .filter(|m| !m.state.ended() && m.state != RollState::Queued)
+                .map(|m| format!("{} {}", m.name, m.state.word()))
+                .collect();
+            let stopping = if status == RollStatus::Stopping {
+                ", stopping"
+            } else {
+                ""
+            };
+            format!("update all: {over} over{stopping}: {}", doing.join(", "))
+        }
     }
 }
 

@@ -48,6 +48,8 @@ pub struct ViewModel {
     pub mode: Mode,
     /// The action in progress, or the last one to end; `None` before the first.
     pub action: Option<ActionView>,
+    /// The update of all (`U`) in progress, or the last one to end; `None` before the first.
+    pub roll: Option<RollView>,
     /// A question waiting for y or N.
     pub confirm: Option<ConfirmView>,
     /// A one-line refusal or note about the last thing the operator asked for ("act mode is
@@ -196,6 +198,11 @@ pub enum ConfirmKind {
     Quit,
     /// Unfreeze a machine (`f` on a frozen one).
     Unfreeze,
+    /// The cluster is being read before an update of all is planned (any key cancels).
+    CheckingCluster,
+    /// Update every machine with an update pending, as [`ConfirmView::lines`] lays out: `y`
+    /// confirms.
+    UpdateAll,
 }
 
 /// A question the operator has to answer before anything happens.
@@ -215,6 +222,9 @@ pub struct ConfirmView {
     pub warnings: Vec<String>,
     /// The typed confirmation, when the question asks for one ([`ConfirmKind::UpdateTyped`]).
     pub typed: Option<TypedView>,
+    /// What the question is about, one line each: for an update of all, the plan (the order, what
+    /// runs in parallel, what is skipped and why). Empty for the other questions.
+    pub lines: Vec<String>,
 }
 
 /// A name the operator has to type to confirm an update.
@@ -255,6 +265,111 @@ impl ActionView {
     #[must_use]
     pub const fn active(&self) -> bool {
         matches!(self.status, ActionStatus::Running | ActionStatus::Stopping)
+    }
+}
+
+/// The update of all (`U`) in progress, or the last one to end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollView {
+    /// Where it is.
+    pub status: RollStatus,
+    /// Every machine of the plan, in the order the plan lists them (rolling groups first, each in
+    /// its own order, then the free machines), with where it is.
+    pub machines: Vec<RollMachineView>,
+    /// Nodes auspex cordoned and did not uncordon: a machine whose update or wait failed (the node
+    /// may be broken, so it is not put back in service) or a quit that left it. Each needs a
+    /// `kubectl uncordon`, which the log and the action log say.
+    pub left_cordoned: Vec<String>,
+}
+
+impl RollView {
+    /// Machines that have ended, however they ended.
+    #[must_use]
+    pub fn finished(&self) -> usize {
+        self.machines.iter().filter(|m| m.state.ended()).count()
+    }
+
+    /// Whether anything of it is still running (or being stopped).
+    #[must_use]
+    pub const fn active(&self) -> bool {
+        matches!(self.status, RollStatus::Running | RollStatus::Stopping)
+    }
+}
+
+/// Where an update of all is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollStatus {
+    /// Machines are being updated, or are waiting for their turn.
+    Running,
+    /// The operator chose to quit: nothing new starts, the running updates are being stopped and
+    /// a node auspex cordoned is being uncordoned.
+    Stopping,
+    /// Every machine has ended.
+    Ended,
+}
+
+/// One machine of an update of all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollMachineView {
+    /// The machine.
+    pub name: String,
+    /// Where it is.
+    pub state: RollState,
+}
+
+/// Where one machine of an update of all is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollState {
+    /// Waiting for its turn.
+    Queued,
+    /// The checks before an update are running.
+    Checking,
+    /// Its node is being drained.
+    Draining,
+    /// `clan machines update` is running.
+    Updating,
+    /// Updated; waiting for it (and its node) to be healthy.
+    Waiting,
+    /// Its node is being uncordoned.
+    Uncordoning,
+    /// Updated, healthy and (if it was drained) uncordoned.
+    Done,
+    /// The checks (or the freeze) refused it; it was not touched and the roll went on.
+    Refused(String),
+    /// It was started and failed: the rest of its rolling group was not started.
+    Failed(String),
+    /// Not started, because of what happened to another machine, or a quit.
+    Skipped(String),
+    /// Stopped by the operator.
+    Cancelled,
+}
+
+impl RollState {
+    /// The machine will not change any more.
+    #[must_use]
+    pub const fn ended(&self) -> bool {
+        matches!(
+            self,
+            Self::Done | Self::Refused(_) | Self::Failed(_) | Self::Skipped(_) | Self::Cancelled
+        )
+    }
+
+    /// One word for it, for the status bar and the log.
+    #[must_use]
+    pub const fn word(&self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Checking => "checking",
+            Self::Draining => "draining",
+            Self::Updating => "updating",
+            Self::Waiting => "waiting for health",
+            Self::Uncordoning => "uncordoning",
+            Self::Done => "done",
+            Self::Refused(_) => "refused",
+            Self::Failed(_) => "failed",
+            Self::Skipped(_) => "skipped",
+            Self::Cancelled => "cancelled",
+        }
     }
 }
 

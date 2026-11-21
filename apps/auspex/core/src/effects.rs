@@ -382,6 +382,11 @@ pub struct ActionRequest {
     pub build_host: Option<String>,
     /// The machine's resolved ssh target in its canonical spelling, when it has one.
     pub target: Option<String>,
+    /// The Log tab run this action writes into, when it is one machine of an update of all
+    /// (`U`): the core began that run (and ends it), so the shell neither begins nor ends one and
+    /// only adds lines to it. `None`: a lone `u` or `b`, whose run the shell begins and ends
+    /// itself, keyed by this request's id.
+    pub log: Option<RequestId>,
 }
 
 impl ActionRequest {
@@ -424,6 +429,9 @@ pub enum ActionResult {
     TimedOut,
     /// The operator stopped it; the process group is gone.
     Cancelled,
+    /// It was not started: the shell's own last look (the freeze state file) refused it. Not a
+    /// failure of the machine, so an update of all skips it and carries on.
+    Refused,
 }
 
 impl ActionResult {
@@ -435,6 +443,7 @@ impl ActionResult {
             Self::Failed => "failed",
             Self::TimedOut => "timed out",
             Self::Cancelled => "cancelled",
+            Self::Refused => "refused",
         }
     }
 }
@@ -554,6 +563,218 @@ impl Operation for LoadFreezesRequest {
     type Output = LoadFreezesAnswer;
 }
 
+/// One call to the cluster, through the operator's `kubectl` and kubeconfig (an update of all,
+/// `U`, for the machines of a Kubernetes rolling group).
+///
+/// The shell resolves the kubeconfig itself (`kubernetes.kubeconfig`, `$KUBECONFIG`,
+/// `~/.kube/config`), so the core never names a path; it asks for the operation and gets a value
+/// back. A call that cannot be made says why ([`KubeAnswer`]'s `Err`).
+///
+/// **Answered on cancellation too**, with [`KubeReply::Cancelled`], after `kubectl` has been
+/// killed and reaped. A drain cancelled by a quit has cordoned the node and may have been in the
+/// middle of the call: the core uncordons only once it knows the drain is over, and it could not
+/// know that from a request that is simply dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubeRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The Log tab run the call's output (a drain's) is added to; see [`ActionRequest::log`].
+    pub log: Option<RequestId>,
+    /// The kubeconfig context to pin the call to (`--context`), resolved once for the plan. `None`
+    /// only for the plan's own questions, before it is known.
+    pub context: Option<String>,
+    /// What to do.
+    pub op: KubeOp,
+}
+
+/// What a [`KubeRequest`] asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KubeOp {
+    /// `kubectl config view --minify -o json`: which cluster the kubeconfig points at.
+    Context,
+    /// `kubectl get nodes -o json`.
+    Nodes,
+    /// `kubectl uncordon <node>`.
+    Uncordon {
+        /// The node, named like its machine.
+        node: String,
+    },
+    /// `kubectl drain <node> --ignore-daemonsets --delete-emptydir-data --timeout <t>s`. Cordons
+    /// the node first, and leaves it cordoned when it fails.
+    Drain {
+        /// The node, named like its machine.
+        node: String,
+        /// kubectl's own `--timeout`.
+        timeout_seconds: u64,
+    },
+}
+
+/// What a successful [`KubeRequest`] came back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KubeReply {
+    /// The kubeconfig's current context and API server.
+    Cluster(auspex_domain::roll::ClusterId),
+    /// The cluster's nodes.
+    Nodes(Vec<auspex_domain::roll::Node>),
+    /// The node was drained or uncordoned.
+    Done,
+    /// The request was cancelled; `kubectl` is gone.
+    Cancelled,
+}
+
+/// The reply, or one line on why the call failed.
+pub type KubeAnswer = Result<KubeReply, String>;
+
+impl Operation for KubeRequest {
+    type Output = KubeAnswer;
+}
+
+/// Wait until a machine that was just updated is healthy again, and (for a Kubernetes machine)
+/// its node is `Ready`: the pause between two machines of a rolling group.
+///
+/// The shell polls: it probes `target` (the same probe a refresh runs), asks the domain whether
+/// the answer is [`auspex_domain::roll::healthy`] for `expect`, and when `node` is given also
+/// reads the cluster's nodes ([`auspex_domain::roll::node_state`]); it asks again every few
+/// seconds until both hold or `timeout_seconds` has passed. Time is the shell's: the core has no
+/// clock. Cancelling it ends the polling; it is not answered then (it has nothing to reap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The Log tab run the polling's progress is added to; see [`ActionRequest::log`].
+    pub log: Option<RequestId>,
+    /// The machine, for the log.
+    pub machine: String,
+    /// Which probe script to run.
+    pub class: MachineClass,
+    /// The resolved, already-validated ssh target.
+    pub target: Target,
+    /// The system the update deployed: what `/run/current-system` must be.
+    pub expect: StorePath,
+    /// The Kubernetes node to wait for, when the machine's rolling group asks for it.
+    pub node: Option<String>,
+    /// The kubeconfig context the node is read in (`--context`).
+    pub context: Option<String>,
+    /// The machine's failed units when its turn began: what was already wrong is not the update's
+    /// doing ([`auspex_domain::roll::healthy`]).
+    pub baseline: Vec<String>,
+    /// How long to wait before giving up.
+    pub timeout_seconds: u64,
+}
+
+/// `Ok(())` when the machine is healthy (and its node `Ready`); otherwise why it was not by the
+/// deadline, naming the last thing seen.
+pub type AwaitAnswer = Result<(), String>;
+
+impl Operation for AwaitRequest {
+    type Output = AwaitAnswer;
+}
+
+/// What to write to the Log tab (fire and forget).
+///
+/// A run is a titled section of the tab. An update of all begins a run of its own (its plan, a
+/// line per machine as it finishes, the totals) and one more for each machine; the shell adds the
+/// process output of that machine's actions to the machine's run ([`ActionRequest::log`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogRequest {
+    /// The run, a number the core made up ([`RequestId`] is only a source of unique ones).
+    pub run: RequestId,
+    /// What to do with it.
+    pub op: LogOp,
+}
+
+/// What a [`LogRequest`] does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogOp {
+    /// Opens the run. `group`: it is the first of a new group of runs (the update of all's own),
+    /// so the tab drops what it kept from before; otherwise it joins the group that is open.
+    Begin {
+        /// The heading.
+        title: String,
+        /// Starts a new group.
+        group: bool,
+    },
+    /// One line of auspex's own words (never process output).
+    Line {
+        /// The text; the shell sanitises it.
+        text: String,
+    },
+    /// Closes the run, with this under it. The result is how the machine ended, for the action
+    /// log row that was kept open for it (a drained machine has one before `clan` starts).
+    End {
+        /// The text.
+        text: String,
+        /// How it ended.
+        result: EndResult,
+    },
+}
+
+/// How a machine of an update of all ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndResult {
+    /// Updated, healthy, node given back.
+    Done,
+    /// Refused before anything was done to it.
+    Refused,
+    /// Started and failed.
+    Failed,
+    /// Not started.
+    Skipped,
+    /// Stopped by the operator.
+    Cancelled,
+}
+
+impl Operation for LogRequest {
+    type Output = ();
+}
+
+/// Take the fleet's update lock: one auspex updates a fleet at a time.
+///
+/// An exclusive `flock` in the state directory, asked for at the `y` of a `u` and of a `U`; the
+/// answer is `Ok` or why not (and who holds it). Held until [`FleetUnlockRequest`], or until the
+/// process ends.
+///
+/// A run with no state directory (the demo, most tests) is granted at once: without one the
+/// freezes are unknown, so a real run could not update anything anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetLockRequest {
+    /// This request; it also names the lock for [`FleetUnlockRequest`].
+    pub id: RequestId,
+    /// What will be done with it, for the refusal another auspex gets ("update all").
+    pub what: String,
+}
+
+impl Operation for FleetLockRequest {
+    type Output = Result<(), String>;
+}
+
+/// Let go of the lock [`FleetLockRequest`] `id` took. Fire and forget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FleetUnlockRequest {
+    /// The lock request.
+    pub id: RequestId,
+}
+
+impl Operation for FleetUnlockRequest {
+    type Output = ();
+}
+
+/// Read the state of the fleet repository, once, for the plan of an update of all: the tree part
+/// of the checks of [`PreflightRequest`], without a closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The fleet flake, as configured.
+    pub flake: String,
+    /// `timeouts.diff`.
+    pub timeout_seconds: u64,
+}
+
+impl Operation for TreeRequest {
+    type Output = Result<TreeState, String>;
+}
+
 /// Stop request `id`: kill its process and drop its `Request`. Fire and forget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CancelRequest {
@@ -604,4 +825,16 @@ pub enum Effect {
     SaveFreeze(SaveFreezeRequest),
     /// [`LoadFreezesRequest`]: read the state file again, before an update.
     LoadFreezes(LoadFreezesRequest),
+    /// [`KubeRequest`]: a call to the cluster, for an update of all.
+    Kube(KubeRequest),
+    /// [`AwaitRequest`]: wait for an updated machine (and its node) to be healthy.
+    Await(AwaitRequest),
+    /// [`LogRequest`]: words for the Log tab.
+    Log(LogRequest),
+    /// [`FleetLockRequest`]: take the update lock of the fleet.
+    FleetLock(FleetLockRequest),
+    /// [`FleetUnlockRequest`]: let it go.
+    FleetUnlock(FleetUnlockRequest),
+    /// [`TreeRequest`]: the state of the fleet repository, for the plan.
+    Tree(TreeRequest),
 }

@@ -208,6 +208,10 @@ pub struct ClanError {
     pub step: ClanStep,
     /// What went wrong, with the process's sanitised stderr tail where there is one.
     pub reason: String,
+    /// `clan` had been started when this went wrong, so what it was doing may have happened. False
+    /// for everything before the process exists (no binary, a refused name, a spawn that failed):
+    /// nothing was done to any machine.
+    pub started: bool,
 }
 
 impl ClanError {
@@ -215,6 +219,15 @@ impl ClanError {
         Self {
             step,
             reason: reason.into(),
+            started: false,
+        }
+    }
+
+    /// The error of a `clan` that was started and then could not be waited for.
+    pub(crate) fn after_start(step: ClanStep, reason: impl Into<String>) -> Self {
+        Self {
+            started: true,
+            ..Self::new(step, reason)
         }
     }
 }
@@ -1255,7 +1268,10 @@ pub(crate) async fn stream(
                 }
                 Err(e) => {
                     sp.kill_and_reap().await;
-                    return Ok(Err(ClanError::new(ClanStep::Run, format!("waiting for clan failed: {e}"))));
+                    return Ok(Err(ClanError::after_start(
+                        ClanStep::Run,
+                        format!("waiting for clan failed: {e}"),
+                    )));
                 }
             },
             () = cancel.cancelled(), if exited.is_none() => {
@@ -1426,6 +1442,16 @@ impl Sink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether `clan` had started when it went wrong is what tells a refusal (nothing done) from a
+    /// failure (maybe something done): only the error after the process exists says `started`.
+    #[test]
+    fn only_an_error_after_the_process_exists_says_it_started() {
+        assert!(!ClanError::new(ClanStep::Run, "no binary").started);
+        let lost = ClanError::after_start(ClanStep::Run, "waiting failed");
+        assert!(lost.started);
+        assert_eq!(lost.reason, "waiting failed");
+    }
 
     const REV: &str = "dbae2100000000000000000000000000000000aa";
 

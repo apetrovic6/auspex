@@ -20,6 +20,7 @@ pub mod app;
 pub mod backend;
 pub mod cli;
 pub mod config;
+pub mod cordon;
 pub mod demo;
 pub mod handoff;
 pub mod headless;

@@ -41,6 +41,8 @@ pub struct Line {
 /// One action's output.
 #[derive(Debug, Default)]
 struct Run {
+    /// The core's number for it, when it was begun with one (an update of all).
+    key: Option<u64>,
     title: String,
     lines: VecDeque<Line>,
     /// Lines dropped from the front to stay within [`KEEP_LINES`].
@@ -74,13 +76,28 @@ impl Run {
 
 #[derive(Debug, Default)]
 struct Inner {
-    last: Option<Run>,
-    current: Option<Run>,
+    last: Vec<Run>,
+    current: Vec<Run>,
 }
 
 impl Inner {
     fn runs(&self) -> impl Iterator<Item = &Run> {
         self.last.iter().chain(self.current.iter())
+    }
+
+    /// The run lines go to: the one with `key`, or (no key) the newest of the current group.
+    fn run_mut(&mut self, key: Option<u64>) -> Option<&mut Run> {
+        match key {
+            Some(k) => self.current.iter_mut().find(|r| r.key == Some(k)),
+            None => self.current.last_mut(),
+        }
+    }
+
+    fn run(&self, key: Option<u64>) -> Option<&Run> {
+        key.map_or_else(
+            || self.current.last(),
+            |k| self.current.iter().find(|r| r.key == Some(k)),
+        )
     }
 }
 
@@ -96,21 +113,44 @@ impl Output {
         f(&mut self.inner.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// A new action begins: the current one becomes the last, and the one before it goes.
+    /// A new action begins: the current group becomes the last, and the one before it goes.
     pub fn begin(&self, title: &str) {
+        self.begin_run(None, title, true);
+    }
+
+    /// Begins run `key` (`None`: a run only the newest-run methods address). With `new_group` the
+    /// current group becomes the last and this run is the first of a new one; otherwise it joins
+    /// the current group, so an update of all keeps every machine's run beside the roll's own.
+    pub fn begin_run(&self, key: Option<u64>, title: &str, new_group: bool) {
         self.with(|inner| {
-            inner.last = inner.current.take();
-            inner.current = Some(Run {
+            let run = Run {
+                key,
                 title: title.to_owned(),
                 ..Run::default()
-            });
+            };
+            if new_group {
+                inner.last = std::mem::take(&mut inner.current);
+            }
+            inner.current.push(run);
         });
     }
 
-    /// Adds a line to the current action, dropping its oldest past [`KEEP_LINES`].
+    /// Adds a line to the newest run of the current group, dropping its oldest past
+    /// [`KEEP_LINES`].
     pub fn push(&self, stream: Stream, text: &str) {
+        self.push_to(None, stream, text);
+    }
+
+    /// [`Output::push`] to run `key`. A line for a run that is not in the current group (it was
+    /// replaced by a newer group) is dropped: it belongs to something no longer shown.
+    pub fn push_to(&self, key: Option<u64>, stream: Stream, text: &str) {
         self.with(|inner| {
-            let run = inner.current.get_or_insert_with(Run::default);
+            if key.is_none() && inner.current.is_empty() {
+                inner.current.push(Run::default());
+            }
+            let Some(run) = inner.run_mut(key) else {
+                return;
+            };
             if run.lines.len() >= KEEP_LINES {
                 run.lines.pop_front();
                 run.dropped += 1;
@@ -122,34 +162,39 @@ impl Output {
         });
     }
 
-    /// The current action is over; `end` is shown under its output.
+    /// The newest run is over; `end` is shown under its output.
     pub fn finish(&self, end: &str) {
+        self.finish_run(None, end);
+    }
+
+    /// [`Output::finish`] for run `key`.
+    pub fn finish_run(&self, key: Option<u64>, end: &str) {
         self.with(|inner| {
-            if let Some(run) = inner.current.as_mut() {
+            if let Some(run) = inner.run_mut(key) {
                 run.end = Some(end.to_owned());
             }
         });
     }
 
-    /// How many rows the tab has: for each of the last and current actions, a heading, its
+    /// How many rows the tab has: for each run of the last and current groups, a heading, its
     /// kept lines and, once over, its ending.
     #[must_use]
     pub fn rows(&self) -> usize {
         self.with(|inner| inner.runs().map(Run::rows).sum())
     }
 
-    /// Lines dropped from the front, over both actions: a scrolled-up view shifts by the
-    /// growth of this.
+    /// Lines dropped from the front, over both groups: a scrolled-up view shifts by the growth of
+    /// this.
     #[must_use]
     pub fn dropped(&self) -> u64 {
         self.with(|inner| inner.runs().map(|r| r.dropped).sum())
     }
 
-    /// How many rows the older of the two actions takes (0 when there is only one), so a
-    /// shift caused by the current action's drops does not move the older one's rows.
+    /// How many rows the older of the two groups takes (0 when there is only one), so a shift
+    /// caused by the current group's drops does not move the older one's rows.
     #[must_use]
     pub fn last_rows(&self) -> usize {
-        self.with(|inner| inner.last.as_ref().map_or(0, Run::rows))
+        self.with(|inner| inner.last.iter().map(Run::rows).sum())
     }
 
     /// `count` rows from row `start`.
@@ -175,12 +220,18 @@ impl Output {
         })
     }
 
-    /// How many lines the current action printed on standard output and error, counting those
+    /// How many lines the newest run printed on standard output and error, counting those
     /// already dropped from the front.
     #[must_use]
     pub fn printed_lines(&self) -> u64 {
+        self.printed_lines_of(None)
+    }
+
+    /// [`Output::printed_lines`] of run `key`.
+    #[must_use]
+    pub fn printed_lines_of(&self, key: Option<u64>) -> u64 {
         self.with(|inner| {
-            inner.current.as_ref().map_or(0, |run| {
+            inner.run(key).map_or(0, |run| {
                 let kept = run
                     .lines
                     .iter()
@@ -191,20 +242,37 @@ impl Output {
         })
     }
 
-    /// The last `n` lines of the current action that came from `stream`, oldest first.
+    /// The last `n` lines of the newest run that came from `stream`, oldest first.
     #[must_use]
     pub fn tail(&self, stream: Stream, n: usize) -> Vec<String> {
-        self.with(|inner| Self::tail_of(inner, n, |l| l.stream == stream))
+        self.tail_of(None, stream, n)
     }
 
-    /// The last `n` lines of the current action, whatever stream, oldest first.
+    /// [`Output::tail`] of run `key`.
+    #[must_use]
+    pub fn tail_of(&self, key: Option<u64>, stream: Stream, n: usize) -> Vec<String> {
+        self.with(|inner| Self::tail_in(inner, key, n, |l| l.stream == stream))
+    }
+
+    /// The last `n` lines of the newest run, whatever stream, oldest first.
     #[must_use]
     pub fn last_lines(&self, n: usize) -> Vec<String> {
-        self.with(|inner| Self::tail_of(inner, n, |_| true))
+        self.last_lines_of(None, n)
     }
 
-    fn tail_of(inner: &Inner, n: usize, keep: impl Fn(&Line) -> bool) -> Vec<String> {
-        let Some(run) = inner.current.as_ref() else {
+    /// [`Output::last_lines`] of run `key`.
+    #[must_use]
+    pub fn last_lines_of(&self, key: Option<u64>, n: usize) -> Vec<String> {
+        self.with(|inner| Self::tail_in(inner, key, n, |_| true))
+    }
+
+    fn tail_in(
+        inner: &Inner,
+        key: Option<u64>,
+        n: usize,
+        keep: impl Fn(&Line) -> bool,
+    ) -> Vec<String> {
+        let Some(run) = inner.run(key) else {
             return Vec::new();
         };
         let mut found: Vec<String> = run

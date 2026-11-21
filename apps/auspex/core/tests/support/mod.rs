@@ -10,9 +10,10 @@
 use std::collections::BTreeMap;
 
 use auspex_core::effects::{
-    ActionRequest, CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest, InventoryRequest,
-    LoadFreezesRequest, PendingClosureRequest, PreflightRequest, ProbeRequest, PrometheusRequest,
-    ResolveRequest, SaveFreezeRequest, ShellRequest,
+    ActionRequest, AwaitRequest, CacheRequest, DeployedClosureRequest, EvalAnswer, EvalRequest,
+    FleetLockRequest, InventoryRequest, KubeRequest, LoadFreezesRequest, LogRequest,
+    PendingClosureRequest, PreflightRequest, ProbeRequest, PrometheusRequest, ResolveRequest,
+    SaveFreezeRequest, ShellRequest, TreeRequest,
 };
 use auspex_core::{
     Auspex, Config, Core, DiffConfig, Effect, Event, FreezeConfig, PrometheusConfig, RequestId,
@@ -122,6 +123,7 @@ pub fn full_config() -> Config {
         public_machines: std::collections::BTreeSet::new(),
         preflight_timeout_seconds: 90,
         freeze: FreezeConfig::default(),
+        rolling: auspex_core::RollingConfig::default(),
     }
 }
 
@@ -169,6 +171,24 @@ pub struct Shell {
     pub hold_freeze_loads: bool,
     /// The re-reads of the freeze file the core asked for and the test holds.
     pub loads: Vec<Request<LoadFreezesRequest>>,
+    /// Calls to the cluster, which the test answers as the shell would.
+    pub kubes: Vec<Request<KubeRequest>>,
+    /// Waits for an updated machine to be healthy.
+    pub awaits: Vec<Request<AwaitRequest>>,
+    /// Every word for the Log tab, in order.
+    pub logs: Vec<LogRequest>,
+    /// Every fleet-lock request the core made, and every unlock, in order.
+    pub lock_requests: Vec<FleetLockRequest>,
+    pub unlocks: Vec<RequestId>,
+    /// What the shell says to a lock request: `Ok` (the default) or why not.
+    pub lock_answer: Result<(), String>,
+    /// What the shell finds in the fleet repository for a plan, answered at once unless held.
+    pub tree_answer: Result<auspex_domain::preflight::TreeState, String>,
+    pub hold_tree: bool,
+    pub trees: Vec<Request<TreeRequest>>,
+    /// Hold the fleet-lock requests instead of answering them at once.
+    pub hold_lock: bool,
+    pub held_locks: Vec<Request<FleetLockRequest>>,
     /// Every cancel the core has emitted, in order.
     pub cancels: Vec<RequestId>,
     /// Every request id the core has issued, in order.
@@ -200,6 +220,17 @@ impl Shell {
             freeze_file: Ok(std::collections::BTreeSet::new()),
             hold_freeze_loads: false,
             loads: Vec::new(),
+            kubes: Vec::new(),
+            awaits: Vec::new(),
+            logs: Vec::new(),
+            lock_requests: Vec::new(),
+            unlocks: Vec::new(),
+            lock_answer: Ok(()),
+            tree_answer: clean_preflight().tree,
+            hold_tree: false,
+            trees: Vec::new(),
+            hold_lock: false,
+            held_locks: Vec::new(),
             cancels: Vec::new(),
             issued: Vec::new(),
         }
@@ -215,6 +246,10 @@ impl Shell {
         self.absorb(effects);
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per effect of the core: the harness keeps every kind of request"
+    )]
     fn absorb(&mut self, effects: Vec<Effect>) {
         for effect in effects {
             match effect {
@@ -279,6 +314,43 @@ impl Shell {
                 Effect::OpenShell(r) => {
                     self.issued.push(r.operation.id);
                     self.shells.push(r);
+                }
+                Effect::Kube(r) => {
+                    self.issued.push(r.operation.id);
+                    self.kubes.push(r);
+                }
+                Effect::Await(r) => {
+                    self.issued.push(r.operation.id);
+                    self.awaits.push(r);
+                }
+                Effect::Log(r) => self.logs.push(r.operation),
+                Effect::FleetLock(mut r) => {
+                    self.issued.push(r.operation.id);
+                    self.lock_requests.push(r.operation.clone());
+                    if self.hold_lock {
+                        self.held_locks.push(r);
+                    } else {
+                        let answer = self.lock_answer.clone();
+                        let more = self
+                            .core
+                            .resolve(&mut r, answer)
+                            .expect("the request resolves");
+                        self.absorb(more);
+                    }
+                }
+                Effect::FleetUnlock(r) => self.unlocks.push(r.operation.id),
+                Effect::Tree(mut r) => {
+                    self.issued.push(r.operation.id);
+                    if self.hold_tree {
+                        self.trees.push(r);
+                    } else {
+                        let answer = self.tree_answer.clone();
+                        let more = self
+                            .core
+                            .resolve(&mut r, answer)
+                            .expect("the request resolves");
+                        self.absorb(more);
+                    }
                 }
                 Effect::Cancel(r) => self.cancels.push(r.operation.id),
             }

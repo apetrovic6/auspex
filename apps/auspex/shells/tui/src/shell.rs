@@ -33,7 +33,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use auspex_core::effects::{
-    EvalAnswer, Generation, LoadFreezesAnswer, RequestId, SaveFreezeAnswer, ShellEnd, ShellRequest,
+    EndResult, EvalAnswer, Generation, KubeOp, KubeReply, KubeRequest, LoadFreezesAnswer, LogOp,
+    LogRequest, RequestId, SaveFreezeAnswer, ShellEnd, ShellRequest,
 };
 use auspex_core::{ActionEnd, ActionKind, ActionResult, Auspex, Core, Effect, Event, ViewModel};
 use auspex_effects::clan::{ClanRun, RunEnd};
@@ -41,6 +42,7 @@ use auspex_effects::deploylog::{
     ActionKind as LoggedKind, ActionLog, ActionResult as LoggedResult, NewAction, OpenParams,
     Outcome,
 };
+use auspex_effects::fleetlock::{self, FleetLock};
 use auspex_effects::freeze::FreezeStore;
 use auspex_effects::nix::EvalItem;
 use auspex_effects::{CancellationToken, Cancelled};
@@ -51,6 +53,7 @@ use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio_util::task::TaskTracker;
 
 use crate::backend::Backend;
+use crate::cordon::{Cordons, LAST_RESORT_BOUND};
 use crate::handoff::Handoff;
 use crate::log::Log;
 use crate::output::{Output, Stream};
@@ -83,6 +86,18 @@ pub const APPROVAL_NOTE_DELAY: Duration = Duration::from_millis(500);
 
 /// How long a shutdown waits for adapter calls to kill and reap what they started.
 pub const REAP_GRACE: Duration = Duration::from_secs(5);
+
+/// An action-log row held open for one machine of an update of all.
+struct RowSlot {
+    sender: oneshot::Sender<Outcome>,
+    exit_code: Option<i32>,
+    /// What happened to the machine before its row closes: the drain, the update's summary.
+    notes: Vec<String>,
+}
+
+/// How long [`Shell::terminate`] waits for the core to stop what runs (and uncordon what it can)
+/// before it cancels everything.
+pub const TERMINATE_BOUND: Duration = Duration::from_secs(20);
 
 /// The core, the adapters behind it, and every request in flight.
 pub struct Shell {
@@ -132,6 +147,15 @@ pub struct Shell {
     /// How many times the freeze state was read for an update (the core's look at the `y` and the
     /// shell's before the spawn), for tests.
     freeze_reads: AtomicUsize,
+    /// The fleet's update locks this run holds, by the core's request id.
+    locks: Mutex<HashMap<RequestId, FleetLock>>,
+    /// Nodes auspex cordoned and has not given back (see [`crate::cordon`]).
+    cordons: Arc<Cordons>,
+    /// Action-log rows held open for the machines of an update of all, by the core's run number:
+    /// a machine's row is closed when its run ends, with how it ended (drain, update, wait).
+    rows: Mutex<HashMap<u64, RowSlot>>,
+    /// What the exit found still cordoned or left cordoned: said loudly after the terminal is back.
+    exit_report: Mutex<Vec<String>>,
 }
 
 impl Shell {
@@ -162,6 +186,10 @@ impl Shell {
             freeze_store: Mutex::new(None),
             frozen_in_memory: Mutex::new(BTreeSet::new()),
             freeze_reads: AtomicUsize::new(0),
+            locks: Mutex::new(HashMap::new()),
+            cordons: Arc::new(Cordons::default()),
+            rows: Mutex::new(HashMap::new()),
+            exit_report: Mutex::new(Vec::new()),
         })
     }
 
@@ -276,6 +304,25 @@ impl Shell {
     /// kill and reap what they started. Used on quit, after the core has already emitted its
     /// own cancels, and on a signal.
     pub async fn shutdown(&self) {
+        // A row held open for a machine whose run never ended (auspex is leaving) is closed now,
+        // saying so, so it does not stay "running" in the log.
+        let held: Vec<(u64, RowSlot)> = lock(&self.rows).drain().collect();
+        let nodes = self.cordons.held();
+        for (_, slot) in held {
+            let mut detail = slot.notes;
+            detail.push("auspex left before this was over".to_owned());
+            if !nodes.is_empty() {
+                detail.push(format!(
+                    "nodes still cordoned by auspex: {}",
+                    nodes.join(", ")
+                ));
+            }
+            let _ = slot.sender.send(Outcome {
+                result: LoggedResult::Interrupted,
+                exit_code: slot.exit_code,
+                detail: Some(detail.join(" | ")),
+            });
+        }
         self.root.cancel();
         self.tasks.close();
         if tokio::time::timeout(REAP_GRACE, self.tasks.wait())
@@ -294,6 +341,10 @@ impl Shell {
     }
 
     /// The mapping, exhaustively.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per effect: the exhaustive match is the point"
+    )]
     fn fulfil(self: &Arc<Self>, effect: Effect) {
         match effect {
             // The TUI's frame timer repaints; headless mode waits on `changed`.
@@ -396,6 +447,41 @@ impl Shell {
             Effect::OpenShell(request) => self.open_shell(request),
             Effect::SaveFreeze(request) => self.save_freeze(request),
             Effect::LoadFreezes(request) => self.load_freezes(request),
+            Effect::Kube(request) => self.kube(request),
+            Effect::FleetLock(mut request) => {
+                let op = request.operation.clone();
+                let answer = self.take_lock(op.id, &op.what);
+                let shell = Arc::clone(self);
+                self.tasks.spawn(async move {
+                    shell.resolve(&mut request, answer);
+                });
+            }
+            Effect::FleetUnlock(request) => {
+                lock(&self.locks).remove(&request.operation.id);
+            }
+            Effect::Tree(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                self.one_shot(op.id, request, async move {
+                    shell.backend.tree(&op, &token).await
+                });
+            }
+            Effect::Await(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                let key = op.log.map(|k| k.0);
+                self.one_shot(op.id, request, async move {
+                    shell
+                        .backend
+                        .await_healthy(&op, &token, &|stream, text| {
+                            shell.output.push_to(key, stream, text);
+                        })
+                        .await
+                });
+            }
+            Effect::Log(request) => self.log_run(request.operation),
             Effect::Cancel(request) => self.cancel(request.operation.id),
         }
     }
@@ -696,8 +782,57 @@ impl Shell {
     /// and reap what they started and for the action log to be written. The caller exits
     /// after this returns, so a process group is never left behind by a quit.
     pub async fn terminate(self: &Arc<Self>) {
+        self.terminate_with(std::future::pending()).await;
+    }
+
+    /// [`Shell::terminate`] that stops waiting when `interrupt` completes (a second signal).
+    ///
+    /// **What leaving means for a roll.** The core is told to stop and given up to
+    /// [`TERMINATE_BOUND`] to do it (the `clan` processes killed and reaped, a drain in progress
+    /// cancelled and its node uncordoned): the loop does not end the moment a signal arrives. Then
+    /// everything is cancelled, and whatever is still registered as cordoned by auspex before its
+    /// update started is uncordoned here with a plain bounded `kubectl`, so a signal, a second `q`
+    /// and a forced quit all give nodes back. What could not be, and what was left on purpose, is
+    /// in [`Shell::exit_report`], for the caller to say after the terminal is restored.
+    pub async fn terminate_with(self: &Arc<Self>, interrupt: impl Future<Output = ()>) {
         self.send(Event::Terminate);
+        let stopped = async {
+            while !self.view().quit {
+                tokio::select! {
+                    () = self.changed() => {}
+                    () = tokio::time::sleep(Duration::from_millis(25)) => {}
+                }
+            }
+        };
+        tokio::select! {
+            () = stopped => {}
+            () = tokio::time::sleep(TERMINATE_BOUND) => {
+                self.log.line("stopping took longer than the bound; cancelling everything");
+            }
+            () = interrupt => {}
+        }
         self.shutdown().await;
+        let cordons = Arc::clone(&self.cordons);
+        let report = tokio::task::spawn_blocking(move || cordons.last_resort(LAST_RESORT_BOUND))
+            .await
+            .unwrap_or_default();
+        for line in &report {
+            self.log.line(line);
+        }
+        lock(&self.exit_report).extend(report);
+    }
+
+    /// Nodes auspex could not give back, and nodes it left cordoned on purpose, each with the
+    /// command that uncordons it: what the caller says loudly on the way out.
+    #[must_use]
+    pub fn exit_report(&self) -> Vec<String> {
+        lock(&self.exit_report).clone()
+    }
+
+    /// The record of cordoned nodes, for a panic hook (which has no runtime to ask).
+    #[must_use]
+    pub fn cordons(&self) -> Arc<Cordons> {
+        Arc::clone(&self.cordons)
     }
 
     /// The action log, opened on first use. `None` when none was configured or it could not be
@@ -873,6 +1008,120 @@ impl Shell {
         }
     }
 
+    /// A call to the cluster. **Answered on cancellation too**, with [`KubeReply::Cancelled`],
+    /// after `kubectl` has been killed and reaped: the core uncordons a node a cancelled drain
+    /// cordoned only once it knows the drain is over.
+    fn kube(self: &Arc<Self>, mut request: Request<KubeRequest>) {
+        let op = request.operation.clone();
+        let token = self.open(op.id);
+        let shell = Arc::clone(self);
+        let key = op.log.map(|k| k.0);
+        // A drain cordons first and leaves the node cordoned when it fails or is killed: the node is
+        // auspex's from this moment, whatever happens to the core, and the machine's action-log row
+        // opens with it (a drained machine whose update never starts has one too).
+        if let KubeOp::Drain { node, .. } = &op.op {
+            if let Some((kubectl, kubeconfig)) = self.backend.kubectl_target() {
+                self.cordons
+                    .register(node, kubectl, kubeconfig, op.context.clone());
+            }
+            if let Some(key) = key {
+                self.open_row(key, node, Some("drained first (kubectl drain)"));
+            }
+        }
+        self.tasks.spawn(async move {
+            let answer = shell
+                .backend
+                .kube(&op, &token, &|stream, text| {
+                    shell.output.push_to(key, stream, text);
+                })
+                .await
+                .unwrap_or(Ok(KubeReply::Cancelled));
+            shell.forget(op.id);
+            if let (KubeOp::Uncordon { node }, Ok(KubeReply::Done)) = (&op.op, &answer) {
+                shell.cordons.release(node);
+            }
+            shell.resolve(&mut request, answer);
+        });
+    }
+
+    /// The core's words for the Log tab. Sanitised here: they carry machine names, tags and what
+    /// `kubectl` said.
+    fn log_run(&self, op: LogRequest) {
+        use auspex_domain::text::sanitize_line;
+        let key = Some(op.run.0);
+        match op.op {
+            LogOp::Begin { title, group } => {
+                self.output.begin_run(key, &sanitize_line(&title), group);
+            }
+            LogOp::Line { text } => self
+                .output
+                .push_to(key, Stream::Note, &sanitize_line(&text)),
+            LogOp::End { text, result } => {
+                let text = sanitize_line(&text);
+                self.output.finish_run(key, &text);
+                if let Some(key) = key {
+                    self.close_row(key, &text, result);
+                }
+            }
+        }
+        self.changed.notify_one();
+    }
+
+    /// Takes the fleet's update lock for the request `id`, or says why not. A run with no state
+    /// directory has none to take: its freezes are unknown, so it cannot update anything anyway.
+    fn take_lock(&self, id: RequestId, what: &str) -> Result<(), String> {
+        let Some(store) = lock(&self.freeze_store).clone() else {
+            return Ok(());
+        };
+        let Some(dir) = store.path().parent() else {
+            return Err(
+                "the state file has no directory, so the update lock cannot be kept".to_owned(),
+            );
+        };
+        let holder = format!("pid {}: {what}", std::process::id());
+        let held = fleetlock::acquire(dir, store.fleet(), &holder)?;
+        lock(&self.locks).insert(id, held);
+        Ok(())
+    }
+
+    /// Opens the action-log row of a machine of an update of all (at its drain, or at its update,
+    /// whichever comes first), keyed by the core's run number, and adds `note` to what it will say.
+    fn open_row(self: &Arc<Self>, key: u64, machine: &str, note: Option<&str>) {
+        let mut held = lock(&self.rows);
+        let slot = held.entry(key).or_insert_with(|| RowSlot {
+            sender: self.log_row(NewAction {
+                kind: LoggedKind::Deploy,
+                machine: machine.to_owned(),
+                fleet_commit: None,
+                fleet_dirty: None,
+            }),
+            exit_code: None,
+            notes: Vec::new(),
+        });
+        if let Some(note) = note {
+            slot.notes.push(note.to_owned());
+        }
+        drop(held);
+    }
+
+    /// The machine's run is over: its row says how, in the words of the Log tab.
+    fn close_row(&self, key: u64, text: &str, result: EndResult) {
+        let Some(slot) = lock(&self.rows).remove(&key) else {
+            return;
+        };
+        let mut detail = slot.notes;
+        detail.push(text.to_owned());
+        let _ = slot.sender.send(Outcome {
+            result: match result {
+                EndResult::Done => LoggedResult::Succeeded,
+                EndResult::Cancelled => LoggedResult::Cancelled,
+                EndResult::Refused | EndResult::Failed | EndResult::Skipped => LoggedResult::Failed,
+            },
+            exit_code: slot.exit_code,
+            detail: Some(detail.join(" | ")),
+        });
+    }
+
     fn run_action(self: &Arc<Self>, mut request: Request<auspex_core::effects::ActionRequest>) {
         let op = request.operation.clone();
         // Answered on cancellation too: quitting waits for this.
@@ -888,11 +1137,16 @@ impl Shell {
         answer: impl FnOnce(&Arc<Self>, ActionEnd) + Send + 'static,
     ) {
         let token = self.open(op.id);
-        self.output
-            .begin(&format!("{} {}", op.kind.label(), op.machine));
+        // A machine of an update of all writes into the run the core began for it; a lone `u` or
+        // `b` begins (and ends) its own.
+        let key = op.log.map(|k| k.0);
+        if key.is_none() {
+            self.output
+                .begin(&format!("{} {}", op.kind.label(), op.machine));
+        }
         // The action's first line, before clan's: where it builds. Auspex's own words (Note),
         // not clan's output.
-        self.output.push(Stream::Note, &op.start_note());
+        self.output.push_to(key, Stream::Note, &op.start_note());
         let shell = Arc::clone(self);
         self.tasks.spawn(async move {
             // An update is the one action that can lift nothing a freeze holds: asked again, here.
@@ -903,26 +1157,72 @@ impl Shell {
             };
             // The row is written only for an action that starts: a refused one is not a deploy
             // that was tried.
+            let gate_refused = gate.is_err();
+            let started = AtomicBool::new(false);
             let (logged, ran) = if let Err(reason) = gate {
                 (None, Ok(Err(reason)))
             } else {
-                let logged = shell.log_action(&op);
+                // A machine of an update of all has its row open already when it was drained, and
+                // closes it when its run ends (with the wait, the uncordon); a lone `u` or `b` has
+                // one that ends with it.
+                let logged = if let (Some(key), ActionKind::Update) = (key, op.kind) {
+                    shell.open_row(key, &op.machine, None);
+                    None
+                } else {
+                    Some(shell.log_action(&op))
+                };
+                // `clan` is about to be spawned (not before: resolving the pinned one can take
+                // minutes, and a quit then has done nothing to the machine): a node drained for
+                // it is not auspex's to put back if auspex goes away (the machine may be half
+                // updated), only to say.
                 let ran = shell
                     .backend
-                    .run_action(&op, &token, &|stream, text| shell.output.push(stream, text))
+                    .run_action(
+                        &op,
+                        &token,
+                        &|stream, text| {
+                            shell.output.push_to(key, stream, text);
+                        },
+                        &|| {
+                            started.store(true, Ordering::SeqCst);
+                            shell.cordons.commit(&op.machine);
+                        },
+                    )
                     .await;
-                (Some(logged), ran)
+                (logged, ran)
             };
             shell.forget(op.id);
-            let end = action_end(&shell.output, &op, ran);
-            shell.output.finish(&ended_line(&end));
+            let end = action_end(
+                &shell.output,
+                key,
+                &op,
+                gate_refused,
+                started.load(Ordering::SeqCst),
+                ran,
+            );
+            if key.is_none() {
+                shell.output.finish(&ended_line(&end));
+            }
+            // A machine of an update of all keeps its row open: what the process did is stored
+            // in it, and the row closes when the machine's run does.
+            if let (None, Some(key), false) = (&logged, key, gate_refused)
+                && op.kind == ActionKind::Update
+                && let Some(slot) = lock(&shell.rows).get_mut(&key)
+            {
+                slot.exit_code = end.exit_code;
+                if !end.summary.is_empty() {
+                    slot.notes.push(end.summary.join(" | "));
+                }
+            }
             // The result is the action's. The row is a record of it: a closed receiver (the
             // log task gave up) is not an error here.
             if let Some(logged) = logged {
                 let _ = logged.send(Outcome {
                     result: match end.result {
                         ActionResult::Succeeded => LoggedResult::Succeeded,
-                        ActionResult::Failed => LoggedResult::Failed,
+                        // A refused action is never logged (it has no row); `Failed` is only
+                        // what this match needs to say.
+                        ActionResult::Failed | ActionResult::Refused => LoggedResult::Failed,
                         ActionResult::TimedOut => LoggedResult::TimedOut,
                         ActionResult::Cancelled => LoggedResult::Cancelled,
                     },
@@ -941,16 +1241,44 @@ impl Shell {
 /// failed update also gets the plain words for an ssh failure when its output shows one.
 fn action_end(
     output: &Output,
+    key: Option<u64>,
     op: &auspex_core::effects::ActionRequest,
+    refused: bool,
+    started: bool,
     ran: Result<Result<ClanRun, String>, Cancelled>,
 ) -> ActionEnd {
     let summary = || {
         auspex_domain::act::summary_lines(
-            &output.tail(Stream::Stderr, 8),
-            &output.tail(Stream::Stdout, 8),
+            &output.tail_of(key, Stream::Stderr, 8),
+            &output.tail_of(key, Stream::Stdout, 8),
         )
     };
     match ran {
+        // Nothing was started (the freeze file's last look said no, or no `clan` could be found or
+        // run): a refusal and not a failure of the machine, which an update of all skips, and
+        // puts a drained node back for. A build that did not start stays a failure.
+        Ok(Err(reason)) if refused || op.kind == ActionKind::Update => {
+            output.push_to(key, Stream::Note, &reason);
+            ActionEnd {
+                result: ActionResult::Refused,
+                exit_code: None,
+                summary: vec![reason],
+                explanation: None,
+            }
+        }
+        // Stopped before `clan` was spawned (while the pinned one was being resolved), in a roll:
+        // nothing was done to the machine, so a drained node is given back, as for a refusal.
+        Err(Cancelled) if !started && key.is_some() && op.kind == ActionKind::Update => {
+            let reason =
+                "cancelled before clan was started: nothing was done to the machine".to_owned();
+            output.push_to(key, Stream::Note, &reason);
+            ActionEnd {
+                result: ActionResult::Refused,
+                exit_code: None,
+                summary: vec![reason],
+                explanation: None,
+            }
+        }
         Err(Cancelled) => ActionEnd {
             result: ActionResult::Cancelled,
             exit_code: None,
@@ -958,7 +1286,7 @@ fn action_end(
             explanation: None,
         },
         Ok(Err(reason)) => {
-            output.push(Stream::Note, &reason);
+            output.push_to(key, Stream::Note, &reason);
             ActionEnd {
                 result: ActionResult::Failed,
                 exit_code: None,
@@ -980,7 +1308,7 @@ fn action_end(
                 // prints, and the action log holds summaries, never output. The Log tab has the
                 // lines.
                 summary: if ok {
-                    let n = output.printed_lines();
+                    let n = output.printed_lines_of(key);
                     vec![format!(
                         "exit 0, {n} {}",
                         if n == 1 { "line" } else { "lines" }
@@ -989,7 +1317,7 @@ fn action_end(
                     summary()
                 },
                 explanation: (!ok && op.kind == ActionKind::Update)
-                    .then(|| output.last_lines(EXPLAIN_LINES))
+                    .then(|| output.last_lines_of(key, EXPLAIN_LINES))
                     .and_then(|lines| auspex_domain::act::explain_ssh_failure(&lines))
                     .map(|e| e.line()),
             }
@@ -1150,5 +1478,83 @@ mod tests {
         .await
         .expect("within returns once timeouts.diff has passed");
         assert_eq!(answer, Ok(Err("q timed out after 10s".to_owned())));
+    }
+
+    /// What the core writes for the Log tab can carry what `kubectl` said and what a machine
+    /// printed: terminal escapes and control characters never reach the screen.
+    #[test]
+    fn the_cores_words_for_the_log_tab_are_sanitised() {
+        let shell = Shell::new(
+            Backend::Demo(crate::demo::Demo::default()),
+            Log::memory(),
+            Duration::from_secs(1),
+        );
+        let run = RequestId(7);
+        let say = |op| {
+            shell.log_run(LogRequest { run, op });
+        };
+        say(LogOp::Begin {
+            title: "update \u{1b}[2Jluna".to_owned(),
+            group: true,
+        });
+        say(LogOp::Line {
+            text: "node \u{1b}[31mluna\u{1b}[0m\u{202e} said\u{7} no".to_owned(),
+        });
+        say(LogOp::End {
+            text: "failed: \u{1b}]0;title\u{7}boom".to_owned(),
+            result: EndResult::Failed,
+        });
+        let shown: Vec<String> = shell
+            .output()
+            .window(0, 10)
+            .into_iter()
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "── update luna ──",
+                "node luna said no",
+                "── failed: boom ──"
+            ]
+        );
+    }
+
+    /// A stop that comes before `clan` was spawned (while the pinned one is being resolved, which
+    /// can take minutes) has done nothing to the machine: in a roll it is a refusal, so the
+    /// drained node is given back. After the spawn it is a cancellation, and the node stays
+    /// cordoned; and a lone `u` or a build has no node to give back and says what happened.
+    #[test]
+    fn a_stop_before_clan_was_spawned_is_a_refusal_only_in_a_roll() {
+        let request = |kind, log| auspex_core::effects::ActionRequest {
+            id: RequestId(1),
+            kind,
+            machine: "luna".to_owned(),
+            class: auspex_domain::fleet::MachineClass::Nixos,
+            system: None,
+            flake: "/f".to_owned(),
+            build_host: None,
+            target: None,
+            log,
+        };
+        let end = |kind, log: Option<RequestId>, started| {
+            action_end(
+                &Output::default(),
+                log.map(|r| r.0),
+                &request(kind, log),
+                false,
+                started,
+                Err(Cancelled),
+            )
+            .result
+        };
+        let run = Some(RequestId(5));
+        assert_eq!(end(ActionKind::Update, run, false), ActionResult::Refused);
+        assert_eq!(end(ActionKind::Update, run, true), ActionResult::Cancelled);
+        assert_eq!(
+            end(ActionKind::Update, None, false),
+            ActionResult::Cancelled
+        );
+        assert_eq!(end(ActionKind::Build, run, false), ActionResult::Cancelled);
     }
 }
