@@ -160,7 +160,7 @@ etcd = false           # RKE2 control plane: every etcd member must be healthy b
 [update]
 parallel = 2           # machines with no rolling tag, at once (1..16, default 2)
 ready_timeout = 600    # wait for an updated machine to be healthy, seconds (default 600)
-poll_interval = 5      # how often to look again while waiting, seconds (1..60, default 5, at most ready_timeout)
+poll_interval = 5      # seconds between looks while waiting (1..60, default 5)
 
 [kubernetes]
 kubeconfig = "~/.kube/config"   # default: $KUBECONFIG, then ~/.kube/config
@@ -241,8 +241,9 @@ client of its own and not `kubectl` over ssh.
   `Ready` condition's `lastHeartbeatTime` and the node lease's `renewTime`, `kubectl get leases -n
   kube-node-lease`): `Ready=True` stays true for about 40 s after a kubelet stops reporting, so a
   switch that restarts rke2 for 20 s would otherwise pass on the condition it had before. `Unknown`
-  is not `Ready`. It polls every `update.poll_interval` (5 s) up to `update.ready_timeout`; a kubectl that fails or a node that
-  is not in the list is "not yet", never "healthy". (The comparison uses this machine's clock and the
+  is not `Ready`. It polls every `update.poll_interval` (default 5 s, never above
+  `update.ready_timeout`) up to `update.ready_timeout`; a kubectl that fails or a node that is not
+  in the list is "not yet", never "healthy". (The comparison uses this machine's clock and the
   kubelets'; a skew of seconds only makes the wait a little longer.)
 - **Drain** (`drain = true`): `kubectl drain --ignore-daemonsets --delete-emptydir-data --timeout
   <t>s` before the update, uncordon after the wait. Off by default because a NixOS switch does not

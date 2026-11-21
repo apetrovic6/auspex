@@ -117,8 +117,8 @@ in {
         };
         update = section {
           parallel = optional (types.ints.between 1 16) "How many machines with no rolling tag `U` updates at once (default 2): clan builds locally and copies each closure.";
-          ready_timeout = timeout "How long `U` waits for an updated machine to be healthy (and its node Ready) before it gives the machine up, in seconds (default 600).";
-          poll_interval = optional (types.ints.between 1 60) "How often `U` looks again while it waits for an updated machine (and its node) to be healthy, in seconds (default 5). Must not be more than ready_timeout, which auspex enforces when it reads the file.";
+          ready_timeout = timeout "How long `U` waits for an updated machine to be healthy (and its node Ready) before it gives the machine up, in seconds (default 600). `update.poll_interval` must not be more than it.";
+          poll_interval = optional (types.ints.between 1 60) "How often `U` looks again while it waits for an updated machine (and its node) to be healthy, in seconds (default 5). Must not be more than ready_timeout (checked here when both are set); left unset it is 5, or ready_timeout when that is shorter.";
         };
         kubernetes = section {
           kubeconfig = optional (types.either types.str types.path) "The kubeconfig `U` reads node state and drains with (kubectl --kubeconfig); a leading ~/ is your home directory. Default: \$KUBECONFIG, then ~/.kube/config. A path value is written as its string, not copied into the store; a path inside the Nix store is refused as a stale copy of a credentials file.";
@@ -146,6 +146,10 @@ in {
       {
         assertion = !(settings ? flake) || !lib.hasPrefix "${builtins.storeDir}/" settings.flake;
         message = "programs.auspex.settings.flake is a ${builtins.storeDir} path, a frozen copy of the fleet (a relative path literal in a flake is evaluated from the flake's store copy). Use an absolute path or a string such as \"~/clan/fleet\".";
+      }
+      {
+        assertion = (settings.update.poll_interval or 0) <= (settings.update.ready_timeout or 600);
+        message = "programs.auspex.settings.update.poll_interval must not be more than update.ready_timeout (default 600): auspex refuses the file.";
       }
       {
         assertion = !hasKubeconfig || !lib.hasPrefix "${builtins.storeDir}/" kubeconfigPath;

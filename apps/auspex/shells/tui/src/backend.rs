@@ -297,7 +297,7 @@ impl Backend {
         }
     }
 
-    /// `Effect::Await`: probe the updated machine (and read its node) every few seconds until it
+    /// `Effect::Await`: probe the updated machine (and read its node) every `op.poll_seconds` until it
     /// is healthy, or `op.timeout_seconds` has passed.
     ///
     /// # Errors

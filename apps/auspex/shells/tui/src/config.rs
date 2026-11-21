@@ -433,23 +433,32 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                 }
             }
             "update" => {
+                let mut poll = None;
                 for (k, v) in w.table(value, "update")? {
                     let name = format!("update.{k}");
                     match k.as_str() {
                         "parallel" => s.update.parallel = w.counted(v, &name, MAX_PARALLEL)?,
                         "ready_timeout" => s.update.ready_timeout = w.timeout(v, &name)?,
                         "poll_interval" => {
-                            s.update.poll_interval = w.counted(v, &name, MAX_POLL_INTERVAL)?;
+                            poll = Some(w.counted(v, &name, MAX_POLL_INTERVAL)?);
                         }
                         _ => w.unknown(&name),
                     }
                 }
-                if s.update.poll_interval > s.update.ready_timeout {
-                    return Err(format!(
-                        "`update.poll_interval` ({}) must not be more than `update.ready_timeout` ({})",
-                        s.update.poll_interval, s.update.ready_timeout
-                    ));
-                }
+                // Left unset it is the default, kept within a short `ready_timeout` so that a
+                // config that only shortens the timeout still loads; only a value the user wrote
+                // can contradict it.
+                s.update.poll_interval = match poll {
+                    Some(p) if p > s.update.ready_timeout => {
+                        return Err(format!(
+                            "`update.poll_interval` ({p}) must not be more than `update.ready_timeout` ({})",
+                            s.update.ready_timeout
+                        ));
+                    }
+                    Some(p) => p,
+                    None => auspex_core::config::DEFAULT_POLL_INTERVAL_SECONDS
+                        .min(s.update.ready_timeout),
+                };
             }
             "kubernetes" => {
                 for (k, v) in w.table(value, "kubernetes")? {
@@ -927,13 +936,18 @@ mod tests {
                 "[update]\npoll_interval = 5\nready_timeout = 4\n",
                 "update.poll_interval",
             ),
-            ("[update]\nready_timeout = 3\n", "update.poll_interval"),
         ] {
             let e = parse(text).unwrap_err();
             assert!(e.contains(&format!("`{key}`")), "{text:?}: {e}");
         }
         let (s, _) = parse("[update]\nparallel = 16\nready_timeout = 86400\n").unwrap();
         assert_eq!((s.update.parallel, s.update.ready_timeout), (16, 86_400));
+        // Only a shorter ready_timeout: valid before poll_interval existed, still valid, and the
+        // default poll is clamped to it rather than refused.
+        for (rt, poll) in [(1, 1), (3, 3), (5, 5), (6, 5)] {
+            let (s, _) = parse(&format!("[update]\nready_timeout = {rt}\n")).unwrap();
+            assert_eq!((s.update.ready_timeout, s.update.poll_interval), (rt, poll));
+        }
         let (s, _) = parse("[update]\npoll_interval = 60\n").unwrap();
         assert_eq!(s.update.poll_interval, 60);
         let (s, _) = parse("[update]\npoll_interval = 2\nready_timeout = 2\n").unwrap();

@@ -221,8 +221,10 @@ let
   storeKubeconfigRejected =
     !(builtins.tryEval (builtins.deepSeq (checked storeKubeconfig).assertions true)).success
     && builtins.any (a: !a.assertion && lib.hasInfix "store" a.message) storeKubeconfig.assertions;
+  updateWith = update: (evaluate { programs.auspex.settings.update = update; }).config;
+  assertionsHold = c: builtins.all (a: a.assertion) c.assertions;
 in {
-  auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
+  auspex-empty =check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;
   auspex-freeform = compareToml "freeform" unknown.xdg.configFile."auspex/config.toml".source { future.answer = 42; };
   # Positive evaluation and the declared type guard prevent an unrelated throw from passing.
@@ -297,7 +299,15 @@ in {
   ];
   auspex-kubeconfig-store-path = check "kubeconfig-store-path" (storeKubeconfigRejected
     && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeKubeconfig pathKubeconfig ]);
-  auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
+  # The Rust loader's rule: a short ready_timeout alone loads (the default poll is clamped to it);
+  # only an explicit poll_interval above the timeout (explicit or the 600 s default) is refused.
+  auspex-poll-interval = check "poll-interval" (
+    assertionsHold (updateWith { ready_timeout = 3; })
+    && assertionsHold (updateWith { poll_interval = 5; ready_timeout = 5; })
+    && assertionsHold (updateWith { poll_interval = 60; })
+    && !assertionsHold (updateWith { poll_interval = 5; ready_timeout = 4; })
+  );
+  auspex-no-stylix =check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision
     && builtins.all (self: revision (exports.lib.mkConfigurationRevisionModule self) { } { }
