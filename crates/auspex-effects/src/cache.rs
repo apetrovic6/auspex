@@ -463,6 +463,42 @@ pub async fn key_for(
     Ok(key_and_top(flake_dir, params, cancel).await?.map(|k| k.key))
 }
 
+/// A fingerprint of the tracked files of `flake_dir`'s repository, as nix reads them.
+///
+/// It is the 64 lowercase hex digits of the worktree digest the cache key is made of (see the
+/// module documentation: the index as `ls-files -s -v -z` prints it, and every index path's
+/// worktree state as nix reads it for a dirty `git+file` flake: a regular file's bytes and owner
+/// exec bit, a symlink's target, or that it is missing).
+///
+/// This is what the update-time check of the fleet tree compares between the confirmed plan
+/// and a machine's turn (AUS-42). It is the same read, with the same bounds, as the cache's
+/// own: [`MAX_WORKTREE_BYTES`] in all, [`GitParams::read_timeout`] for the reads and
+/// [`GitParams::timeout`] for each git command. It is **not** `git diff HEAD --binary`: that
+/// runs git's diff machinery (textconv, external diff drivers, filters named by attributes),
+/// which the tree check is built never to run in an untrusted repository, and it would also
+/// disagree with what nix evaluates (a `diff` is relative to `HEAD`; the digest is the
+/// state itself). Untracked files are not in it: auspex evaluates the fleet as a `git+file`
+/// flake, which does not see them, so an untracked file cannot change what is deployed.
+///
+/// The inner `Err` is one line on why there is none (no cache directory is involved).
+///
+/// # Errors
+///
+/// [`Cancelled`] when `cancel` fired; any running git has been killed and reaped.
+pub async fn worktree_fingerprint(
+    flake_dir: &Path,
+    params: &GitParams<'_>,
+    cancel: &CancellationToken,
+) -> Result<Result<String, String>, Cancelled> {
+    Ok(key_and_top(flake_dir, params, cancel).await?.map(|k| {
+        k.worktree.iter().fold(String::new(), |mut s, b| {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{b:02x}");
+            s
+        })
+    }))
+}
+
 /// The run guard: a digest of the [`Stamp`] of every path the key read or looked at, and of
 /// the git directory's `HEAD` and `index`. It is compared between the two key computations
 /// around one evaluation and never enters the key (see the module documentation).
@@ -476,6 +512,8 @@ struct Keyed {
     /// nix evaluates names the same repository.
     top: PathBuf,
     guard: Guard,
+    /// The worktree digest alone, without `HEAD` and `flake.lock` that the key also holds.
+    worktree: Vec<u8>,
 }
 
 /// [`key_for`], also returning git's top level and the run [`Guard`].
@@ -575,7 +613,12 @@ async fn key_and_top(
             untracked: &[],
         },
     });
-    Ok(Ok(Keyed { key, top, guard }))
+    Ok(Ok(Keyed {
+        key,
+        top,
+        guard,
+        worktree: digest,
+    }))
 }
 
 /// The git directory, HEAD's commit id (with its newline, as the key has always hashed it)
@@ -1072,7 +1115,7 @@ async fn cache_key_or_why<'c>(
                     // ancestor with a `.git`; the key from git's own discovery. Where they
                     // disagree (a ceiling, a `.git` that is not a repository, `core.worktree`)
                     // the two describe different trees, so there is no caching.
-                    Ok(Keyed { key, top, guard })
+                    Ok(Keyed { key, top, guard, .. })
                         if std::fs::canonicalize(&top).ok().as_deref() == flake.repo_top() =>
                     {
                         Ok((dir, key, guard))

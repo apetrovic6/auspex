@@ -11,6 +11,12 @@
 //!   that would point git at another repository removed), plus the hardening that command
 //!   needs because, unlike those, it can read file contents. A fleet that is not a local
 //!   directory, or not a git repository, is an answer ("cannot be checked"), not a failure.
+//!   The state also names `HEAD`'s commit (`rev-parse --verify HEAD`, none for a branch with no
+//!   commit yet) and, for a tree with changes to tracked files, carries a fingerprint of what nix
+//!   would evaluate ([`worktree_fingerprint`]: the cache key's own bounded worktree digest,
+//!   which reads no file through git and runs no filter), so a machine's turn can tell a tree
+//!   that was pulled, or edited again, from the one the operator confirmed. A fingerprint that
+//!   cannot be had is [`Edits::Unavailable`] with the reason, not a failed check.
 //! - [`closure_size`]: the NAR size of every path of the pending toplevel's closure, from
 //!   `nix path-info --recursive --size`: against the local store first (valid there when this
 //!   machine built it), then against the binary cache. The package preview's pending-closure
@@ -26,14 +32,15 @@ use std::time::Duration;
 
 use auspex_domain::observe::StorePath;
 use auspex_domain::preflight::{
-    LIST_CONFIG_ARGS, TreeState, parse_closure_sizes, parse_filter_names, parse_tree_status,
-    status_args,
+    Edits, LIST_CONFIG_ARGS, TreeState, branch_is_unborn, parse_closure_sizes, parse_commit_id,
+    parse_filter_names, parse_tree_status, status_args,
 };
+use auspex_domain::text::sanitize_line;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::Cancelled;
-use crate::cache::{GitParams, git};
+use crate::cache::{GitParams, git, worktree_fingerprint};
 use crate::closure::{Failure, PendingParams, limits, text_of};
 use crate::http::base_url;
 use crate::nix::FlakeRef;
@@ -46,6 +53,9 @@ const STATUS_CAP: usize = 4 * 1024 * 1024;
 /// The most config-key listing kept: 1 MiB. Past it the check is "could not be done", not a
 /// list of filters with some missing.
 const CONFIG_CAP: usize = 1024 * 1024;
+
+/// The most `rev-parse HEAD` output kept: a commit id is 65 bytes; anything past this is not one.
+const HEAD_CAP: usize = 4096;
 
 /// The fleet repository's state, read from `dir`.
 ///
@@ -76,7 +86,35 @@ pub async fn tree_state(
         Ok(out) => out,
         Err(why) => return Ok(Err(why)),
     };
-    Ok(parse_tree_status(&String::from_utf8_lossy(&out)))
+    let text = String::from_utf8_lossy(&out);
+    let mut state = match parse_tree_status(&text) {
+        Ok(s) => s,
+        Err(why) => return Ok(Err(why)),
+    };
+    // HEAD's commit id: `status` does not print it. A branch with no commit yet has none, and
+    // asking would fail; every other failure is the check not running.
+    if !branch_is_unborn(&text) {
+        let args = ["rev-parse", "--verify", "HEAD"];
+        let id = match git(params, dir, &args, HEAD_CAP, cancel).await? {
+            Ok(out) => out,
+            Err(why) => return Ok(Err(why)),
+        };
+        state.head = match parse_commit_id(&id) {
+            Ok(id) => Some(id),
+            Err(why) => return Ok(Err(why)),
+        };
+    }
+    // What a deploy would evaluate, for a tree that has changes: nothing to fingerprint when
+    // it has none. The fingerprint is bounded as the cache key's worktree read is; when it
+    // cannot be had the state says why instead of failing the whole check, and the turn
+    // compares commits only.
+    if state.changed_files > 0 {
+        state.edits = match worktree_fingerprint(dir, params, cancel).await? {
+            Ok(digest) => Edits::Digest(digest),
+            Err(why) => Edits::Unavailable(sanitize_line(&why)),
+        };
+    }
+    Ok(Ok(state))
 }
 
 /// The exact argv (after the program) of the local size query. `path` is a validated

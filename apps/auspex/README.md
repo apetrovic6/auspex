@@ -1,4 +1,5 @@
-# auspex
+| the fleet repository stands on another commit than the plan showed (a `git pull`, or a commit then pushed: no warning changes), or its uncommitted changes are not the ones it showed (the same files saved again) | **refused**, with a sentence naming both commits or saying the uncommitted changes changed; the roll goes on (and the next machine is held to the same plan, so is refused the same way) |
+`HEAD` ahead of its upstream; no upstream (or a deleted one, or a detached `HEAD`); the check could not run; uncommitted changes that could not be fingerprinted (see below) |# auspex
 
 The Crux app: one core holding the decisions, one terminal shell drawing them.
 
@@ -89,6 +90,23 @@ store holds older generations, and paths are shared between them), which is the 
 the same rules decide again at `y`: a typed name that became required, or a warning that was not in
 the dialog, asks again instead of deploying.
 
+**The fleet tree at the `y`** is read once more, under the update lock, and the update starts only
+on the same `HEAD` commit and the same uncommitted changes the dialog was answered about; otherwise
+nothing is deployed and the notice names both commits (or says the uncommitted changes changed).
+
+**What "the same uncommitted changes" means.** For a tree with changes to tracked files, auspex
+hashes (SHA-256) what nix would evaluate: auspex evaluates the fleet as a `git+file` flake, which
+reads the tracked files as they are in the worktree, so the digest covers the index and each
+tracked file's bytes and executable bit (a symlink's target), bounded to 1 GiB read and 30 s, as
+the evaluation cache key is. Untracked files, ignored or not, are **not** in it: nix does not see
+them, so they cannot change what is deployed. It is not `git diff HEAD`: that would run git's diff
+machinery (textconv, external diff drivers, filters) which the checks never run in a repository
+they do not trust. The plan shows `HEAD`'s first 12 digits and, for a dirty tree, `dirty` with the
+digest's first 8. When the digest cannot be computed (too big, too slow, not readable) the plan says
+so in a warning and the turn compares the commit only, and says that too (in the machine's log for
+`U`, in the status bar for `u`). Not covered, as for the status check itself: a tracked file marked
+assume-unchanged or skip-worktree (git reports the tree clean, so there is no digest).
+
 The question is `update luna to 0a1b2c3d nixos-system-luna-…? y/N` for a machine that is not **public**.
 For a machine marked public (`machines.<m>.public = true`, see Configuration) it is `type luna,
 then Enter`: `y` is just a letter there, only the machine's exact name confirms, and Esc
@@ -128,12 +146,13 @@ nodes) and at the fleet repository (one `git status`), and the question carries 
 ```
 update 4 machines:
 cluster: context rke2 (https://10.0.0.1:6443); every kubectl call is pinned to it
+fleet repository: HEAD 1a2b3c4d5e6f
 rolling taghmata (one at a time; each node must be Ready before the next): luna → mars → sol → terra
 in parallel, at most 2 at a time: alfrost, cerberus
 at most 3 machines updating at once: one of the cluster's group + 2 of the machines in parallel
 skipped genetor: frozen
 warning: the fleet repository has uncommitted changes to 2 tracked files: the update deploys them, …
-each machine is checked at its turn: a refusal skips it, a failure stops its rolling group, and a new warning about the fleet repository refuses it
+each machine is checked at its turn: a refusal skips it, a failure stops its rolling group, and a fleet repository that is not as it was at the y (a new warning, another commit, other uncommitted changes) refuses it
 update 6 machines as listed above? y/N
 ```
 

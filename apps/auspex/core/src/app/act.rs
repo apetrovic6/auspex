@@ -95,7 +95,7 @@ pub(super) enum Confirm {
         /// it the question is asked again.
         to: String,
         path: String,
-        answer: PreflightAnswer,
+        answer: Box<PreflightAnswer>,
         review: Preflight,
         /// What has been typed, when the machine is one whose name has to be typed. Only for
         /// a review with no refusals: there is nothing to confirm otherwise.
@@ -648,7 +648,7 @@ fn preflight_answered(
         machine,
         to,
         path,
-        answer,
+        answer: Box::new(answer),
         review,
         typed,
     });
@@ -818,7 +818,7 @@ fn confirm_update(model: &mut Model, asked: Asked, stage: Stage) -> Command<Effe
     if stage == Stage::FreezesRead {
         // The last rule: one auspex updates a fleet at a time. The update is launched when the lock
         // is held (`roll::lock_answered`).
-        return roll::lock_for_update(model, machine);
+        return roll::lock_for_update(model, machine, answer.tree);
     }
     // Everything the core can know says yes. The last look is at the file, which another
     // running auspex may have changed since this one read it (`freeze.rs`); every rule above is
@@ -849,7 +849,7 @@ pub(super) struct Asked {
     pub(super) machine: String,
     to: String,
     pub(super) path: String,
-    answer: PreflightAnswer,
+    answer: Box<PreflightAnswer>,
     /// What the checks decided when the dialog was drawn.
     review: Preflight,
     /// The operator typed the machine's name (so the typed confirmation, if required now, is

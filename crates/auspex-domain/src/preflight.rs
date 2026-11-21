@@ -10,9 +10,14 @@
 //!
 //! | check | refuses | warns |
 //! |---|---|---|
-//! | fleet tree | never | uncommitted changes to tracked files; `HEAD` ahead of its upstream; no upstream, or one that is gone; the check could not run |
+//! | fleet tree | never | uncommitted changes to tracked files; `HEAD` ahead of its upstream; no upstream, or one that is gone; the check could not run; the changes could not be fingerprinted |
 //! | free disk | free < closure + [`FREE_MARGIN_BYTES`] | free space or closure size unknown |
 //! | duplicate IP | the machine's address is shared with another machine's, **or is not known** | other machines' addresses are not known |
+//!
+//! The fleet tree has a second job, [`compare`]: at a machine's turn it refuses a tree whose `HEAD`
+//! commit or uncommitted changes are not the ones the confirmed plan found. That is the one tree
+//! rule that refuses, and it is held to the plan, not to the rules' table: the check itself still
+//! only warns.
 //!
 //! A check that fails to *run* is a warning, not a refusal, because a refusal the operator
 //! cannot act on teaches them to stop reading the dialog. The one exception is the duplicate
@@ -51,6 +56,146 @@ pub struct TreeState {
     pub changed_files: usize,
     /// Where `HEAD` stands against its upstream.
     pub upstream: Upstream,
+    /// `HEAD`'s full commit id; `None` for a branch with no commit yet.
+    pub head: Option<String>,
+    /// What the uncommitted changes are, for telling "the same files edited again" from "not
+    /// touched": see [`Edits`].
+    pub edits: Edits,
+}
+
+/// A fingerprint of the uncommitted changes, as far as a deploy would see them.
+///
+/// It is computed by the adapter only when `changed_files` is above zero, and it covers what
+/// auspex's own evaluation reads: the fleet is evaluated as a `git+file` flake, so nix sees the
+/// tracked files as they are in the worktree (the index included) and **not** untracked files,
+/// which therefore are not in it. Two states with the same `changed_files` and the same
+/// warning text (the same files saved again) have different fingerprints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Edits {
+    /// No tracked file has changes, so there is nothing to fingerprint.
+    None,
+    /// SHA-256 of the worktree as nix reads it, as 64 lowercase hex digits.
+    Digest(String),
+    /// The fingerprint could not be computed, and why (one line). The plan says so and a
+    /// machine's turn then compares commits only.
+    Unavailable(String),
+}
+
+/// How many hex digits of a commit id the plan and a refusal show.
+const SHORT_COMMIT: usize = 12;
+
+/// How many hex digits of the changes' digest the plan shows.
+const SHORT_DIGEST: usize = 8;
+
+/// The start of the warning that says the changes could not be fingerprinted. A machine's turn
+/// does not take it for news ([`is_fingerprint_warning`]): its text carries the reason, which can
+/// differ between two looks, and [`compare`] already says what it means for that turn.
+const FINGERPRINT_WARNING: &str = "the fleet repository's uncommitted changes could not be \
+                                   fingerprinted, so a machine's turn compares the commit only \
+                                   and cannot see the same files edited again";
+
+/// Whether `warning` is the one [`tree_warnings`] gives for changes that could not be
+/// fingerprinted.
+#[must_use]
+pub fn is_fingerprint_warning(warning: &str) -> bool {
+    warning.starts_with(FINGERPRINT_WARNING)
+}
+
+/// `commit id` as the plan shows it: its first 12 digits.
+fn short_commit(head: Option<&str>) -> String {
+    head.map_or_else(
+        || "no commit yet".to_owned(),
+        |h| sanitize_line(&h.chars().take(SHORT_COMMIT).collect::<String>()),
+    )
+}
+
+/// A line for the plan: the commit the tree stands on and whether it is dirty.
+///
+/// `HEAD 1a2b3c4d5e6f`, `HEAD 1a2b3c4d5e6f, dirty (9f8e7d6c)`, or `no commit yet`. A dirty tree
+/// whose changes could not be fingerprinted says that in the place of the digest.
+#[must_use]
+pub fn describe_tree(tree: &TreeState) -> String {
+    let head = match &tree.head {
+        Some(_) => format!("HEAD {}", short_commit(tree.head.as_deref())),
+        None => short_commit(None),
+    };
+    if tree.changed_files == 0 {
+        return head;
+    }
+    match &tree.edits {
+        Edits::Digest(d) => format!(
+            "{head}, dirty ({})",
+            sanitize_line(&d.chars().take(SHORT_DIGEST).collect::<String>())
+        ),
+        Edits::Unavailable(_) => format!("{head}, dirty (changes not fingerprinted)"),
+        Edits::None => format!("{head}, dirty"),
+    }
+}
+
+/// What [`compare`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeChange {
+    /// The same commit, and the same changes (or both clean).
+    Same,
+    /// The same commit; the changes could not be compared (one of the two looks could not
+    /// fingerprint them). The line says so, for the machine's log.
+    CommitOnly(String),
+    /// Not what the plan found: the sentence says how, for the refusal.
+    Moved(String),
+}
+
+/// Whether the fleet repository is as the confirmed plan found it: the same `HEAD` commit and
+/// the same uncommitted changes.
+///
+/// This catches what comparing warning texts cannot: a pull or a commit then push (a clean,
+/// pushed tree before and after), and the same files saved again (the same count, the same
+/// text). A look that could not read the repository is no commit to compare: if the plan had
+/// one, that is a change (the repository could not be read again); if the plan had none, the
+/// warnings already said so and there is nothing to hold the turn to.
+#[must_use]
+pub fn compare(planned: Result<&TreeState, &str>, now: Result<&TreeState, &str>) -> TreeChange {
+    let (planned, now) = match (planned, now) {
+        (Ok(planned), Ok(now)) => (planned, now),
+        (Ok(_), Err(why)) => {
+            return TreeChange::Moved(format!(
+                "the fleet repository could not be read again, so it is not known to be as the \
+                 confirmed plan found it: {}",
+                sanitize_line(why)
+            ));
+        }
+        (Err(_), _) => return TreeChange::Same,
+    };
+    if planned.head != now.head {
+        return TreeChange::Moved(format!(
+            "the fleet repository's HEAD moved since the confirmed plan: it was {} and is {}",
+            short_commit(planned.head.as_deref()),
+            short_commit(now.head.as_deref())
+        ));
+    }
+    let (was_dirty, is_dirty) = (planned.changed_files > 0, now.changed_files > 0);
+    if was_dirty != is_dirty {
+        return TreeChange::Moved(format!(
+            "the uncommitted changes changed since the confirmed plan: the tree was {} and is {}",
+            if was_dirty { "dirty" } else { "clean" },
+            if is_dirty { "dirty" } else { "clean" },
+        ));
+    }
+    if !is_dirty {
+        return TreeChange::Same;
+    }
+    match (&planned.edits, &now.edits) {
+        (Edits::Digest(a), Edits::Digest(b)) if a == b => TreeChange::Same,
+        (Edits::Digest(_), Edits::Digest(_)) => TreeChange::Moved(
+            "the uncommitted changes changed since the confirmed plan (same commit, other \
+             contents)"
+                .to_owned(),
+        ),
+        _ => TreeChange::CommitOnly(
+            "the uncommitted changes could not be fingerprinted, so only the commit was compared \
+             with the confirmed plan's"
+                .to_owned(),
+        ),
+    }
 }
 
 /// A branch's upstream, as `git status --branch` reports it.
@@ -198,6 +343,10 @@ pub fn status_args(filters: &[String]) -> Vec<String> {
 /// # Errors
 ///
 /// One line when the text is not that output (no `## ` branch record first).
+///
+/// `head` and `edits` are not in `git status`'s output: they come back as `None` and
+/// [`Edits::None`] for the adapter to fill in ([`branch_is_unborn`] says whether there is a
+/// `HEAD` to ask for).
 pub fn parse_tree_status(text: &str) -> Result<TreeState, String> {
     let mut records = text.split('\0');
     let header = records.next().unwrap_or_default();
@@ -208,7 +357,39 @@ pub fn parse_tree_status(text: &str) -> Result<TreeState, String> {
     Ok(TreeState {
         changed_files,
         upstream: parse_branch_line(header),
+        head: None,
+        edits: Edits::None,
     })
+}
+
+/// Whether the branch line of `git status --porcelain=v1 -b -z` output ([`parse_tree_status`]'s
+/// input) says the branch has no commit yet, so `HEAD` names nothing.
+#[must_use]
+pub fn branch_is_unborn(text: &str) -> bool {
+    let header = text.split('\0').next().unwrap_or_default();
+    header
+        .strip_prefix("## ")
+        .is_some_and(|h| h.starts_with("No commits yet on ") || h.starts_with("Initial commit on "))
+}
+
+/// The commit id in the output of `git rev-parse --verify HEAD`: 40 hex digits (SHA-1) or 64
+/// (SHA-256), lowercase, and a newline.
+///
+/// # Errors
+///
+/// One line when it is anything else: the id is shown to the operator and compared, so text
+/// that is not an id is not taken for one.
+pub fn parse_commit_id(text: &[u8]) -> Result<String, String> {
+    let id = text.strip_suffix(b"\n").unwrap_or(text);
+    let is_id = matches!(id.len(), 40 | 64)
+        && id
+            .iter()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b));
+    if is_id {
+        Ok(String::from_utf8_lossy(id).into_owned())
+    } else {
+        Err("git rev-parse printed something other than a commit id for HEAD".to_owned())
+    }
 }
 
 fn parse_branch_line(line: &str) -> Upstream {
@@ -521,6 +702,10 @@ fn tree_check_of(tree: Result<&TreeState, &str>, out: &mut Preflight) {
              no commit says what was deployed",
             plural(tree.changed_files as u64, "tracked file", "tracked files")
         ));
+        if let Edits::Unavailable(why) = &tree.edits {
+            out.warnings
+                .push(format!("{FINGERPRINT_WARNING}: {}", sanitize_line(why)));
+        }
     }
     match &tree.upstream {
         Upstream::Tracking { name, ahead, .. } if *ahead > 0 => {
@@ -650,7 +835,211 @@ mod tests {
         TreeState {
             changed_files: changed,
             upstream,
+            head: None,
+            edits: Edits::None,
         }
+    }
+
+    const COMMIT_A: &str = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
+    const COMMIT_B: &str = "ffeeddccbbaa99887766554433221100ffeeddcc";
+    const DIGEST_A: &str = "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0";
+    const DIGEST_B: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// A tree as the adapter reports it: on `commit`, with `changed` files changed and, when
+    /// there are any, their `edits`.
+    fn at(commit: Option<&str>, changed: usize, edits: Edits) -> TreeState {
+        TreeState {
+            head: commit.map(str::to_owned),
+            edits,
+            ..tree(changed, tracking(0))
+        }
+    }
+
+    fn digest(d: &str) -> Edits {
+        Edits::Digest(d.to_owned())
+    }
+
+    fn compared(planned: &TreeState, now: &TreeState) -> TreeChange {
+        compare(Ok(planned), Ok(now))
+    }
+
+    fn moved(change: TreeChange) -> String {
+        match change {
+            TreeChange::Moved(why) => why,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_same_commit_and_the_same_changes_are_the_same_tree() {
+        let clean = at(Some(COMMIT_A), 0, Edits::None);
+        assert_eq!(compared(&clean, &clean.clone()), TreeChange::Same);
+        let dirty = at(Some(COMMIT_A), 2, digest(DIGEST_A));
+        assert_eq!(compared(&dirty, &dirty.clone()), TreeChange::Same);
+        let unborn = at(None, 0, Edits::None);
+        assert_eq!(compared(&unborn, &unborn.clone()), TreeChange::Same);
+    }
+
+    #[test]
+    fn a_moved_head_is_refused_and_names_both_commits() {
+        // A pull, or a commit then pushed: the tree stays clean and pushed, so no warning
+        // changes.
+        let before = at(Some(COMMIT_A), 0, Edits::None);
+        let after = at(Some(COMMIT_B), 0, Edits::None);
+        let why = moved(compared(&before, &after));
+        assert!(why.contains("1a2b3c4d5e6f"), "{why}");
+        assert!(why.contains("ffeeddccbbaa"), "{why}");
+        assert!(!why.contains(COMMIT_A), "the short form: {why}");
+        // Dirty on both sides: the commit decides first.
+        let why = moved(compared(
+            &at(Some(COMMIT_A), 1, digest(DIGEST_A)),
+            &at(Some(COMMIT_B), 1, digest(DIGEST_A)),
+        ));
+        assert!(why.contains("HEAD moved"), "{why}");
+    }
+
+    #[test]
+    fn a_first_commit_is_a_moved_head() {
+        let why = moved(compared(
+            &at(None, 0, Edits::None),
+            &at(Some(COMMIT_A), 0, Edits::None),
+        ));
+        assert!(why.contains("no commit yet"), "{why}");
+        assert!(why.contains("1a2b3c4d5e6f"), "{why}");
+    }
+
+    #[test]
+    fn the_same_files_edited_again_are_refused() {
+        // The same count, the same warning text: only the fingerprint tells.
+        let before = at(Some(COMMIT_A), 2, digest(DIGEST_A));
+        let after = at(Some(COMMIT_A), 2, digest(DIGEST_B));
+        assert_eq!(
+            tree_warnings(Ok(&before)),
+            tree_warnings(Ok(&after)),
+            "the warning texts cannot tell them apart"
+        );
+        let why = moved(compared(&before, &after));
+        assert!(why.contains("uncommitted changes changed"), "{why}");
+    }
+
+    #[test]
+    fn clean_to_dirty_and_back_are_refused() {
+        let clean = at(Some(COMMIT_A), 0, Edits::None);
+        let dirty = at(Some(COMMIT_A), 1, digest(DIGEST_A));
+        let why = moved(compared(&clean, &dirty));
+        assert!(why.contains("uncommitted changes changed"), "{why}");
+        assert!(why.contains("was clean and is dirty"), "{why}");
+        let why = moved(compared(&dirty, &clean));
+        assert!(why.contains("was dirty and is clean"), "{why}");
+    }
+
+    #[test]
+    fn changes_that_cannot_be_fingerprinted_are_compared_by_commit_only_and_it_is_said() {
+        let known = at(Some(COMMIT_A), 1, digest(DIGEST_A));
+        let unknown = at(
+            Some(COMMIT_A),
+            1,
+            Edits::Unavailable("timed out".to_owned()),
+        );
+        for (a, b) in [(&known, &unknown), (&unknown, &known), (&unknown, &unknown)] {
+            match compared(a, b) {
+                TreeChange::CommitOnly(note) => assert!(note.contains("only the commit"), "{note}"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // The commit is still compared.
+        let other_commit = at(
+            Some(COMMIT_B),
+            1,
+            Edits::Unavailable("timed out".to_owned()),
+        );
+        assert!(matches!(
+            compared(&known, &other_commit),
+            TreeChange::Moved(_)
+        ));
+    }
+
+    #[test]
+    fn a_repository_that_cannot_be_read_again_is_a_change_only_if_the_plan_could_read_it() {
+        let planned = at(Some(COMMIT_A), 0, Edits::None);
+        let why = moved(compare(Ok(&planned), Err("git timed out")));
+        assert!(why.contains("could not be read again"), "{why}");
+        assert!(why.contains("git timed out"), "{why}");
+        // The plan had no look: the warnings said so, and there is nothing to hold the turn to.
+        assert_eq!(compare(Err("no git"), Ok(&planned)), TreeChange::Same);
+        assert_eq!(compare(Err("no git"), Err("no git")), TreeChange::Same);
+    }
+
+    #[test]
+    fn the_plan_line_names_the_commit_and_the_changes() {
+        assert_eq!(
+            describe_tree(&at(Some(COMMIT_A), 0, Edits::None)),
+            "HEAD 1a2b3c4d5e6f"
+        );
+        assert_eq!(
+            describe_tree(&at(Some(COMMIT_A), 3, digest(DIGEST_A))),
+            "HEAD 1a2b3c4d5e6f, dirty (9f8e7d6c)"
+        );
+        assert_eq!(
+            describe_tree(&at(Some(COMMIT_A), 3, Edits::Unavailable("x".to_owned()))),
+            "HEAD 1a2b3c4d5e6f, dirty (changes not fingerprinted)"
+        );
+        assert_eq!(describe_tree(&at(None, 0, Edits::None)), "no commit yet");
+    }
+
+    #[test]
+    fn unfingerprinted_changes_are_a_warning_that_a_turn_does_not_take_for_news() {
+        let t = at(
+            Some(COMMIT_A),
+            1,
+            Edits::Unavailable("git timed out after 2s".to_owned()),
+        );
+        let warnings = tree_warnings(Ok(&t));
+        let w = warnings
+            .iter()
+            .find(|w| is_fingerprint_warning(w))
+            .expect("the plan says so");
+        assert!(w.contains("git timed out after 2s"), "{w}");
+        assert!(w.contains("compares the commit only"), "{w}");
+        // A clean tree has nothing to fingerprint, whatever the field says.
+        let clean = at(Some(COMMIT_A), 0, Edits::Unavailable("x".to_owned()));
+        assert!(
+            !tree_warnings(Ok(&clean))
+                .iter()
+                .any(|w| is_fingerprint_warning(w))
+        );
+    }
+
+    #[test]
+    fn a_commit_id_is_hex_of_a_known_length() {
+        assert_eq!(
+            parse_commit_id(format!("{COMMIT_A}\n").as_bytes()).unwrap(),
+            COMMIT_A
+        );
+        assert_eq!(parse_commit_id(COMMIT_A.as_bytes()).unwrap(), COMMIT_A);
+        assert!(
+            parse_commit_id(format!("{DIGEST_A}\n").as_bytes()).is_ok(),
+            "64: SHA-256"
+        );
+        for bad in [
+            "",
+            "HEAD\n",
+            "1a2b\n",
+            &COMMIT_A.to_uppercase(),
+            "\u{1b}[31mred\n",
+        ] {
+            assert!(parse_commit_id(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        assert!(parse_commit_id(format!("{COMMIT_A}\n{COMMIT_A}\n").as_bytes()).is_err());
+    }
+
+    #[test]
+    fn an_unborn_branch_is_known_from_its_status_line() {
+        assert!(branch_is_unborn("## No commits yet on main\0"));
+        assert!(branch_is_unborn("## Initial commit on main\0"));
+        assert!(!branch_is_unborn("## main...origin/main\0"));
+        assert!(!branch_is_unborn("## HEAD (no branch)\0"));
+        assert!(!branch_is_unborn(""));
     }
 
     fn tracking(ahead: u64) -> Upstream {

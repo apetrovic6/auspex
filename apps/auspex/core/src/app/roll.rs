@@ -22,7 +22,9 @@
 //!   of a started update, a failed drain, a cluster that is no longer healthy, or a machine that
 //!   does not become healthy **stops its rolling group** (the rest is skipped) and the others carry
 //!   on. A warning about the fleet repository that was not in the confirmed plan (someone edited
-//!   the tree after the `y`) refuses the machine. A machine whose name has to be typed
+//!   the tree after the `y`), another `HEAD` commit than the plan showed (a pull, or a commit then
+//!   pushed), or other uncommitted changes than it showed (the same files saved again: a digest of
+//!   what nix would evaluate tells) refuses the machine. A machine whose name has to be typed
 //!   (`public`) is skipped: that confirmation is for `u`.
 //! - **Kubernetes.** The cluster is read again before every machine that uses it (and so right
 //!   after the `y` for the first of each group): any node that is `NotReady` or cordoned, or
@@ -198,6 +200,10 @@ pub(super) struct Roll {
     /// The fleet repository's warnings in the confirmed plan: a machine's turn may show these and
     /// no others.
     tree_warnings: Vec<String>,
+    /// The fleet repository as the confirmed plan found it (`None`: it was not looked at): a
+    /// machine's turn finds the same `HEAD` commit and the same uncommitted changes, or is
+    /// refused ([`auspex_domain::preflight::compare`]).
+    tree: Option<Result<TreeState, String>>,
     /// The fleet lock, released when the roll is over.
     lock: RequestId,
     /// Nodes left cordoned on purpose, with the command that gives them back.
@@ -338,6 +344,9 @@ pub(super) struct Planned {
     cluster: Option<ClusterId>,
     /// What the fleet repository's state warns about, once, for the whole roll.
     tree_warnings: Vec<String>,
+    /// The fleet repository as the plan found it (`None`: it was not looked at). Shown in the
+    /// question, and what each machine's turn is held to.
+    tree: Option<Result<TreeState, String>>,
     /// Machines that are nodes of the cluster yet roll with no group, or only in a group that does
     /// not use the cluster (its label is the second field), so they update beside the cluster's
     /// group: shown in the plan, one warning each. Not held to the plan at a machine's turn (the
@@ -365,6 +374,12 @@ impl Planned {
             lines.push(format!(
                 "cluster: context {} ({}); every kubectl call is pinned to it",
                 c.context, c.server
+            ));
+        }
+        if let Some(Ok(tree)) = &self.tree {
+            lines.push(format!(
+                "fleet repository: {}",
+                auspex_domain::preflight::describe_tree(tree)
             ));
         }
         for g in &self.groups {
@@ -435,7 +450,7 @@ impl Planned {
         }
         lines.push(
             "each machine is checked at its turn: a refusal skips it, a failure stops its \
-             rolling group, and a new warning about the fleet repository refuses it"
+             rolling group, and a fleet repository that is not as it was at the y (a new warning, another commit, other uncommitted changes) refuses it"
                 .to_owned(),
         );
         lines
@@ -595,6 +610,7 @@ impl Draft {
             poll_interval_seconds: self.poll_interval_seconds,
             cluster,
             tree_warnings,
+            tree: self.tree,
             ungrouped_nodes,
         }
     }
@@ -846,17 +862,32 @@ pub(super) fn tree_checked(
     answer: &Result<TreeState, String>,
 ) -> Option<Command<Effect, Event>> {
     stage_answered(model, id, &Found::Tree(answer))
+        .or_else(|| update_tree_answered(model, id, answer))
 }
 
 // ---------------------------------------------------------------------------------------
 // The lock
 // ---------------------------------------------------------------------------------------
 
-/// What is waiting for the fleet's update lock.
+/// What is waiting for the fleet's update lock, or for the last look at the fleet repository that
+/// follows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum LockWait {
-    /// A `u` of this machine, confirmed.
-    Update { id: RequestId, machine: String },
+    /// A `u` of this machine, confirmed; `tree` is the fleet repository as its dialog showed it.
+    Update {
+        id: RequestId,
+        machine: String,
+        tree: Result<TreeState, String>,
+    },
+    /// The lock for a `u` is held and the repository is being read once more: `id` is that
+    /// request, `lock` the lock's. The update starts only if the tree is still as the dialog
+    /// showed it.
+    UpdateTree {
+        id: RequestId,
+        lock: RequestId,
+        machine: String,
+        tree: Result<TreeState, String>,
+    },
     /// A `U`, confirmed.
     Roll {
         id: RequestId,
@@ -867,7 +898,7 @@ pub(super) enum LockWait {
 impl LockWait {
     const fn id(&self) -> RequestId {
         match self {
-            Self::Update { id, .. } | Self::Roll { id, .. } => *id,
+            Self::Update { id, .. } | Self::UpdateTree { id, .. } | Self::Roll { id, .. } => *id,
         }
     }
 }
@@ -878,11 +909,16 @@ fn lock_command(id: RequestId, what: String) -> Command<Effect, Event> {
 }
 
 /// A `u` has passed every rule and the last look at the freeze file: take the fleet's lock, then
-/// launch.
-pub(super) fn lock_for_update(model: &mut Model, machine: String) -> Command<Effect, Event> {
+/// look at the fleet repository once more, then launch. `tree` is the repository as the dialog
+/// the operator confirmed showed it.
+pub(super) fn lock_for_update(
+    model: &mut Model,
+    machine: String,
+    tree: Result<TreeState, String>,
+) -> Command<Effect, Event> {
     let id = model.fresh_id();
     let what = format!("update {machine}");
-    model.lock_wait = Some(LockWait::Update { id, machine });
+    model.lock_wait = Some(LockWait::Update { id, machine, tree });
     Command::all([lock_command(id, what), render()])
 }
 
@@ -905,15 +941,86 @@ pub(super) fn lock_answered(
         return Command::all([unlock(), render()]);
     }
     match wait {
-        LockWait::Update { machine, .. } => {
+        LockWait::Update { machine, tree, .. } => {
             // The world may have moved while the lock was taken: decided again.
             if let Err(why) = check(model, ActionKind::Update, &machine) {
                 return Command::all([unlock(), model.notice(why)]);
             }
-            super::act::launch_locked(model, machine, id)
+            // The last rule: `clan` deploys the tree as it is when it starts, and the dialog was
+            // answered at some earlier time. The tree is read again, under the lock, and the
+            // update starts only on the commit and the changes the dialog showed.
+            let tree_id = model.fresh_id();
+            let (flake, timeout_seconds) = model.config.as_ref().map_or_else(
+                || (String::new(), 0),
+                |c| (c.flake.clone(), c.preflight_timeout_seconds),
+            );
+            model.lock_wait = Some(LockWait::UpdateTree {
+                id: tree_id,
+                lock: id,
+                machine,
+                tree,
+            });
+            Command::all([
+                Command::request_from_shell(TreeRequest {
+                    id: tree_id,
+                    flake,
+                    timeout_seconds,
+                })
+                .then_send(move |answer| Event::TreeChecked {
+                    id: tree_id,
+                    answer,
+                }),
+                render(),
+            ])
         }
+        // Not the lock's answer: that is a tree look, which has its own.
+        LockWait::UpdateTree { .. } => Command::done(),
         LockWait::Roll { planned, .. } => start(model, &planned, id),
     }
+}
+
+/// The repository as it is, read after the lock was taken for a `u`. `None`: `id` is not that
+/// look.
+fn update_tree_answered(
+    model: &mut Model,
+    id: RequestId,
+    answer: &Result<TreeState, String>,
+) -> Option<Command<Effect, Event>> {
+    let LockWait::UpdateTree {
+        lock,
+        machine,
+        tree,
+        ..
+    } = model.lock_wait.take_if(|w| w.id() == id)?
+    else {
+        return None;
+    };
+    let unlock = || -> Command<Effect, Event> {
+        Command::notify_shell(FleetUnlockRequest { id: lock }).into()
+    };
+    if model.view.quit || !model.act {
+        return Some(Command::all([unlock(), render()]));
+    }
+    let now = answer.as_ref().map_err(String::as_str);
+    let planned = tree.as_ref().map_err(String::as_str);
+    match auspex_domain::preflight::compare(planned, now) {
+        auspex_domain::preflight::TreeChange::Moved(why) => {
+            return Some(Command::all([
+                unlock(),
+                model.notice(format!("not updating {machine}: {why}")),
+            ]));
+        }
+        // Said in the status bar: this update goes ahead on the commit alone.
+        auspex_domain::preflight::TreeChange::CommitOnly(note) => {
+            model.view.notice = Some(note);
+        }
+        auspex_domain::preflight::TreeChange::Same => {}
+    }
+    // The world may have moved while the tree was read: decided again, as at the lock.
+    if let Err(why) = check(model, ActionKind::Update, &machine) {
+        return Some(Command::all([unlock(), model.notice(why)]));
+    }
+    Some(super::act::launch_locked(model, machine, lock))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1014,6 +1121,7 @@ fn start(model: &mut Model, planned: &Planned, lock: RequestId) -> Command<Effec
         context: planned.cluster.as_ref().map(|c| c.context.clone()),
         kubeconfig: planned.cluster.as_ref().map(|c| c.kubeconfig.clone()),
         tree_warnings: planned.tree_warnings.clone(),
+        tree: planned.tree.clone(),
         lock,
         left_cordoned: Vec::new(),
         ids: BTreeMap::new(),
@@ -1198,9 +1306,14 @@ pub(super) fn preflight_answered(
         // The warnings about the fleet repository were shown in the plan the operator confirmed.
         // One that is not among them is news: someone changed the tree (or its upstream) since,
         // and `clan` deploys the tree as it is now. That machine is not updated on it.
-        let tree =
-            auspex_domain::preflight::tree_warnings(answer.tree.as_ref().map_err(String::as_str));
-        if let Some(new) = tree.iter().find(|w| !roll.tree_warnings.contains(w)) {
+        let now_tree = answer.tree.as_ref().map_err(String::as_str);
+        let tree = auspex_domain::preflight::tree_warnings(now_tree);
+        // (The warning that the changes could not be fingerprinted carries its reason, which can
+        // differ between two looks; what it means for this turn is decided by `compare` below.)
+        let is_news = |w: &&String| {
+            !roll.tree_warnings.contains(w) && !auspex_domain::preflight::is_fingerprint_warning(w)
+        };
+        if let Some(new) = tree.iter().find(is_news) {
             return end_member(
                 model,
                 roll,
@@ -1211,6 +1324,24 @@ pub(super) fn preflight_answered(
                 false,
                 out,
             );
+        }
+        // The same warnings are not the same tree: a pull, or a commit then pushed, leaves a
+        // clean pushed tree clean and pushed, and the same files saved again leave their count and
+        // their text as they were. The commit and a digest of the changes tell.
+        let planned = roll
+            .tree
+            .as_ref()
+            .map_or(Err("the fleet repository was not looked at"), |t| {
+                t.as_ref().map_err(String::as_str)
+            });
+        match auspex_domain::preflight::compare(planned, now_tree) {
+            auspex_domain::preflight::TreeChange::Same => {}
+            auspex_domain::preflight::TreeChange::CommitOnly(note) => {
+                out.push(say(run, format!("warning: {note}")));
+            }
+            auspex_domain::preflight::TreeChange::Moved(why) => {
+                return end_member(model, roll, &name, Outcome::Refused(why), false, out);
+            }
         }
         for w in review.warnings.iter().filter(|w| !tree.contains(w)) {
             out.push(say(run, format!("warning: {w}")));
