@@ -4,8 +4,8 @@
 //!
 //! The core uncordons a node when it ends a machine that is safe to put back (a failed drain, a
 //! quit before the update started). A termination signal, a second `q` and a panic do not wait for
-//! the core: the loop ends, the shell's tasks are cancelled, and the uncordon the core asked for
-//! is cancelled with them. This registry is what is left to act on at that point:
+//! the core indefinitely: a signal or `q` gives it a grace to stop the roll, and a panic gives it
+//! none; then the shell acts on its own record. This registry is what there is to act on:
 //!
 //! - a node is **registered** when its drain starts (the drain cordons first, and leaves the node
 //!   cordoned when it fails or is killed);
@@ -14,9 +14,13 @@
 //!   updated, the core's rule is to leave the node cordoned, and the exit does not undo that. It is
 //!   still *reported*;
 //! - at exit [`Cordons::last_resort`] runs `kubectl uncordon` for every node still registered, with
-//!   a plain child process and a bound (the async machinery is gone or cancelled by then, and a
-//!   panic hook has none), and returns the lines that say which nodes remain cordoned and the
-//!   command that gives each back.
+//!   a plain child process and a bound, and returns the lines that say which nodes remain cordoned
+//!   and the command that gives each back. It is plain `std` because a panic hook has no runtime to
+//!   ask. On a signal or `q` it runs **after the core's grace and before the shell cancels its
+//!   tasks** (so the rows are closed with what is left, [`crate::shell::Shell::shutdown`]): the
+//!   core's own uncordon of the same node may still be running beside it. Two uncordons of one
+//!   node do no harm; a node the core's one gives back meanwhile is [`Cordons::release`]d, and
+//!   the last resort then does not report it.
 //!
 //! `kubectl` is the one the run uses, with the same kubeconfig and context.
 
@@ -75,6 +79,10 @@ struct Inner {
     pending: Vec<Held>,
     /// Cordoned by auspex, update started: left on purpose, reported at exit.
     left: Vec<Held>,
+    /// Taken from `pending` by a last resort that is running `kubectl` for them now. A node
+    /// released (or registered anew) meanwhile leaves this list, and is then not reported when its
+    /// attempt fails.
+    trying: Vec<Held>,
 }
 
 /// The record. One per [`crate::shell::Shell`], so two shells in one process (the tests) never
@@ -92,7 +100,9 @@ impl Cordons {
             .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
-    /// `node`'s drain is starting: it is cordoned by auspex from now on.
+    /// `node`'s drain is starting: it is cordoned by auspex from now on, and only now: a node an
+    /// earlier run left cordoned (and the operator then uncordoned by hand) is not "left" any more,
+    /// whatever this drain comes to.
     pub fn register(
         &self,
         node: &str,
@@ -102,6 +112,8 @@ impl Cordons {
     ) {
         self.with(|i| {
             i.pending.retain(|h| h.node != node);
+            i.left.retain(|h| h.node != node);
+            i.trying.retain(|h| h.node != node);
             i.pending.push(Held {
                 node: node.to_owned(),
                 kubectl,
@@ -116,6 +128,7 @@ impl Cordons {
         self.with(|i| {
             i.pending.retain(|h| h.node != node);
             i.left.retain(|h| h.node != node);
+            i.trying.retain(|h| h.node != node);
         });
     }
 
@@ -124,6 +137,9 @@ impl Cordons {
         self.with(|i| {
             if let Some(at) = i.pending.iter().position(|h| h.node == node) {
                 let held = i.pending.remove(at);
+                // One entry per node: a second commit (or one after a `left` that was never
+                // cleared) would name the node twice at exit.
+                i.left.retain(|h| h.node != node);
                 i.left.push(held);
             }
         });
@@ -160,27 +176,37 @@ impl Cordons {
     /// line for every node that is **still** cordoned by auspex afterwards (the ones that could
     /// not be uncordoned, and the ones left on purpose), with the command that gives it back.
     ///
-    /// Plain `std` processes: this runs after the runtime's tasks are cancelled, and from a panic
-    /// hook. Output is discarded, stdin is `/dev/null`, and a `kubectl` past the bound is killed.
+    /// Plain `std` processes, because a panic hook has no runtime. Output is discarded, stdin is
+    /// `/dev/null`, and a `kubectl` past the bound is killed. A node that is released while its
+    /// attempt runs (the core's own uncordon of it succeeded) is not reported even if the attempt
+    /// fails: it is back.
     pub fn last_resort(&self, bound: Duration) -> Vec<String> {
-        let pending = self.with(|i| std::mem::take(&mut i.pending));
-        let mut lines = Vec::new();
-        let mut failed = Vec::new();
+        let pending = self.with(|i| {
+            let taken = std::mem::take(&mut i.pending);
+            i.trying.clone_from(&taken);
+            taken
+        });
+        let mut failures = Vec::new();
         for held in pending {
-            match run_bounded(&held, bound) {
-                Ok(()) => {}
-                Err(why) => {
-                    lines.push(format!(
-                        "node {} is STILL CORDONED ({why}): {}",
-                        held.node,
-                        held.by_hand()
-                    ));
-                    failed.push(held);
-                }
+            if let Err(why) = run_bounded(&held, bound) {
+                failures.push((held, why));
             }
         }
+        let mut lines = Vec::new();
         self.with(|i| {
-            i.pending.extend(failed);
+            let trying = std::mem::take(&mut i.trying);
+            for (held, why) in failures {
+                let released = !trying.iter().any(|t| t.node == held.node);
+                if released || i.pending.iter().any(|p| p.node == held.node) {
+                    continue;
+                }
+                lines.push(format!(
+                    "node {} is STILL CORDONED ({why}): {}",
+                    held.node,
+                    held.by_hand()
+                ));
+                i.pending.push(held);
+            }
             for held in &i.left {
                 lines.push(format!(
                     "node {} was left cordoned (its update was stopped or failed; the machine \
@@ -295,6 +321,97 @@ mod tests {
         assert_eq!(c.held(), ["sol", "luna"]);
         // Releasing a node it never held is nothing.
         c.release("nobody");
+    }
+
+    /// N8. A node whose update failed is left cordoned and the operator uncordons it by hand; the next
+    /// `U` of the same process drains it again. The old record must not outlive the new drain: the
+    /// exit names the node once (and not as "left cordoned" when it was uncordoned at quit), and a
+    /// second commit never lists it twice.
+    #[test]
+    fn a_new_drain_replaces_what_an_earlier_run_left_and_a_commit_never_lists_a_node_twice() {
+        let c = Cordons::default();
+        held(&c, "luna");
+        c.commit("luna");
+        assert_eq!(c.held(), ["luna"], "left cordoned by the first run");
+        // The operator uncordoned it by hand; a later drain of luna starts.
+        held(&c, "luna");
+        assert_eq!(c.held(), ["luna"], "named once, as pending");
+        // Quit during that drain: the exit uncordons it, and does not also say it was left.
+        let report = c.last_resort(Duration::from_secs(1));
+        assert_eq!(report.len(), 1, "{report:?}");
+        assert!(
+            report[0].starts_with("node luna is STILL CORDONED"),
+            "{report:?}"
+        );
+        // `commit` is a guard of its own: a record that already has the node as left (it cannot
+        // through `register`, which clears it) still ends with one entry.
+        held(&c, "sol");
+        c.with(|i| {
+            let again = i.pending.last().unwrap().clone();
+            i.left.push(again);
+        });
+        c.commit("sol");
+        assert_eq!(
+            c.held(),
+            ["luna", "sol"],
+            "luna is still pending; sol is named once"
+        );
+    }
+
+    /// R5. On the signal and quit paths the last resort runs while the core's own uncordon of the
+    /// same node may still be under way. Suppose the core's succeeds (`release`) while the
+    /// shell's attempt fails: the exit must not then say the node is still cordoned. The fake
+    /// `kubectl` takes a second and fails; the release lands while it runs.
+    #[test]
+    fn a_node_the_core_gave_back_while_the_last_resort_failed_is_not_reported_as_still_cordoned() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (Some(sh), Some(sleep)) = (
+            crate::backend::on_path("sh"),
+            crate::backend::on_path("sleep"),
+        ) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // Written by a process of its own, as the integration tests do, so a fork in another test
+        // thread cannot hold the file open for writing when it is run ("text file busy").
+        let src = dir.path().join("kubectl.src");
+        let dst = dir.path().join("kubectl");
+        std::fs::write(
+            &src,
+            format!("#!{}\n{} 1\nexit 1\n", sh.display(), sleep.display()),
+        )
+        .unwrap();
+        let copied = Command::new(&sh)
+            .arg("-c")
+            .arg(
+                r#"while IFS= read -r l || [ -n "$l" ]; do printf '%s\n' "$l"; done < "$1" > "$2""#,
+            )
+            .arg("sh")
+            .arg(&src)
+            .arg(&dst)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let c = std::sync::Arc::new(Cordons::default());
+        c.register(
+            "luna",
+            dst.into_os_string(),
+            PathBuf::from("/k/config"),
+            Some("rke2".to_owned()),
+        );
+        let last_resort = {
+            let c = std::sync::Arc::clone(&c);
+            std::thread::spawn(move || c.last_resort(Duration::from_secs(10)))
+        };
+        // The last resort has taken the entry and is running `kubectl`; the core's own uncordon
+        // of luna now succeeds.
+        std::thread::sleep(Duration::from_millis(300));
+        c.release("luna");
+        let report = last_resort.join().unwrap();
+        assert_eq!(report, Vec::<String>::new(), "luna is back");
+        assert_eq!(c.held(), Vec::<String>::new());
     }
 
     /// A panic in some other thread (an adapter's task) is not the end of auspex, so the hook must

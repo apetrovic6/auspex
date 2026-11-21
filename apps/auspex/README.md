@@ -147,6 +147,12 @@ all`). The kernel drops the lock when the process ends, so a crash cannot leave 
 with no usable state directory has no lock to take, and then the freezes are unknown and nothing
 can be updated anyway.
 
+That lock is **per user, per machine and per checkout of the fleet**, not global: it lives in the
+state directory of the user running auspex and is keyed by the fleet's canonical path (or by the
+flake reference as written). Two operators, one operator on two machines, a second checkout of the
+same fleet, and a remote flake reference beside a local checkout each take a different lock and are
+**not** kept apart by it.
+
 **Rolling is configuration, not tag names built into auspex.** Name the tags whose machines must
 never update together:
 
@@ -204,7 +210,29 @@ client of its own and not `kubectl` over ssh.
   whose current context is another cluster, cannot send a drain elsewhere.
 - **Before the roll,** any node that is `NotReady` or cordoned refuses the group (listed as
   skipped, with the reason), and so does a machine that is no node of the cluster (a node is named
-  like its machine).
+  like its machine). So does a node that says `Ready` but whose kubelet has gone quiet (below).
+  A machine that **is** a node of the cluster but has no rolling group, or only a group that does not
+  use the cluster (neither `kubernetes` nor `drain`), would update beside the cluster's group; the
+  plan says so in a `warning:` line naming it (and its group), and does not refuse anything. It
+  looks at the machines of this roll only, and at node names as the cluster lists them.
+- **A kubelet that has gone quiet is not healthy.** A node whose kubelet stopped keeps
+  `Ready=True` for about 40 s before the node controller flips it, so a kubelet that has missed
+  three 10 s lease renewals still looks `Ready`. A `Ready` node whose **lease** (`renewTime`;
+  the condition's own heartbeat is rewritten only every few minutes and says nothing about a live
+  kubelet) is **more than 25 s older** than the newest lease of any node in the same read counts as
+  not healthy (two missed renewals plus a margin for the read's own timing; the usual jitter of a
+  renewal or two is well inside it): it refuses the group in the plan and stops it before the next
+  machine, with a sentence naming the node, the age and the node that is the reference (`node mars
+  is Ready, but its kubelet has been silent for 30 s by luna's clock (the newest lease in this
+  read)`). The age is node against node, never against this machine's clock, so a skew between the
+  desktop and the cluster does not matter. 25 s is fixed, not a setting. **The nodes' own clocks
+  must agree within a few seconds**: a node whose clock runs ahead makes every other node look
+  silent (when more than one is flagged the last sentence says that the reference clock may be the
+  wrong one), and a node whose own clock runs ahead can be silent that much longer before it is
+  flagged. A cluster in which every kubelet went quiet at once looks healthy by this rule alone.
+  A `Ready` node with no lease while others have one is refused too (`has no lease, so its kubelet
+  cannot be vouched for`). When no lease can be read at all the check is skipped, and the machine's
+  Log line says so.
 - **Before every machine** that uses the cluster, the nodes are read again (so also right after the
   `y`, for the first of each group, however long the plan sat on screen): any node that is `NotReady`
   or cordoned, **whoever cordoned it**, stops the group, and a node is drained only when it was
@@ -237,14 +265,19 @@ client of its own and not `kubectl` over ssh.
   has **no failed unit that it did not already have** when its turn began (a baseline probe, compared
   by unit name: a unit that was failed before is not the update's doing, a new one is, and
   `degraded` is accepted only when every failed unit is in the baseline), systemd is past `starting`,
-  **and** its node is `Ready` **with a heartbeat newer than the end of the update** (the newer of the
-  `Ready` condition's `lastHeartbeatTime` and the node lease's `renewTime`, `kubectl get leases -n
-  kube-node-lease`): `Ready=True` stays true for about 40 s after a kubelet stops reporting, so a
-  switch that restarts rke2 for 20 s would otherwise pass on the condition it had before. `Unknown`
-  is not `Ready`. It polls every `update.poll_interval` (default 5 s, never above
-  `update.ready_timeout`) up to `update.ready_timeout`; a kubectl that fails or a node that is not
-  in the list is "not yet", never "healthy". (The comparison uses this machine's clock and the
-  kubelets'; a skew of seconds only makes the wait a little longer.)
+  **and** its node is `Ready` **with a heartbeat newer than the one it had when the wait began**
+  (a lease newer than its recorded lease, or the `Ready` condition's `lastHeartbeatTime` newer than
+  its recorded one; `kubectl get leases -n kube-node-lease`): `Ready=True` stays true for about 40 s
+  after a kubelet stops reporting, so a switch that restarts rke2 for 20 s would otherwise pass on the condition it
+  had before. `Unknown` is not `Ready`. A kind of heartbeat that could not be recorded when the wait
+  began (the lease read failed, or the node had none) is recorded by the first look that has it, and
+  proves nothing itself: only a later one of the same kind does, because a lease and a condition are
+  rewritten at very different rates and must never be compared with each other. It polls every `update.poll_interval` (default 5 s, never above
+  `update.ready_timeout`) up to `update.ready_timeout`; a kubectl that fails or a node that is not in
+  the list is "not yet", never "healthy". (Each node's heartbeat is compared with **its own** earlier one, recorded when the wait began, so no clock is
+  compared with another: not this machine's with the kubelets', in either direction, and not one
+  node's with another's. A node that was already back when the wait began shows its next heartbeat
+  within about 10 s.)
 - **Drain** (`drain = true`): `kubectl drain --ignore-daemonsets --delete-emptydir-data --timeout
   <t>s` before the update, uncordon after the wait. Off by default because a NixOS switch does not
   reboot the node and RKE2's containers survive a restart of the service.
@@ -273,13 +306,18 @@ that was never tried and has none.
 alfrost); quit and stop it? …`). On `y` nothing new starts, the running `clan` processes are
 cancelled (their process groups are killed and reaped), a drain in progress is cancelled and its
 node uncordoned, a node whose update was under way stays cordoned and is named; auspex exits when
-every machine has ended. A second `q`, a termination signal (SIGTERM, SIGHUP, SIGINT, SIGQUIT) and a
-panic do not wait for the question: the roll is stopped the same way within 20 s (a second signal
-cuts that wait short), and then **auspex itself runs `kubectl uncordon` for every node it cordoned
-for an update that had not started**, one at a time, each bounded at 15 s, with a plain process
-(the async machinery is gone by then, and a panic hook has none). What it could not give back, and
-what is left cordoned on purpose, is printed with the commands. While a roll runs, `u`, `b`, `r` and
-`A` say so and do nothing.
+every machine has ended. A second `q` and a termination signal (SIGTERM, SIGHUP, SIGINT, SIGQUIT)
+do not wait for the question: the roll is stopped the same way within 20 s (a second signal cuts
+that wait short), and then **auspex itself runs `kubectl uncordon` for every node it cordoned for
+an update that had not started**, one at a time, each bounded at 15 s, with a plain process. That
+runs after the 20 s and before auspex cancels what is still in flight, so the core's own uncordon
+of the same node may be running beside it: two uncordons of one node do no harm, and a node the
+core's one gave back is not reported as still cordoned. The action-log rows still open are closed
+after that, naming only the nodes really left cordoned. A panic does not take that path. A panic
+on the loop thread (the one that runs the interface) runs the bounded last-resort uncordon from the
+panic hook, each node bounded at 10 s, and auspex ends. A panic in a task does nothing to the roll.
+What could not be given back, and what is left cordoned on purpose, is printed with the commands.
+While a roll runs, `u`, `b`, `r` and `A` say so and do nothing.
 
 ## Freezing
 

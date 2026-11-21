@@ -156,6 +156,10 @@ pub struct Shell {
     rows: Mutex<HashMap<u64, RowSlot>>,
     /// What the exit found still cordoned or left cordoned: said loudly after the terminal is back.
     exit_report: Mutex<Vec<String>>,
+    /// The last resort ran (once per shell: a second [`Shell::shutdown`] has nothing to add).
+    gave_back: AtomicBool,
+    /// How long one last-resort `kubectl uncordon` may take ([`LAST_RESORT_BOUND`]; tests shorten it).
+    last_resort_bound: Mutex<Duration>,
 }
 
 impl Shell {
@@ -190,6 +194,8 @@ impl Shell {
             cordons: Arc::new(Cordons::default()),
             rows: Mutex::new(HashMap::new()),
             exit_report: Mutex::new(Vec::new()),
+            gave_back: AtomicBool::new(false),
+            last_resort_bound: Mutex::new(LAST_RESORT_BOUND),
         })
     }
 
@@ -303,7 +309,27 @@ impl Shell {
     /// Cancels every request in flight and waits (at most [`REAP_GRACE`]) for the adapters to
     /// kill and reap what they started. Used on quit, after the core has already emitted its
     /// own cancels, and on a signal.
+    ///
+    /// **Nodes are given back before the rows are closed.** What is still registered as cordoned
+    /// by auspex before its update started is uncordoned here ([`Cordons::last_resort`]), so the
+    /// row of a machine whose run never ended names only the nodes that really stay cordoned: a row
+    /// closed first said "nodes still cordoned: luna" about a node the next line uncordoned.
     pub async fn shutdown(&self) {
+        // Before anything is cancelled: the core may still be ending its machines, and a machine it
+        // ends after a cancel says "may still be cordoned" about a node the uncordon below is about
+        // to give back. (A drain still running meanwhile is killed a moment later, below, and it
+        // does not cordon again.)
+        if !self.gave_back.swap(true, Ordering::SeqCst) {
+            let cordons = Arc::clone(&self.cordons);
+            let bound = *lock(&self.last_resort_bound);
+            let report = tokio::task::spawn_blocking(move || cordons.last_resort(bound))
+                .await
+                .unwrap_or_default();
+            for line in &report {
+                self.log.line(line);
+            }
+            lock(&self.exit_report).extend(report);
+        }
         // A row held open for a machine whose run never ended (auspex is leaving) is closed now,
         // saying so, so it does not stay "running" in the log.
         let held: Vec<(u64, RowSlot)> = lock(&self.rows).drain().collect();
@@ -790,9 +816,10 @@ impl Shell {
     /// **What leaving means for a roll.** The core is told to stop and given up to
     /// [`TERMINATE_BOUND`] to do it (the `clan` processes killed and reaped, a drain in progress
     /// cancelled and its node uncordoned): the loop does not end the moment a signal arrives. Then
-    /// everything is cancelled, and whatever is still registered as cordoned by auspex before its
-    /// update started is uncordoned here with a plain bounded `kubectl`, so a signal, a second `q`
-    /// and a forced quit all give nodes back. What could not be, and what was left on purpose, is
+    /// ([`Shell::shutdown`]) whatever is still registered as cordoned by auspex before its update
+    /// started is uncordoned here with a plain bounded `kubectl`, the rows still open are closed
+    /// with what is left, and everything is cancelled, so a signal, a second `q` and a forced quit
+    /// all give nodes back. What could not be, and what was left on purpose, is
     /// in [`Shell::exit_report`], for the caller to say after the terminal is restored.
     pub async fn terminate_with(self: &Arc<Self>, interrupt: impl Future<Output = ()>) {
         self.send(Event::Terminate);
@@ -812,14 +839,11 @@ impl Shell {
             () = interrupt => {}
         }
         self.shutdown().await;
-        let cordons = Arc::clone(&self.cordons);
-        let report = tokio::task::spawn_blocking(move || cordons.last_resort(LAST_RESORT_BOUND))
-            .await
-            .unwrap_or_default();
-        for line in &report {
-            self.log.line(line);
-        }
-        lock(&self.exit_report).extend(report);
+    }
+
+    /// Shortens (for a test) how long one last-resort `kubectl uncordon` may take at exit.
+    pub fn set_last_resort_bound(&self, bound: Duration) {
+        *lock(&self.last_resort_bound) = bound;
     }
 
     /// Nodes auspex could not give back, and nodes it left cordoned on purpose, each with the

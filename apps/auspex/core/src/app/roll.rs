@@ -25,12 +25,14 @@
 //!   the tree after the `y`) refuses the machine. A machine whose name has to be typed
 //!   (`public`) is skipped: that confirmation is for `u`.
 //! - **Kubernetes.** The cluster is read again before every machine that uses it (and so right
-//!   after the `y` for the first of each group): any node that is `NotReady` or cordoned stops
-//!   the group, and a node is drained only when it is schedulable at that moment, which is what
-//!   makes it auspex's to uncordon. Every call is pinned to the context the plan showed. Between
-//!   machines the roll waits ([`AwaitRequest`]) until the updated one runs the deployed system,
-//!   has no failed unit it did not already have when its turn began, and its node is `Ready` with
-//!   a heartbeat newer than the end of the update.
+//!   after the `y` for the first of each group): any node that is `NotReady` or cordoned, or
+//!   `Ready` with a kubelet silent for more than 25 s against the newest lease of the same
+//!   read ([`roll::silent_kubelets`]), stops the group, and a node is drained only when it is
+//!   schedulable at that moment, which is what makes it auspex's to uncordon. Every call is
+//!   pinned to the context the plan showed. Between machines the roll waits ([`AwaitRequest`])
+//!   until the updated one runs the deployed system, has no failed unit it did not already have
+//!   when its turn began, and its node is `Ready` with a heartbeat newer than the one it had when
+//!   the wait began (its own earlier one: no clock is compared with another).
 //! - **A node is put back where it is safe to.** After a failed drain, or a quit before the update
 //!   started, the node is uncordoned. After an update or a wait that failed the node **stays
 //!   cordoned**: the machine may be broken, and workloads must not return to it unasked. That is
@@ -336,6 +338,11 @@ pub(super) struct Planned {
     cluster: Option<ClusterId>,
     /// What the fleet repository's state warns about, once, for the whole roll.
     tree_warnings: Vec<String>,
+    /// Machines that are nodes of the cluster yet roll with no group, or only in a group that does
+    /// not use the cluster (its label is the second field), so they update beside the cluster's
+    /// group: shown in the plan, one warning each. Not held to the plan at a machine's turn (the
+    /// cluster does not change under it the way the repository does).
+    ungrouped_nodes: Vec<(String, Option<String>)>,
 }
 
 impl Planned {
@@ -406,6 +413,25 @@ impl Planned {
         }
         for w in &self.tree_warnings {
             lines.push(format!("warning: {w}"));
+        }
+        for (name, group) in &self.ungrouped_nodes {
+            lines.push(group.as_ref().map_or_else(
+                || {
+                    format!(
+                        "warning: {name} is a node of the cluster but rolls with no group, so it \
+                         updates in parallel with the cluster's group (give it a rolling tag to \
+                         roll it one at a time)"
+                    )
+                },
+                |group| {
+                    format!(
+                        "warning: {name} is a node of the cluster but rolls in group {group}, \
+                         which does not use the cluster, so it updates in parallel with the \
+                         cluster's group (give that group `kubernetes = true`, or the machine a \
+                         tag that does)"
+                    )
+                },
+            ));
         }
         lines.push(
             "each machine is checked at its turn: a refusal skips it, a failure stops its \
@@ -526,6 +552,35 @@ impl Draft {
                 _ => None,
             })
             .flatten();
+        // A machine that is a node of the cluster and rolls with no group, or only in a group that
+        // does not use the cluster, would go out of service beside the cluster group's machine,
+        // which is what the group exists to prevent. The node list is already in hand, so say so.
+        let ungrouped_nodes = match &self.nodes {
+            Some(Ok(nodes)) if groups.iter().any(|g| g.group.uses_cluster()) => {
+                let is_node = |name: &str| nodes.iter().any(|n| n.name == name);
+                let mut found: Vec<(String, Option<String>)> = groups
+                    .iter()
+                    .filter(|g| !g.group.uses_cluster())
+                    .flat_map(|g| {
+                        g.group
+                            .members
+                            .iter()
+                            .filter(|m| is_node(&m.name))
+                            .map(|m| (m.name.clone(), Some(g.group.label())))
+                    })
+                    .chain(
+                        self.plan
+                            .free
+                            .iter()
+                            .filter(|f| is_node(f))
+                            .map(|f| (f.clone(), None)),
+                    )
+                    .collect();
+                found.sort();
+                found
+            }
+            _ => Vec::new(),
+        };
         let tree_warnings = auspex_domain::preflight::tree_warnings(match &self.tree {
             Some(Ok(t)) => Ok(t),
             Some(Err(why)) => Err(why.as_str()),
@@ -540,6 +595,7 @@ impl Draft {
             poll_interval_seconds: self.poll_interval_seconds,
             cluster,
             tree_warnings,
+            ungrouped_nodes,
         }
     }
 }
@@ -1571,6 +1627,19 @@ pub(super) fn kube_answered(
                         );
                     }
                 };
+                if !roll::leases_read(nodes)
+                    && let Some(run) = roll.entries.get(&name).and_then(|e| e.log)
+                {
+                    // `cluster_unhealthy` cannot tell a silent kubelet without them: said, so a
+                    // roll that went ahead on a cluster nobody could vouch for is not a mystery.
+                    out.push(say(
+                        run,
+                        format!(
+                            "{name}: the node leases could not be read, so whether a kubelet has \
+                             gone silent was not checked"
+                        ),
+                    ));
+                }
                 let mut why = roll::cluster_unhealthy(nodes);
                 if !nodes.iter().any(|n| n.name == name) {
                     why.push(format!("{name} is not a node of the cluster"));
