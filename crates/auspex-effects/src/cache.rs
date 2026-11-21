@@ -33,14 +33,29 @@
 //! **What decides clean or dirty** (review of PR #8, N1). nix sets `self.rev` or
 //! `self.dirtyRev` from libgit2's status, and the plan's `configurationRevision` puts it in
 //! every toplevel, so the key has to cover whatever that status depends on. It depends on the
-//! index (keyed), the worktree's bytes and owner exec bit (keyed), and three things more:
+//! index (keyed), the worktree's bytes and owner exec bit (keyed), and four things more:
 //!
 //! - `core.fileMode`, `core.symlinks` and `core.ignorecase`, which change the answer for the
 //!   same bytes: keyed when they are not libgit2's defaults ([`STATUS_SETTINGS`]), read with
-//!   `git config` from the repository and the operator's global and system files. Not
-//!   verified: a configuration file that libgit2 searches and git does not (for instance
-//!   through git's own `GIT_CONFIG_*` variables, which this process may have set and nix
-//!   does not see) would be outside the key;
+//!   `git config` from the repository and the operator's global and system files. git is run
+//!   without `GIT_CONFIG_COUNT` and its `KEY_n`/`VALUE_n`, `GIT_CONFIG_PARAMETERS`,
+//!   `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM` (libgit2 ignores them,
+//!   review of PR #37, finding 4), so it reads the files libgit2 reads. Not verified: a
+//!   configuration file that libgit2 searches and git does not;
+//! - the CRLF/`text` filter (review of PR #37, finding 1). libgit2 runs the worktree's bytes
+//!   through it before comparing them with the index, so the same bytes are clean or dirty
+//!   depending on `core.autocrlf`, `core.eol` and `core.safecrlf` ([`FILTER_SETTINGS`], keyed
+//!   as git prints them when they are not the defaults) and on the attributes that apply: the
+//!   tracked `.gitattributes` files (their bytes are in the key already), and the three that
+//!   are not in the tree, whose **bytes** are keyed: `info/attributes` in the common git
+//!   directory, `core.attributesFile` (else `$XDG_CONFIG_HOME/git/attributes`, else
+//!   `~/.config/git/attributes`) and the system `/etc/gitattributes`. A symlink is followed, as
+//!   libgit2 does; a path with nothing there is absent, which adds nothing to the key (the key
+//!   of a repository without them is the key it always was) and differs from a present empty
+//!   file; a file that is not a regular file or is over 1 MiB means no caching. Their stamps
+//!   are in the run guard, with `config.worktree` and the user's and system's git
+//!   configuration files (`~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, `/etc/gitconfig`; a
+//!   different system file compiled into git is not seen);
 //! - the index's stat data (size, mtime, `ctime`, inode, owner): libgit2 trusts it, and calls a
 //!   file unmodified when it matches the entry, without reading the bytes. With the default
 //!   `core.trustctime=true` it cannot match after a write, since no ordinary program sets
@@ -259,7 +274,16 @@ const MAX_ENTRY_BYTES: u64 = 1024 * 1024;
 pub const GIT_HARDENING: &[&str] = &["-c", "core.fsmonitor=false"];
 
 /// Inherited variables that would point git at another repository, index or object
-/// store. `GIT_CEILING_DIRECTORIES` is kept: it is the operator's own limit on discovery.
+/// store, or give it configuration that nix's libgit2 does not see. `GIT_CEILING_DIRECTORIES`
+/// is kept: it is the operator's own limit on discovery.
+///
+/// The configuration ones matter to the key (review of PR #37, finding 4): `status_settings`
+/// asks git for the settings that decide what nix reads as modified, and git honours
+/// `GIT_CONFIG_COUNT` with its `KEY_n`/`VALUE_n`, `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_GLOBAL`,
+/// `GIT_CONFIG_SYSTEM` and `GIT_CONFIG_NOSYSTEM`, which libgit2 ignores. Under one of them the
+/// key would carry a value nix never used, and a later run without it would share the key.
+/// Removed, git reads the files libgit2 reads. The indexed ones are removed by prefix
+/// ([`GIT_ENV_REMOVED_PREFIXES`]).
 const GIT_ENV_REMOVED: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -267,7 +291,15 @@ const GIT_ENV_REMOVED: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
 ];
+
+/// Variables removed whatever the number after the prefix: `GIT_CONFIG_KEY_0`, `GIT_CONFIG_VALUE_0`, ….
+const GIT_ENV_REMOVED_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
 
 /// The cache directory from the environment: `$XDG_CACHE_HOME/auspex` when that is an
 /// absolute path, else `$HOME/.cache/auspex`; `None` when neither is usable. The one place
@@ -394,6 +426,15 @@ pub(crate) async fn git_typed(
         .args(args);
     for v in GIT_ENV_REMOVED {
         cmd.env_remove(v);
+    }
+    for (name, _) in std::env::vars_os() {
+        let name_s = name.to_string_lossy();
+        if GIT_ENV_REMOVED_PREFIXES
+            .iter()
+            .any(|p| name_s.starts_with(p))
+        {
+            cmd.env_remove(&name);
+        }
     }
     let limits = Limits {
         stdout: cap,
@@ -584,7 +625,10 @@ async fn key_and_top(
         Ok(h) => h,
         Err(e) => return Ok(Err(e)),
     };
-    let settings = match status_settings(params, &top, cancel).await? {
+    let StatusInputs {
+        settings,
+        attribute_files,
+    } = match status_settings(params, &top, cancel).await? {
         Ok(s) => s,
         Err(e) => return Ok(Err(e)),
     };
@@ -601,19 +645,9 @@ async fn key_and_top(
         Err(e) => return Ok(Err(e)),
     };
     // Two flakes in one repository must not share a key (review finding N2e).
-    let rel = match (
-        std::fs::canonicalize(flake_dir),
-        std::fs::canonicalize(&top),
-    ) {
-        (Ok(f), Ok(t)) => match f.strip_prefix(&t) {
-            Ok(r) => r.to_path_buf(),
-            Err(_) => {
-                return Ok(Err(
-                    "the flake directory is outside its repository".to_owned()
-                ));
-            }
-        },
-        _ => return Ok(Err("cannot resolve the flake directory".to_owned())),
+    let rel = match flake_rel(flake_dir, &top) {
+        Ok(r) => r,
+        Err(why) => return Ok(Err(why)),
     };
 
     // The reads: off the async threads, stopped by the token or the deadline.
@@ -629,7 +663,9 @@ async fn key_and_top(
         let digest = worktree_digest::<MAX_WORKTREE_BYTES>(
             &tree_top, &rel, &index, &paths, &settings, &stop, &mut guard,
         )?;
-        git_dir_stamps(&git_dir, &head_ref, &stop, &mut guard)?;
+        let common = git_dir_stamps(&git_dir, &head_ref, &stop, &mut guard)?;
+        let digest = with_attributes(digest, &common, attribute_files, &stop, &mut guard)?;
+        stamp_user_config(&mut guard);
         Ok::<_, Stop>((lock, digest, Guard(guard.finalize().to_vec())))
     });
     let (lock, digest, guard) = tokio::select! {
@@ -667,6 +703,17 @@ async fn key_and_top(
     }))
 }
 
+/// The flake directory relative to the repository top level, both canonical.
+fn flake_rel(flake_dir: &Path, top: &Path) -> Result<PathBuf, String> {
+    match (std::fs::canonicalize(flake_dir), std::fs::canonicalize(top)) {
+        (Ok(f), Ok(t)) => f
+            .strip_prefix(&t)
+            .map(Path::to_path_buf)
+            .map_err(|_| "the flake directory is outside its repository".to_owned()),
+        _ => Err("cannot resolve the flake directory".to_owned()),
+    }
+}
+
 /// The settings nix's libgit2 consults when it decides whether a tracked file is modified (and
 /// so whether `self.rev` or `self.dirtyRev` is set, and with it `configurationRevision` and
 /// every toplevel that records it), with the values libgit2 assumes when one is unset
@@ -682,6 +729,27 @@ const STATUS_SETTINGS: &[(&str, &str)] = &[
     // Whether `ctime` takes part in "the stat data still matches the index"; see below.
     ("core.trustctime", "true"),
 ];
+
+/// The settings that drive libgit2's CRLF/`text` filter, which the worktree's bytes pass through
+/// before they are compared with the index (review of PR #37, finding 1), with the value
+/// libgit2 assumes when one is unset. Their values are not booleans (`core.autocrlf` is `true`,
+/// `false` or `input`), so each is keyed as git prints it, lower-cased, when it differs from the
+/// default; a different spelling of the same value is a harmless miss. `core.safecrlf` is keyed
+/// whenever it is set, since whether libgit2 consults it was not established.
+const FILTER_SETTINGS: &[(&str, &str)] = &[
+    ("core.autocrlf", "false"),
+    ("core.eol", "native"),
+    ("core.safecrlf", ""),
+];
+
+/// What [`status_settings`] found.
+struct StatusInputs {
+    /// The non-default settings, as `name=value\0` each: empty when every one is a default.
+    settings: Vec<u8>,
+    /// The attributes files outside the tree that libgit2 reads: `core.attributesFile`, or its
+    /// default location, and the system file.
+    attribute_files: Vec<PathBuf>,
+}
 
 /// The non-default values of [`STATUS_SETTINGS`], as `name=value\0` each, to go into the key;
 /// empty when every setting is at its default. Or why there is no caching.
@@ -702,7 +770,7 @@ async fn status_settings(
     params: &GitParams<'_>,
     top: &Path,
     cancel: &CancellationToken,
-) -> Result<Result<Vec<u8>, String>, Cancelled> {
+) -> Result<Result<StatusInputs, String>, Cancelled> {
     let mut keyed = Vec::new();
     for (name, default) in STATUS_SETTINGS {
         // `--type=bool` spells `yes`, `on`, `1` and `true` one way, and a value that is no
@@ -716,8 +784,8 @@ async fn status_settings(
         let value = value.trim_end();
         if *name == "core.trustctime" && value == "false" {
             return Ok(Err(
-                "core.trustctime is false in this repository's git configuration, so nix \
-                 decides whether a tracked file changed from size, mtime and inode alone and \
+                "core.trustctime is false in git's configuration for this repository (its own file, \
+                 or the global or system one), so nix decides whether a tracked file changed from size, mtime and inode alone and \
                  may read a rewritten file as the committed one, which the cache key cannot \
                  follow; set it to true (the default) for caching"
                     .to_owned(),
@@ -730,7 +798,187 @@ async fn status_settings(
             keyed.extend_from_slice(format!("{name}={value}\0").as_bytes());
         }
     }
-    Ok(Ok(keyed))
+    for (name, default) in FILTER_SETTINGS {
+        let args = ["config", "--default", default, "--get", name];
+        let out = match git(params, top, &args, 256, cancel).await? {
+            Ok(out) => out,
+            Err(e) => return Ok(Err(e)),
+        };
+        let value = lossy(&out).trim().to_ascii_lowercase();
+        if value != *default {
+            keyed.extend_from_slice(format!("{name}={value}\0").as_bytes());
+        }
+    }
+    // `--path` expands a leading `~/`, as git does for this setting.
+    let args = [
+        "config",
+        "--path",
+        "--default",
+        "",
+        "--get",
+        "core.attributesFile",
+    ];
+    let configured = match git(params, top, &args, 4096, cancel).await? {
+        Ok(out) => lossy(&out).trim_end_matches('\n').to_owned(),
+        Err(e) => return Ok(Err(e)),
+    };
+    let mut attribute_files = Vec::new();
+    attribute_files.extend(global_attributes(
+        &configured,
+        top,
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    ));
+    attribute_files.push(PathBuf::from("/etc/gitattributes"));
+    Ok(Ok(StatusInputs {
+        settings: keyed,
+        attribute_files,
+    }))
+}
+
+/// The global attributes file libgit2 reads: `core.attributesFile` when set (a relative one is
+/// relative to `top`), else `$XDG_CONFIG_HOME/git/attributes` when `XDG_CONFIG_HOME` is set and
+/// not empty, else `$HOME/.config/git/attributes`; `None` with neither.
+fn global_attributes(
+    configured: &str,
+    top: &Path,
+    xdg_config_home: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if !configured.is_empty() {
+        return Some(top.join(configured));
+    }
+    xdg_config_home.filter(|d| !d.is_empty()).map_or_else(
+        || {
+            home.filter(|h| !h.is_empty())
+                .map(|h| Path::new(h).join(".config/git/attributes"))
+        },
+        |d| Some(Path::new(d).join("git/attributes")),
+    )
+}
+
+/// The worktree `digest` with the attributes files outside the tree: the common git directory's
+/// `info/attributes` and the files `status_settings` found. Only a file that is there adds to
+/// it, so a repository with none of them has the key it always had.
+fn with_attributes(
+    digest: Vec<u8>,
+    common: &Path,
+    attribute_files: Vec<PathBuf>,
+    stop: &dyn Fn() -> bool,
+    g: &mut Sha256,
+) -> Result<Vec<u8>, Stop> {
+    let mut files = vec![common.join("info/attributes")];
+    files.extend(attribute_files);
+    let extra = attribute_digest(&files, stop, g)?;
+    if extra.is_empty() {
+        return Ok(digest);
+    }
+    let mut h = Sha256::new_with_prefix(b"auspex attribute files v1\0");
+    h.update(&digest);
+    h.update(&extra);
+    Ok(h.finalize().to_vec())
+}
+
+/// The guard record of a name outside the tree: its own `lstat`, or, when nothing is there, its
+/// directory's `stat` (which changes when the name is created in it, so a file created and
+/// removed again during a scan is seen).
+fn stamp_name(g: &mut Sha256, tag: u8, path: &Path) {
+    if let Ok(st) = rustix::fs::lstat(path) {
+        stamp(g, tag, Some(Stamp::of(&st)));
+    } else {
+        stamp(g, tag, None);
+        let dir = path.parent().and_then(|p| rustix::fs::stat(p).ok());
+        stamp(g, tag.to_ascii_uppercase(), dir.as_ref().map(Stamp::of));
+    }
+}
+
+/// The most an attributes file may hold and still be keyed: 1 MiB.
+const MAX_ATTRIBUTES_BYTES: u64 = 1024 * 1024;
+
+/// For each of `files` that is there, a tagged digest of its bytes; empty when none is (the
+/// key then is what it was before these files were keyed). Each file's own and resolved
+/// stamp goes to the guard `g`, there or not.
+///
+/// A symlink is followed, as libgit2 does (a home-manager `~/.config/git/attributes` is one),
+/// by resolving the path first and then reading the resolved name without following anything
+/// more. A path with nothing there, or a dangling link, is absent. A file that is not a
+/// regular file (a FIFO, a device), is larger than [`MAX_ATTRIBUTES_BYTES`] or cannot be read
+/// means no caching: its bytes would decide clean or dirty, and the key cannot hold them.
+fn attribute_digest(
+    files: &[PathBuf],
+    stop: &dyn Fn() -> bool,
+    g: &mut Sha256,
+) -> Result<Vec<u8>, Stop> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut out = Vec::new();
+    for path in files {
+        field(g, b'a', path.as_os_str().as_bytes());
+        stamp_name(g, b'a', path);
+        let no = |what: &str| {
+            Stop::NoCache(format!(
+                "the git attributes file {} {what}, so there is no caching",
+                path.display()
+            ))
+        };
+        let resolved = match std::fs::canonicalize(path) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(no(&format!("cannot be resolved ({e})"))),
+        };
+        let (Some(parent), Some(name)) = (resolved.parent(), resolved.file_name()) else {
+            return Err(no("is not a file"));
+        };
+        let dir = open_root(parent).map_err(|e| no(&format!("cannot be opened ({e:?})")))?;
+        let mut h = Sha256::new();
+        match read_file(
+            &dir,
+            name.as_bytes(),
+            MAX_ATTRIBUTES_BYTES,
+            stop,
+            &mut |b| h.update(b),
+        ) {
+            Ok(read) => stamp(g, b'A', Some(read.stamp)),
+            Err(ReadError::Missing) => continue,
+            Err(ReadError::NotAFile(what)) => return Err(no(&format!("is {what}"))),
+            Err(ReadError::TooBig) => {
+                return Err(no(&format!("is larger than {MAX_ATTRIBUTES_BYTES} bytes")));
+            }
+            Err(ReadError::Stopped) => return Err(Stop::Stopped),
+            Err(ReadError::Io(e)) => return Err(no(&format!("cannot be read ({e})"))),
+        }
+        let digest = h.finalize();
+        for (tag, bytes) in [(b'a', path.as_os_str().as_bytes()), (b'd', &digest[..])] {
+            out.push(tag);
+            out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            out.extend_from_slice(bytes);
+        }
+    }
+    Ok(out)
+}
+
+/// The user's and the system's git configuration files, one `lstat` and one `stat` each, in
+/// the guard: a keyed setting changed in one of them and put back during a scan leaves two
+/// equal keys. Which files git reads is `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config` (else
+/// `~/.config/git/config`) and `/etc/gitconfig`; a different system file compiled into git is
+/// not seen.
+fn stamp_user_config(g: &mut Sha256) {
+    use std::os::unix::ffi::OsStrExt as _;
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").filter(|d| !d.is_empty());
+    let mut files = vec![PathBuf::from("/etc/gitconfig")];
+    files.extend(home.as_deref().map(|h| Path::new(h).join(".gitconfig")));
+    files.push(match (xdg.as_deref(), home.as_deref()) {
+        (Some(d), _) => Path::new(d).join("git/config"),
+        (None, Some(h)) => Path::new(h).join(".config/git/config"),
+        (None, None) => PathBuf::from("/nonexistent/git/config"),
+    });
+    for f in files {
+        field(g, b'u', f.as_os_str().as_bytes());
+        // Only the file's own stamp: a missing one would stamp $HOME or /etc, which change all
+        // the time and would skip stores for nothing.
+        stamp(g, b'u', rustix::fs::lstat(&f).ok().as_ref().map(Stamp::of));
+        stamp(g, b'v', rustix::fs::stat(&f).ok().as_ref().map(Stamp::of));
+    }
 }
 
 /// The git directory, HEAD's commit id (with its newline, as the key has always hashed it)
@@ -836,7 +1084,7 @@ fn git_dir_stamps(
     head_ref: &[u8],
     stop: &dyn Fn() -> bool,
     g: &mut Sha256,
-) -> Result<(), Stop> {
+) -> Result<PathBuf, Stop> {
     let unusable = |what: &str, e: &dyn std::fmt::Debug| {
         Stop::NoCache(format!(
             "the git directory {} cannot be checked for changes during the scan ({what}: \
@@ -848,7 +1096,10 @@ fn git_dir_stamps(
     for (tag, name) in [(b'H', &b"HEAD"[..]), (b'I', b"index")] {
         stamp(g, tag, kind(&dir, name).ok().map(|(_, s)| s));
     }
+    // A linked worktree's own configuration, under `extensions.worktreeConfig`.
+    stamp(g, b'W', kind(&dir, b"config.worktree").ok().map(|(_, s)| s));
     let mut named = Vec::new();
+    let mut common_path = git_dir.to_path_buf();
     let common = match read_file(&dir, b"commondir", 4096, stop, &mut |b| {
         named.extend_from_slice(b);
     }) {
@@ -856,10 +1107,10 @@ fn git_dir_stamps(
             use std::os::unix::ffi::OsStrExt as _;
             let named = named.strip_suffix(b"\n").unwrap_or(&named);
             let common = git_dir.join(OsStr::from_bytes(named));
-            Some(
-                open_path_root(&common)
-                    .map_err(|e| unusable("cannot open its common directory", &e))?,
-            )
+            let fd = open_path_root(&common)
+                .map_err(|e| unusable("cannot open its common directory", &e))?;
+            common_path = common;
+            Some(fd)
         }
         Err(ReadError::Missing) => None,
         Err(ReadError::Stopped) => return Err(Stop::Stopped),
@@ -889,7 +1140,7 @@ fn git_dir_stamps(
         .ok()
         .and_then(|(d, name)| kind(&d, name).ok());
     stamp(g, b'T', tables.map(|(_, s)| s));
-    Ok(())
+    Ok(common_path)
 }
 
 /// `flake.lock` in `flake_dir`: `None` when absent; refused when it is a symlink, not a
@@ -1535,6 +1786,54 @@ mod tests {
         )
         .await;
         assert!(r.is_err(), "a dropped receiver is Cancelled");
+
+        // Review of PR #37 (mutation R12): with results to store the same holds, and with no
+        // `Finished` to fail on the send, only the check itself can say so: a closed receiver
+        // or a cancel means nothing is stored and the call is Cancelled.
+        let hash = "0123456789abcdfghijklmnpqrsvwxyz";
+        let pending = || {
+            vec![(
+                "a".to_owned(),
+                EvalSuccess {
+                    attr: "a".to_owned(),
+                    attr_path: vec!["a".to_owned()],
+                    drv_path: auspex_domain::observe::StorePath::new(format!(
+                        "/nix/store/{hash}-a.drv"
+                    ))
+                    .unwrap(),
+                    out_path: auspex_domain::observe::StorePath::new(format!(
+                        "/nix/store/{hash}-a"
+                    ))
+                    .unwrap(),
+                    system: None,
+                },
+            )]
+        };
+        let (tx, rx) = unbounded_channel();
+        drop(rx);
+        let r = finish_run(
+            &flake,
+            &cache,
+            &CancellationToken::new(),
+            &tx,
+            (&key, &guard),
+            pending(),
+            None,
+        )
+        .await;
+        assert!(r.is_err(), "pending results and a dropped receiver");
+        let (tx, _rx) = unbounded_channel();
+        let r = finish_run(
+            &flake,
+            &cache,
+            &cancel,
+            &tx,
+            (&key, &guard),
+            pending(),
+            None,
+        )
+        .await;
+        assert!(r.is_err(), "pending results and a cancel");
 
         // The ordinary end: nothing to store, and the held Finished goes out.
         let (tx, mut rx) = unbounded_channel();

@@ -1114,6 +1114,32 @@ async fn evaluator_output_not_read_to_its_end_is_an_error() {
     );
 }
 
+/// The repository of the N6 test: `modules/tracked.nix` is in the index; `modules/new.nix`,
+/// `modules/other.nix` and `outside-the-store.nix` are not, and `secret.nix` is outside it.
+fn untracked_repository(dir: &Path) -> std::path::PathBuf {
+    let repo = fs::canonicalize(dir).unwrap().join("repo");
+    fs::create_dir_all(repo.join("modules")).unwrap();
+    fs::write(repo.join("modules/tracked.nix"), "{}").unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "modules/tracked.nix"]);
+    // Not added: nix cannot see these.
+    fs::write(repo.join("modules/new.nix"), "{}").unwrap();
+    fs::write(repo.join("modules/other.nix"), "{}").unwrap();
+    fs::write(repo.join("outside-the-store.nix"), "{}").unwrap();
+    fs::write(dir.join("secret.nix"), "{}").unwrap();
+    repo
+}
+
 /// Review of PR #8, N6: a configuration that imports a new, untracked module fails with nix's
 /// "path '/nix/store/…-source/new.nix' does not exist", which says nothing about git. When
 /// the named file exists in the worktree, the operator gets one note saying why nix cannot
@@ -1121,14 +1147,9 @@ async fn evaluator_output_not_read_to_its_end_is_an_error() {
 /// repository, or for a path that is not below a store path.
 #[tokio::test]
 async fn an_untracked_file_nix_cannot_find_is_explained_once() {
-    let Some(t) = tools(&[]) else { return };
+    let Some(t) = tools(&["git"]) else { return };
     let dir = tempdir();
-    let repo = fs::canonicalize(dir.path()).unwrap().join("repo");
-    fs::create_dir_all(repo.join(".git")).unwrap();
-    fs::create_dir_all(repo.join("modules")).unwrap();
-    fs::write(repo.join("modules/new.nix"), "{}").unwrap();
-    fs::write(repo.join("outside-the-store.nix"), "{}").unwrap();
-    fs::write(dir.path().join("secret.nix"), "{}").unwrap();
+    let repo = untracked_repository(dir.path());
     let store = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-source";
     let err = |name: &str, text: String| {
         format!(
@@ -1144,7 +1165,7 @@ async fn an_untracked_file_nix_cannot_find_is_explained_once() {
         ),
         err(
             "b",
-            format!("error: getting status of '{store}/modules/new.nix': No such file"),
+            format!("error: getting status of '{store}/modules/new.nix': No such file or directory"),
         ),
         // Not in the worktree, an escape attempt, and no store path before `-source/`.
         err(
@@ -1163,6 +1184,23 @@ async fn an_untracked_file_nix_cannot_find_is_explained_once() {
             "f",
             format!("error: path '{store}//modules/new.nix' does not exist"),
         ),
+        // A tracked file that nix reports on is not an untracked one: a missing-file line
+        // naming it, and the module system's "In `…'" line (which says nothing is missing)
+        // naming a tracked file and an untracked one.
+        err(
+            "g",
+            format!("error: path '{store}/modules/tracked.nix' does not exist"),
+        ),
+        err(
+            "h",
+            format!("error: attribute 'x' missing\n- In `{store}/modules/tracked.nix': true"),
+        ),
+        err(
+            "i",
+            format!(
+                "error: The option `x' has conflicting definitions\n- In `{store}/modules/other.nix': true"
+            ),
+        ),
     ];
     let script = lines
         .iter()
@@ -1173,7 +1211,7 @@ async fn an_untracked_file_nix_cannot_find_is_explained_once() {
     let flake = FlakeRef::new(repo.to_str().unwrap()).unwrap();
     assert!(flake.is_git(), "{flake:?}");
     let (tx, mut rx) = unbounded_channel();
-    let ms = machines(&["a", "b", "c", "d", "e", "f"]);
+    let ms = machines(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
     evaluate(
         &flake,
         &ms,
@@ -1214,5 +1252,5 @@ async fn an_untracked_file_nix_cannot_find_is_explained_once() {
             )
         })
         .count();
-    assert_eq!(errors, 6);
+    assert_eq!(errors, 9);
 }

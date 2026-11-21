@@ -52,9 +52,16 @@ at most that limit and a 2-second git timeout per refresh. The index listing is 
 
 Git settings are part of the key where they change what nix reads as modified, so the
 recorded revision (`configurationRevision`) cannot differ under one key: `core.fileMode`,
-`core.symlinks` and `core.ignorecase`, when they are not the defaults. `core.trustctime=false`
-means no caching, with a note: nix then trusts the index's stat data (size, mtime, inode) and
-may read a rewritten file as the committed one, which no key built from the bytes can follow.
+`core.symlinks` and `core.ignorecase`, and the CRLF filter's inputs `core.autocrlf`,
+`core.eol` and `core.safecrlf`, when they are not the defaults, and the **bytes** of the
+attributes files outside the tree that libgit2 reads (`$GIT_DIR/info/attributes`,
+`core.attributesFile` or its default `~/.config/git/attributes`, and `/etc/gitattributes`), a
+symlink followed. git runs without its `GIT_CONFIG_*` variables, so it reads the files nix's
+libgit2 reads. `core.trustctime=false` means no caching, with a note: nix then trusts the
+index's stat data (size, mtime, inode) and may read a rewritten file as the committed one, which
+no key built from the bytes can follow. What is not covered: a configuration file that libgit2
+reads and git does not; and, in the run guard only (a setting changed and put back during one
+scan), a system git configuration compiled in at another path than `/etc/gitconfig`.
 
 When a machine's error names a file below a `…-source/` store path that exists in the
 worktree but is untracked, the Log tab (stderr when headless) says why nix cannot see it, once

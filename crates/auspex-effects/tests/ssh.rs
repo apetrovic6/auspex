@@ -1767,3 +1767,147 @@ async fn distinct_users_are_distinct_sockets_and_each_connects() {
     sockets.sort();
     assert_eq!(sockets, ["alice@h-22", "bob@h-22"]);
 }
+
+// ---------------------------------------------------------------------------------------
+// Review of PR #37, finding 3: the control directory is checked before every ssh
+// ---------------------------------------------------------------------------------------
+
+/// `recheck` accepts the directory as prepared, and refuses what a periodic clean-up of `/tmp`
+/// and a local user could make of it: gone, made again (even 0700 and ours, it is another
+/// directory), another mode, a symlink.
+#[test]
+fn a_control_directory_that_changed_since_it_was_prepared_is_refused() {
+    let dir = tempdir();
+    let path = dir.path().join("c");
+    let cd = ControlDir::prepare(&path).unwrap();
+    cd.recheck().unwrap();
+
+    // Removed: nothing is created for it.
+    fs::remove_dir(&path).unwrap();
+    let e = cd.recheck().unwrap_err();
+    assert!(e.0.contains("cannot inspect"), "{e}");
+    assert!(!path.exists(), "recheck must not create the directory");
+
+    // Made again, 0700 and ours: not the directory auspex prepared.
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let e = cd.recheck().unwrap_err();
+    assert!(e.0.contains("not the directory auspex made"), "{e}");
+    assert!(e.0.contains("XDG_RUNTIME_DIR"), "{e}");
+
+    // A fresh preparation of it is a fresh start.
+    let cd = ControlDir::prepare(&path).unwrap();
+    cd.recheck().unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(cd.recheck().unwrap_err().0.contains("mode 0755"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    cd.recheck().unwrap();
+
+    // A symlink to a directory that is ours and 0700.
+    let elsewhere = dir.path().join("elsewhere");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&elsewhere)
+        .unwrap();
+    fs::remove_dir(&path).unwrap();
+    symlink(&elsewhere, &path).unwrap();
+    assert!(cd.recheck().unwrap_err().0.contains("symlink"));
+}
+
+/// The directory's owner is named with a way out: set `XDG_RUNTIME_DIR`.
+#[test]
+fn a_control_directory_owned_by_someone_else_says_to_set_xdg_runtime_dir() {
+    use std::os::unix::fs::MetadataExt as _;
+    let me = rustix::process::getuid().as_raw();
+    let Some(theirs) = ["/", "/proc", "/dev", "/nix/store"]
+        .iter()
+        .map(Path::new)
+        .find(|p| fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() && m.uid() != me))
+    else {
+        eprintln!("SKIPPED: no directory owned by another user to test with (running as root?)");
+        return;
+    };
+    let e = ControlDir::prepare(theirs).unwrap_err();
+    assert!(e.0.contains("XDG_RUNTIME_DIR"), "{e}");
+}
+
+/// No ssh is started in a directory that is no longer the prepared one: not the first ssh of a
+/// probe (connect), not the later ones (a master that is already up), and not the interactive
+/// one the shell runs itself.
+#[tokio::test]
+async fn no_ssh_is_started_after_the_control_directory_changed() {
+    let Some(t) = tools(&[]) else { return };
+    let dir = tempdir();
+    let prog = warm_script(
+        &t,
+        dir.path(),
+        "ssh",
+        &format!("echo ran >> '@dir@/ran'\nprintf '{}'", probe_output()),
+    );
+    let ran = || fs::read_to_string(dir.path().join("ran")).map_or(0, |s| s.lines().count());
+    let cd = control(dir.path());
+    let target = Target::parse("h").unwrap();
+
+    // Healthy: ssh runs (the master check, then the probe).
+    let (r, _) = run_probe(&prog, &cd, &target, Duration::from_secs(10)).await;
+    assert!(matches!(r.unwrap(), ProbeOutcome::Observed(_)));
+    let before = ran();
+    assert!(before >= 1);
+
+    // The directory is removed and made again: the master is believed up, so only the
+    // probe's own spawn is left to refuse it.
+    let path = dir.path().join("c");
+    fs::remove_dir(&path).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let (r, _) = run_probe(&prog, &cd, &target, Duration::from_secs(10)).await;
+    let ProbeOutcome::Failed { reason } = r.unwrap() else {
+        panic!("a probe in a replaced control directory must fail")
+    };
+    assert!(reason.contains("not the directory auspex made"), "{reason}");
+    assert_eq!(ran(), before, "ssh ran in a replaced directory");
+
+    // A host not seen before has no master to believe in: the connect phase refuses.
+    let other = Target::parse("other").unwrap();
+    let (r, _) = run_probe(&prog, &cd, &other, Duration::from_secs(10)).await;
+    assert!(matches!(r.unwrap(), ProbeOutcome::Failed { .. }));
+    assert_eq!(ran(), before);
+
+    // And the interactive command is not handed out.
+    let e = auspex_effects::ssh::interactive_command(prog.as_os_str(), &target, &cd).unwrap_err();
+    assert!(e.contains("not the directory auspex made"), "{e}");
+}
+
+/// Each spawn rechecks on its own (review of PR #37, finding 3): a fake ssh whose master check
+/// replaces the control directory and then answers. With the answer "no master", the next ssh
+/// is the connect phase; with "master up", it is the probe itself. Either must be refused, and
+/// only the check may have run.
+#[tokio::test]
+async fn the_connect_phase_and_the_probe_each_recheck_the_control_directory() {
+    let Some(t) = tools(&[]) else { return };
+    for (answer, phase) in [(1, "connect"), (0, "probe")] {
+        let dir = tempdir();
+        let prog = t.script(
+            dir.path(),
+            "ssh",
+            &format!(
+                "echo run >> '@dir@/ran'\nfor arg; do\n  if [ \"$arg\" = -O ]; then\n    rmdir '@dir@/c' && mkdir -m 700 '@dir@/c'\n    exit {answer}\n  fi\ndone\nprintf '{}'",
+                probe_output()
+            ),
+        );
+        let cd = control(dir.path());
+        let target = Target::parse("h").unwrap();
+        let (r, _) = run_probe(&prog, &cd, &target, Duration::from_secs(10)).await;
+        let ProbeOutcome::Failed { reason } = r.unwrap() else {
+            panic!("{phase}: a replaced control directory must fail the probe")
+        };
+        assert!(
+            reason.contains("not the directory auspex made"),
+            "{phase}: {reason}"
+        );
+        let ran = fs::read_to_string(dir.path().join("ran")).unwrap();
+        assert_eq!(
+            ran.lines().count(),
+            1,
+            "{phase}: only the check may run: {ran}"
+        );
+    }
+}

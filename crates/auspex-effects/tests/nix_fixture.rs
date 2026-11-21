@@ -937,3 +937,107 @@ async fn an_untracked_import_is_explained_and_added_it_evaluates() {
             .any(|i| matches!(i, EvalItem::Note(n) if n.contains("not tracked")))
     );
 }
+
+/// Review of PR #37, finding 1, end to end with the real nix: a file committed with LF endings
+/// and checked out with CRLF is dirty to nix until `core.autocrlf` or an attributes file outside
+/// the tree makes the CRLF filter turn it back into the committed bytes. `touch` makes
+/// libgit2 look at the file instead of trusting the index's stat data. One key used to stand
+/// for both answers.
+#[tokio::test]
+async fn crlf_settings_and_attribute_files_do_not_give_stale_hits() {
+    for tool in ["nix", "nix-eval-jobs", "git"] {
+        if find_on_path(tool).is_none() {
+            eprintln!("SKIPPED: {tool} is not on PATH");
+            return;
+        }
+    }
+    let repo = tempdir();
+    let r = repo.path();
+    fs::write(
+        r.join("flake.nix"),
+        r#"{ outputs = { self }: {
+          nixosConfigurations.m.config.system.build.toplevel = derivation {
+            name = "toplevel";
+            system = "x86_64-linux";
+            builder = "/auspex-fixture-never-built";
+            configurationRevision = self.rev or self.dirtyRev or "none";
+          };
+        }; }"#,
+    )
+    .unwrap();
+    fs::write(r.join("f.nix"), "a\nb\n").unwrap();
+    git(r, &["init", "-q"]);
+    git(r, &["add", "."]);
+    git(r, &["commit", "-q", "-m", "one"]);
+    // The worktree has CRLF, the index the LF blob (added through the filter).
+    fs::write(r.join("f.nix"), "a\r\nb\r\n").unwrap();
+    git(r, &["-c", "core.autocrlf=true", "add", "f.nix"]);
+    let flake = FlakeRef::new(r.to_str().unwrap()).unwrap();
+    let machines = [EvalMachine {
+        name: "m".to_owned(),
+        class: MachineClass::Nixos,
+    }];
+    let cache_dir = tempdir();
+    let cached = CacheParams {
+        cache_dir: Some(cache_dir.path()),
+        flake_dir: r,
+        git: GitParams::new(),
+    };
+    let uncached = CacheParams {
+        cache_dir: None,
+        ..cached
+    };
+    let touch = || {
+        let f = fs::OpenOptions::new()
+            .append(true)
+            .open(r.join("f.nix"))
+            .unwrap();
+        f.set_modified(std::time::SystemTime::now()).unwrap();
+    };
+    touch();
+    let (first, error) = split(&run(&flake, &machines, &cached).await);
+    assert_eq!(error, None);
+    let (dirty, _) = split(&run(&flake, &machines, &uncached).await);
+    assert_eq!(first["m"].1, dirty["m"].1);
+
+    for (what, apply) in [
+        ("core.autocrlf", &["config", "core.autocrlf", "true"][..]),
+        ("core.eol", &["config", "core.eol", "lf"][..]),
+    ] {
+        git(r, apply);
+        touch();
+        let (warm, error) = split(&run(&flake, &machines, &cached).await);
+        assert_eq!(error, None);
+        let (fresh, _) = split(&run(&flake, &machines, &uncached).await);
+        assert_eq!(
+            warm["m"].1, fresh["m"].1,
+            "{what}: a stale result was served"
+        );
+        if what == "core.autocrlf" {
+            // The experiment can tell: nix reads the file as clean once the filter runs.
+            assert_ne!(
+                first["m"].1, fresh["m"].1,
+                "core.autocrlf did not change nix's answer"
+            );
+            assert!(!warm["m"].0, "{what}: hit the other setting's entry");
+        }
+        git(r, &["config", "--unset", what]);
+    }
+
+    // The same through an attributes file that is not in the tree.
+    fs::create_dir_all(r.join(".git/info")).unwrap();
+    fs::write(r.join(".git/info/attributes"), "* text=auto\n").unwrap();
+    touch();
+    let (warm, error) = split(&run(&flake, &machines, &cached).await);
+    assert_eq!(error, None);
+    let (fresh, _) = split(&run(&flake, &machines, &uncached).await);
+    assert_eq!(
+        warm["m"].1, fresh["m"].1,
+        "info/attributes: a stale result was served"
+    );
+    assert_ne!(
+        first["m"].1, fresh["m"].1,
+        "info/attributes did not change nix's answer"
+    );
+    assert!(!warm["m"].0, "info/attributes: hit the first run's entry");
+}

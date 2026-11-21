@@ -777,6 +777,15 @@ async fn the_key_of_a_fixed_repository_is_pinned() {
     fs::write(r.path().join("flake.nix"), "{ outputs = _: {}; }\n").unwrap();
     fs::write(r.path().join("flake.lock"), "{}\n").unwrap();
     git(r.path(), &["init", "-q"]);
+    // The key reads the operator's own git settings and attributes files, so the pinned value
+    // fixes each one to its default in the repository: whatever the machine has, the key is the same.
+    for (k, v) in [
+        ("core.autocrlf", "false"),
+        ("core.eol", "native"),
+        ("core.attributesFile", "/nonexistent/auspex-attributes"),
+    ] {
+        git(r.path(), &["config", k, v]);
+    }
     git(r.path(), &["add", "flake.nix", "flake.lock"]);
     let ok = Command::new("git")
         .current_dir(r.path())
@@ -954,4 +963,245 @@ async fn a_status_setting_that_is_no_boolean_means_no_caching() {
         git(r.path(), &["config", "--unset", name]);
     }
     assert!(key(r.path()).await.is_ok());
+}
+
+// ---------------------------------------------------------------------------------------
+// Review of PR #37, finding 1: what drives libgit2's CRLF/text filter
+// ---------------------------------------------------------------------------------------
+
+/// nix's libgit2 runs the worktree's bytes through the CRLF/`text` filter before it compares
+/// them with the index, so `core.autocrlf`, `core.eol`, and the attributes that come from
+/// `$GIT_DIR/info/attributes`, `core.attributesFile` and the system file decide clean or
+/// dirty for the same bytes. Each is in the key (the tracked `.gitattributes` always was).
+/// Absent is the key it always was; a present empty file is a different value.
+#[tokio::test]
+async fn crlf_settings_and_attribute_files_outside_the_tree_are_keyed() {
+    let Some(r) = repo() else { return };
+    let d = r.path();
+    let plain = key(d).await.unwrap();
+
+    // core.autocrlf: true, input and false are three answers; false is the default.
+    git(d, &["config", "core.autocrlf", "true"]);
+    let t = key(d).await.unwrap();
+    git(d, &["config", "core.autocrlf", "input"]);
+    let i = key(d).await.unwrap();
+    assert!(t != plain && i != plain && t != i, "autocrlf is not keyed");
+    git(d, &["config", "core.autocrlf", "false"]);
+    assert_eq!(key(d).await.unwrap(), plain, "false is the default");
+    git(d, &["config", "--unset", "core.autocrlf"]);
+    assert_eq!(key(d).await.unwrap(), plain);
+
+    for (name, value) in [("core.eol", "crlf"), ("core.safecrlf", "true")] {
+        git(d, &["config", name, value]);
+        assert_ne!(key(d).await.unwrap(), plain, "{name} is not keyed");
+        git(d, &["config", "--unset", name]);
+        assert_eq!(key(d).await.unwrap(), plain, "{name} unset");
+    }
+
+    // $GIT_DIR/info/attributes: absent, present, edited, empty.
+    let info = d.join(".git/info/attributes");
+    fs::create_dir_all(info.parent().unwrap()).unwrap();
+    fs::write(&info, "* text=auto\n").unwrap();
+    let a = key(d).await.unwrap();
+    assert_ne!(a, plain, "info/attributes is not keyed");
+    fs::write(&info, "* text=auto eol=crlf\n").unwrap();
+    let b = key(d).await.unwrap();
+    assert!(
+        b != a && b != plain,
+        "an edit of info/attributes is not keyed"
+    );
+    fs::write(&info, "").unwrap();
+    let empty = key(d).await.unwrap();
+    assert!(empty != plain, "an empty file is not an absent one");
+    fs::remove_file(&info).unwrap();
+    assert_eq!(key(d).await.unwrap(), plain);
+
+    // core.attributesFile: its bytes, through a symlink too (home-manager makes one); a
+    // path with nothing there is an absent file.
+    let side = tempdir();
+    let attrs = side.path().join("attributes");
+    git(
+        d,
+        &["config", "core.attributesFile", attrs.to_str().unwrap()],
+    );
+    assert_eq!(key(d).await.unwrap(), plain, "a file that is not there");
+    fs::write(&attrs, "* text=auto\n").unwrap();
+    let g = key(d).await.unwrap();
+    assert_ne!(g, plain, "core.attributesFile is not keyed");
+    let target = side.path().join("target");
+    fs::rename(&attrs, &target).unwrap();
+    std::os::unix::fs::symlink(&target, &attrs).unwrap();
+    assert_eq!(key(d).await.unwrap(), g, "the same bytes through a symlink");
+    fs::write(&target, "* text=auto eol=crlf\n").unwrap();
+    assert_ne!(key(d).await.unwrap(), g, "an edit behind the symlink");
+    git(d, &["config", "--unset", "core.attributesFile"]);
+    assert_eq!(key(d).await.unwrap(), plain);
+}
+
+/// An attributes file that is not a file (a FIFO would block a read) means no caching, with
+/// a note that names it, and returns at once.
+#[tokio::test]
+async fn an_attributes_file_that_is_a_fifo_means_no_caching() {
+    let Some(r) = repo() else { return };
+    let d = r.path();
+    let info = d.join(".git/info/attributes");
+    fs::create_dir_all(info.parent().unwrap()).unwrap();
+    fifo(&info);
+    let start = Instant::now();
+    let e = tokio::time::timeout(Duration::from_secs(20), key(d))
+        .await
+        .expect("the key must not wait on a FIFO")
+        .unwrap_err();
+    assert!(
+        e.contains("attributes") && e.contains("not a regular file"),
+        "{e}"
+    );
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+/// A linked worktree reads the attributes of the common git directory.
+#[tokio::test]
+async fn a_linked_worktree_keys_the_common_info_attributes() {
+    let Some(r) = repo() else { return };
+    let d = r.path();
+    let side = tempdir();
+    let wt = side.path().join("wt");
+    git(
+        d,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "linked",
+            wt.to_str().unwrap(),
+        ],
+    );
+    let plain = key(&wt).await.unwrap();
+    let info = d.join(".git/info/attributes");
+    fs::create_dir_all(info.parent().unwrap()).unwrap();
+    fs::write(&info, "* text=auto\n").unwrap();
+    assert_ne!(key(&wt).await.unwrap(), plain);
+}
+
+/// Review of PR #37, finding 4: git honours `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n`,
+/// `GIT_CONFIG_PARAMETERS` and `GIT_CONFIG_GLOBAL`, which nix's libgit2 ignores, so under one of
+/// them the key would carry a setting nix never used. Each is set here to `core.autocrlf=true`
+/// (a keyed setting) and the key must be the one of the same repository without them. In a child
+/// test process, since the variables must be in this crate's own environment.
+#[tokio::test]
+async fn git_configuration_variables_do_not_reach_the_key() {
+    if std::env::var_os("AUSPEX_TEST_GIT_CONFIG_ENV").is_some() {
+        return;
+    }
+    let Some(r) = repo() else { return };
+    let plain = key(r.path()).await.unwrap();
+    let global = tempdir();
+    fs::write(global.path().join("config"), "[core]\n\tautocrlf = true\n").unwrap();
+    for (name, vars) in [
+        (
+            "count",
+            vec![
+                ("GIT_CONFIG_COUNT", "1".to_owned()),
+                ("GIT_CONFIG_KEY_0", "core.autocrlf".to_owned()),
+                ("GIT_CONFIG_VALUE_0", "true".to_owned()),
+            ],
+        ),
+        (
+            "parameters",
+            vec![("GIT_CONFIG_PARAMETERS", "'core.autocrlf'='true'".to_owned())],
+        ),
+        (
+            "global",
+            vec![(
+                "GIT_CONFIG_GLOBAL",
+                global.path().join("config").display().to_string(),
+            )],
+        ),
+        (
+            "system",
+            vec![(
+                "GIT_CONFIG_SYSTEM",
+                global.path().join("config").display().to_string(),
+            )],
+        ),
+    ] {
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "git_config_env_inner",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("AUSPEX_TEST_GIT_CONFIG_ENV", r.path())
+            .env("AUSPEX_TEST_EXPECTED_KEY", plain.as_str())
+            .envs(vars)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "{name}: {text}");
+        assert!(text.contains("1 passed"), "{name}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn git_config_env_inner() {
+    let Some(repo) = std::env::var_os("AUSPEX_TEST_GIT_CONFIG_ENV") else {
+        return;
+    };
+    let expected = std::env::var("AUSPEX_TEST_EXPECTED_KEY").unwrap();
+    assert_eq!(key(Path::new(&repo)).await.unwrap().as_str(), expected);
+}
+
+/// Review of PR #37, mutations R10 and R11: only git saying no is "not a git repository". A
+/// first command that runs out of memory or times out is reported as that (the N4 class: the
+/// label sent the operator to the repository).
+#[tokio::test]
+async fn a_first_git_command_that_runs_out_of_memory_or_times_out_is_not_a_missing_repository() {
+    let Some(t) = tools(&["sleep"]) else { return };
+    let Some(r) = repo() else { return };
+    let side = tempdir();
+
+    let oom = t.script(
+        side.path(),
+        "git-oom",
+        "echo 'fatal: Out of memory, malloc failed' >&2\nexit 128",
+    );
+    let mut g = GitParams::new();
+    g.program = oom.as_os_str();
+    let e = key_for(r.path(), &g, &CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("memory limit"), "{e}");
+    assert!(!e.contains("not a git repository"), "{e}");
+
+    let slow = t.script(side.path(), "git-slow", "@sleep@ 30");
+    let mut g = GitParams::new();
+    g.program = slow.as_os_str();
+    g.timeout = Duration::from_millis(300);
+    let e = key_for(r.path(), &g, &CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.contains("timed out"), "{e}");
+    assert!(!e.contains("not a git repository"), "{e}");
+
+    // And git exiting non-zero, whatever it says, is still labelled.
+    let no = t.script(
+        side.path(),
+        "git-no",
+        "echo 'fatal: something' >&2\nexit 128",
+    );
+    let mut g = GitParams::new();
+    g.program = no.as_os_str();
+    let e = key_for(r.path(), &g, &CancellationToken::new())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(e.starts_with("not a git repository"), "{e}");
 }

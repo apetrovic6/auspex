@@ -797,6 +797,8 @@ struct Collector<'a> {
     top: Option<&'a Path>,
     /// Paths already hinted about, so one missing module is one note, not one per machine.
     hinted: BTreeSet<String>,
+    /// (machine, path) pairs to check against the index once the run is over.
+    candidates: Vec<(String, String)>,
 }
 
 impl Collector<'_> {
@@ -817,19 +819,42 @@ impl Collector<'_> {
     /// changes silently. The path after `-source/` is relative to the repository top level.
     fn untracked_hint(&mut self, machine: &str, tail: &[String]) {
         let Some(top) = self.top else { return };
-        for rel in tail.iter().flat_map(|l| source_paths(l)) {
-            if self.hinted.contains(&rel) || std::fs::symlink_metadata(top.join(&rel)).is_err() {
+        for rel in tail.iter().flat_map(|l| missing_paths(l)) {
+            if self.candidates.len() >= MAX_LINE_NOTES
+                || self.hinted.contains(&rel)
+                || std::fs::symlink_metadata(top.join(&rel)).is_err()
+            {
                 continue;
             }
             self.hinted.insert(rel.clone());
-            self.note(format!(
-                "{machine}: nix could not find {:?}, which exists in the worktree but is not \
-                 tracked by git. A plain path in a git repository is evaluated as a git+file \
-                 reference, which sees tracked files only (as `nix build .#…` does): `git add` \
-                 the file",
-                sanitize_line(&rel)
-            ));
+            self.candidates.push((machine.to_owned(), rel));
         }
+    }
+
+    /// The notes for the candidates [`Self::untracked_hint`] collected, once the run is over:
+    /// only for a path that is **not in the index** (`git ls-files` lists nothing for it), since
+    /// a tracked file that nix reports on is not an untracked file (review of PR #37, finding 2).
+    /// When git cannot answer, there is no note: it is a hint, never a guess.
+    async fn explain_untracked(&mut self, cancel: &CancellationToken) -> Result<(), Cancelled> {
+        let Some(top) = self.top else { return Ok(()) };
+        let git = crate::cache::GitParams::new();
+        for (machine, rel) in std::mem::take(&mut self.candidates) {
+            // `:(literal)`: the name is data, not a pathspec with wildcards.
+            let spec = format!(":(literal){rel}");
+            let args = ["ls-files", "-z", "--", spec.as_str()];
+            if let Ok(listed) = crate::cache::git(&git, top, &args, 64 * 1024, cancel).await?
+                && listed.is_empty()
+            {
+                self.note(format!(
+                    "{machine}: nix could not find {:?}, which exists in the worktree but is \
+                     not tracked by git. A plain path in a git repository is evaluated as a \
+                     git+file reference, which sees tracked files only (as `nix build .#…` \
+                     does): `git add` the file",
+                    sanitize_line(&rel)
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn line(&mut self, line: Line) {
@@ -875,6 +900,26 @@ impl Collector<'_> {
             outcome,
             from_cache: false,
         });
+    }
+}
+
+/// [`source_paths`] of a line that says the file is missing: nix's `does not exist`, the system's
+/// `No such file or directory`, or `is not tracked by Git`. Any other line that quotes a source
+/// path (the module system's "- In" line, a trace, a warning) says nothing about a
+/// file being absent, and gets nothing (review of PR #37, finding 2).
+fn missing_paths(line: &str) -> Vec<String> {
+    let lower = line.to_ascii_lowercase();
+    if [
+        "does not exist",
+        "no such file or directory",
+        "is not tracked by git",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        source_paths(line)
+    } else {
+        Vec::new()
     }
 }
 
@@ -1013,15 +1058,15 @@ pub async fn evaluate(
         tx: &tx,
         top: flake.repo_top(),
         hinted: BTreeSet::new(),
+        candidates: Vec::new(),
     };
-    let deadline = Instant::now() + params.timeout;
     let stop = pump(
         &mut sp,
         &mut lines,
         &mut collect,
         &mut err,
         &mut err_pipe,
-        deadline,
+        Instant::now() + params.timeout,
         cancel,
     )
     .await;
@@ -1045,6 +1090,7 @@ pub async fn evaluate(
             Some(format!("waiting for nix-eval-jobs failed: {e}"))
         }
     };
+    collect.explain_untracked(cancel).await?;
     drop(list);
     let error = error.map(|what| match reason(&lossy(&err.buf)) {
         Some(r) => format!("{what}: {r}"),
@@ -1323,6 +1369,58 @@ mod tests {
         std::fs::create_dir(&q).unwrap();
         let f = FlakeRef::new(q.to_str().unwrap()).unwrap();
         assert!(f.as_str().ends_with("/q%3Fdir=sub"), "{f:?}");
+    }
+
+    /// Review of PR #37, finding 2 and mutations R14 and R15: which paths nix's error text
+    /// names. A path ends at a quote or a space, must be below a real store path, stays below
+    /// it, and is at most 1024 bytes; and only a line that says something is missing counts.
+    #[test]
+    fn source_paths_are_what_nix_names_and_missing_paths_only_when_it_says_so() {
+        let store = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-source";
+        assert_eq!(
+            source_paths(&format!("path '{store}/a/b.nix' does not exist")),
+            ["a/b.nix"]
+        );
+        assert_eq!(
+            source_paths(&format!("path \"{store}/dq.nix\" does not exist")),
+            ["dq.nix"]
+        );
+        assert_eq!(source_paths(&format!("at {store}/sp.nix :1:1")), ["sp.nix"]);
+        assert_eq!(
+            source_paths(&format!("{store}/one.nix and {store}/two.nix")),
+            ["one.nix", "two.nix"]
+        );
+        // The length cap: 1024 bytes pass, 1025 do not.
+        let long = |n: usize| format!("'{store}/{}'", "x".repeat(n));
+        assert_eq!(source_paths(&long(1024)).len(), 1);
+        assert_eq!(source_paths(&long(1025)), Vec::<String>::new());
+        // Not below a store path, not a hash, escapes, absolute.
+        for line in [
+            "'/tmp/x-source/a.nix'",
+            "'/nix/store/short-source/a.nix'",
+            &format!("'{store}/../a.nix'"),
+            &format!("'{store}/a/../../b.nix'"),
+            &format!("'{store}//a.nix'"),
+            &format!("'{store}/'"),
+        ] {
+            assert!(source_paths(line).is_empty(), "{line}");
+        }
+        // Only a missing-file line is a candidate.
+        for said in [
+            format!("error: path '{store}/a.nix' does not exist"),
+            format!("error: getting status of '{store}/a.nix': No such file or directory"),
+            format!("error: '{store}/a.nix' is not tracked by Git"),
+            format!("error: PATH '{store}/a.nix' DOES NOT EXIST"),
+        ] {
+            assert_eq!(missing_paths(&said), ["a.nix"], "{said}");
+        }
+        for silent in [
+            format!("- In `{store}/a.nix': true"),
+            format!("error: The option `x' has conflicting definitions in `{store}/a.nix'"),
+            format!("trace: evaluating {store}/a.nix"),
+        ] {
+            assert!(missing_paths(&silent).is_empty(), "{silent}");
+        }
     }
 
     /// Review item N9, now documented and pinned: an explicit `git+file:` reference without a

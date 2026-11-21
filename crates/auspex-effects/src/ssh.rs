@@ -109,6 +109,13 @@ pub(crate) fn prepare_private_dir(path: &Path, kind: &str) -> Result<(), String>
         Err(e) => return Err(format!("cannot create {kind} {shown}: {e}")),
     }
     // Inspect after creating too: creation does not guarantee what remains at this path.
+    check_private_dir(path, kind)
+}
+
+/// The checks of [`prepare_private_dir`] on a directory that is already there, creating
+/// nothing: not a symlink, a directory, ours, mode exactly 0700.
+fn check_private_dir(path: &Path, kind: &str) -> Result<(), String> {
+    let shown = path.display();
     let meta =
         fs::symlink_metadata(path).map_err(|e| format!("cannot inspect {kind} {shown}: {e}"))?;
     if meta.file_type().is_symlink() {
@@ -121,7 +128,8 @@ pub(crate) fn prepare_private_dir(path: &Path, kind: &str) -> Result<(), String>
     if meta.uid() != me {
         return Err(format!(
             "{kind} {shown} is owned by uid {}, not by this user (uid {me}); \
-             refusing to use it",
+             refusing to use it. Set XDG_RUNTIME_DIR to a directory of yours (such as \
+             /run/user/{me}) so that auspex makes its own",
             meta.uid()
         ));
     }
@@ -138,6 +146,9 @@ pub(crate) fn prepare_private_dir(path: &Path, kind: &str) -> Result<(), String>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlDir {
     path: String,
+    /// The device and inode of the directory as [`ControlDir::prepare`] found it: what every
+    /// later ssh must still find at `path` ([`ControlDir::recheck`]).
+    identity: (u64, u64),
 }
 
 /// Why a control directory was refused.
@@ -195,7 +206,46 @@ impl ControlDir {
         // into an error here rather than on every probe.
         let probe_target = Target::parse("x").map_err(|e| ControlDirError(e.to_string()))?;
         ssh_args(&probe_target, &SshOptions::new(s)).map_err(|e| ControlDirError(e.to_string()))?;
-        Ok(Self { path: s.to_owned() })
+        let meta = fs::symlink_metadata(path).map_err(|e| {
+            ControlDirError(format!("cannot inspect control directory {shown}: {e}"))
+        })?;
+        Ok(Self {
+            path: s.to_owned(),
+            identity: (meta.dev(), meta.ino()),
+        })
+    }
+
+    /// The checks of [`Self::prepare`] again, without creating anything, and that this is still
+    /// the directory it prepared (same device and inode). Run before every ssh is started.
+    ///
+    /// The path is trusted from start-up otherwise, and under `/tmp` (the macOS default, F9) a
+    /// periodic clean-up of old empty directories can remove it while auspex is open, after
+    /// which any local user can create `/tmp/auspex-<uid>` first, a name that is predictable,
+    /// and ssh would bind and connect its control sockets inside a directory that is theirs
+    /// (review of PR #37, finding 3). A directory that was removed and made again is refused
+    /// even when the new one is ours and 0700: it is not the one whose sockets this run made.
+    ///
+    /// # Errors
+    ///
+    /// [`ControlDirError`] saying what changed.
+    pub fn recheck(&self) -> Result<(), ControlDirError> {
+        let path = Path::new(&self.path);
+        check_private_dir(path, "control directory").map_err(ControlDirError)?;
+        let meta = fs::symlink_metadata(path).map_err(|e| {
+            ControlDirError(format!(
+                "cannot inspect control directory {}: {e}",
+                self.path
+            ))
+        })?;
+        if (meta.dev(), meta.ino()) != self.identity {
+            return Err(ControlDirError(format!(
+                "control directory {} is not the directory auspex made at start-up (it was \
+                 removed and made again, or replaced), so ssh is not run in it; restart auspex \
+                 (or set XDG_RUNTIME_DIR to a directory that is not cleaned up)",
+                self.path
+            )));
+        }
+        Ok(())
     }
 
     /// The directory.
@@ -276,6 +326,7 @@ pub fn interactive_command(
     target: &Target,
     control_dir: &ControlDir,
 ) -> Result<(PathBuf, Vec<String>), String> {
+    control_dir.recheck().map_err(|e| e.0)?;
     let path = crate::process::resolve_in(program, std::env::var_os("PATH").as_deref())
         .map_err(|e| spawn_error("run", program, &e))?;
     let mut options = SshOptions::new(control_dir.as_str());
@@ -536,6 +587,11 @@ async fn connect_once(
                 window: connect_window(params.control_dir),
             }
         });
+        // Before each ssh: the directory it will bind and connect sockets in is still the one
+        // that was checked at start-up (review of PR #37, finding 3).
+        if let Err(e) = params.control_dir.recheck() {
+            return Ok(Some(ProbeOutcome::Failed { reason: e.0 }));
+        }
         let mut cmd = match command(params.ssh_program) {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -678,6 +734,9 @@ pub async fn probe(
         Ok(a) => a,
         Err(reason) => return Ok(ProbeOutcome::Failed { reason }),
     };
+    if let Err(e) = params.control_dir.recheck() {
+        return Ok(ProbeOutcome::Failed { reason: e.0 });
+    }
     let mut cmd = match command(params.ssh_program) {
         Ok(c) => c,
         Err(e) => {
