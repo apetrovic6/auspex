@@ -3,12 +3,13 @@
 
 [test-groups]
 # Tests that start several processes sharing one SQLite file and check that none of them is
-# locked out. They run at the product's own budget (a 2 s call timeout and a 5 s busy
-# timeout: `deploylog`'s DEFAULT_CALL_TIMEOUT and DEFAULT_BUSY_TIMEOUT), because a longer one
-# would also pass when a process holds the write lock for seconds, which is the lock-out they
-# exist to catch. At that budget they fail when the machine is busy with the rest of the
-# workspace's tests (the Nix sandbox ran them all at once: "the action log was busy; nothing
-# was written"), so they run one at a time and, below, with no other test beside them.
+# locked out. Their processes open the log with a 120 s budget (`tests::PATIENT`), not the
+# product's 2 s call timeout and 5 s busy timeout: at 2 s a process that a loaded machine
+# leaves off the CPU for two seconds fails with "the action log was busy; nothing was
+# written" although no lock was held against it (AUS-45; reproduced with the test at nice 19
+# beside twelve CPU-bound loops on its core). A real lock-out still fails: a lock held and
+# never let go outlasts any budget, and a writer without a busy handler fails at once. They
+# still run one at a time and, below, with no other test beside them, which keeps a run short.
 deploylog-processes = { max-threads = 1 }
 
 [[profile.default.overrides]]

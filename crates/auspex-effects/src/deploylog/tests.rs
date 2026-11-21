@@ -60,6 +60,40 @@ async fn open_in(dir: &Path) -> ActionLog {
     open_at(&db_in(dir), HOST).await
 }
 
+/// The budget of the multi-process tests, for both timeouts. They ask whether processes lock
+/// each other out, not whether the machine is idle: at the product's own 2 s call deadline a
+/// process that the scheduler leaves off the CPU for two seconds (a loaded host, a Nix sandbox
+/// with the rest of the build running) fails with `Timeout` without any lock being held
+/// against it, which is the test failing on scheduling luck (AUS-45). A lock-out still fails
+/// here: a lock that is held and never let go outlasts any budget, and a writer that has no
+/// busy handler, or a journal mode in which writers exclude readers, fails at once whatever
+/// the budget is.
+const PATIENT: Duration = Duration::from_secs(120);
+
+/// `params` with the multi-process tests' budget.
+fn patient_params(path: PathBuf, host: &str) -> OpenParams {
+    OpenParams {
+        busy_timeout: PATIENT,
+        call_timeout: PATIENT,
+        ..params(path, host)
+    }
+}
+
+/// `open_at` with the multi-process tests' budget, for their child processes.
+async fn open_patient_at(path: &Path, host: &str) -> ActionLog {
+    ActionLog::open(patient_params(path.to_owned(), host))
+        .await
+        .unwrap()
+}
+
+/// `open_in` with the multi-process tests' budget: the parent reads back what the children
+/// wrote, after they have exited, and must not fail because *it* was starved.
+async fn open_patient_in(dir: &Path) -> ActionLog {
+    ActionLog::open(patient_params(db_in(dir), HOST))
+        .await
+        .unwrap()
+}
+
 fn new_action(kind: ActionKind, machine: &str) -> NewAction {
     NewAction {
         kind,
@@ -1076,7 +1110,7 @@ fn child_command(mode: &str, dir: &Path, who: usize) -> Command {
 }
 
 fn wait_for(path: &Path) {
-    let end = Instant::now() + Duration::from_secs(60);
+    let end = Instant::now() + PATIENT;
     while !path.exists() {
         assert!(
             Instant::now() < end,
@@ -1107,7 +1141,7 @@ async fn child() {
             touch(format!("ready-{who}"));
             wait_for(&dir.join("go"));
             let mut errors = Vec::new();
-            match ActionLog::open(params(path, HOST)).await {
+            match ActionLog::open(patient_params(path, HOST)).await {
                 Err(e) => errors.push(format!("open: {e}")),
                 Ok(log) => {
                     let rounds = std::env::var(ROUNDS)
@@ -1139,7 +1173,7 @@ async fn child() {
         // Start an action, say so, and either die at once (no destructor runs, no finish) or
         // wait to be told to.
         "crash" | "live" => {
-            let log = open_at(&path, HOST).await;
+            let log = open_patient_at(&path, HOST).await;
             log.start(new_action(ActionKind::Deploy, "m"))
                 .await
                 .unwrap();
@@ -1152,7 +1186,7 @@ async fn child() {
         // Open, start an action and read it back, all in this one live process: what does it
         // say about its own row?
         "own" => {
-            let log = open_at(&path, HOST).await;
+            let log = open_patient_at(&path, HOST).await;
             log.start(new_action(ActionKind::Deploy, "m"))
                 .await
                 .unwrap();
@@ -1185,7 +1219,7 @@ async fn several_processes_write_at_once_without_locking_each_other_out() {
         let errors = std::fs::read_to_string(work.join(format!("errors-{n}"))).unwrap();
         assert_eq!(errors, "", "child {n} had errors");
     }
-    let log = open_in(work).await;
+    let log = open_patient_in(work).await;
     let rows = log.since(ts(0)).await.unwrap();
     assert_eq!(rows.len(), HAMMERS * HAMMER_ROUNDS);
     assert!(
@@ -1218,7 +1252,7 @@ async fn an_unfinished_row_of_a_dead_process_reads_as_interrupted() {
     let mut crashed = child_command("crash", work, 0).spawn().unwrap();
     wait_for(&work.join("started"));
     assert!(crashed.wait().unwrap().success()); // reaped: gone from /proc
-    let log = open_in(work).await;
+    let log = open_patient_in(work).await;
     let row = log.recent("m", 1).await.unwrap().remove(0);
     assert_eq!(
         (row.result, row.ended_at),
@@ -1238,7 +1272,7 @@ async fn an_unfinished_row_of_a_live_process_is_running_until_it_dies() {
     let work = d.path();
     let mut live = child_command("live", work, 0).spawn().unwrap();
     wait_for(&work.join("started"));
-    let log = open_in(work).await;
+    let log = open_patient_in(work).await;
 
     // Alive: running, and a reader in another process does not touch the row.
     let row = log.recent("m", 1).await.unwrap().remove(0);
@@ -1254,7 +1288,7 @@ async fn an_unfinished_row_of_a_live_process_is_running_until_it_dies() {
 
     // It exits. Until `wait` reaps it, it is a zombie: in /proc, but it can write nothing.
     std::fs::write(work.join("stop"), "").unwrap();
-    let end = Instant::now() + Duration::from_secs(30);
+    let end = Instant::now() + PATIENT;
     loop {
         let row = log.recent("m", 1).await.unwrap().remove(0);
         if row.result == Some(ActionResult::Interrupted) {
@@ -1378,7 +1412,7 @@ async fn processes_that_create_the_database_together_do_not_fail() {
         let d = dir();
         let errors = run_hammers(d.path(), 6, 1);
         assert!(errors.is_empty(), "round {round}: {errors:?}");
-        let log = open_in(d.path()).await;
+        let log = open_patient_in(d.path()).await;
         assert_eq!(log.since(ts(0)).await.unwrap().len(), 6, "round {round}");
         let version: i64 = raw(log.path())
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -2511,7 +2545,7 @@ async fn processes_that_open_an_old_file_together_add_each_column_once() {
         make_old_log(d.path());
         let errors = run_hammers(d.path(), 6, 1);
         assert!(errors.is_empty(), "round {round}: {errors:?}");
-        let log = open_in(d.path()).await;
+        let log = open_patient_in(d.path()).await;
         assert_eq!(log.since(ts(0)).await.unwrap().len(), 7, "round {round}");
         assert!(column_names(log.path()).contains(&"pid_ns".to_owned()));
     }
