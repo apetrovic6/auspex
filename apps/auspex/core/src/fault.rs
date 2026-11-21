@@ -14,9 +14,10 @@ use std::thread::ThreadId;
 /// The flake of the core to break, and the thread that is spared.
 static ARMED: Mutex<Option<(String, ThreadId)>> = Mutex::new(None);
 
-/// Arms the fault: the next `update` of the core whose flake is `flake`, on a thread **other than
-/// this one**, panics, once. The thread that arms it is the shell's loop in the test, whose own
-/// updates must not be the ones.
+/// Arms the fault for the core whose flake is `flake`.
+///
+/// The next `update` of that core, on a thread **other than this one**, panics, once. The thread
+/// that arms it is the shell's loop in the test, whose own updates must not be the ones.
 pub fn arm_except_this_thread(flake: &str) {
     *ARMED
         .lock()
