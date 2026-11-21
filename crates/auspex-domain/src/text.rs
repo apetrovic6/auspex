@@ -132,9 +132,44 @@ pub fn sanitized_tail(text: &str, max_lines: usize) -> Vec<String> {
     lines
 }
 
+/// Quotes `word` for a POSIX shell, only when it needs it.
+///
+/// A word made of letters, digits and `_@%+=:,./-` is returned as it is, so the common command
+/// reads the same; anything else (a space, a quote, `$`, an empty word) is wrapped in single
+/// quotes, each single quote written `'\''`. For the by-hand commands the operator is told to
+/// paste.
+///
+/// ```
+/// use auspex_domain::text::shell_quote;
+///
+/// assert_eq!(shell_quote("/k/config"), "/k/config");
+/// assert_eq!(shell_quote("/my dir/it's"), r"'/my dir/it'\''s'");
+/// ```
+#[must_use]
+pub fn shell_quote(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+    if safe {
+        return word.to_owned();
+    }
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_quote_leaves_safe_words_bare_and_quotes_the_rest() {
+        assert_eq!(shell_quote("/k/config"), "/k/config");
+        assert_eq!(shell_quote("rke2-a_b.c:d"), "rke2-a_b.c:d");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("/my dir/kube"), "'/my dir/kube'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("a$b;c"), "'a$b;c'");
+    }
 
     #[test]
     fn strips_csi_osc_and_controls() {

@@ -1752,3 +1752,41 @@ fn a_build_or_an_update_between_the_y_and_the_lock_is_refused() {
     s.resolve(&mut lock, Ok(()));
     assert_eq!(state(&s, "luna"), RollState::Checking);
 }
+
+/// The by-hand command is meant to be pasted into a shell: a kubeconfig path with a space and a
+/// single quote, and a context with a space, are quoted (POSIX single quotes), in the roll's note
+/// and so in the Log run line and the action-log row.
+#[test]
+fn the_by_hand_command_quotes_a_kubeconfig_and_a_context_that_need_it() {
+    let mut s = settled(config_with(draining(), 2));
+    s.send(Event::UpdateAll);
+    let mut k = take_kube(&mut s);
+    assert_eq!(k.operation.op, KubeOp::Context);
+    s.resolve(
+        &mut k,
+        Ok(KubeReply::Cluster(ClusterId {
+            context: "my ctx".to_owned(),
+            server: "https://10.0.0.1:6443".to_owned(),
+            kubeconfig: "/my dir/it's/config".to_owned(),
+        })),
+    );
+    let mut k = take_kube(&mut s);
+    s.resolve(&mut k, Ok(KubeReply::Nodes(healthy_cluster())));
+    s.send(Event::ConfirmAnswer(true));
+    pass_checks(&mut s, "luna");
+    let mut drain = take_kube(&mut s);
+    s.resolve(&mut drain, Ok(KubeReply::Done));
+    let mut a = take_action(&mut s, "luna");
+    s.resolve(&mut a, ended(ActionResult::Failed));
+    let by_hand = r"kubectl --kubeconfig '/my dir/it'\''s/config' --context 'my ctx' uncordon luna";
+    match state(&s, "luna") {
+        RollState::Failed(why) => assert!(why.contains(by_hand), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(log_lines(&s).iter().any(|l| l.contains(by_hand)));
+    assert!(
+        s.logs
+            .iter()
+            .any(|l| matches!(&l.op, LogOp::End { text, .. } if text.contains(by_hand)))
+    );
+}

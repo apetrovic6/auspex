@@ -54,6 +54,7 @@ use std::fmt::Write as _;
 
 use auspex_domain::preflight::TreeState;
 use auspex_domain::roll::{self, Candidate, ClusterId, Group, Member, Node};
+use auspex_domain::text::shell_quote;
 use crux_core::Command;
 use crux_core::render::render;
 
@@ -253,10 +254,10 @@ impl Roll {
     fn kubectl_prefix(&self) -> String {
         let mut prefix = "kubectl".to_owned();
         if let Some(k) = &self.kubeconfig {
-            let _ = write!(prefix, " --kubeconfig {k}");
+            let _ = write!(prefix, " --kubeconfig {}", shell_quote(k));
         }
         if let Some(c) = &self.context {
-            let _ = write!(prefix, " --context {c}");
+            let _ = write!(prefix, " --context {}", shell_quote(c));
         }
         prefix
     }

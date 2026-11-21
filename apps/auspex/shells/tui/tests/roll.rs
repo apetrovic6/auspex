@@ -38,6 +38,10 @@ struct World {
     db: PathBuf,
 }
 
+/// The kubeconfig file name: a space and a single quote in it, so that every command the shell
+/// builds by hand must be quoted to be pasted.
+const KUBECONFIG: &str = "kube config's";
+
 impl World {
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
@@ -62,7 +66,7 @@ impl World {
     /// A call as the log shows it, for this world's kubeconfig.
     fn kc(&self, rest: &str) -> String {
         format!(
-            "--kubeconfig {}/kubeconfig {rest}",
+            "--kubeconfig {}/{KUBECONFIG} {rest}",
             self.dir.path().display()
         )
     }
@@ -220,7 +224,7 @@ fn world_in(
     let nix = t.script(dir.path(), "nix", "exit 0");
     let kubectl = t.script(dir.path(), "kubectl", kubectl);
     let real = Real::for_actions(nix.into_os_string(), Some(clan))
-        .with_kubectl(kubectl.into_os_string(), dir.path().join("kubeconfig"));
+        .with_kubectl(kubectl.into_os_string(), dir.path().join(KUBECONFIG));
     let backend = Backend::Demo(Demo {
         real_actions: Some(Box::new(real)),
         ..Demo::default()
@@ -690,14 +694,15 @@ async fn quitting_mid_update_kills_clan_starts_nothing_and_names_the_cordon() {
     // The row of the action log says it too.
     let r = rows(&w.db, w.fleet.path(), "luna").await;
     assert_eq!(r.len(), 1, "{r:?}");
-    assert!(
-        r[0].detail.clone().unwrap_or_default().contains(&format!(
-            "kubectl --kubeconfig {}/kubeconfig --context rke2 uncordon luna",
-            w.dir.path().display()
-        )),
-        "{:?}",
-        r[0].detail
+    let detail = r[0].detail.clone().unwrap_or_default();
+    let by_hand = format!(
+        "kubectl --kubeconfig {} --context rke2 uncordon luna",
+        auspex_domain::text::shell_quote(&w.path(KUBECONFIG).display().to_string())
     );
+    assert!(detail.contains("is left cordoned"), "{detail:?}");
+    assert!(detail.contains(&by_hand), "{detail:?}");
+    // The shell's own report, written from its own record, quotes the same way.
+    assert!(report[0].contains(&by_hand), "{report:?}");
 }
 
 /// F2. A termination signal while luna's update runs does what a `q` does: `clan` is stopped,

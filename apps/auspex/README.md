@@ -227,7 +227,8 @@ client of its own and not `kubectl` over ssh.
   under way, the node **stays cordoned**: the machine may be half updated or broken, and workloads
   must not return to it unasked. That is said in the Log tab, the status bar (`LEFT CORDONED: luna`),
   the machine's row of the action log, and, whenever auspex leaves, on stderr after the terminal is
-  restored, each with the command (`kubectl --kubeconfig /home/me/.kube/config --context rke2 uncordon luna`: the same kubeconfig auspex used). If an
+  restored, each with the command, pasteable as it stands (the kubeconfig auspex used, quoted when
+  it needs it): `kubectl --kubeconfig /home/me/.kube/config --context rke2 uncordon luna`. If an
   uncordon that auspex owes cannot be made, the machine is failed and says the same.
 - `kubernetes.kubeconfig` takes a leading `~/` like `flake`; with no setting `$KUBECONFIG` is used
   when it names exactly one absolute path, else `~/.kube/config`. auspex never reads the file:
