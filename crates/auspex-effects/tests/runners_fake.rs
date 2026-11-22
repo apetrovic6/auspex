@@ -815,3 +815,121 @@ async fn a_transport_error_that_quotes_the_url_is_guarded_and_cut() {
     let e = a.runners.unwrap_err();
     assert!(e.chars().count() <= 301, "{}", e.chars().count());
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1 (review of PR #43)
+// ---------------------------------------------------------------------------------------
+
+/// B1: the guard runs on the text as it will be shown, after the sanitiser has taken out what it
+/// takes out. A token with a zero-width space, a bell or an escape sequence in the middle is not
+/// the token to the guard, and is the token again once sanitised.
+#[tokio::test]
+async fn a_token_split_by_what_the_sanitiser_removes_is_still_withheld() {
+    let (head, tail) = TOKEN.split_at(8);
+    let mut named = runner(1, &format!("{head}\u{200b}{tail}"), "idle");
+    named["labels"] = serde_json::json!(["docker", format!("{head}\u{7}{tail}")]);
+    named["version"] = serde_json::json!(format!("v{head}\u{1b}[0m{tail}"));
+    let Some(s) = serve(paged(
+        vec![named, runner(2, "alpha", "idle")],
+        serde_json::json!([]),
+    ))
+    .await
+    else {
+        return;
+    };
+    let got = ask(&s, &Scope::Admin, Some(&token()))
+        .await
+        .unwrap()
+        .runners
+        .unwrap();
+    let shown = format!("{got:?}");
+    assert!(!shown.to_ascii_lowercase().contains(TOKEN), "{shown}");
+    assert_eq!(got[0].name, "(withheld)");
+    assert_eq!(got[0].labels, ["docker", "(withheld)"]);
+    assert_eq!(got[0].version.as_deref(), Some("(withheld)"));
+    assert_eq!(got[1].name, "alpha", "the honest runner is as it was");
+}
+
+/// B3: Forgejo's lists are Go slices, and an empty one that was never built is `null`.
+#[tokio::test]
+async fn a_null_list_is_an_empty_one() {
+    let Some(s) = serve(|_| Reply::Json("null".into())).await else {
+        return;
+    };
+    let a = ask(&s, &Scope::Admin, None).await.unwrap();
+    assert_eq!(a.queued, Ok(0), "no jobs is an empty queue, not an error");
+    assert_eq!(a.runners, Ok(vec![]), "no runners is an empty list");
+    // Only `null` is: anything else that is not a list still is not.
+    let Some(s) = serve(|_| Reply::Json("null null".into())).await else {
+        return;
+    };
+    let a = ask(&s, &Scope::Admin, None).await.unwrap();
+    assert!(a.queued.is_err() && a.runners.is_err());
+}
+
+/// B4: the swagger's default for the runners list is only what the scope owns directly; `visible`
+/// asks for every runner visible to it, which is what `admin` is documented to list. Every scope
+/// has the parameter.
+#[tokio::test]
+async fn every_scope_asks_for_all_the_visible_runners() {
+    for scope in [
+        Scope::Admin,
+        Scope::User,
+        Scope::Org("acme".into()),
+        Scope::Repo {
+            owner: "acme".into(),
+            name: "fleet".into(),
+        },
+    ] {
+        let Some(s) = serve(paged(vec![], serde_json::json!([]))).await else {
+            return;
+        };
+        ask(&s, &scope, None).await.unwrap().runners.unwrap();
+        let listing: Vec<_> = s
+            .seen()
+            .into_iter()
+            .filter(|r| !r.path().ends_with("/jobs"))
+            .collect();
+        assert!(!listing.is_empty(), "{scope}");
+        for r in listing {
+            assert_eq!(
+                r.query("visible").as_deref(),
+                Some("true"),
+                "{scope}: {}",
+                r.target
+            );
+            assert!(r.query("page").is_some() && r.query("limit").is_some());
+        }
+    }
+}
+
+/// N8: a queue of several thousand jobs is counted, as the bound on jobs says. A job is a few
+/// hundred bytes, so the body cap of a page (1 MiB) would have refused it first.
+#[tokio::test]
+async fn a_queue_of_several_thousand_jobs_is_counted() {
+    let jobs: Vec<_> = (0..6_000)
+        .map(|i| {
+            serde_json::json!({
+                "id": i, "name": "x".repeat(250), "status": "waiting",
+                "runs_on": ["docker"], "needs": [], "task_id": 0,
+            })
+        })
+        .collect();
+    let body = serde_json::Value::Array(jobs).to_string();
+    assert!(body.len() > 1024 * 1024, "{}", body.len());
+    let Some(s) = serve(move |seen| {
+        Reply::Json(if seen.path().ends_with("/jobs") {
+            body.clone()
+        } else {
+            "[]".into()
+        })
+    })
+    .await
+    else {
+        return;
+    };
+    assert_eq!(
+        ask(&s, &Scope::Admin, None).await.unwrap().queued,
+        Ok(6_000)
+    );
+}

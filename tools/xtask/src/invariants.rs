@@ -209,12 +209,39 @@ pub fn check() -> Result<Report> {
     step!(the_scheduled_checkout_persists_no_credentials);
     step!(the_publish_step_receives_its_secrets);
     step!(swift_keywords::facet_names_are_legal_swift_identifiers);
+    step!(readmes_start_with_a_title);
 
     Ok(Report {
         checked,
         problems,
         breakdown,
     })
+}
+
+/// Every `README.md` opens with a heading: its first line that is not blank starts with `#`.
+///
+/// A line above the title renders as a stray paragraph before it, and nothing else would notice:
+/// a table row meant for the keys table, put at the top of the file by an edit aimed at the wrong
+/// place, did exactly that (AUS-19). Build output and nested checkouts are not the repository's.
+fn readmes_start_with_a_title(root: &Path, checked: &mut usize, problems: &mut Vec<String>) {
+    let mut files = Vec::new();
+    crate::rename::walk(root, &mut files);
+    files.sort();
+    for file in files
+        .iter()
+        .filter(|f| f.file_name().is_some_and(|n| n == "README.md"))
+    {
+        *checked += 1;
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        let first = text.lines().find(|l| !l.trim().is_empty());
+        if !first.is_some_and(|l| l.starts_with('#')) {
+            let shown = file.strip_prefix(root).unwrap_or(file).display();
+            problems.push(format!(
+                "{shown} does not open with a heading: its first line is {:?}",
+                first.unwrap_or("(empty)")
+            ));
+        }
+    }
 }
 
 /// The glob list this file reasons about must be the one Cargo actually uses.
@@ -2903,6 +2930,47 @@ mod tests {
         category_dirs_have_guards(&fixture.root, &mut checked, &mut problems)
             .expect("the fixture manifest parses");
         problems
+    }
+
+    /// A README opens with its title. A line put above it (a table row an edit aimed at the wrong
+    /// place, once) renders as a stray paragraph before the title, and nothing else notices.
+    #[test]
+    fn a_readme_opens_with_a_heading() {
+        let fixture = Fixture::new("readme-title");
+        fixture
+            .file("README.md", "# product\n\ntext\n")
+            .file(
+                "apps/a/README.md",
+                "| `R` | a key row, above the title |\n\n# a\n",
+            )
+            .file("crates/b/README.md", "\n# b with a blank line first\n")
+            .file("crates/c/README.md", "no heading at all\n")
+            .file("crates/d/README.md", "")
+            .file(
+                "crates/e/README.md",
+                "## a second-level heading is a heading\n",
+            )
+            .file(
+                "target/debug/README.md",
+                "build output is not the repository's\n",
+            );
+        let (mut checked, mut problems) = (0, Vec::new());
+        readmes_start_with_a_title(&fixture.root, &mut checked, &mut problems);
+        problems.sort();
+        let bad = [
+            "apps/a/README.md",
+            "crates/c/README.md",
+            "crates/d/README.md",
+        ];
+        assert_eq!(problems.len(), bad.len(), "{problems:?}");
+        for (problem, file) in problems.iter().zip(bad) {
+            assert!(
+                problem.contains(file) && problem.contains("heading"),
+                "{problem}"
+            );
+        }
+        // The README with a blank line first still opens with its heading: first non-blank line.
+        assert_eq!(checked, 6, "every README but the one in target/");
     }
 
     #[test]

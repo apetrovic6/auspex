@@ -990,3 +990,207 @@ async fn runners_wiring_child() {
     }
     shell.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------------------
+// Fix round 1 (review of PR #43)
+// ---------------------------------------------------------------------------------------
+
+/// N1: `note_runners` runs with every frame. One forge answering and another failing is a steady
+/// state, and the failure is written once, not once a frame.
+#[tokio::test(start_paused = true)]
+async fn a_failing_forge_beside_a_good_one_is_logged_once_however_often_it_is_drawn() {
+    let shell = settled_demo().await;
+    let slots = [
+        slot(
+            "forge.example.org",
+            "admin",
+            answered(vec![runner("alpha", "idle")], Ok(0)).into(),
+        ),
+        slot(
+            "forge.example.org:8443",
+            "admin",
+            Some(ForgeAnswer {
+                runners: Err("forge: the forge answered HTTP 502".to_owned()),
+                queued: Err("forge: the forge answered HTTP 502".to_owned()),
+            }),
+        ),
+    ];
+    let view = with_report(&shell.view(), &slots, &[], &RunnersConfig::default());
+    for _ in 0..5 {
+        shell.note_runners(&view);
+    }
+    let n = shell
+        .log
+        .lines()
+        .iter()
+        .filter(|l| l.starts_with("Runners:"))
+        .count();
+    assert_eq!(n, 1, "{:?}", shell.log.lines());
+}
+
+/// N1: two entries on one host are two headings, each with its own runners.
+#[tokio::test(start_paused = true)]
+async fn each_forge_entry_shows_only_its_own_runners() {
+    let shell = settled_demo().await;
+    let slots = [
+        slot(
+            "forge.example.org",
+            "admin",
+            answered(vec![runner("alpha", "idle")], Ok(0)).into(),
+        ),
+        slot(
+            "forge.example.org:8443",
+            "admin",
+            answered(vec![runner("beta", "idle")], Ok(0)).into(),
+        ),
+    ];
+    let view = with_report(&shell.view(), &slots, &[], &RunnersConfig::default());
+    let lines: Vec<String> = auspex_tui::runners::lines(&view.report, 116)
+        .into_iter()
+        .map(|(_, l)| l)
+        .collect();
+    let at = |needle: &str| lines.iter().position(|l| l.starts_with(needle)).unwrap();
+    let (first, second) = (
+        at("forge.example.org (admin)"),
+        at("forge.example.org:8443"),
+    );
+    assert!(first < at("alpha") && at("alpha") < second, "{lines:?}");
+    assert!(second < at("beta"), "{lines:?}");
+}
+
+/// N6, T1: a stopped unit turns the row red in the tab as well as in `--json`: the line is `Red`
+/// even when the same row is also near its memory cap (the warning colour must not win).
+#[tokio::test(start_paused = true)]
+async fn the_tab_draws_a_down_unit_red_even_beside_a_memory_warning() {
+    use auspex_tui::runners::Kind;
+    let trouble = trouble_view().await;
+    let alpha = trouble
+        .report
+        .runners
+        .iter()
+        .find(|r| r.name.as_deref() == Some("alpha"))
+        .unwrap();
+    assert!(alpha.is_red() && alpha.badges.len() == 2, "{alpha:?}");
+    for width in [36, 116] {
+        let lines = auspex_tui::runners::lines(&trouble.report, width);
+        let alpha_line = lines.iter().find(|(_, l)| l.starts_with("alpha")).unwrap();
+        assert_eq!(alpha_line.0, Kind::Red, "{width}: {alpha_line:?}");
+        // The rest of the row, in a narrow pane, is as red as its first line.
+        if width < 100 {
+            let n = lines.iter().position(|l| l == alpha_line).unwrap();
+            assert_eq!(lines[n + 1].0, Kind::Red, "{:?}", lines[n + 1]);
+        }
+        // A forge that failed is red; one still being asked and a note are not.
+        assert!(
+            lines
+                .iter()
+                .any(|(k, l)| *k == Kind::Red && l.contains("refused"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(k, l)| *k == Kind::Note && l.starts_with("busy:"))
+        );
+    }
+    // Memory near the cap alone is the warning colour.
+    let calm_warn = {
+        let shell = settled_demo().await;
+        let machines = [MachineFacts {
+            name: "alpha",
+            units: None,
+            memory: Some(auspex_domain::observe::Memory {
+                total_bytes: 16 * GIB,
+                available_bytes: 16 * GIB - 4 * GIB + 100 * 1024 * 1024,
+            }),
+            load: None,
+        }];
+        let config = RunnersConfig {
+            hosts: BTreeMap::from([(
+                "alpha".to_owned(),
+                HostCaps {
+                    cpus: None,
+                    memory_bytes: Some(4 * GIB),
+                },
+            )]),
+            ..RunnersConfig::default()
+        };
+        with_report(
+            &shell.view(),
+            &[slot(
+                "forge.example.org",
+                "admin",
+                answered(vec![runner("alpha", "idle")], Ok(0)).into(),
+            )],
+            &machines,
+            &config,
+        )
+    };
+    let lines = auspex_tui::runners::lines(&calm_warn.report, 116);
+    assert_eq!(
+        lines
+            .iter()
+            .find(|(_, l)| l.starts_with("alpha"))
+            .unwrap()
+            .0,
+        Kind::Warn
+    );
+}
+
+/// N3: the refresh state and the pending count stay on the status bar at 40 columns whether or not
+/// runners are configured (they were before `[runners]`); the runners line follows them.
+#[tokio::test(start_paused = true)]
+async fn the_status_bar_keeps_its_refresh_state_and_pending_count_beside_the_runners() {
+    let calm = calm_view().await;
+    let off = settled_demo().await.view();
+    let narrow = bar(&calm, 40);
+    let plain = bar(&off, 40);
+    assert!(
+        narrow.contains("settled") && narrow.contains("0 pending"),
+        "{narrow}"
+    );
+    // What the bar says without `[runners]` is not pushed off by having it.
+    assert!(
+        narrow.starts_with("OBSERVE │ settled │ 0 pending")
+            && plain.starts_with("OBSERVE │ settled │ 0 pending"),
+        "{narrow} / {plain}"
+    );
+    // With room, all of it, in that order.
+    let wide = bar(&calm, 140);
+    let at = |w: &str| wide.find(w).unwrap_or_else(|| panic!("{w} in {wide}"));
+    assert!(
+        at("settled") < at("0 pending") && at("0 pending") < at("runners: 7/8"),
+        "{wide}"
+    );
+}
+
+/// N1: the log's memory of what it already wrote is by entry, not by name: a view whose entries
+/// share a name (nothing the config can make now, but a report is a value) still logs once.
+#[tokio::test(start_paused = true)]
+async fn the_log_remembers_by_entry_and_not_by_name() {
+    let shell = settled_demo().await;
+    let down = |why: &str| {
+        Some(ForgeAnswer {
+            runners: Err(why.to_owned()),
+            queued: Err(why.to_owned()),
+        })
+    };
+    let slots = [
+        slot(
+            "same",
+            "admin",
+            answered(vec![runner("alpha", "idle")], Ok(0)).into(),
+        ),
+        slot("same", "admin", down("forge: the forge answered HTTP 502")),
+    ];
+    let view = with_report(&shell.view(), &slots, &[], &RunnersConfig::default());
+    for _ in 0..5 {
+        shell.note_runners(&view);
+    }
+    let n = shell
+        .log
+        .lines()
+        .iter()
+        .filter(|l| l.starts_with("Runners:"))
+        .count();
+    assert_eq!(n, 1, "{:?}", shell.log.lines());
+}

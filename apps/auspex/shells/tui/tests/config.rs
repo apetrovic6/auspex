@@ -923,3 +923,107 @@ fn two_entries_on_different_hosts_keep_their_host_alone() {
         .collect();
     assert_eq!(names, ["a.example.org", "b.example.org"]);
 }
+
+/// N1: two entries are told apart by everything that tells two forges apart (host, port, path),
+/// then by scope, then by position: a name two entries share would put each one's runners under
+/// both headings and make `--json` unable to say whose a row is.
+#[test]
+fn every_runners_forge_has_a_name_of_its_own() {
+    let names = |toml: &str| -> Vec<String> {
+        config::parse(toml)
+            .unwrap()
+            .0
+            .runners
+            .unwrap()
+            .forges
+            .into_iter()
+            .map(|f| f.name)
+            .collect()
+    };
+    let entry = |url: &str, scope: &str| {
+        format!("[[runners.forge]]\nurl = \"{url}\"\nscope = \"{scope}\"\n")
+    };
+    // Another port, another path: other forges, named so, with no scope needed.
+    assert_eq!(
+        names(&format!(
+            "{}{}{}",
+            entry("https://forge.example.org", "admin"),
+            entry("https://forge.example.org:8443", "admin"),
+            entry("https://forge.example.org/forgejo/", "admin"),
+        )),
+        [
+            "forge.example.org",
+            "forge.example.org:8443",
+            "forge.example.org/forgejo"
+        ]
+    );
+    // The port that is the scheme's own is no part of the name.
+    assert_eq!(
+        names(&entry("https://forge.example.org:443", "user")),
+        ["forge.example.org"]
+    );
+    // The same forge twice, by scope.
+    assert_eq!(
+        names(&format!(
+            "{}{}",
+            entry("https://forge.example.org", "admin"),
+            entry("https://forge.example.org", "user")
+        )),
+        ["forge.example.org (admin)", "forge.example.org (user)"]
+    );
+    // The same forge and scope twice (two tokens, say): by position.
+    assert_eq!(
+        names(&format!(
+            "{}{}{}",
+            entry("https://forge.example.org", "admin"),
+            entry("https://forge.example.org", "admin"),
+            entry("https://forge.example.org", "admin"),
+        )),
+        [
+            "forge.example.org (admin)",
+            "forge.example.org (admin) #2",
+            "forge.example.org (admin) #3"
+        ]
+    );
+    // Never two the same, whatever the mix.
+    let all = names(&format!(
+        "{}{}{}{}",
+        entry("https://a.example.org", "admin"),
+        entry("https://a.example.org", "admin"),
+        entry("https://a.example.org:8443", "admin"),
+        entry("https://a.example.org", "user"),
+    ));
+    let mut sorted = all.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), all.len(), "{all:?}");
+}
+
+/// B2: a `unit_glob` that starts with `-` is a `systemctl` option, not a pattern, and is refused at
+/// load, each of them naming the key and none quoted.
+#[test]
+fn a_unit_glob_that_is_an_option_is_refused_at_load() {
+    let forge = "[[runners.forge]]\nurl = \"https://forge.example.org\"\n";
+    for bad in [
+        "-Hroot@host.example.org",
+        "-Mother",
+        "-thelp",
+        "--user",
+        "-",
+        "-x*",
+    ] {
+        let e = config::parse(&format!("{forge}[runners]\nunit_glob = \"{bad}\"\n")).unwrap_err();
+        assert!(
+            e.contains("`runners.unit_glob`") && e.contains("must not start with `-`"),
+            "{bad}: {e}"
+        );
+        if bad.len() > 2 {
+            assert!(!e.contains(bad), "{bad}: {e}");
+        }
+    }
+    // A hyphen anywhere else is a unit name's own.
+    for ok in ["gitea-runner-*", "a-", "x-y-z"] {
+        let (s, _) = config::parse(&format!("{forge}[runners]\nunit_glob = \"{ok}\"\n")).unwrap();
+        assert_eq!(s.runners.unwrap().unit_glob, ok);
+    }
+}

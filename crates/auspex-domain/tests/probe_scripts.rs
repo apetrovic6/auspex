@@ -516,7 +516,7 @@ gitea-runner-gamma\\x2ddocker.service loaded inactive dead Gitea Actions Runner 
 gitea-runner-ghost.service not-found inactive dead gitea-runner-ghost.service";
 
 const UNITS_ARGS: &str =
-    "list-units --type=service --all --plain --no-legend --no-pager gitea-runner-*";
+    "list-units --type=service --all --plain --no-legend --no-pager -- gitea-runner-*";
 
 static RUNNER_CASES: &[(&str, &str)] = &[
     ("is-system-running", "running"),
@@ -525,7 +525,7 @@ static RUNNER_CASES: &[(&str, &str)] = &[
     // What a script that listed without being asked would run: an empty glob. systemctl would
     // answer, so only the script's own rule keeps the key out.
     (
-        "list-units --type=service --all --plain --no-legend --no-pager ",
+        "list-units --type=service --all --plain --no-legend --no-pager -- ",
         RUNNER_UNITS,
     ),
 ];
@@ -593,30 +593,41 @@ fn runner_units_are_listed_only_when_asked_and_only_loaded_ones() {
     assert_eq!(observed(r.run(&script)).runner_units, Some(vec![]));
 }
 
+/// N4: more units than the bound make the list unreadable, as for the forge's lists (past a bound
+/// the answer is an error, never a truncated list believed as the truth): the script reports one
+/// past the bound and the parser refuses it. Exactly the bound is fine.
 #[test]
-fn the_unit_list_is_bounded_at_sixty_four() {
+fn a_unit_list_past_the_bound_is_refused_not_cut() {
     use auspex_domain::observe::{MAX_RUNNER_UNITS, probe_script_with};
 
     let Some((sh, tools)) = host_tools() else {
         return;
     };
-    let mut many = String::new();
-    for i in 0..100 {
-        let _ = writeln!(many, "gitea-runner-r{i}.service loaded active running d");
+    for (count, kept) in [
+        (MAX_RUNNER_UNITS, Some(MAX_RUNNER_UNITS)),
+        (MAX_RUNNER_UNITS + 1, None),
+        (100, None),
+    ] {
+        let mut many = String::new();
+        for i in 0..count {
+            let _ = writeln!(many, "gitea-runner-r{i}.service loaded active running d");
+        }
+        let many: &'static str = Box::leak(many.trim_end().to_owned().into_boxed_str());
+        let cases: &'static [(&str, &str)] = Box::leak(Box::new([
+            ("is-system-running", "running"),
+            ("--failed --output=json --no-pager", "[]"),
+            (UNITS_ARGS, many),
+        ]));
+        let r = nixos_root("runners-many", &sh, &tools);
+        let sys = r.system(SYSTEM, KERNEL_NEW, &unit_bins(cases));
+        r.link("run/current-system", &sys);
+        let script = probe_script_with(MachineClass::Nixos, "gitea-runner-*").unwrap();
+        let units = observed(r.run(&script)).runner_units;
+        assert_eq!(units.as_ref().map(Vec::len), kept, "{count} units");
+        if let Some(units) = units {
+            assert_eq!(units[0].unit, "gitea-runner-r0.service");
+        }
     }
-    let many: &'static str = Box::leak(many.trim_end().to_owned().into_boxed_str());
-    let cases: &'static [(&str, &str)] = Box::leak(Box::new([
-        ("is-system-running", "running"),
-        ("--failed --output=json --no-pager", "[]"),
-        (UNITS_ARGS, many),
-    ]));
-    let r = nixos_root("runners-many", &sh, &tools);
-    let sys = r.system(SYSTEM, KERNEL_NEW, &unit_bins(cases));
-    r.link("run/current-system", &sys);
-    let script = probe_script_with(MachineClass::Nixos, "gitea-runner-*").unwrap();
-    let units = observed(r.run(&script)).runner_units.unwrap();
-    assert_eq!(units.len(), MAX_RUNNER_UNITS);
-    assert_eq!(units[0].unit, "gitea-runner-r0.service");
 }
 
 #[test]

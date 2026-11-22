@@ -1,1 +1,1 @@
-OBSERVE │ runners: 7/8 online, 2 busy, 3 queued │ settled │ 0 pending │ prom: ok                                  ? help
+OBSERVE │ settled │ 0 pending │ runners: 7/8 online, 2 busy, 3 queued │ prom: ok                                  ? help

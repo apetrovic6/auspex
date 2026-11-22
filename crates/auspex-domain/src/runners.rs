@@ -25,7 +25,7 @@
 //! name without the `<machine>-` prefix. A machine whose probe did not report units has no unit
 //! facts, and no row of it is ever called "unit down".
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
@@ -520,11 +520,16 @@ const fn is_up(a: UnitActive) -> bool {
     matches!(a, UnitActive::Active | UnitActive::Reloading)
 }
 
+/// The distinct runner names each machine was joined to, over every forge: what tells a machine
+/// with exactly one runner from one with several.
+type Joined<'a> = BTreeMap<&'a str, BTreeSet<&'a str>>;
+
 fn row_of(
     forge: &str,
     runner: &ForgeRunner,
     config: &RunnersConfig,
     machines: &[MachineFacts<'_>],
+    joined: &Joined<'_>,
 ) -> RunnerRow {
     let machine = machine_of(&runner.name, config, machines);
     let facts = machine.and_then(|n| machines.iter().find(|m| m.name == n));
@@ -532,10 +537,23 @@ fn row_of(
         let stripped = machine
             .and_then(|n| runner.name.strip_prefix(&format!("{n}-")))
             .map(str::to_owned);
-        units.iter().find(|u| {
-            let instance = instance_of(&u.unit, &config.unit_glob);
-            instance == runner.name || stripped.as_deref() == Some(&*instance)
-        })
+        units
+            .iter()
+            .find(|u| {
+                let instance = instance_of(&u.unit, &config.unit_glob);
+                instance == runner.name || stripped.as_deref() == Some(&*instance)
+            })
+            // The usual NixOS layout is one instance, `instances.default`, whose unit is
+            // `gitea-runner-default.service` and whose runner is named after the host: no name
+            // joins them. A machine with exactly one runner unit and exactly one runner (the same
+            // runner on two forges is one runner) has them be the same thing; with more of
+            // either, which is whose is not known, and none is guessed.
+            .or_else(|| match units {
+                [only] if machine.is_some_and(|n| joined.get(n).is_some_and(|r| r.len() == 1)) => {
+                    Some(only)
+                }
+                _ => None,
+            })
     });
     let caps = machine.and_then(|n| config.hosts.get(n));
     let memory = facts
@@ -621,6 +639,17 @@ pub fn report(
     config: &RunnersConfig,
 ) -> RunnersReport {
     let mut out = RunnersReport::default();
+    let mut joined: Joined<'_> = BTreeMap::new();
+    for runner in slots
+        .iter()
+        .filter_map(|s| s.answer.as_ref())
+        .filter_map(|a| a.runners.as_ref().ok())
+        .flatten()
+    {
+        if let Some(m) = machine_of(&runner.name, config, machines) {
+            joined.entry(m).or_default().insert(&runner.name);
+        }
+    }
     for slot in slots {
         let mut facts = ForgeFacts {
             forge: slot.forge.clone(),
@@ -641,7 +670,7 @@ pub fn report(
                     Ok(runners) => {
                         let mut rows: Vec<RunnerRow> = runners
                             .iter()
-                            .map(|r| row_of(&slot.forge, r, config, machines))
+                            .map(|r| row_of(&slot.forge, r, config, machines, &joined))
                             .collect();
                         rows.sort_by(|a, b| a.name.cmp(&b.name));
                         out.rows.extend(rows);
@@ -929,6 +958,114 @@ mod tests {
             &cfg,
         );
         assert_eq!(rep.rows[0].badges, [RunnerBadge::ForgeUpUnitDown]);
+    }
+
+    /// N6: every state the README names is pinned: a unit that is deactivating, in maintenance,
+    /// failed or inactive is down under an online runner; one that is reloading or active is up
+    /// under an offline one.
+    #[test]
+    fn each_unit_state_is_up_or_down_as_the_readme_says() {
+        let cfg = RunnersConfig::default();
+        let badges = |active: UnitActive, status: &str| {
+            let units = [unit("gitea-runner-alpha.service", active)];
+            let ms = [machine("alpha", Some(&units))];
+            report(&[slot("f", vec![runner("alpha", status)], 0)], &ms, &cfg).rows[0]
+                .badges
+                .clone()
+        };
+        for down in [
+            UnitActive::Inactive,
+            UnitActive::Failed,
+            UnitActive::Deactivating,
+            UnitActive::Maintenance,
+        ] {
+            assert_eq!(
+                badges(down, "idle"),
+                [RunnerBadge::ForgeUpUnitDown],
+                "{down:?}"
+            );
+            assert_eq!(
+                badges(down, "active"),
+                [RunnerBadge::ForgeUpUnitDown],
+                "{down:?}"
+            );
+            assert_eq!(badges(down, "offline"), [RunnerBadge::Offline], "{down:?}");
+        }
+        for up in [UnitActive::Active, UnitActive::Reloading] {
+            assert_eq!(badges(up, "idle"), Vec::<RunnerBadge>::new(), "{up:?}");
+            assert_eq!(
+                badges(up, "offline"),
+                [RunnerBadge::Offline, RunnerBadge::ForgeDownUnitUp],
+                "{up:?}"
+            );
+        }
+    }
+
+    /// N5: the common NixOS layout is one instance, `instances.default`, whose unit is
+    /// `gitea-runner-default.service` and whose runner is named after the host. When a machine
+    /// has exactly one runner unit and exactly one runner, they are the same thing.
+    #[test]
+    fn a_machine_with_one_unit_and_one_runner_joins_them_whatever_they_are_called() {
+        let cfg = RunnersConfig::default();
+        let one = [unit("gitea-runner-default.service", UnitActive::Failed)];
+        let ms = [machine("alpha", Some(&one))];
+        let rep = report(&[slot("f", vec![runner("alpha", "idle")], 0)], &ms, &cfg);
+        assert_eq!(rep.rows[0].badges, [RunnerBadge::ForgeUpUnitDown]);
+        assert_eq!(
+            rep.rows[0].unit.as_ref().unwrap().unit,
+            "gitea-runner-default.service"
+        );
+        // The same runner on two forges is one runner: both rows join.
+        let rep = report(
+            &[
+                slot("f", vec![runner("alpha", "idle")], 0),
+                slot("g", vec![runner("alpha", "idle")], 0),
+            ],
+            &ms,
+            &cfg,
+        );
+        assert!(rep.rows.iter().all(|r| r.unit.is_some()), "{rep:?}");
+        // Two runners on the machine: which unit is whose is not known, so none is guessed.
+        let rep = report(
+            &[slot(
+                "f",
+                vec![runner("alpha", "idle"), runner("alpha-b", "idle")],
+                0,
+            )],
+            &ms,
+            &cfg,
+        );
+        assert!(
+            rep.rows
+                .iter()
+                .all(|r| r.unit.is_none() && r.badges.is_empty()),
+            "{rep:?}"
+        );
+        // Two units for one runner: likewise.
+        let two = [
+            unit("gitea-runner-default.service", UnitActive::Failed),
+            unit("gitea-runner-other.service", UnitActive::Active),
+        ];
+        let ms2 = [machine("alpha", Some(&two))];
+        let rep = report(&[slot("f", vec![runner("alpha", "idle")], 0)], &ms2, &cfg);
+        assert!(rep.rows[0].unit.is_none() && rep.rows[0].badges.is_empty());
+        // A name that matches wins over the fallback, and a runner on no machine has no unit.
+        let named = [
+            unit("gitea-runner-alpha.service", UnitActive::Active),
+            unit("gitea-runner-default.service", UnitActive::Failed),
+        ];
+        let ms3 = [machine("alpha", Some(&named))];
+        let rep = report(&[slot("f", vec![runner("alpha", "idle")], 0)], &ms3, &cfg);
+        assert_eq!(
+            rep.rows[0].unit.as_ref().unwrap().unit,
+            "gitea-runner-alpha.service"
+        );
+        let rep = report(&[slot("f", vec![runner("gamma", "idle")], 0)], &ms, &cfg);
+        assert!(rep.rows[0].unit.is_none());
+        // A machine whose probe gave no units still has none to join.
+        let ms4 = [machine("alpha", None)];
+        let rep = report(&[slot("f", vec![runner("alpha", "idle")], 0)], &ms4, &cfg);
+        assert!(rep.rows[0].unit.is_none());
     }
 
     #[test]

@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use auspex_domain::roll::{RollRule, RollRules};
@@ -757,7 +758,11 @@ fn parse_runners(w: &mut Walk, value: &Value) -> Result<Option<RunnersSettings>,
                     let url = auspex_effects::forge::forge_url(&url)
                         .map_err(|e| format!("`{at}.url`: {e}"))?;
                     r.forges.push(RunnerForgeSettings {
-                        name: url.host_str().unwrap_or_default().to_owned(),
+                        name: forge_label(
+                            url.host_str().unwrap_or_default(),
+                            url.port(),
+                            url.path(),
+                        ),
                         url: url.to_string(),
                         scope,
                         token_file,
@@ -803,14 +808,43 @@ fn parse_runners(w: &mut Walk, value: &Value) -> Result<Option<RunnersSettings>,
         }
         return Ok(None);
     }
-    // Two entries on one host (admin and a repository, say) are told apart by their scope.
-    let names: Vec<String> = r.forges.iter().map(|f| f.name.clone()).collect();
-    for f in &mut r.forges {
-        if names.iter().filter(|n| **n == f.name).count() > 1 {
+    tell_apart(&mut r.forges);
+    Ok(Some(r))
+}
+
+/// Gives every entry a name of its own. Two entries with the same name (the same forge by two
+/// scopes, say) are told apart by their scope, and two that still share one (the same forge and
+/// scope with two tokens) by position: a name two entries share would put each one's runners under
+/// both headings, and `--json` could not say whose a row is.
+fn tell_apart(forges: &mut [RunnerForgeSettings]) {
+    let shared = |forges: &[RunnerForgeSettings], f: &RunnerForgeSettings| {
+        forges.iter().filter(|o| o.name == f.name).count() > 1
+    };
+    let by_scope: Vec<bool> = forges.iter().map(|f| shared(forges, f)).collect();
+    for (f, clash) in forges.iter_mut().zip(by_scope) {
+        if clash {
             f.name = format!("{} ({})", f.name, f.scope);
         }
     }
-    Ok(Some(r))
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for f in forges {
+        let nth = seen.entry(f.name.clone()).or_insert(0);
+        *nth += 1;
+        if *nth > 1 {
+            f.name = format!("{} #{nth}", f.name);
+        }
+    }
+}
+
+/// What a forge entry is called on screen: its host, with the port when it is not the scheme's
+/// own and the path when it is not the root, so two forges on one host are two names.
+fn forge_label(host: &str, port: Option<u16>, path: &str) -> String {
+    let mut name = host.to_owned();
+    if let Some(port) = port {
+        let _ = write!(name, ":{port}");
+    }
+    name.push_str(path.trim_end_matches('/'));
+    name
 }
 
 const fn type_name(v: &Value) -> &'static str {

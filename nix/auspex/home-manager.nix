@@ -160,13 +160,16 @@ in {
           token_file = optional (types.either types.str types.path) "A file holding a read-only API token for the forge, sent as `Authorization: token …`; a leading ~/ is your home directory. Never the token itself: it would be written to config.toml. auspex refuses a file that group or others can access (use mode 0600) or that you do not own, and strips one trailing newline. Without it the forge is asked anonymously (public repositories). A path value is written as its string, not copied into the store; a path inside the Nix store is refused, since the store is world-readable.";
         };
         runners = section {
-          unit_glob = optional (types.strMatching "[]A-Za-z0-9:_.@*?[-]{1,64}") "Which systemd units on a machine are CI runner units, as a glob (default `gitea-runner-*`, which is what the NixOS module `services.gitea-actions-runner` names its units: `gitea-runner-<name>.service`). The probe lists the matching services of every NixOS machine; darwin reports none. Letters, digits and `: _ . @ - * ? [ ]` only: it is written into a shell script.";
+          unit_glob = optional (types.strMatching "[]A-Za-z0-9:_.@*?[][]A-Za-z0-9:_.@*?[-]{0,63}") "Which systemd units on a machine are CI runner units, as a glob (default `gitea-runner-*`, which is what the NixOS module `services.gitea-actions-runner` names its units: `gitea-runner-<name>.service`). The probe lists the matching services of every NixOS machine; darwin reports none. Letters, digits and `: _ . @ - * ? [ ]` only, and not starting with `-` (systemctl would read it as an option): it is written into a shell script.";
           memory_warn_percent = optional (types.ints.between 1 100) "From this share of a host's memory cap (`runners.hosts.<machine>.memory`) a runner row is badged (default 90). Without a cap there is nothing to compare, and no badge.";
           forge = mkOption {
             default = [ ];
             description = "The forges whose CI runners the Runners tab (`R`) and the status bar's `runners: 7/8 online, 2 busy, 3 queued` show, and `runners` in --json. One entry each, as many as there are scopes to read. Omit them all to switch the view off: nothing is then read, asked or listed on any machine. Forgejo's API: GET /api/v1/{admin,user,orgs/<org>,repos/<owner>/<repo>}/actions/runners and .../runners/jobs.";
             type = types.listOf (table {
-              url = optional httpsUrl "The forge's URL; https only, without credentials (as `forge.url`).";
+              url = mkOption {
+                type = httpsUrl;
+                description = "The forge's URL; https only, without credentials (as `forge.url`). Required: an entry without it is refused here, as auspex refuses it at start.";
+              };
               scope = optional (types.strMatching "admin|user|org:${repoPart}|repo:${repoPart}/${repoPart}") "Whose runners to list: `admin` (the default: every runner of the instance, which needs a token with `read:admin`), `user` (the token owner's), `org:<name>` or `repo:<owner>/<name>`.";
               token_file = optional (types.either types.str types.path) "A file holding a read-only API token for this forge (as `forge.token_file`: mode 0600, yours, one trailing newline; a leading ~/ is your home directory; never the token itself; refused in the Nix store, which is world-readable). A forge whose token is refused shows that on its rows and is never asked anonymously instead.";
             });

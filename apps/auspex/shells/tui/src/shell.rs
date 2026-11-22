@@ -147,7 +147,7 @@ pub struct Shell {
     ci_noted: Mutex<Option<String>>,
     /// The reason each runners forge entry last had written to the log, by entry, so it is written
     /// once.
-    runners_noted: Mutex<std::collections::BTreeMap<String, String>>,
+    runners_noted: Mutex<std::collections::BTreeMap<usize, String>>,
     /// What `f` froze in a run with no state file (the demo, most tests): kept for the run, so
     /// that freezing and unfreezing work as they do with a file.
     frozen_in_memory: Mutex<BTreeSet<String>>,
@@ -335,7 +335,8 @@ impl Shell {
     pub fn note_runners(&self, view: &ViewModel) {
         let mut noted = lock(&self.runners_noted);
         let mut lines = Vec::new();
-        for f in &view.report.runner_forges {
+        // By position, not by name: the entries are in config order, and a name is only a label.
+        for (i, f) in view.report.runner_forges.iter().enumerate() {
             let reason = f
                 .error
                 .clone()
@@ -343,13 +344,13 @@ impl Shell {
             match reason {
                 // Answered well since: the next failure is news again.
                 None => {
-                    noted.remove(&f.forge);
+                    noted.remove(&i);
                 }
                 Some(_) if f.checking => {}
                 Some(reason) => {
-                    if noted.get(&f.forge) != Some(&reason) {
+                    if noted.get(&i) != Some(&reason) {
                         lines.push(format!("Runners: {}: {reason}", f.forge));
-                        noted.insert(f.forge.clone(), reason);
+                        noted.insert(i, reason);
                     }
                 }
             }

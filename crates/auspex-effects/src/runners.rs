@@ -10,7 +10,8 @@
 //! - **Time**: the whole of the runners listing shares one `timeout` (its pages included), and the
 //!   jobs request has one of its own; they run side by side, so the answer is at most `timeout`
 //!   late.
-//! - **Size**: a page is read up to [`BODY_CAP`] bytes.
+//! - **Size**: a page is read up to [`BODY_CAP`] bytes, and the jobs list up to [`JOBS_BODY_CAP`]
+//!   (10,000 jobs of a few hundred bytes each do not fit in a page's allowance).
 //! - **Count**: at most [`MAX_RUNNERS`] runners over at most [`MAX_PAGES`] pages, and at most
 //!   [`MAX_JOBS`] jobs, counted while the body is read: past any of them the answer is an error,
 //!   never a truncated list that would read as the truth.
@@ -42,6 +43,10 @@ use crate::http::{Call, HttpClient, base_url, join};
 ///
 /// A runner is about 400 bytes of JSON, so [`PAGE_SIZE`] of them are 20 KiB.
 pub const BODY_CAP: usize = 1024 * 1024;
+
+/// The largest jobs list read: 4 MiB. An `ActionRunJob` is 300 to 400 bytes, so this is what lets
+/// [`MAX_JOBS`] be the bound that acts, and not the cap on a page.
+pub const JOBS_BODY_CAP: usize = 4 * 1024 * 1024;
 
 /// The page size asked for. Forgejo clamps it to its own maximum (50 by default), which is why a
 /// short page does not end the listing: only an empty one, or one with nothing new, does.
@@ -98,6 +103,7 @@ async fn get(
     client: &HttpClient,
     url: &Url,
     token: Option<&Token>,
+    body_cap: usize,
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<Result<hyper::body::Bytes, String>, Cancelled> {
@@ -110,7 +116,7 @@ async fn get(
         url,
         accept: "application/json",
         timeout,
-        body_cap: BODY_CAP,
+        body_cap,
         authorization: authorization.as_ref(),
     };
     let (status, body) = match client.send_call(&call, cancel).await? {
@@ -169,6 +175,10 @@ fn capped<T: for<'de> Deserialize<'de>>(body: &[u8], max: usize) -> Result<Vec<T
             Ok(v)
         }
     }
+    // Forgejo's lists are Go slices, and a slice that was never built is `null`: an empty list.
+    if body.trim_ascii() == b"null" {
+        return Ok(Vec::new());
+    }
     let mut de = serde_json::Deserializer::from_slice(body);
     let items =
         serde::Deserializer::deserialize_seq(&mut de, Capped::<T>(max, std::marker::PhantomData))
@@ -184,12 +194,30 @@ fn capped<T: for<'de> Deserialize<'de>>(body: &[u8], max: usize) -> Result<Vec<T
     Ok(items)
 }
 
-fn shown(token: Option<&Token>, text: &str) -> String {
-    if token.is_some_and(|t| t.appears_in(text)) {
+/// `text` as it will be shown, or [`WITHHELD_TEXT`] when it holds the token.
+fn shown(token: Option<&Token>, text: String) -> String {
+    if token.is_some_and(|t| t.appears_in(&text)) {
         WITHHELD_TEXT.to_owned()
     } else {
-        text.to_owned()
+        text
     }
+}
+
+/// A runner from the forge's own words, **sanitised first and guarded second**, as
+/// [`reason_line`] does: the sanitiser removes control and format characters and escape sequences,
+/// so a token with one inserted is not the token to a guard that looks at the raw text and is the
+/// token again once cleaned. Every text that reaches output is checked as it will be shown.
+fn guarded_runner(token: Option<&Token>, item: &Item) -> ForgeRunner {
+    let mut r = ForgeRunner::new(
+        item.name.as_deref().unwrap_or(""),
+        item.status.as_deref().unwrap_or(""),
+        item.labels.as_deref().unwrap_or(&[]),
+        item.version.as_deref(),
+    );
+    r.name = shown(token, r.name);
+    r.labels = r.labels.into_iter().map(|l| shown(token, l)).collect();
+    r.version = r.version.map(|v| shown(token, v));
+    r
 }
 
 /// Every runner the scope lists, page by page, all within one `timeout`.
@@ -231,8 +259,12 @@ async fn pages(
         target
             .query_pairs_mut()
             .append_pair("page", &page.to_string())
-            .append_pair("limit", &PAGE_SIZE.to_string());
-        let body = match get(client, &target, token, timeout, cancel).await? {
+            .append_pair("limit", &PAGE_SIZE.to_string())
+            // The swagger's default is only the runners the scope owns directly; `admin` is
+            // documented to list every runner of the instance, and `org`/`repo` the global ones
+            // that serve them too.
+            .append_pair("visible", "true");
+        let body = match get(client, &target, token, BODY_CAP, timeout, cancel).await? {
             Ok(b) => b,
             Err(e) => return Ok(Err(e)),
         };
@@ -254,18 +286,7 @@ async fn pages(
             if found.len() == MAX_RUNNERS {
                 return Ok(Err(format!("forge: more than {MAX_RUNNERS} runners")));
             }
-            let labels: Vec<String> = item
-                .labels
-                .unwrap_or_default()
-                .iter()
-                .map(|l| shown(token, l))
-                .collect();
-            found.push(ForgeRunner::new(
-                &shown(token, item.name.as_deref().unwrap_or("")),
-                item.status.as_deref().unwrap_or(""),
-                &labels,
-                item.version.as_deref().map(|v| shown(token, v)).as_deref(),
-            ));
+            found.push(guarded_runner(token, &item));
         }
         if found.len() == before {
             return Ok(Ok(found));
@@ -296,7 +317,7 @@ async fn queued(
         Ok(u) => u,
         Err(e) => return Ok(Err(e)),
     };
-    let body = match get(client, &target, token, timeout, cancel).await? {
+    let body = match get(client, &target, token, JOBS_BODY_CAP, timeout, cancel).await? {
         Ok(b) => b,
         Err(e) => return Ok(Err(e)),
     };

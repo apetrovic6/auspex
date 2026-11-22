@@ -302,6 +302,15 @@ let
       forge = f: { forge = [ ({ url = "https://forge.example.org"; } // f) ]; };
     in builtins.all (g: (probe { unit_glob = g; }).unit_glob == g) [ "gitea-runner-*" "ci-?" "a[bc]-*.x" "r_1@:y" "x" ]
       && builtins.all (g: rejected { unit_glob = g; }) [ "" "a b" "a'b" "a;b" "a\"b" "a`b" "$(x)" "a\\b" "a/b" "é" (lib.fixedWidthString 65 "x" "") 1 ]
+      # systemctl reads options after the verb: a glob that starts with `-` is one (`-H user@host`
+      # makes it ssh somewhere), so it is refused here as the binary refuses it (B2).
+      && builtins.all (g: rejected { unit_glob = g; }) [ "-" "-Hroot@host.example.org" "-Mother" "-thelp" "--user" "-x*" ]
+      && builtins.all (g: (probe { unit_glob = g; }).unit_glob == g) [ "a-" "gitea-runner-*" "x-y-z" ]
+      # An entry says where its forge is: the binary refuses one without (`runners.forge[i].url is
+      # required`), so a switch fails here and not auspex at start (N7).
+      && rejected { forge = [ { scope = "user"; } ]; }
+      && rejected { forge = [ { url = "https://forge.example.org"; } { token_file = "/x"; } ]; }
+      && (probe { forge = [ { url = "https://forge.example.org"; } ]; }).forge != [ ]
       && (probe { unit_glob = lib.fixedWidthString 64 "x" ""; }).unit_glob == lib.fixedWidthString 64 "x" ""
       && (probe { memory_warn_percent = 1; }).memory_warn_percent == 1
       && (probe { memory_warn_percent = 100; }).memory_warn_percent == 100

@@ -34,7 +34,9 @@ use crate::text::{sanitize_line, sanitized_tail};
 //   prefixes `auspex_runner_glob='…'`, a value `valid_unit_glob` has checked, so quoting it is
 //   safe). The glob is quoted at its use, so the shell never expands it against the local
 //   directory. At most 64 units, only loaded ones (`not-found` is a name something referred to),
-//   and a failing `systemctl` prints no key at all: "could not be read" is not "no runner units".
+//   and a 65th is *reported*, which the parser refuses: a cut list believed as the whole is the
+//   opposite of the rule for the forge's lists.
+//   A failing `systemctl` prints no key at all: "could not be read" is not "no runner units".
 // - Uptime, disk and load are always collected; whether to use them or Prometheus's is the
 //   caller's decision (`merge_health`), and costs nothing extra in the same round trip.
 //
@@ -62,8 +64,8 @@ kv load "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
 kv root_disk_kb "$(df -Pk / 2>/dev/null | awk 'NR==2 {print $2 " " $3 " " $4}')"
 kv store_disk_kb "$(df -Pk /nix/store 2>/dev/null | awk 'NR==2 {print $2 " " $3 " " $4}')"
 if [ -n "${auspex_runner_glob:-}" ]; then
-  if units=$(systemctl list-units --type=service --all --plain --no-legend --no-pager "$auspex_runner_glob" 2>/dev/null); then
-    kv runner_units "$(printf '%s\n' "$units" | awk 'BEGIN {sep = ""; n = 0} { i = ($1 ~ /\.service$/) ? 1 : 2; if (n < 64 && $(i + 1) == "loaded") { printf "%s%s %s %s", sep, $i, $(i + 2), $(i + 3); sep = ";"; n++ } }')"
+  if units=$(systemctl list-units --type=service --all --plain --no-legend --no-pager -- "$auspex_runner_glob" 2>/dev/null); then
+    kv runner_units "$(printf '%s\n' "$units" | awk 'BEGIN {sep = ""; n = 0} { i = ($1 ~ /\.service$/) ? 1 : 2; if (n < 65 && $(i + 1) == "loaded") { printf "%s%s %s %s", sep, $i, $(i + 2), $(i + 3); sep = ";"; n++ } }')"
   fi
 fi
 printf 'auspex_end=1\n'
@@ -115,6 +117,12 @@ pub const MAX_UNIT_GLOB: usize = 64;
 pub fn valid_unit_glob(glob: &str) -> Result<(), String> {
     if glob.is_empty() || glob.len() > MAX_UNIT_GLOB {
         return Err(format!("must be 1 to {MAX_UNIT_GLOB} characters"));
+    }
+    // `systemctl` reads options after the verb, so a value that starts with `-` is an option
+    // (`-H user@host` makes it ssh somewhere, `--user` lists another manager's units), not a
+    // pattern. The script also passes `--`; this is the second lock on the same door.
+    if glob.starts_with('-') {
+        return Err("must not start with `-` (systemctl would read it as an option)".to_owned());
     }
     if !glob.bytes().all(|b| {
         b.is_ascii_alphanumeric()
@@ -1333,6 +1341,13 @@ mod tests {
             "a/b",
             "a\nb",
             "é",
+            // An option, not a pattern: systemctl reads options after the verb.
+            "-",
+            "-Hroot@host.example.org",
+            "-Mother",
+            "-thelp",
+            "--user",
+            "-x*",
             &"x".repeat(65),
         ] {
             assert!(valid_unit_glob(bad).is_err(), "{bad:?}");
@@ -1340,6 +1355,10 @@ mod tests {
         }
         let s = probe_script_with(MachineClass::Nixos, "gitea-runner-*").unwrap();
         assert!(s.starts_with("auspex_runner_glob='gitea-runner-*'\n"));
+        // Whatever the glob is, systemctl is told that what follows is not an option.
+        assert!(s.contains(" --no-pager -- \"$auspex_runner_glob\""), "{s}");
+        // A hyphen is fine anywhere but first.
+        assert!(valid_unit_glob("gitea-runner-*").is_ok() && valid_unit_glob("a-").is_ok());
         assert!(s.ends_with(NIXOS_PROBE));
         assert_eq!(
             probe_script(MachineClass::Nixos),

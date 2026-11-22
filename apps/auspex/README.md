@@ -1,4 +1,3 @@
-| `R` | The Runners tab (see *CI runners* below): every runner the configured forges list, with its machine's unit, memory against its cap and badges, and what each forge's queue holds. Read-only; `q` or `Esc` closes it. |
 # auspex
 
 The Crux app: one core holding the decisions, one terminal shell drawing them.
@@ -62,6 +61,7 @@ colour, and `A` turns it off again at once. In observe mode `u` and `s` only say
 | `s` | Act mode only. Suspends the TUI and opens `ssh` to the selected machine (see below); when ssh ends the TUI is back, and the status bar says `ssh to luna exited (code N)`. |
 | `f` | Freezes the machine: `u` refuses it from then on (`luna is frozen; f to unfreeze`) and a later `U` will skip it. Shows `❄` in the list and `frozen` in the detail panel. **Needs no act mode**, because it only prevents changes. On a frozen machine `f` asks `unfreeze luna? updates to it will be possible again. y/N` (answered like every question: only once it could be read). A freeze is kept across restarts, per fleet, in `$XDG_STATE_HOME/auspex/state.toml` (see *Freezing* below), and every freeze and unfreeze is a row in the action log. |
 | `L` | The Log tab: the streamed output of the current and last action, standard error in its own colour, the last 10 000 lines of each, following the tail until you scroll up (`k`, `Ctrl-u`, `gg`; `G` follows again). `Tab` switches to the adapters' notes. |
+| `R` | The Runners tab (see *CI runners* below): every runner the configured forges list, with its machine's unit, memory against its cap and badges, and what each forge's queue holds. Read-only; `q` or `Esc` closes it. |
 
 **`s` is your own ssh, not auspex's.** It runs `ssh -o ControlMaster=no -o ControlPath=<runtime dir>/auspex/%C [-p port] -- user@host` for the machine's target (the same user, host and port the probes use), with the terminal. auspex's own `-o` options come first, so your `ControlPath` and `ControlMaster` never apply, with a live master or without one. Your agent, your `SSH_ASKPASS` and your prompts (host keys, passwords, passphrases) work, because none of auspex's probe guards (`BatchMode`, no tty, askpass removed) apply to it. **Which connection it uses depends on whether auspex holds a live control master for that host.** If it does, the session is a channel on *that* connection: no second agent approval, but the connection is auspex's, so its settings decide the transport, not your `~/.ssh/config`: a keepalive of 5 s (a network drop of about 15 s ends the session: 5 s times `ServerAliveCountMax`, which is 3 unless the machine's options set it, 1 to 5, so 5 to 25 s; a direct ssh under your own keepalive settings might have survived it), and its `Compression`, `TCPKeepAlive` and `IPQoS`. What is per session still follows your config (`ForwardAgent`, `RemoteCommand`, `SendEnv`, the tty). If there is no live master, ssh connects directly under your `~/.ssh/config` entirely, and leaves no master behind (a socket left by a dead master makes ssh print `Control socket connect(...): Connection refused` first). While ssh runs auspex draws nothing and reads no key (its probes and an update's output carry on, and the Log tab has them when you are back), and Ctrl-C, Ctrl-\ and Ctrl-Z go to ssh: Ctrl-Z does not suspend it (auspex has no job control to bring it back, so a stopped ssh is continued at once). Signals: ssh is in auspex's process group, so the terminal's own signals reach auspex as well as ssh and auspex ignores them: that includes a `kill -INT` or `kill -QUIT` aimed at auspex from another terminal while ssh runs (SIGTERM and SIGHUP are obeyed, below). After ssh ends auspex waits 100 ms for a late copy of such a signal and discards it, which is a timing heuristic: on a very loaded machine one that is noticed later still quits auspex. The SIGTSTP handler, installed the first time you press `s`, stays for the rest of the run, so a `kill -TSTP` aimed at auspex itself no longer stops it. ssh may leave your terminal in raw mode (it cannot restore it when it is killed): auspex saves the terminal's modes before ssh and puts them back as soon as it ends, on every path. A panic in auspex while ssh runs writes only its message, as plain text with no escape sequences, to the terminal ssh is using; it does not touch the terminal's modes or screen. **To get back, leave ssh the way you would anywhere: `exit`, Ctrl-D, or `~.` on a new line.** Whatever its exit code, or if it was killed, the TUI redraws and says how it ended; keys typed to a dead ssh are discarded. If auspex is sent `SIGTERM` or `SIGHUP` while ssh runs, it ends ssh (`SIGTERM`, then `SIGKILL` after 3 s), leaves your terminal as it is (normal screen, cursor shown) and exits with 128 plus the signal. `s` is refused with a reason in observe mode ("act mode is off (A)"), for a machine whose target did not parse, and in `--demo` (nothing real to ssh to); `--plain` and `--json` never have it.
 
@@ -655,13 +655,21 @@ memory = "4GiB"
 **Three sources, joined.** A row is `(forge, runner name)`.
 
 1. **The forge** (Forgejo 15 / gitea 1.22): `GET /api/v1/{admin,user,orgs/<org>,repos/<owner>/<repo>}/actions/runners`
-   (paged: 50 a page, until an empty page) for each runner's `name`, `status` (`offline`, `idle`,
-   `active`), `labels` and `version`, and `…/actions/runners/jobs` for the jobs that are waiting.
+   for each runner's `name`, `status` (`offline`, `idle`, `active`), `labels` and `version`, and
+   `…/actions/runners/jobs` for the jobs that are waiting. The listing is paged (50 a page) and is
+   read until a page is empty or has nothing it has not seen (a forge that ignores `page` is not
+   read twice), and is asked with `visible=true`: the API's default is only the runners the scope
+   owns directly, and `visible` is what makes `admin` list every runner of the instance (and `org:`
+   and `repo:` the global ones that serve them too). A forge answers an empty list as `null`, which
+   is read as the empty list it is.
 2. **ssh**, NixOS only: the probe lists the systemd services matching `unit_glob`
-   (`systemctl list-units --type=service --all`, loaded units only, at most 64) in the round trip
-   it makes anyway. The glob is checked (letters, digits and `: _ . @ - * ? [ ]`: it is written into
-   a shell script) and the unit names and states are checked like the failed-unit list's: one
-   malformed entry makes the whole list unreadable, never half-believed. darwin reports nothing.
+   (`systemctl list-units --type=service --all -- <glob>`, loaded units only) in the round trip it
+   makes anyway. The glob is checked (letters, digits and `: _ . @ - * ? [ ]`, not starting with `-`:
+   it is written into a shell script, and systemctl reads options after the verb, so it also comes
+   after `--`) and the unit names and states are checked like the failed-unit list's: one
+   malformed entry makes the whole list unreadable, never half-believed. So does a list of more
+   than 64 units, which is refused and not cut: a cut list read as the whole would hide the runner
+   whose unit was cut. darwin reports nothing.
    The default matches what the NixOS module `services.gitea-actions-runner` names its units,
    `gitea-runner-<name>.service`; without a `[[runners.forge]]` the probe lists no units.
 3. **Prometheus**, when `[prometheus]` is configured: the host's memory in use (total less
@@ -672,8 +680,12 @@ memory = "4GiB"
 **Joining.** A runner is on the machine `[runners.machines]` names for it, else the machine whose
 name it equals or begins with `<machine>-` (the longest such machine). Its unit is that machine's
 runner unit whose instance name (`gitea-runner-<instance>.service`, the glob's literal prefix and
-systemd's `\x2d` escapes removed) equals the runner's name or its name without `<machine>-`. A
-machine whose probe did not report units has no unit facts and is never called "unit down".
+systemd's `\x2d` escapes removed) equals the runner's name or its name without `<machine>-`. Failing
+that, a machine with **exactly one runner unit and exactly one runner** (the same runner listed by
+two forges is one runner) has them be the same thing: that is the common NixOS layout, one
+`instances.default` whose unit is `gitea-runner-default.service` and whose runner is named after the
+host. With more of either, which is whose is not known and none is guessed. A machine whose probe
+did not report units has no unit facts and is never called "unit down".
 
 **Badges**, per row (the first three make it red; in `--json`, `badges`):
 
@@ -692,16 +704,21 @@ no mismatch badge. A forge status the API does not define is `unknown`: not onli
 job a runner is running, and the waiting-jobs payload has no time at all, so:
 
 - a busy runner is **busy**; which job it runs is not known and is not guessed;
-- the queue is a **count** of waiting jobs (those with status `waiting`, or none); there is no
-  "oldest has waited 12 minutes";
+- the queue is a **count** of waiting jobs (those with status `waiting`, or none; an empty list, or
+  `null`, is no jobs); there is no "oldest has waited 12 minutes". The request carries no `labels`
+  filter, which the API documents as "a comma separated list of labels to search for": **whether
+  Forgejo then matches every waiting job or only those whose labels fit the ones given has not been
+  checked against a real forge**, and if it is the second the count is of jobs no label filter
+  excludes, which may be fewer than are waiting;
 - there is **no "job running too long" badge**: the API does not say when a job began. It will be
   added when the API does.
 
 **A failing forge** shows on its own row, with the reason, and never delays a machine row or the
 refresh: every request is bounded (one timeout, `timeouts.probe`, for the whole listing and one
-for the queue, side by side; 1 MiB a page; at most 1,000 runners over 20 pages and 10,000 jobs,
+for the queue, side by side; 1 MiB a page, 4 MiB for the jobs list; at most 1,000 runners over 20 pages and 10,000 jobs,
 counted while the body is read, and past a bound the answer is an error, never a truncated list
-that would read as the truth). The runners and the queue fail independently: a token that may list
+that would read as the truth; the jobs list may be 4 MiB, since 10,000 jobs of a few hundred bytes
+each do not fit in a page's allowance). The runners and the queue fail independently: a token that may list
 runners and not jobs still shows the runners, with the queue `?`. The forge's reason is written to
 the Log tab once.
 

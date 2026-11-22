@@ -808,11 +808,12 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
     // is the one part that is about the commit and not about this refresh. After the mode it fits
     // whole at 40 columns in every state, 'unknown: set forge.repo' included.
     parts.extend(ci_text(view));
-    // After the badge, which keeps its place: the runners line is long (`runners: 7/8 online, 2 busy,
-    // 3 queued`) and is cut at 40 columns, where the tab (`R`) has all of it.
-    parts.extend(runners_text(view));
     parts.push(refresh.to_owned());
     parts.push(format!("{} pending", view.refresh.pending_machines));
+    // After the refresh state and the pending count, which stay on the bar at 40 columns as they
+    // always did: the runners line is long (`runners: 7/8 online, 2 busy, 3 queued`) and is cut
+    // there, where the tab (`R`) has all of it.
+    parts.extend(runners_text(view));
     // The action first: what is running (or how the last one ended) matters more than the scan.
     if let Some(a) = &view.action {
         parts.insert(1, action_text(a));
