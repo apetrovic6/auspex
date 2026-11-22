@@ -1,0 +1,24 @@
+┌ machines (18) ───────────────────────┐
+│┌ runners: not configured ───────────┐│
+││no [[runners.forge]] is configured:…││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+│└q/esc close ────────────────────────┘│
+└──────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ settled │ 0 pending │ prom: ok

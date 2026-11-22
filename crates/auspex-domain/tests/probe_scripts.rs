@@ -368,6 +368,7 @@ fn nixos_probe_runs_and_parses() {
                 "k3s.service".to_owned(),
                 r"dev-disk-by\x2duuid.mount".to_owned()
             ]),
+            runner_units: None,
             ssh_health: SshHealth {
                 uptime_seconds: Some(864_123),
                 root_disk: Some(DISK),
@@ -463,6 +464,7 @@ fn darwin_probe_runs_and_parses() {
             configuration_revision: None,
             system_state: None,
             failed_units: None,
+            runner_units: None,
             ssh_health: SshHealth {
                 uptime_seconds: Some(302_400),
                 root_disk: Some(DiskUsage {
@@ -503,4 +505,141 @@ fn darwin_probe_runs_and_parses() {
     let r = setup("darwin-dangling");
     r.link("run/current-system", &r.store(GONE));
     assert_eq!(observed(r.run(script)).current_system, None);
+}
+
+/// What `systemctl list-units --type=service --all --plain --no-legend --no-pager <glob>` prints:
+/// a failed unit may carry a leading bullet even with `--plain`, a unit systemd only knows by
+/// name is `not-found`, and a description has spaces in it.
+const RUNNER_UNITS: &str = "gitea-runner-alpha.service loaded active running Gitea Actions Runner alpha\n\
+● gitea-runner-beta.service loaded failed failed Gitea Actions Runner beta\n\
+gitea-runner-gamma\\x2ddocker.service loaded inactive dead Gitea Actions Runner gamma-docker\n\
+gitea-runner-ghost.service not-found inactive dead gitea-runner-ghost.service";
+
+const UNITS_ARGS: &str =
+    "list-units --type=service --all --plain --no-legend --no-pager -- gitea-runner-*";
+
+static RUNNER_CASES: &[(&str, &str)] = &[
+    ("is-system-running", "running"),
+    ("--failed --output=json --no-pager", "[]"),
+    (UNITS_ARGS, RUNNER_UNITS),
+    // What a script that listed without being asked would run: an empty glob. systemctl would
+    // answer, so only the script's own rule keeps the key out.
+    (
+        "list-units --type=service --all --plain --no-legend --no-pager -- ",
+        RUNNER_UNITS,
+    ),
+];
+
+static NO_RUNNER_CASES: &[(&str, &str)] = &[
+    ("is-system-running", "running"),
+    ("--failed --output=json --no-pager", "[]"),
+    (UNITS_ARGS, ""),
+];
+
+fn unit_bins(
+    list: &'static [(&'static str, &'static str)],
+) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
+    vec![("systemctl", list)]
+}
+
+#[test]
+fn runner_units_are_listed_only_when_asked_and_only_loaded_ones() {
+    use auspex_domain::observe::{RunnerUnit, UnitActive, probe_script_with};
+
+    let Some((sh, tools)) = host_tools() else {
+        return;
+    };
+    let r = nixos_root("runners", &sh, &tools);
+    let sys = r.system(SYSTEM, KERNEL_NEW, &unit_bins(RUNNER_CASES));
+    r.link("run/current-system", &sys);
+
+    // Not asked: the unit list is not collected at all.
+    let o = observed(r.run(probe_script(MachineClass::Nixos)));
+    assert_eq!(o.runner_units, None);
+
+    // Asked: the loaded units, bullet and escape and all; the `not-found` name is left out.
+    let script = probe_script_with(MachineClass::Nixos, "gitea-runner-*").unwrap();
+    let o = observed(r.run(&script));
+    let unit = |u: &str, active, sub: &str| RunnerUnit {
+        unit: u.to_owned(),
+        active,
+        sub: sub.to_owned(),
+    };
+    assert_eq!(
+        o.runner_units,
+        Some(vec![
+            unit("gitea-runner-alpha.service", UnitActive::Active, "running"),
+            unit("gitea-runner-beta.service", UnitActive::Failed, "failed"),
+            unit(
+                r"gitea-runner-gamma\x2ddocker.service",
+                UnitActive::Inactive,
+                "dead"
+            ),
+        ])
+    );
+    // The rest of the observation is as without the glob.
+    assert_eq!(o.system_state.as_deref(), Some("running"));
+
+    // A glob the shim does not know: systemctl answers nothing and exits 2, which is "could not
+    // be read" (no key), not "no runner units".
+    let script = probe_script_with(MachineClass::Nixos, "other-*").unwrap();
+    assert_eq!(observed(r.run(&script)).runner_units, None);
+
+    // systemctl answers and nothing matches: an empty list, which is a fact.
+    let r = nixos_root("runners-none", &sh, &tools);
+    let sys = r.system(SYSTEM, KERNEL_NEW, &unit_bins(NO_RUNNER_CASES));
+    r.link("run/current-system", &sys);
+    let script = probe_script_with(MachineClass::Nixos, "gitea-runner-*").unwrap();
+    assert_eq!(observed(r.run(&script)).runner_units, Some(vec![]));
+}
+
+/// N4: more units than the bound make the list unreadable, as for the forge's lists (past a bound
+/// the answer is an error, never a truncated list believed as the truth): the script reports one
+/// past the bound and the parser refuses it. Exactly the bound is fine.
+#[test]
+fn a_unit_list_past_the_bound_is_refused_not_cut() {
+    use auspex_domain::observe::{MAX_RUNNER_UNITS, probe_script_with};
+
+    let Some((sh, tools)) = host_tools() else {
+        return;
+    };
+    for (count, kept) in [
+        (MAX_RUNNER_UNITS, Some(MAX_RUNNER_UNITS)),
+        (MAX_RUNNER_UNITS + 1, None),
+        (100, None),
+    ] {
+        let mut many = String::new();
+        for i in 0..count {
+            let _ = writeln!(many, "gitea-runner-r{i}.service loaded active running d");
+        }
+        let many: &'static str = Box::leak(many.trim_end().to_owned().into_boxed_str());
+        let cases: &'static [(&str, &str)] = Box::leak(Box::new([
+            ("is-system-running", "running"),
+            ("--failed --output=json --no-pager", "[]"),
+            (UNITS_ARGS, many),
+        ]));
+        let r = nixos_root("runners-many", &sh, &tools);
+        let sys = r.system(SYSTEM, KERNEL_NEW, &unit_bins(cases));
+        r.link("run/current-system", &sys);
+        let script = probe_script_with(MachineClass::Nixos, "gitea-runner-*").unwrap();
+        let units = observed(r.run(&script)).runner_units;
+        assert_eq!(units.as_ref().map(Vec::len), kept, "{count} units");
+        if let Some(units) = units {
+            assert_eq!(units[0].unit, "gitea-runner-r0.service");
+        }
+    }
+}
+
+#[test]
+fn darwin_asks_for_no_units() {
+    use auspex_domain::observe::probe_script_with;
+
+    let Some((sh, tools)) = host_tools() else {
+        return;
+    };
+    let r = Root::new("darwin-runners", &sh, &tools);
+    let script = probe_script_with(MachineClass::Darwin, "gitea-runner-*").unwrap();
+    assert!(!script.contains("systemctl"));
+    r.file("proc/uptime", "1.0 1.0\n");
+    assert_eq!(observed(r.run(&script)).runner_units, None);
 }

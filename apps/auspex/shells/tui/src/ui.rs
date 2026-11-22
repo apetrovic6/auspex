@@ -263,6 +263,9 @@ pub fn draw(frame: &mut Frame, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>)
     if ui.input.diff_open {
         draw_diff(frame, main, view, ui, ctx);
     }
+    if ui.input.runners_open {
+        draw_runners(frame, main, view, ui, ctx);
+    }
     if view.help_open {
         draw_help(frame, main, ctx);
     }
@@ -776,7 +779,13 @@ pub fn ci_text(view: &ViewModel) -> Option<String> {
     })
 }
 
-/// The status bar's text: mode, the CI badge, refresh state, pending machines, Prometheus, fleet
+/// The runners summary as the status bar says it, or `None` without a `[[runners.forge]]`.
+#[must_use]
+pub fn runners_text(view: &ViewModel) -> Option<String> {
+    auspex_domain::runners::summary_line(&view.report.runner_forges, &view.report.runners)
+}
+
+/// The status bar's text: mode, the CI badge, the runners, refresh state, pending machines, Prometheus, fleet
 /// errors.
 #[must_use]
 pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
@@ -801,6 +810,10 @@ pub fn status_text(view: &ViewModel, ui: &Ui) -> (String, Option<String>) {
     parts.extend(ci_text(view));
     parts.push(refresh.to_owned());
     parts.push(format!("{} pending", view.refresh.pending_machines));
+    // After the refresh state and the pending count, which stay on the bar at 40 columns as they
+    // always did: the runners line is long (`runners: 7/8 online, 2 busy, 3 queued`) and is cut
+    // there, where the tab (`R`) has all of it.
+    parts.extend(runners_text(view));
     // The action first: what is running (or how the last one ended) matters more than the scan.
     if let Some(a) = &view.action {
         parts.insert(1, action_text(a));
@@ -1423,6 +1436,78 @@ fn draw_diff(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, ctx: 
                 theme.style(Role::Text),
             )),
             Kind::Note => Line::from(Span::styled(cut(text, width), theme.style(Role::Dim))),
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(shown), inner);
+}
+
+/// The runners tab (`R`): over the list, like the diff. Read-only; scrolled by the same keys.
+fn draw_runners(frame: &mut Frame, area: Rect, view: &ViewModel, ui: &mut Ui, ctx: &Context<'_>) {
+    use crate::runners::{self, Kind as RKind};
+    let theme = ctx.theme;
+    let rect = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    frame.render_widget(Clear, rect);
+    let inner_width = usize::from(rect.width.saturating_sub(2));
+    let lines = runners::lines(&view.report, inner_width);
+    let inner_height = usize::from(rect.height.saturating_sub(2));
+    let last_start = lines.len().saturating_sub(inner_height.max(1));
+    ui.input.runners_scroll = ui.input.runners_scroll.min(last_start);
+    let start = ui.input.runners_scroll;
+    let position = if lines.len() > inner_height {
+        format!(
+            " {}–{}/{} ",
+            start + 1,
+            (start + inner_height).min(lines.len()),
+            lines.len()
+        )
+    } else {
+        String::new()
+    };
+    let close = ctx
+        .keymap
+        .keys_for(Action::Quit)
+        .into_iter()
+        .find(|k| k == "q")
+        .map_or_else(
+            || ctx.keymap.keys_for(Action::Runners).join(" "),
+            |_| "q".to_owned(),
+        );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Span::styled(
+            cut(
+                &format!(" {} ", runners::title(&view.report)),
+                usize::from(rect.width.saturating_sub(4)),
+            ),
+            theme.style(Role::Title),
+        ))
+        .title_bottom(Span::styled(
+            format!("{position}{close}/esc close "),
+            theme.style(Role::Dim),
+        ))
+        .border_style(theme.style(Role::Dim))
+        .style(theme.base());
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let width = usize::from(inner.width);
+    let shown: Vec<Line> = lines
+        .iter()
+        .skip(start)
+        .take(inner_height)
+        .map(|(kind, text)| {
+            let role = match kind {
+                RKind::Heading => Role::Title,
+                RKind::Ok => Role::Text,
+                RKind::Warn => Role::Warning,
+                RKind::Red => Role::Error,
+                RKind::Note => Role::Dim,
+            };
+            Line::from(Span::styled(cut(text, width), theme.style(role)))
         })
         .collect();
     frame.render_widget(Paragraph::new(shown), inner);

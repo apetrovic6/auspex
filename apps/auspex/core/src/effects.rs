@@ -32,6 +32,7 @@ use auspex_domain::eval::EvalOutcome;
 use auspex_domain::fleet::{Machine, MachineClass, Target};
 use auspex_domain::observe::{ProbeOutcome, PromSample, StorePath};
 use auspex_domain::preflight::TreeState;
+use auspex_domain::runners::ForgeAnswer;
 use auspex_domain::status::NarCache;
 use crux_core::capability::Operation;
 use crux_core::macros::effect;
@@ -234,6 +235,27 @@ pub type ForgeStatusAnswer = Result<CiStatus, String>;
 
 impl Operation for ForgeStatusRequest {
     type Output = ForgeStatusAnswer;
+}
+
+/// List one forge entry's CI runners and its waiting jobs (the runners view).
+///
+/// One request per `[[runners.forge]]` entry, asked beside the machine list: a slow or failing
+/// forge shows on its own rows and never delays a machine row. The URL, the scope and the token
+/// are the shell's, found by `forge`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnersRequest {
+    /// This request.
+    pub id: RequestId,
+    /// The refresh it belongs to.
+    pub generation: Generation,
+    /// Which entry: its index in [`crate::RunnersSetup::forges`].
+    pub forge: usize,
+}
+
+impl Operation for RunnersRequest {
+    /// What the forge listed, or why not (the runners and the queue each fail on their own; no
+    /// text in it holds the token).
+    type Output = ForgeAnswer;
 }
 
 /// Ask the binary cache whether `store_path` is there (`HEAD <cache>/<hash>.narinfo`).
@@ -869,6 +891,8 @@ pub enum Effect {
     ForgeHead(ForgeHeadRequest),
     /// [`ForgeStatusRequest`]: the forge's combined status of that commit.
     ForgeStatus(ForgeStatusRequest),
+    /// [`RunnersRequest`]: one forge entry's runners and queue.
+    Runners(RunnersRequest),
     /// [`CacheRequest`].
     CacheLookup(CacheRequest),
     /// [`ResolveRequest`].

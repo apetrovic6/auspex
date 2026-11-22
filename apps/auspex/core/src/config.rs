@@ -20,6 +20,12 @@ pub struct Config {
     /// The CI badge, or `None` when `[forge]` is not configured (then nothing is read or asked:
     /// the badge is `off`).
     pub forge: Option<ForgeConfig>,
+    /// The CI runners view, or `None` when `[runners]` has no forge (then nothing is asked: the
+    /// view is empty and the status bar says nothing of runners).
+    ///
+    /// Boxed: `Config` is carried by `Event::Start`, and the setup would make it (and so every
+    /// event) larger than clippy accepts.
+    pub runners: Option<Box<RunnersSetup>>,
     /// Whether a binary cache (ncps) is configured. Without one the "already cached" question
     /// is never asked.
     pub binary_cache: bool,
@@ -79,6 +85,28 @@ pub struct ForgeConfig {
     pub host: String,
     /// `forge.repo` (`owner/name`), or `None` to read it from the `origin` remote.
     pub repo: Option<String>,
+}
+
+/// The runners view's settings the core decides with. The forges' URLs and tokens are the
+/// adapter's, as the badge's are; the core needs a name to show and the rules for joining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnersSetup {
+    /// The forge entries, in config order. A request names one by its index.
+    pub forges: Vec<RunnerForge>,
+    /// The joining rules and thresholds ([`auspex_domain::runners::report`]).
+    pub join: auspex_domain::runners::RunnersConfig,
+}
+
+/// One `[[runners.forge]]` entry, as the core shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerForge {
+    /// Its name on screen (its host; the scope too when two entries share a host).
+    pub forge: String,
+    /// Its scope as configured (`admin`, `user`, `org:<name>`, `repo:<owner>/<name>`).
+    pub scope: String,
+    /// Which forge it reads (host, port and path): two entries with the same site are two scopes of
+    /// one forge, and a runner both list is one runner.
+    pub site: String,
 }
 
 /// The package preview's settings. `None` in [`Config::diff`] means the preview is off: no

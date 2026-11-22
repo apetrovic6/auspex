@@ -1,0 +1,24 @@
+┌ machines (18) ───────────────────────┐
+│┌ runners: … ────────────────────────┐│
+││forge.example.org (admin): asking…  ││
+││busy: the forge does not say which  ││
+││job a runner runs                   ││
+││queued is a count of waiting jobs:  ││
+││the API gives no time to age them by││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+││                                    ││
+│└q/esc close ────────────────────────┘│
+└──────────────────────────────────────┘
+fleet demo:omnissiah
+OBSERVE │ settled │ 0 pending │ runners…

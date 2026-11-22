@@ -62,6 +62,10 @@ pub struct LogTab {
 
 /// The shell's own interaction state (the core keeps selection, search and help).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per overlay that can be open: the log, the diff, the runners and the narrow layout's detail"
+)]
 pub struct Input {
     /// A count being typed (`5` of `5j`).
     pub count: Option<usize>,
@@ -78,6 +82,10 @@ pub struct Input {
     /// Its first visible line. Only ever set by keys; the drawing clamps it to the list (and
     /// writes the clamped value back), so `G` can say "the end" without knowing how long it is.
     pub diff_scroll: usize,
+    /// The runners tab (`R`): every runner the forges list. Read-only, like the diff.
+    pub runners_open: bool,
+    /// Its first visible line, set and clamped as [`Self::diff_scroll`] is.
+    pub runners_scroll: usize,
     /// The Log tab's own state: which text, and where it is scrolled to.
     pub log: LogTab,
     /// A one-line message for the prompt row (an unknown command), until the next key.
@@ -177,6 +185,10 @@ impl Input {
                 self.diff_open = false;
                 return Vec::new();
             }
+            if self.runners_open {
+                self.runners_open = false;
+                return Vec::new();
+            }
             if self.log_open {
                 self.log_open = false;
                 return Vec::new();
@@ -218,7 +230,10 @@ impl Input {
         // Over the diff overlay a plain quit key (`q`, Esc by default) closes it; a quit key
         // that is a control chord (`ctrl-c` by default) still quits, as it does from help. It
         // is the keymap's own Quit binding either way, so a rebound or unbound chord follows.
-        if (self.diff_open || self.log_open) && action == Action::Quit && key.ctrl {
+        if (self.diff_open || self.log_open || self.runners_open)
+            && action == Action::Quit
+            && key.ctrl
+        {
             return vec![Event::Quit];
         }
         if screen.help_open && !matches!(action, Action::Help | Action::Quit) {
@@ -240,6 +255,9 @@ impl Input {
         let half = screen.page.max(1);
         if self.diff_open {
             return self.diff_action(action, n, half);
+        }
+        if self.runners_open {
+            return self.runners_action(action, n, half);
         }
         if self.log_open {
             return self.log_action(action, n, half);
@@ -306,8 +324,52 @@ impl Input {
                 self.diff_scroll = 0;
                 Vec::new()
             }
+            Action::Runners => {
+                self.runners_open = true;
+                self.runners_scroll = 0;
+                Vec::new()
+            }
             Action::Quit => vec![Event::Quit],
         }
+    }
+
+    /// What an action does while the runners tab is open: scroll it, or close it. As for the diff,
+    /// nothing else: the tab covers the list, and `q` closes it rather than quitting from under it.
+    /// The tab has no action of its own to take: it is read-only.
+    fn runners_action(&mut self, action: Action, n: usize, half: usize) -> Vec<Event> {
+        match action {
+            Action::Quit | Action::Runners => self.runners_open = false,
+            Action::Down => self.runners_scroll = self.runners_scroll.saturating_add(n),
+            Action::Up => self.runners_scroll = self.runners_scroll.saturating_sub(n),
+            Action::HalfPageDown => {
+                self.runners_scroll = self
+                    .runners_scroll
+                    .saturating_add(n.saturating_mul(half / 2).max(1));
+            }
+            Action::HalfPageUp => {
+                self.runners_scroll = self
+                    .runners_scroll
+                    .saturating_sub(n.saturating_mul(half / 2).max(1));
+            }
+            Action::Top => self.runners_scroll = 0,
+            Action::Bottom => self.runners_scroll = usize::MAX,
+            Action::Search
+            | Action::SearchNext
+            | Action::SearchPrevious
+            | Action::Refresh
+            | Action::Help
+            | Action::Command
+            | Action::Detail
+            | Action::Log
+            | Action::Diff
+            | Action::Act
+            | Action::Update
+            | Action::UpdateAll
+            | Action::Build
+            | Action::Shell
+            | Action::Freeze => {}
+        }
+        Vec::new()
     }
 
     /// What an action does while the package diff is open: scroll it, or close it. Nothing
@@ -339,6 +401,7 @@ impl Input {
             | Action::Command
             | Action::Detail
             | Action::Log
+            | Action::Runners
             | Action::Act
             | Action::Update
             | Action::UpdateAll
@@ -398,6 +461,7 @@ impl Input {
             | Action::Help
             | Action::Command
             | Action::Diff
+            | Action::Runners
             | Action::Act
             | Action::Update
             | Action::UpdateAll

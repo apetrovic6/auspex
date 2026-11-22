@@ -60,3 +60,23 @@ file = "~/.config/auspex/theme.toml"
 url = "https://forge.example.org"
 repo = "owner/fleet"
 token_file = "/home/me/.config/auspex/forge-token"
+
+[runners]
+unit_glob = "ci-runner-*"
+memory_warn_percent = 80
+
+[[runners.forge]]
+url = "https://forge.example.org"
+scope = "admin"
+token_file = "/home/me/.config/auspex/forge-admin-token"
+
+[[runners.forge]]
+url = "https://forge.example.org"
+scope = "repo:owner/fleet"
+
+[runners.hosts.alpha]
+cpus = 2
+memory = "4GiB"
+
+[runners.machines]
+"alpha-docker" = "alpha"

@@ -26,9 +26,14 @@ let
   hasColors = colors != null && builtins.all (slot: builtins.hasAttr slot colors) slots;
   theme = toml.generate "auspex-theme.toml"
     (lib.genAttrs slots (slot: "#${lib.removePrefix "#" colors.${slot}}"));
-  # Null is an option-level sentinel only: omit it and empty sections from TOML.
-  prune = value: if builtins.isAttrs value then
-    lib.filterAttrs (_: v: v != null && v != { }) (lib.mapAttrs (_: prune) value)
+  # Null is an option-level sentinel only: omit it and empty sections from TOML. A list is pruned
+  # item by item (`[[runners.forge]]` entries are tables with optional keys), and a list with
+  # nothing in it is omitted like an empty table: `runners.forge` defaults to `[ ]`, and writing
+  # `[runners]` with `forge = []` into every config would say something nobody did.
+  prune = value:
+    if builtins.isAttrs value then
+      lib.filterAttrs (_: v: v != null && v != { } && v != [ ]) (lib.mapAttrs (_: prune) value)
+    else if builtins.isList value then map prune value
     else value;
   # Except inside `rolling`: a tag with no keys is the rule "these machines update one at a time",
   # with the defaults, and pruning it away (as an empty section is) silently made its machines
@@ -54,6 +59,13 @@ let
   # `_` and `-`, each part 1 to 100 bytes and not `.` or `..` (POSIX ERE has no lookahead, so the
   # three ways a part can start without being a dot-only name are spelled out).
   repoPart = "([A-Za-z0-9_-][A-Za-z0-9._-]{0,99}|\\.[A-Za-z0-9_-][A-Za-z0-9._-]{0,98}|\\.\\.[A-Za-z0-9._-]{1,98})";
+  # The runners' forges are a list, each with a token file of its own: the same, per entry.
+  hasRunnerForges = (pruned.runners or { }) ? forge;
+  runnerTokenFiles = lib.optionals hasRunnerForges
+    (map (f: toString f.token_file) (builtins.filter (f: f ? token_file) pruned.runners.forge));
+  # `https` without credentials, whitespace or a character a host cannot hold; what only the
+  # parser can see (a port out of range, an unmatched bracket) is refused by auspex at start.
+  httpsUrl = types.strMatching "https://[^@/?#<>^|%\\[:space:][:cntrl:]]+([/?#][^[:space:][:cntrl:]]*)?";
   expandHome = path: if lib.hasPrefix "~/" path
     then "${config.home.homeDirectory}/${lib.removePrefix "~/" path}"
     else path;
@@ -66,6 +78,13 @@ let
     }
     // lib.optionalAttrs hasTokenFile {
       forge = pruned.forge // { token_file = expandHome tokenFilePath; };
+    }
+    // lib.optionalAttrs hasRunnerForges {
+      runners = pruned.runners // {
+        forge = map
+          (f: f // lib.optionalAttrs (f ? token_file) { token_file = expandHome (toString f.token_file); })
+          pruned.runners.forge;
+      };
     };
   themePath = "${config.xdg.configHome}/auspex/theme.toml";
   selectedThemePath =
@@ -136,9 +155,38 @@ in {
           kubeconfig = optional (types.either types.str types.path) "The kubeconfig `U` reads node state and drains with (kubectl --kubeconfig); a leading ~/ is your home directory. Default: \$KUBECONFIG, then ~/.kube/config. A path value is written as its string, not copied into the store; a path inside the Nix store is refused as a stale copy of a credentials file.";
         };
         forge = section {
-          url = optional (types.strMatching "https://[^@/?#<>^|%\\[:space:][:cntrl:]]+([/?#][^[:space:][:cntrl:]]*)?") "The forge whose combined commit status for the fleet's current commit is shown as a CI badge (status bar and `fleet_ci` in --json); https only, without credentials, whitespace or a character a host cannot hold; what only the parser can see (a port out of range, an unmatched bracket) is refused by auspex at start. Omit it to switch the badge off: nothing is then read or asked. Forgejo's API: GET /api/v1/repos/{owner}/{repo}/commits/{sha}/status.";
+          url = optional httpsUrl "The forge whose combined commit status for the fleet's current commit is shown as a CI badge (status bar and `fleet_ci` in --json); https only, without credentials, whitespace or a character a host cannot hold; what only the parser can see (a port out of range, an unmatched bracket) is refused by auspex at start. Omit it to switch the badge off: nothing is then read or asked. Forgejo's API: GET /api/v1/repos/{owner}/{repo}/commits/{sha}/status.";
           repo = optional (types.strMatching "${repoPart}/${repoPart}") "The repository on the forge, owner/name (letters, digits, `.`, `_` and `-`; no part is `.` or `..` or over 100 bytes). Default: read from the fleet checkout's `origin` remote, which must then be on the same host as forge.url (otherwise the badge says `unknown: set forge.repo`).";
           token_file = optional (types.either types.str types.path) "A file holding a read-only API token for the forge, sent as `Authorization: token …`; a leading ~/ is your home directory. Never the token itself: it would be written to config.toml. auspex refuses a file that group or others can access (use mode 0600) or that you do not own, and strips one trailing newline. Without it the forge is asked anonymously (public repositories). A path value is written as its string, not copied into the store; a path inside the Nix store is refused, since the store is world-readable.";
+        };
+        runners = section {
+          unit_glob = optional (types.strMatching "[]A-Za-z0-9:_.@*?[][]A-Za-z0-9:_.@*?[-]{0,63}") "Which systemd units on a machine are CI runner units, as a glob (default `gitea-runner-*`, which is what the NixOS module `services.gitea-actions-runner` names its units: `gitea-runner-<name>.service`). The probe lists the matching services of every NixOS machine; darwin reports none. Letters, digits and `: _ . @ - * ? [ ]` only, and not starting with `-` (systemctl would read it as an option): it is written into a shell script.";
+          memory_warn_percent = optional (types.ints.between 1 100) "From this share of a host's memory cap (`runners.hosts.<machine>.memory`) a runner row is badged (default 90). Without a cap there is nothing to compare, and no badge.";
+          forge = mkOption {
+            default = [ ];
+            description = "The forges whose CI runners the Runners tab (`R`) and the status bar's `runners: 7/8 online, 2 busy, 3 queued` show, and `runners` in --json. One entry each, as many as there are scopes to read. Omit them all to switch the view off: nothing is then read, asked or listed on any machine. Forgejo's API: GET /api/v1/{admin,user,orgs/<org>,repos/<owner>/<repo>}/actions/runners and .../runners/jobs.";
+            type = types.listOf (table {
+              url = mkOption {
+                type = httpsUrl;
+                description = "The forge's URL; https only, without credentials (as `forge.url`). Required: an entry without it is refused here, as auspex refuses it at start.";
+              };
+              scope = optional (types.strMatching "admin|user|org:${repoPart}|repo:${repoPart}/${repoPart}") "Whose runners to list: `admin` (the default: every runner of the instance, which needs a token with `read:admin`), `user` (the token owner's), `org:<name>` or `repo:<owner>/<name>`.";
+              token_file = optional (types.either types.str types.path) "A file holding a read-only API token for this forge (as `forge.token_file`: mode 0600, yours, one trailing newline; a leading ~/ is your home directory; never the token itself; refused in the Nix store, which is world-readable). A forge whose token is refused shows that on its rows and is never asked anonymously instead.";
+            });
+          };
+          hosts = mkOption {
+            default = { };
+            description = "Caps of the runner host, by inventory machine name, for the Prometheus figures (memory in use against the cap, the load average against the CPUs). Nothing is assumed: a host without a cap shows no figure and no badge.";
+            type = types.attrsOf (table {
+              cpus = optional types.ints.positive "CPUs the runner host may use.";
+              memory = optional (types.strMatching "[0-9]+(B|KiB|MiB|GiB|TiB|kB|MB|GB|TB)") "Memory the runner host may use, such as `4GiB` or `512MiB` (a whole number and a unit: B, KiB, MiB, GiB, TiB, kB, MB, GB, TB).";
+            });
+          };
+          machines = mkOption {
+            default = { };
+            description = "Which machine a runner is on, by runner name, when the name does not say. By default a runner whose name equals a machine's name, or begins with `<machine>-`, is on that machine.";
+            type = types.attrsOf types.str;
+          };
         };
         keymap = mkOption {
           default = { };
@@ -175,7 +223,12 @@ in {
       {
         assertion = !hasTokenFile || !lib.hasPrefix "${builtins.storeDir}/" tokenFilePath;
         message = "programs.auspex.settings.forge.token_file is a ${builtins.storeDir} path, which is world-readable (a relative path literal in a flake is evaluated from the flake's store copy, and so is a token file added to the flake). Use a path outside the store that only you can read, such as \"~/.config/auspex/forge-token\" or a secrets manager's runtime path.";
-      }];
+      }
+      {
+        assertion = builtins.all (p: !lib.hasPrefix "${builtins.storeDir}/" p) runnerTokenFiles;
+        message = "programs.auspex.settings.runners.forge[].token_file is a ${builtins.storeDir} path, which is world-readable (a relative path literal in a flake is evaluated from the flake's store copy, and so is a token file added to the flake). Use a path outside the store that only you can read, such as \"~/.config/auspex/forge-admin-token\" or a secrets manager's runtime path.";
+      }
+      ];
       xdg.configFile = lib.mkIf (settings != { }) {
         "auspex/config.toml".source = toml.generate "auspex-config.toml" settings;
       };

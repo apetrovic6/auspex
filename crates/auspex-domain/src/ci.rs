@@ -311,7 +311,7 @@ fn same_host(a: &str, b: &str) -> bool {
 /// One path segment of an `owner/name`: letters, digits, `.`, `_` and `-`, not empty, not `.`
 /// or `..`, at most 100 bytes. What a forge allows is narrower; this is what cannot do harm in
 /// a URL path.
-fn segment_ok(s: &str) -> bool {
+pub(crate) fn segment_ok(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 100
         && s != "."

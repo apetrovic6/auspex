@@ -57,6 +57,47 @@ fn the_home_manager_contract_fixture_loads_whole() {
             token_file: Some("/home/me/.config/auspex/forge-token".into()),
         })
     );
+    // The runners view: every key, each the opposite of its default, so one never read fails here.
+    let runners = s.runners.clone().unwrap();
+    assert_eq!(runners.unit_glob, "ci-runner-*");
+    assert_eq!(runners.memory_warn_percent, 80);
+    assert_eq!(
+        runners.forges,
+        vec![
+            config::RunnerForgeSettings {
+                url: "https://forge.example.org/".to_owned(),
+                // Two entries on one host are told apart by their scope.
+                name: "forge.example.org (admin)".to_owned(),
+                site: "forge.example.org".to_owned(),
+                scope: auspex_domain::runners::Scope::Admin,
+                token_file: Some("/home/me/.config/auspex/forge-admin-token".into()),
+            },
+            config::RunnerForgeSettings {
+                url: "https://forge.example.org/".to_owned(),
+                name: "forge.example.org (repo:owner/fleet)".to_owned(),
+                site: "forge.example.org".to_owned(),
+                scope: auspex_domain::runners::Scope::Repo {
+                    owner: "owner".to_owned(),
+                    name: "fleet".to_owned(),
+                },
+                token_file: None,
+            },
+        ]
+    );
+    assert_eq!(
+        runners.hosts,
+        BTreeMap::from([(
+            "alpha".to_owned(),
+            auspex_domain::runners::HostCaps {
+                cpus: Some(2),
+                memory_bytes: Some(4 << 30),
+            }
+        )])
+    );
+    assert_eq!(
+        runners.machines,
+        BTreeMap::from([("alpha-docker".to_owned(), "alpha".to_owned())])
+    );
     assert_eq!(
         s.machines,
         BTreeMap::from([(
@@ -676,4 +717,315 @@ fn debug_printing_the_settings_shows_a_path_and_never_a_token() {
     .unwrap();
     let shown = format!("{s:?}");
     assert!(shown.contains("/run/secrets/forge-token"), "{shown}");
+}
+
+// ---------------------------------------------------------------------------------------
+// `[runners]`: the CI runners view (AUS-19)
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn no_runners_section_is_no_view() {
+    let (s, w) = config::parse("").unwrap();
+    assert_eq!((s.runners.clone(), w), (None, vec![]));
+    assert_eq!(core_config(&s, "/fleet".to_owned()).runners, None);
+}
+
+#[test]
+fn a_minimal_forge_takes_the_defaults() {
+    let (s, w) = config::parse("[[runners.forge]]\nurl = \"https://forge.example.org\"\n").unwrap();
+    assert_eq!(w, Vec::<String>::new());
+    let r = s.runners.unwrap();
+    // What the briefed config says when nothing is: the NixOS module's unit names, 90 percent,
+    // the admin scope, no token, no host assumed.
+    assert_eq!(r.unit_glob, "gitea-runner-*");
+    assert_eq!(r.memory_warn_percent, 90);
+    assert_eq!(r.forges.len(), 1);
+    assert_eq!(r.forges[0].scope, auspex_domain::runners::Scope::Admin);
+    assert_eq!(r.forges[0].name, "forge.example.org");
+    assert_eq!(r.forges[0].token_file, None);
+    assert!(r.hosts.is_empty() && r.machines.is_empty());
+}
+
+#[test]
+fn the_core_is_told_the_forges_the_rules_and_the_caps() {
+    let text =
+        std::fs::read_to_string(crate_dir().join("../../../../nix/auspex/expected.toml")).unwrap();
+    let (s, _) = config::parse(&text).unwrap();
+    let core = core_config(&s, "/fleet".to_owned()).runners.unwrap();
+    assert_eq!(
+        core.forges
+            .iter()
+            .map(|f| (f.forge.as_str(), f.scope.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("forge.example.org (admin)", "admin"),
+            ("forge.example.org (repo:owner/fleet)", "repo:owner/fleet"),
+        ]
+    );
+    assert_eq!(core.join.unit_glob, "ci-runner-*");
+    assert_eq!(core.join.memory_warn_percent, 80);
+    assert_eq!(core.join.hosts["alpha"].cpus, Some(2));
+    assert_eq!(core.join.machines["alpha-docker"], "alpha");
+}
+
+#[test]
+fn runners_settings_without_a_forge_are_ignored_with_a_warning() {
+    let (s, w) = config::parse("[runners]\nunit_glob = \"x-*\"\n").unwrap();
+    assert_eq!(s.runners, None);
+    assert!(
+        w.iter()
+            .any(|w| w.contains("no `[[runners.forge]]`") && w.contains("off")),
+        "{w:?}"
+    );
+    let (s, w) = config::parse("[runners]\n").unwrap();
+    assert_eq!((s.runners, w), (None, vec![]));
+}
+
+#[test]
+fn every_runners_refusal_names_its_key_and_quotes_no_url() {
+    let forge = "[[runners.forge]]\nurl = \"https://forge.example.org\"\n";
+    for (text, key, why) in [
+        (
+            "[[runners.forge]]\nurl = \"http://forge.example.org\"\n".to_owned(),
+            "`runners.forge[0].url`",
+            "https",
+        ),
+        (
+            "[[runners.forge]]\nurl = \"https://user:hunter2@forge.example.org\"\n".to_owned(),
+            "`runners.forge[0].url`",
+            "credentials",
+        ),
+        (
+            "[[runners.forge]]\nscope = \"admin\"\n".to_owned(),
+            "`runners.forge[0].url`",
+            "required",
+        ),
+        (
+            format!("{forge}scope = \"global\"\n"),
+            "`runners.forge[0].scope`",
+            "admin, user, org:<name> or repo:<owner>/<name>",
+        ),
+        (
+            format!("{forge}scope = \"repo:a/b/c\"\n"),
+            "`runners.forge[0].scope`",
+            "repo:<owner>/<name>",
+        ),
+        (
+            format!("{forge}token_file = \"relative/token\"\n"),
+            "`runners.forge[0].token_file`",
+            "absolute",
+        ),
+        (
+            format!("{forge}token_file = \"~bob/token\"\n"),
+            "`runners.forge[0].token_file`",
+            "~/",
+        ),
+        (
+            format!("{forge}\n[runners.hosts.alpha]\nmemory = \"4 GiB\"\n"),
+            "`runners.hosts.alpha.memory`",
+            "a whole number and a unit",
+        ),
+        (
+            format!("{forge}\n[runners.hosts.alpha]\nmemory = \"0GiB\"\n"),
+            "`runners.hosts.alpha.memory`",
+            "more than 0",
+        ),
+        (
+            format!("{forge}\n[runners.hosts.alpha]\ncpus = 0\n"),
+            "`runners.hosts.alpha.cpus`",
+            "1 or more",
+        ),
+        (
+            format!("{forge}\n[runners]\nmemory_warn_percent = 0\n"),
+            "`runners.memory_warn_percent`",
+            "from 1 to 100",
+        ),
+        (
+            format!("{forge}\n[runners]\nmemory_warn_percent = 101\n"),
+            "`runners.memory_warn_percent`",
+            "from 1 to 100",
+        ),
+        (
+            format!("{forge}\n[runners]\nunit_glob = \"a;rm -rf /\"\n"),
+            "`runners.unit_glob`",
+            "shell script",
+        ),
+        (
+            format!("{forge}\n[runners]\nunit_glob = \"\"\n"),
+            "`runners.unit_glob`",
+            "1 to 64",
+        ),
+        (
+            format!("{forge}\n[runners.machines]\nalpha = 3\n"),
+            "`runners.machines.alpha`",
+            "a string",
+        ),
+        (
+            "[runners]\nforge = \"https://forge.example.org\"\n".to_owned(),
+            "`runners.forge`",
+            "list of tables",
+        ),
+    ] {
+        let e = config::parse(&text).unwrap_err();
+        assert!(e.contains(key) && e.contains(why), "{text:?}: {e}");
+        assert!(!e.contains("hunter2"), "{e}");
+    }
+}
+
+#[test]
+fn an_unknown_runners_key_is_ignored_with_a_warning() {
+    let (s, w) = config::parse(
+        "[[runners.forge]]\nurl = \"https://forge.example.org\"\nfuture = 1\n\
+         [runners]\nsomething = true\n[runners.hosts.alpha]\ncolour = \"red\"\n",
+    )
+    .unwrap();
+    assert!(s.runners.is_some());
+    for key in [
+        "runners.forge[0].future",
+        "runners.something",
+        "runners.hosts.alpha.colour",
+    ] {
+        assert!(w.iter().any(|w| w.contains(key)), "{key}: {w:?}");
+    }
+}
+
+#[test]
+fn memory_sizes_are_read_as_written() {
+    for (text, bytes) in [
+        ("4GiB", 4_u64 << 30),
+        ("512MiB", 512 << 20),
+        ("2GB", 2_000_000_000),
+    ] {
+        let (s, _) = config::parse(&format!(
+            "[[runners.forge]]\nurl = \"https://forge.example.org\"\n\
+             [runners.hosts.alpha]\nmemory = \"{text}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            s.runners.unwrap().hosts["alpha"].memory_bytes,
+            Some(bytes),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn two_entries_on_different_hosts_keep_their_host_alone() {
+    let (s, _) = config::parse(
+        "[[runners.forge]]\nurl = \"https://a.example.org\"\n\
+         [[runners.forge]]\nurl = \"https://b.example.org\"\nscope = \"user\"\n",
+    )
+    .unwrap();
+    let names: Vec<_> = s
+        .runners
+        .unwrap()
+        .forges
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(names, ["a.example.org", "b.example.org"]);
+}
+
+/// N1: two entries are told apart by everything that tells two forges apart (host, port, path),
+/// then by scope, then by position: a name two entries share would put each one's runners under
+/// both headings and make `--json` unable to say whose a row is.
+#[test]
+fn every_runners_forge_has_a_name_of_its_own() {
+    let names = |toml: &str| -> Vec<String> {
+        config::parse(toml)
+            .unwrap()
+            .0
+            .runners
+            .unwrap()
+            .forges
+            .into_iter()
+            .map(|f| f.name)
+            .collect()
+    };
+    let entry = |url: &str, scope: &str| {
+        format!("[[runners.forge]]\nurl = \"{url}\"\nscope = \"{scope}\"\n")
+    };
+    // Another port, another path: other forges, named so, with no scope needed.
+    assert_eq!(
+        names(&format!(
+            "{}{}{}",
+            entry("https://forge.example.org", "admin"),
+            entry("https://forge.example.org:8443", "admin"),
+            entry("https://forge.example.org/forgejo/", "admin"),
+        )),
+        [
+            "forge.example.org",
+            "forge.example.org:8443",
+            "forge.example.org/forgejo"
+        ]
+    );
+    // The port that is the scheme's own is no part of the name.
+    assert_eq!(
+        names(&entry("https://forge.example.org:443", "user")),
+        ["forge.example.org"]
+    );
+    // The same forge twice, by scope.
+    assert_eq!(
+        names(&format!(
+            "{}{}",
+            entry("https://forge.example.org", "admin"),
+            entry("https://forge.example.org", "user")
+        )),
+        ["forge.example.org (admin)", "forge.example.org (user)"]
+    );
+    // The same forge and scope twice (two tokens, say): by position.
+    assert_eq!(
+        names(&format!(
+            "{}{}{}",
+            entry("https://forge.example.org", "admin"),
+            entry("https://forge.example.org", "admin"),
+            entry("https://forge.example.org", "admin"),
+        )),
+        [
+            "forge.example.org (admin)",
+            "forge.example.org (admin) #2",
+            "forge.example.org (admin) #3"
+        ]
+    );
+    // Never two the same, whatever the mix.
+    let all = names(&format!(
+        "{}{}{}{}",
+        entry("https://a.example.org", "admin"),
+        entry("https://a.example.org", "admin"),
+        entry("https://a.example.org:8443", "admin"),
+        entry("https://a.example.org", "user"),
+    ));
+    let mut sorted = all.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), all.len(), "{all:?}");
+}
+
+/// B2: a `unit_glob` that starts with `-` is a `systemctl` option, not a pattern, and is refused at
+/// load, each of them naming the key and none quoted.
+#[test]
+fn a_unit_glob_that_is_an_option_is_refused_at_load() {
+    let forge = "[[runners.forge]]\nurl = \"https://forge.example.org\"\n";
+    for bad in [
+        "-Hroot@host.example.org",
+        "-Mother",
+        "-thelp",
+        "--user",
+        "-",
+        "-x*",
+    ] {
+        let e = config::parse(&format!("{forge}[runners]\nunit_glob = \"{bad}\"\n")).unwrap_err();
+        assert!(
+            e.contains("`runners.unit_glob`") && e.contains("must not start with `-`"),
+            "{bad}: {e}"
+        );
+        if bad.len() > 2 {
+            assert!(!e.contains(bad), "{bad}: {e}");
+        }
+    }
+    // A hyphen anywhere else is a unit name's own.
+    for ok in ["gitea-runner-*", "a-", "x-y-z"] {
+        let (s, _) = config::parse(&format!("{forge}[runners]\nunit_glob = \"{ok}\"\n")).unwrap();
+        assert_eq!(s.runners.unwrap().unit_glob, ok);
+    }
 }

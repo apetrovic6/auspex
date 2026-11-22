@@ -42,6 +42,16 @@ let
     update = { parallel = 3; ready_timeout = 300; poll_interval = 10; };
     kubernetes.kubeconfig = "/home/me/.kube/fleet";
     forge = { url = "https://forge.example.org"; repo = "owner/fleet"; token_file = "/home/me/.config/auspex/forge-token"; };
+    runners = {
+      unit_glob = "ci-runner-*";
+      memory_warn_percent = 80;
+      forge = [
+        { url = "https://forge.example.org"; scope = "admin"; token_file = "/home/me/.config/auspex/forge-admin-token"; }
+        { url = "https://forge.example.org"; scope = "repo:owner/fleet"; }
+      ];
+      hosts.alpha = { cpus = 2; memory = "4GiB"; };
+      machines."alpha-docker" = "alpha";
+    };
     keymap = { quit = [ "q" "esc" ]; down = "j"; };
     theme.file = "~/.config/auspex/theme.toml";
   };
@@ -262,6 +272,60 @@ let
         "https://forge.example.org/\n" "https://a<b>.example.org" "https://a|b.example.org" "https://a%b.example.org" ]
       && builtins.all (url: probe "url" url == url) [ "https://[fd00::1]:3000/forgejo" "https://forge.example.org:8443/x?y#z"
         "https://forge.example.org/a%20b" ];
+  # The runners' forges are a list with a token file each: `~/` is the home directory in every
+  # entry, a Nix path value is written as its string, an entry that says no token says none, and
+  # one in the store (world-readable) is refused whichever entry it is in.
+  withRunnerForges = forge: (evaluate {
+    programs.auspex.settings.runners.forge = forge;
+  }).config;
+  tildeRunners = withRunnerForges [
+    { url = "https://forge.example.org"; token_file = "~/.config/auspex/a"; }
+    { url = "https://ci.example.org"; scope = "user"; }
+    { url = "https://ci.example.org"; scope = null; token_file = /home/me/b; }
+  ];
+  storeRunners = withRunnerForges [
+    { url = "https://forge.example.org"; token_file = "~/.config/auspex/a"; }
+    { url = "https://ci.example.org"; token_file = "${pkgs.hello}/token"; }
+  ];
+  storeRunnersRejected =
+    !(builtins.tryEval (builtins.deepSeq (checked storeRunners).assertions true)).success
+    && builtins.any (a: !a.assertion && lib.hasInfix "world-readable" a.message) storeRunners.assertions;
+  # What the binary refuses (`auspex_tui::config`, `auspex_domain::observe::valid_unit_glob`,
+  # `auspex_domain::runners::{Scope, parse_size}`) is refused at evaluation, so a home-manager
+  # switch fails here and not auspex at start.
+  runnersOK =
+    let
+      probe = value: (evaluate {
+        programs.auspex.settings.runners = value;
+      }).config.programs.auspex.settings.runners;
+      rejected = value: !(builtins.tryEval (builtins.deepSeq (probe value) true)).success;
+      forge = f: { forge = [ ({ url = "https://forge.example.org"; } // f) ]; };
+    in builtins.all (g: (probe { unit_glob = g; }).unit_glob == g) [ "gitea-runner-*" "ci-?" "a[bc]-*.x" "r_1@:y" "x" ]
+      && builtins.all (g: rejected { unit_glob = g; }) [ "" "a b" "a'b" "a;b" "a\"b" "a`b" "$(x)" "a\\b" "a/b" "é" (lib.fixedWidthString 65 "x" "") 1 ]
+      # systemctl reads options after the verb: a glob that starts with `-` is one (`-H user@host`
+      # makes it ssh somewhere), so it is refused here as the binary refuses it (B2).
+      && builtins.all (g: rejected { unit_glob = g; }) [ "-" "-Hroot@host.example.org" "-Mother" "-thelp" "--user" "-x*" ]
+      && builtins.all (g: (probe { unit_glob = g; }).unit_glob == g) [ "a-" "gitea-runner-*" "x-y-z" ]
+      # An entry says where its forge is: the binary refuses one without (`runners.forge[i].url is
+      # required`), so a switch fails here and not auspex at start (N7).
+      && rejected { forge = [ { scope = "user"; } ]; }
+      && rejected { forge = [ { url = "https://forge.example.org"; } { token_file = "/x"; } ]; }
+      && (probe { forge = [ { url = "https://forge.example.org"; } ]; }).forge != [ ]
+      && (probe { unit_glob = lib.fixedWidthString 64 "x" ""; }).unit_glob == lib.fixedWidthString 64 "x" ""
+      && (probe { memory_warn_percent = 1; }).memory_warn_percent == 1
+      && (probe { memory_warn_percent = 100; }).memory_warn_percent == 100
+      && builtins.all (p: rejected { memory_warn_percent = p; }) [ 0 101 (-1) "ninety" ]
+      && builtins.all (s: (builtins.head (probe (forge { scope = s; })).forge).scope == s) [ "admin" "user" "org:acme" "repo:owner/fleet" "org:.acme" "repo:o/..x" ]
+      && builtins.all (s: rejected (forge { scope = s; }))
+        [ "global" "Admin" "org:" "org:a/b" "repo:a" "repo:a/b/c" "repo:../x" "org:.." "org:a b" "" 1 ]
+      && builtins.all (u: rejected (forge { url = u; }))
+        [ "http://forge.example.org" "https://user:pw@forge.example.org" "forge.example.org" "https://" "https://a b" 1 ]
+      && builtins.all (m: (probe { hosts.alpha.memory = m; }).hosts.alpha.memory == m) [ "4GiB" "512MiB" "2GB" "100B" "7kB" ]
+      && builtins.all (m: rejected { hosts.alpha.memory = m; }) [ "" "4" "GiB" "4 GiB" "4gib" "1.5GiB" "4G" "-4GiB" 4 ]
+      && (probe { hosts.alpha.cpus = 2; }).hosts.alpha.cpus == 2
+      && builtins.all (c: rejected { hosts.alpha.cpus = c; }) [ 0 (-1) "two" ]
+      && (probe { machines."alpha-docker" = "alpha"; }).machines."alpha-docker" == "alpha"
+      && rejected { machines.x = 1; };
 in {
   auspex-empty = check "empty" ((evaluate { }).config.xdg.configFile == { });
   auspex-full = compareToml "full" fullSource expected;
@@ -361,6 +425,21 @@ in {
   auspex-forge-token-store-path = check "forge-token-store-path" (storeTokenFileRejected
     && builtins.all (c: builtins.all (a: a.assertion) c.assertions) [ tildeTokenFile pathTokenFile ]);
   auspex-forge-types = check "forge-types" forgeOK;
+  auspex-runners-types = check "runners-types" runnersOK;
+  auspex-runners-token-path = pkgs.linkFarm "auspex-runners-token-path" [
+    {
+      name = "per-entry";
+      path = compareToml "runners-token-per-entry" tildeRunners.xdg.configFile."auspex/config.toml".source {
+        runners.forge = [
+          { url = "https://forge.example.org"; token_file = "/home/test/.config/auspex/a"; }
+          { url = "https://ci.example.org"; scope = "user"; }
+          { url = "https://ci.example.org"; token_file = "/home/me/b"; }
+        ];
+      };
+    }
+  ];
+  auspex-runners-token-store-path = check "runners-token-store-path" (storeRunnersRejected
+    && builtins.all (a: a.assertion) tildeRunners.assertions);
   auspex-no-stylix = check "no-stylix" (paletteRejected absent && builtins.all paletteRejected partialPalettes);
   auspex-revisions = check "revisions" (revisionOK exports.nixosModules.configurationRevision
     && revisionOK exports.darwinModules.configurationRevision

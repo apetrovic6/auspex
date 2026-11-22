@@ -63,6 +63,7 @@ use auspex_domain::eval::{EvalFailure, EvalOutcome};
 use auspex_domain::fleet::{Machine, ResolveError, ResolvedTarget, resolve_target, shared_ips};
 use auspex_domain::observe::{Health, ProbeOutcome, PromSample, StorePath, merge_health};
 use auspex_domain::report::{FleetError, FleetErrorKind, FleetFacts, fleet_report, machine_report};
+use auspex_domain::runners::{ForgeAnswer, ForgeSlot, MachineFacts as RunnerMachine};
 use auspex_domain::status::{Badge, MachineFacts, NarCache, Outstanding, machine_status};
 use crux_core::render::render;
 use crux_core::{App, Command};
@@ -73,7 +74,8 @@ use crate::effects::{
     Effect, EvalAnswer, EvalMachine, EvalRequest, ForgeHeadAnswer, ForgeHeadRequest,
     ForgeStatusAnswer, ForgeStatusRequest, Generation, InventoryAnswer, InventoryRequest,
     KubeAnswer, LoadFreezesAnswer, PendingClosureRequest, PreflightAnswer, ProbeRequest,
-    PrometheusAnswer, PrometheusRequest, RequestId, ResolveRequest, SaveFreezeAnswer, ShellEnd,
+    PrometheusAnswer, PrometheusRequest, RequestId, ResolveRequest, RunnersRequest,
+    SaveFreezeAnswer, ShellEnd,
 };
 use crate::view::{
     FreezeView, Phase, PrometheusStatus, RefreshView, SearchView, ViewModel, ViewState,
@@ -100,6 +102,8 @@ pub const PREVIEW_TIMED_OUT: &str =
 pub const CI_CHECKING: &str = "still being checked";
 /// The CI badge's `reason` when the deadline passed first.
 pub const CI_TIMED_OUT: &str = "no answer before the global deadline";
+/// A runners forge entry's reason when the deadline passed first.
+pub const RUNNERS_TIMED_OUT: &str = "forge: no answer before the global deadline";
 /// The `inventory_timed_out` fleet error's reason.
 pub const INVENTORY_TIMED_OUT: &str = "the machine list did not arrive before the global deadline";
 
@@ -200,6 +204,15 @@ pub enum Event {
         id: RequestId,
         /// What it answered.
         answer: ForgeStatusAnswer,
+    },
+    /// [`RunnersRequest`] answered.
+    RunnersAnswered {
+        /// The request's generation.
+        generation: Generation,
+        /// The request.
+        id: RequestId,
+        /// What the forge listed.
+        answer: ForgeAnswer,
     },
     /// [`CacheRequest`] answered.
     CacheAnswered {
@@ -393,6 +406,8 @@ enum Pending {
     ForgeHead,
     /// The forge's combined status of this commit.
     ForgeStatus(String),
+    /// The runners of the forge entry at this index of `RunnersSetup::forges`.
+    Runners(usize),
     /// The cache lookup for this machine.
     Cache(String),
     /// Address resolution for exactly these machines: its answer may update no others, so
@@ -532,6 +547,8 @@ pub struct Model {
     prometheus: PrometheusStatus,
     /// The CI badge (`[forge]`): `HEAD` of the fleet checkout and what the forge says of it.
     ci: CiSlot,
+    /// What each `[[runners.forge]]` entry has answered this refresh, by index; `None` while out.
+    runners: Vec<Option<ForgeAnswer>>,
     samples: BTreeMap<String, PromSample>,
     /// Each machine's known addresses: IP-literal targets at once, hostnames once resolved.
     addresses: BTreeMap<String, Vec<IpAddr>>,
@@ -593,7 +610,7 @@ impl Model {
             Inventory::NotStarted | Inventory::Pending => false,
             // The machine list failed, but the badge is not the list's: `fleet_ci` is printed
             // with its answer in it, so it is waited for (bounded, like everything else).
-            Inventory::Failed => !self.ci_outstanding(),
+            Inventory::Failed => !self.ci_outstanding() && !self.runners_outstanding(),
             Inventory::Loaded => {
                 self.outstanding.is_empty() && !self.rows.iter().any(Row::spinning)
             }
@@ -605,6 +622,13 @@ impl Model {
         self.outstanding
             .values()
             .any(|p| matches!(p, Pending::ForgeHead | Pending::ForgeStatus(_)))
+    }
+
+    /// A forge's runners request is out.
+    fn runners_outstanding(&self) -> bool {
+        self.outstanding
+            .values()
+            .any(|p| matches!(p, Pending::Runners(_)))
     }
 
     /// A package-preview query is out.
@@ -662,6 +686,7 @@ impl Model {
                         | Pending::Prometheus
                         | Pending::ForgeHead
                         | Pending::ForgeStatus(_)
+                        | Pending::Runners(_)
                         | Pending::Resolve(_)
                 )
             })
@@ -797,6 +822,11 @@ impl App for Auspex {
                 id,
                 answer,
             } => forge_status_answered(model, generation, id, answer),
+            Event::RunnersAnswered {
+                generation,
+                id,
+                answer,
+            } => runners_answered(model, generation, id, answer),
             Event::CacheAnswered {
                 generation,
                 id,
@@ -923,6 +953,7 @@ impl App for Auspex {
                 timed_out: model.timed_out,
                 errors: errors.clone(),
                 fleet_ci: model.ci.report(),
+                runners: runners_report(model),
             },
         );
         let settled = model.fleet_settled();
@@ -1001,6 +1032,7 @@ fn refresh(model: &mut Model) -> Command<Effect, Event> {
     model.started.clear();
     model.timed_out = false;
     model.ci = CiSlot::Off;
+    model.runners = Vec::new();
     model.prometheus = if model
         .config
         .as_ref()
@@ -1033,6 +1065,8 @@ fn refresh(model: &mut Model) -> Command<Effect, Event> {
     // Beside the list, not after it: the badge reads `HEAD` and asks the forge, which no row
     // depends on and which depends on no row.
     commands.extend(ask_forge_head(model));
+    // Likewise the runners: one request per forge entry, beside the list and beside each other.
+    commands.extend(ask_runners(model));
     commands.push(render());
     Command::all(commands)
 }
@@ -1727,6 +1761,15 @@ fn deadline(model: &mut Model, generation: Generation) -> Command<Effect, Event>
                 };
             }
             // Not heard from in time: the badge says so, with the commit when `HEAD` was read.
+            Pending::Runners(i) => {
+                let why = RUNNERS_TIMED_OUT.to_owned();
+                if let Some(slot) = model.runners.get_mut(i) {
+                    *slot = Some(ForgeAnswer {
+                        runners: Err(why.clone()),
+                        queued: Err(why),
+                    });
+                }
+            }
             Pending::ForgeHead => {
                 model.ci = CiSlot::Done(FleetCi::unknown(None, CI_TIMED_OUT));
             }
@@ -1800,6 +1843,7 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::PrometheusAnswered { .. }
         | Event::ForgeHeadAnswered { .. }
         | Event::ForgeStatusAnswered { .. }
+        | Event::RunnersAnswered { .. }
         | Event::CacheAnswered { .. }
         | Event::DeployedClosureAnswered { .. }
         | Event::PendingClosureAnswered { .. }
@@ -1826,4 +1870,82 @@ fn view_update(model: &mut Model, event: Event) {
         | Event::Terminate
         | Event::Quit => {}
     }
+}
+
+/// One request per `[[runners.forge]]` entry, when `[runners]` is configured.
+fn ask_runners(model: &mut Model) -> Vec<Command<Effect, Event>> {
+    let Some(setup) = model.config.as_ref().and_then(|c| c.runners.clone()) else {
+        return Vec::new();
+    };
+    let generation = model.generation;
+    model.runners = vec![None; setup.forges.len()];
+    (0..setup.forges.len())
+        .map(|forge| {
+            let id = model.issue(Pending::Runners(forge));
+            Command::request_from_shell(RunnersRequest {
+                id,
+                generation,
+                forge,
+            })
+            .then_send(move |answer| Event::RunnersAnswered {
+                generation,
+                id,
+                answer,
+            })
+        })
+        .collect()
+}
+
+fn runners_answered(
+    model: &mut Model,
+    generation: Generation,
+    id: RequestId,
+    answer: ForgeAnswer,
+) -> Command<Effect, Event> {
+    match model.accept(generation, id, |p| matches!(p, Pending::Runners(_))) {
+        Some(Pending::Runners(forge)) => {
+            if let Some(slot) = model.runners.get_mut(forge) {
+                *slot = Some(answer);
+            }
+            render()
+        }
+        _ => Command::done(),
+    }
+}
+
+/// The runners view as it stands: every forge's answer joined with what each machine's probe and
+/// Prometheus said. Empty without `[runners]`.
+fn runners_report(model: &Model) -> auspex_domain::runners::RunnersReport {
+    let Some(setup) = model.config.as_ref().and_then(|c| c.runners.as_ref()) else {
+        return auspex_domain::runners::RunnersReport::default();
+    };
+    let slots: Vec<ForgeSlot> = setup
+        .forges
+        .iter()
+        .enumerate()
+        .map(|(i, f)| ForgeSlot {
+            forge: f.forge.clone(),
+            scope: f.scope.clone(),
+            site: f.site.clone(),
+            // Before the refresh has asked, nothing has answered.
+            answer: model.runners.get(i).cloned().flatten(),
+        })
+        .collect();
+    let machines: Vec<RunnerMachine<'_>> = model
+        .rows
+        .iter()
+        .map(|r| {
+            let health = model.health(r);
+            RunnerMachine {
+                name: &r.machine.name,
+                units: match &r.probe {
+                    Some(ProbeOutcome::Observed(o)) => o.runner_units.as_deref(),
+                    _ => None,
+                },
+                memory: health.memory.map(|m| m.value),
+                load: health.load.map(|l| l.value),
+            }
+        })
+        .collect();
+    auspex_domain::runners::report(&slots, &machines, &setup.join)
 }

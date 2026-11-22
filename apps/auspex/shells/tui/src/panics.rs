@@ -395,6 +395,17 @@ impl Internal for auspex_core::effects::PreflightAnswer {
     }
 }
 
+/// A forge entry whose adapter call panicked: its runners and its queue both failed, as when the
+/// forge could not be asked. The row says so; no other row waits.
+impl Internal for auspex_domain::runners::ForgeAnswer {
+    fn internal(why: &str) -> Self {
+        Self {
+            runners: Err(internal_error(why)),
+            queued: Err(internal_error(why)),
+        }
+    }
+}
+
 impl Internal for auspex_core::ActionEnd {
     fn internal(why: &str) -> Self {
         Self {
@@ -461,5 +472,8 @@ mod tests {
         assert_eq!(end.summary, ["internal error: x"]);
         let pre = auspex_core::effects::PreflightAnswer::internal("x");
         assert!(pre.tree.is_err() && pre.closure.is_err());
+        let forge = auspex_domain::runners::ForgeAnswer::internal("x");
+        assert_eq!(forge.runners, Err("internal error: x".to_owned()));
+        assert_eq!(forge.queued, Err("internal error: x".to_owned()));
     }
 }

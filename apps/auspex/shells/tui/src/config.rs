@@ -13,9 +13,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use auspex_domain::roll::{RollRule, RollRules};
+use auspex_domain::runners::{DEFAULT_MEMORY_WARN_PERCENT, HostCaps, Scope, parse_size};
 use toml::{Table, Value};
 
 /// Everything `config.toml` can say, with the defaults filled in.
@@ -38,6 +40,9 @@ pub struct Settings {
     /// `[forge]`, or `None` when there is no `url` (then the CI badge is off and nothing is read
     /// or asked).
     pub forge: Option<ForgeSettings>,
+    /// `[runners]`, or `None` when it has no `[[runners.forge]]` (then the runners view is off and
+    /// nothing is read, asked or listed on any machine).
+    pub runners: Option<RunnersSettings>,
     /// `[machines.<name>]`, by machine name.
     pub machines: BTreeMap<String, MachineSettings>,
     /// `[keymap]`: action name to its keys, exactly as written (parsed by `keymap`). An
@@ -185,6 +190,40 @@ pub struct ForgeSettings {
     /// `forge.repo` (`owner/name`), or `None` to read it from the fleet's `origin` remote.
     pub repo: Option<String>,
     /// `forge.token_file`, `~/` expanded and absolute, or `None` to ask anonymously.
+    pub token_file: Option<PathBuf>,
+}
+
+/// `[runners]`: the CI runners view.
+///
+/// Debug-printing it is safe: it holds the *paths* of the tokens, never a token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnersSettings {
+    /// `runners.unit_glob`: which systemd units on a machine are runner units.
+    pub unit_glob: String,
+    /// `runners.memory_warn_percent`: from this share of a host's memory cap a row is badged.
+    pub memory_warn_percent: u8,
+    /// `[[runners.forge]]`, in file order.
+    pub forges: Vec<RunnerForgeSettings>,
+    /// `[runners.hosts.<machine>]`: caps for the Prometheus figures. No host is assumed.
+    pub hosts: BTreeMap<String, HostCaps>,
+    /// `[runners.machines]`: runner name to machine name.
+    pub machines: BTreeMap<String, String>,
+}
+
+/// One `[[runners.forge]]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerForgeSettings {
+    /// `url`, normalised (`https` only, no credentials).
+    pub url: String,
+    /// What the entry is called on screen: the host, port and path, then `(scope)` and `#n` only as
+    /// far as two entries would otherwise share a name.
+    pub name: String,
+    /// Which forge it reads: the host, port and path alone (what [`Self::name`] is before it is told
+    /// apart). Two entries with the same site are two scopes of one forge.
+    pub site: String,
+    /// `scope`, `admin` by default.
+    pub scope: Scope,
+    /// `token_file`, `~/` expanded and absolute, or `None` to ask anonymously.
     pub token_file: Option<PathBuf>,
 }
 
@@ -422,17 +461,7 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                     match k.as_str() {
                         "url" => url = Some(w.string(v, &name)?),
                         "repo" => repo = Some(w.string(v, &name)?),
-                        "token_file" => {
-                            let path = expand_flake(&w.string(v, &name)?, &name)?;
-                            // Read at start, from wherever auspex was started: a relative path
-                            // would be a different file each time.
-                            if !Path::new(&path).is_absolute() {
-                                return Err(format!(
-                                    "`{name}` must be an absolute path (or start with `~/`), not `{path}`"
-                                ));
-                            }
-                            token_file = Some(PathBuf::from(path));
-                        }
+                        "token_file" => token_file = Some(token_path(&w, v, &name)?),
                         _ => w.unknown(&name),
                     }
                 }
@@ -467,6 +496,7 @@ pub fn parse(text: &str) -> Result<(Settings, Vec<String>), String> {
                     }
                 }
             }
+            "runners" => s.runners = parse_runners(&mut w, value)?,
             "machines" => {
                 let t = w.table(value, "machines")?;
                 for (machine, v) in t {
@@ -673,6 +703,151 @@ fn expand_flake_in(
         ));
     }
     Ok(value.to_owned())
+}
+
+/// A token file path from the config: `~/` expanded, and absolute (it is read at start, from
+/// wherever auspex was started: a relative path would be a different file each time).
+fn token_path(w: &Walk, v: &Value, name: &str) -> Result<PathBuf, String> {
+    let path = expand_flake(&w.string(v, name)?, name)?;
+    if !Path::new(&path).is_absolute() {
+        return Err(format!(
+            "`{name}` must be an absolute path (or start with `~/`), not `{path}`"
+        ));
+    }
+    Ok(PathBuf::from(path))
+}
+
+/// `[runners]`. Every refusal names its key and quotes no URL (it could carry a password).
+fn parse_runners(w: &mut Walk, value: &Value) -> Result<Option<RunnersSettings>, String> {
+    let t = w.table(value, "runners")?;
+    let mut r = RunnersSettings {
+        unit_glob: auspex_domain::observe::DEFAULT_RUNNER_GLOB.to_owned(),
+        memory_warn_percent: DEFAULT_MEMORY_WARN_PERCENT,
+        forges: Vec::new(),
+        hosts: BTreeMap::new(),
+        machines: BTreeMap::new(),
+    };
+    for (k, v) in t {
+        let name = format!("runners.{k}");
+        match k.as_str() {
+            "unit_glob" => {
+                r.unit_glob = w.string(v, &name)?;
+                auspex_domain::observe::valid_unit_glob(&r.unit_glob)
+                    .map_err(|e| format!("`{name}` {e}"))?;
+            }
+            "memory_warn_percent" => {
+                r.memory_warn_percent = u8::try_from(w.counted(v, &name, 100)?).unwrap_or(100);
+            }
+            "forge" => {
+                let list = v
+                    .as_array()
+                    .ok_or_else(|| wrong(&name, "a list of tables ([[runners.forge]])", v))?;
+                for (i, entry) in list.iter().enumerate() {
+                    let at = format!("runners.forge[{i}]");
+                    let t = w.table(entry, &at)?;
+                    let (mut url, mut scope, mut token_file) = (None, Scope::Admin, None);
+                    for (k, v) in t {
+                        let key = format!("{at}.{k}");
+                        match k.as_str() {
+                            "url" => url = Some(w.string(v, &key)?),
+                            "scope" => {
+                                scope = Scope::parse(&w.string(v, &key)?)
+                                    .map_err(|e| format!("`{key}` {e}"))?;
+                            }
+                            "token_file" => token_file = Some(token_path(w, v, &key)?),
+                            _ => w.unknown(&key),
+                        }
+                    }
+                    let url = url.ok_or_else(|| format!("`{at}.url` is required"))?;
+                    let url = auspex_effects::forge::forge_url(&url)
+                        .map_err(|e| format!("`{at}.url`: {e}"))?;
+                    let site =
+                        forge_label(url.host_str().unwrap_or_default(), url.port(), url.path());
+                    r.forges.push(RunnerForgeSettings {
+                        name: site.clone(),
+                        site,
+                        url: url.to_string(),
+                        scope,
+                        token_file,
+                    });
+                }
+            }
+            "hosts" => {
+                for (machine, v) in w.table(v, &name)? {
+                    let at = format!("{name}.{machine}");
+                    let mut caps = HostCaps::default();
+                    for (k, v) in w.table(v, &at)? {
+                        let key = format!("{at}.{k}");
+                        match k.as_str() {
+                            "cpus" => caps.cpus = Some(w.positive(v, &key)?),
+                            "memory" => {
+                                caps.memory_bytes = Some(
+                                    parse_size(&w.string(v, &key)?)
+                                        .map_err(|e| format!("`{key}` {e}"))?,
+                                );
+                            }
+                            _ => w.unknown(&key),
+                        }
+                    }
+                    r.hosts.insert(machine.clone(), caps);
+                }
+            }
+            "machines" => {
+                for (runner, v) in w.table(v, &name)? {
+                    r.machines
+                        .insert(runner.clone(), w.string(v, &format!("{name}.{runner}"))?);
+                }
+            }
+            _ => w.unknown(&name),
+        }
+    }
+    if r.forges.is_empty() {
+        if !t.is_empty() {
+            w.warnings.push(
+                "`[runners]` has settings but no `[[runners.forge]]`, so the runners view is off \
+                 and they are ignored"
+                    .to_owned(),
+            );
+        }
+        return Ok(None);
+    }
+    tell_apart(&mut r.forges);
+    Ok(Some(r))
+}
+
+/// Gives every entry a name of its own. Two entries with the same name (the same forge by two
+/// scopes, say) are told apart by their scope, and two that still share one (the same forge and
+/// scope with two tokens) by position: a name two entries share would put each one's runners under
+/// both headings, and `--json` could not say whose a row is.
+fn tell_apart(forges: &mut [RunnerForgeSettings]) {
+    let shared = |forges: &[RunnerForgeSettings], f: &RunnerForgeSettings| {
+        forges.iter().filter(|o| o.name == f.name).count() > 1
+    };
+    let by_scope: Vec<bool> = forges.iter().map(|f| shared(forges, f)).collect();
+    for (f, clash) in forges.iter_mut().zip(by_scope) {
+        if clash {
+            f.name = format!("{} ({})", f.name, f.scope);
+        }
+    }
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for f in forges {
+        let nth = seen.entry(f.name.clone()).or_insert(0);
+        *nth += 1;
+        if *nth > 1 {
+            f.name = format!("{} #{nth}", f.name);
+        }
+    }
+}
+
+/// What a forge entry is called on screen: its host, with the port when it is not the scheme's
+/// own and the path when it is not the root, so two forges on one host are two names.
+fn forge_label(host: &str, port: Option<u16>, path: &str) -> String {
+    let mut name = host.to_owned();
+    if let Some(port) = port {
+        let _ = write!(name, ":{port}");
+    }
+    name.push_str(path.trim_end_matches('/'));
+    name
 }
 
 const fn type_name(v: &Value) -> &'static str {

@@ -123,7 +123,7 @@ impl Token {
     /// (the shortest a forge issues is dozens of characters). Not caught, by nature: a copy the
     /// forge splits or re-encodes in a way it invents (base64, say); no guard can be complete
     /// against a forge that already holds the token and wants it shown.
-    fn appears_in(&self, text: &str) -> bool {
+    pub(crate) fn appears_in(&self, text: &str) -> bool {
         let needle = self.0.to_ascii_lowercase();
         let mut current = text.to_owned();
         for _ in 0..=MAX_DECODE_PASSES {
@@ -300,7 +300,7 @@ pub fn forge_url(s: &str) -> Result<Url, String> {
 }
 
 /// Whether a URL's host is this machine: `localhost` or a loopback address.
-fn is_loopback(url: &Url) -> bool {
+pub(crate) fn is_loopback(url: &Url) -> bool {
     match url.host() {
         Some(Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
         Some(Host::Ipv4(ip)) => IpAddr::V4(ip).is_loopback(),
@@ -393,6 +393,28 @@ async fn combined_status_unguarded(
     })
 }
 
+/// The `Authorization` header for a request to `base`, or none without a token. Before any
+/// connection: a token must not cross the network in the clear, so a plain-`http` URL on another
+/// host is refused. Every forge request (the badge's and the runners') goes through here.
+///
+/// # Errors
+///
+/// One line, which does not quote the token.
+pub(crate) fn authorization(
+    base: &Url,
+    token: Option<&Token>,
+) -> Result<Option<HeaderValue>, String> {
+    match token {
+        None => Ok(None),
+        Some(t) => {
+            if base.scheme() != "https" && !is_loopback(base) {
+                return Err("refusing to send the token over plain http to another host".to_owned());
+            }
+            Ok(Some(t.header()?))
+        }
+    }
+}
+
 struct Prepared {
     url: Url,
     authorization: Option<HeaderValue>,
@@ -407,16 +429,7 @@ fn build(url: &str, repo: &str, commit: &str, token: Option<&Token>) -> Result<P
         .split_once('/')
         .filter(|(o, n)| !o.is_empty() && !n.is_empty() && !n.contains('/'))
         .ok_or_else(|| "the repository is not owner/name".to_owned())?;
-    let authorization = match token {
-        None => None,
-        Some(t) => {
-            // Before any connection: a token must not cross the network in the clear.
-            if base.scheme() != "https" && !is_loopback(&base) {
-                return Err("refusing to send the token over plain http to another host".to_owned());
-            }
-            Some(t.header()?)
-        }
-    };
+    let authorization = authorization(&base, token)?;
     Ok(Prepared {
         url: join(
             &base,

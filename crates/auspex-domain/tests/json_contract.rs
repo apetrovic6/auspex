@@ -852,3 +852,168 @@ fn fleet_ci_shape() {
     let back: FleetReport = serde_json::from_value(old).unwrap();
     assert_eq!(back.fleet_ci, FleetCi::off());
 }
+
+/// AUS-19: the runners' shape. `runners` and `runner_forges` are always present (`[]` without
+/// `[runners]`), a row's keys are always all there (`null` when unknown, as everywhere in the
+/// contract), and an old report without either key still reads, as empty.
+#[test]
+fn runners_shape() {
+    use auspex_domain::observe::{RunnerUnit, UnitActive};
+    use auspex_domain::runners::{
+        ForgeAnswer, ForgeRunner, ForgeSlot, MachineFacts, RunnersConfig, report,
+    };
+
+    let units = [RunnerUnit {
+        unit: "gitea-runner-alpha.service".to_owned(),
+        active: UnitActive::Inactive,
+        sub: "dead".to_owned(),
+    }];
+    let machines = [MachineFacts {
+        name: "alpha",
+        units: Some(&units),
+        memory: None,
+        load: None,
+    }];
+    let slots = [
+        ForgeSlot {
+            forge: "forge.example.org".to_owned(),
+            scope: "admin".to_owned(),
+            site: String::new(),
+            answer: Some(ForgeAnswer {
+                runners: Ok(vec![ForgeRunner::new(
+                    "alpha",
+                    "idle",
+                    &["docker".to_owned()],
+                    Some("v9.0.0"),
+                )]),
+                queued: Ok(3),
+            }),
+        },
+        ForgeSlot {
+            forge: "beta.example.org".to_owned(),
+            scope: "user".to_owned(),
+            site: String::new(),
+            answer: Some(ForgeAnswer {
+                runners: Err("forge: the forge refused the token (HTTP 403)".to_owned()),
+                queued: Err("forge: the forge refused the token (HTTP 403)".to_owned()),
+            }),
+        },
+    ];
+    let runners = report(&slots, &machines, &RunnersConfig::default());
+    let r = fleet_report(
+        vec![],
+        vec![],
+        FleetFacts {
+            scan_complete: true,
+            runners,
+            ..FleetFacts::default()
+        },
+    );
+    let v = serde_json::to_value(&r).unwrap();
+    assert_eq!(
+        v["runners"],
+        serde_json::json!([
+            {
+                "forge": "forge.example.org", "name": "alpha", "status": "idle",
+                "labels": ["docker"], "version": "v9.0.0", "machine": "alpha",
+                "unit": {"unit": "gitea-runner-alpha.service", "active": "inactive", "sub": "dead"},
+                "memory": null, "load": null, "badges": ["forge_up_unit_down"], "error": null
+            },
+            {
+                "forge": "beta.example.org", "name": null, "status": "unknown",
+                "labels": [], "version": null, "machine": null, "unit": null,
+                "memory": null, "load": null, "badges": ["forge_error"],
+                "error": "forge: the forge refused the token (HTTP 403)"
+            }
+        ])
+    );
+    assert_eq!(
+        v["runner_forges"],
+        serde_json::json!([
+            {"forge": "forge.example.org", "scope": "admin", "checking": false,
+             "error": null, "queued": 3, "queue_error": null},
+            {"forge": "beta.example.org", "scope": "user", "checking": false,
+             "error": "forge: the forge refused the token (HTTP 403)", "queued": null,
+             "queue_error": "forge: the forge refused the token (HTTP 403)"}
+        ])
+    );
+    // Without `[runners]`: both are `[]`, present.
+    let none = serde_json::to_value(fleet_report(vec![], vec![], FleetFacts::default())).unwrap();
+    assert_eq!(none["runners"], serde_json::json!([]));
+    assert_eq!(none["runner_forges"], serde_json::json!([]));
+    // An old report reads as empty.
+    let mut old = none;
+    old.as_object_mut().unwrap().remove("runners");
+    old.as_object_mut().unwrap().remove("runner_forges");
+    let back: auspex_domain::report::FleetReport = serde_json::from_value(old).unwrap();
+    assert!(back.runners.is_empty() && back.runner_forges.is_empty());
+}
+
+fn spell<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// AUS-19: every spelling a reader of `runners` can meet is pinned, so a rename is a test failure
+/// and not a silent break of whoever reads the JSON.
+#[test]
+fn runner_enum_spellings_are_pinned() {
+    use auspex_domain::observe::UnitActive;
+    use auspex_domain::runners::{RunnerBadge, RunnerStatus};
+
+    let statuses = [
+        RunnerStatus::Offline,
+        RunnerStatus::Idle,
+        RunnerStatus::Active,
+        RunnerStatus::Unknown,
+    ];
+    assert_eq!(
+        statuses.iter().map(spell).collect::<Vec<_>>(),
+        ["offline", "idle", "active", "unknown"]
+    );
+    let badges = [
+        RunnerBadge::Offline,
+        RunnerBadge::ForgeUpUnitDown,
+        RunnerBadge::ForgeDownUnitUp,
+        RunnerBadge::MemoryNearCap,
+        RunnerBadge::ForgeError,
+    ];
+    assert_eq!(
+        badges.iter().map(spell).collect::<Vec<_>>(),
+        [
+            "offline",
+            "forge_up_unit_down",
+            "forge_down_unit_up",
+            "memory_near_cap",
+            "forge_error"
+        ]
+    );
+    let active = [
+        UnitActive::Active,
+        UnitActive::Reloading,
+        UnitActive::Inactive,
+        UnitActive::Failed,
+        UnitActive::Activating,
+        UnitActive::Deactivating,
+        UnitActive::Maintenance,
+    ];
+    assert_eq!(
+        active.iter().map(spell).collect::<Vec<_>>(),
+        [
+            "active",
+            "reloading",
+            "inactive",
+            "failed",
+            "activating",
+            "deactivating",
+            "maintenance"
+        ]
+    );
+    // And the words the unit parser reads are the words the JSON speaks.
+    for a in active {
+        assert_eq!(spell(&a), a.word());
+    }
+}

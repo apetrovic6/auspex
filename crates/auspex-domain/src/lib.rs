@@ -25,6 +25,8 @@
 //!   the rule for typed confirmation.
 //! - [`roll`]: updating many machines (`U`): rolling groups by tag, Kubernetes node state, and
 //!   what "healthy again" means.
+//! - [`runners`]: the CI runners view: scopes, joining a runner to its machine and unit, the badges,
+//!   and the status line.
 //! - [`eval`]: `nix-eval-jobs` lines, the eval cache key and the cache entry.
 //! - [`closure`]: the two closure queries' script and output parser.
 //! - [`diff`]: bounded package previews from two runtime closures.
@@ -42,5 +44,6 @@ pub mod observe;
 pub mod preflight;
 pub mod report;
 pub mod roll;
+pub mod runners;
 pub mod status;
 pub mod text;

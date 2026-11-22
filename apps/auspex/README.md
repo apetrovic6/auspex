@@ -8,7 +8,7 @@ shells/tui      terminal (ratatui): rendering, keys, and fulfilling the core's e
 ```
 
 The core never performs an effect; it asks for one, and the shell fulfils it by calling
-`crates/auspex-effects` (ssh, nix, Prometheus, the binary cache, the forge's CI status). The rules both sides apply
+`crates/auspex-effects` (ssh, nix, Prometheus, the binary cache, the forge's CI status, the CI runners). The rules both sides apply
 live in `crates/auspex-domain`. Dependencies point inward: the core never sees the effects
 crate.
 
@@ -61,6 +61,7 @@ colour, and `A` turns it off again at once. In observe mode `u` and `s` only say
 | `s` | Act mode only. Suspends the TUI and opens `ssh` to the selected machine (see below); when ssh ends the TUI is back, and the status bar says `ssh to luna exited (code N)`. |
 | `f` | Freezes the machine: `u` refuses it from then on (`luna is frozen; f to unfreeze`) and a later `U` will skip it. Shows `❄` in the list and `frozen` in the detail panel. **Needs no act mode**, because it only prevents changes. On a frozen machine `f` asks `unfreeze luna? updates to it will be possible again. y/N` (answered like every question: only once it could be read). A freeze is kept across restarts, per fleet, in `$XDG_STATE_HOME/auspex/state.toml` (see *Freezing* below), and every freeze and unfreeze is a row in the action log. |
 | `L` | The Log tab: the streamed output of the current and last action, standard error in its own colour, the last 10 000 lines of each, following the tail until you scroll up (`k`, `Ctrl-u`, `gg`; `G` follows again). `Tab` switches to the adapters' notes. |
+| `R` | The Runners tab (see *CI runners* below): every runner the configured forges list, with its machine's unit, memory against its cap and badges, and what each forge's queue holds. Read-only; `q` or `Esc` closes it. |
 
 **`s` is your own ssh, not auspex's.** It runs `ssh -o ControlMaster=no -o ControlPath=<runtime dir>/auspex/%C [-p port] -- user@host` for the machine's target (the same user, host and port the probes use), with the terminal. auspex's own `-o` options come first, so your `ControlPath` and `ControlMaster` never apply, with a live master or without one. Your agent, your `SSH_ASKPASS` and your prompts (host keys, passwords, passphrases) work, because none of auspex's probe guards (`BatchMode`, no tty, askpass removed) apply to it. **Which connection it uses depends on whether auspex holds a live control master for that host.** If it does, the session is a channel on *that* connection: no second agent approval, but the connection is auspex's, so its settings decide the transport, not your `~/.ssh/config`: a keepalive of 5 s (a network drop of about 15 s ends the session: 5 s times `ServerAliveCountMax`, which is 3 unless the machine's options set it, 1 to 5, so 5 to 25 s; a direct ssh under your own keepalive settings might have survived it), and its `Compression`, `TCPKeepAlive` and `IPQoS`. What is per session still follows your config (`ForwardAgent`, `RemoteCommand`, `SendEnv`, the tty). If there is no live master, ssh connects directly under your `~/.ssh/config` entirely, and leaves no master behind (a socket left by a dead master makes ssh print `Control socket connect(...): Connection refused` first). While ssh runs auspex draws nothing and reads no key (its probes and an update's output carry on, and the Log tab has them when you are back), and Ctrl-C, Ctrl-\ and Ctrl-Z go to ssh: Ctrl-Z does not suspend it (auspex has no job control to bring it back, so a stopped ssh is continued at once). Signals: ssh is in auspex's process group, so the terminal's own signals reach auspex as well as ssh and auspex ignores them: that includes a `kill -INT` or `kill -QUIT` aimed at auspex from another terminal while ssh runs (SIGTERM and SIGHUP are obeyed, below). After ssh ends auspex waits 100 ms for a late copy of such a signal and discards it, which is a timing heuristic: on a very loaded machine one that is noticed later still quits auspex. The SIGTSTP handler, installed the first time you press `s`, stays for the rest of the run, so a `kill -TSTP` aimed at auspex itself no longer stops it. ssh may leave your terminal in raw mode (it cannot restore it when it is killed): auspex saves the terminal's modes before ssh and puts them back as soon as it ends, on every path. A panic in auspex while ssh runs writes only its message, as plain text with no escape sequences, to the terminal ssh is using; it does not touch the terminal's modes or screen. **To get back, leave ssh the way you would anywhere: `exit`, Ctrl-D, or `~.` on a new line.** Whatever its exit code, or if it was killed, the TUI redraws and says how it ended; keys typed to a dead ssh are discarded. If auspex is sent `SIGTERM` or `SIGHUP` while ssh runs, it ends ssh (`SIGTERM`, then `SIGKILL` after 3 s), leaves your terminal as it is (normal screen, cursor shown) and exits with 128 plus the signal. `s` is refused with a reason in observe mode ("act mode is off (A)"), for a machine whose target did not parse, and in `--demo` (nothing real to ssh to); `--plain` and `--json` never have it.
 
@@ -507,6 +508,22 @@ kubeconfig = "~/.kube/config"
 url = "https://forge.example.org"   # https only, no credentials
 repo = "owner/name"                 # optional; default: from the fleet checkout's `origin` remote
 token_file = "~/.config/auspex/forge-token"   # optional; a read-only API token, never inline
+
+[runners]           # the CI runners tab and status line (see CI runners); omit [[runners.forge]] for none
+unit_glob = "gitea-runner-*"
+memory_warn_percent = 90
+
+[[runners.forge]]
+url = "https://forge.example.org"
+scope = "admin"                   # admin | user | org:<name> | repo:<owner>/<name>
+token_file = "~/.config/auspex/forge-admin-token"
+
+[runners.hosts.alpha]             # optional caps for the Prometheus figures
+cpus = 2
+memory = "4GiB"
+
+[runners.machines]                # optional: runner name -> machine name
+"alpha-docker" = "alpha"
 ```
 
 The config file's `flake` and `CLAN_DIR` take a leading `~/` (your `$HOME`; `~user/` is refused);
@@ -608,6 +625,121 @@ send the token on to another host; and a token is sent only over `https` (or to 
 address, which only a test uses: `forge.url` itself must be `https`). The token never reaches
 `config.toml` through Home Manager either: `programs.auspex.settings.forge.token_file` is a path,
 and one inside the Nix store (world-readable) is refused at evaluation.
+
+## CI runners
+
+With a `[[runners.forge]]` configured, `R` opens the **Runners tab** and the status bar says
+`runners: 7/8 online, 2 busy, 3 queued`. The tab is read-only: nothing in it acts on a runner (`q`
+or `Esc` closes it, the scroll keys move it, every other key does nothing until it is closed).
+`--json` carries the same data as `runners` (one entry per runner) and `runner_forges` (what each
+forge gave beside rows: its queue, or why it failed).
+
+```toml
+[runners]
+unit_glob = "gitea-runner-*"   # which systemd units are runner units (NixOS: the default)
+memory_warn_percent = 90       # badge a row from this share of its host's memory cap
+
+[[runners.forge]]
+url = "https://forge.example.org"
+scope = "admin"                # admin | user | org:<name> | repo:<owner>/<name>
+token_file = "~/.config/auspex/forge-admin-token"   # read-only; `admin` needs read:admin
+
+[runners.hosts.alpha]          # optional caps for the Prometheus figures
+cpus = 2
+memory = "4GiB"
+
+[runners.machines]             # optional: runner name -> machine name
+"alpha-docker" = "alpha"
+```
+
+**Three sources, joined.** A row is `(forge, runner name)`.
+
+1. **The forge** (Forgejo 15 / gitea 1.22): `GET /api/v1/{admin,user,orgs/<org>,repos/<owner>/<repo>}/actions/runners`
+   for each runner's `name`, `status` (`offline`, `idle`, `active`), `labels` and `version`, and
+   `…/actions/runners/jobs` for the jobs that are waiting. The listing is paged (50 a page) and is
+   read until a page is empty or has nothing it has not seen (a forge that ignores `page` is not
+   read twice), and is asked with `visible=true`: the API's default is only the runners the scope
+   owns directly, and `visible` is what makes `admin` list every runner of the instance (and `org:`
+   and `repo:` the global ones that serve them too). A forge answers an empty list as `null`, which
+   is read as the empty list it is. Two scopes of **one forge** (`admin` and a `repo:` on the same
+   URL, say) list some of the same runners: a runner both list, by the forge's own identifier, is
+   one runner, shown once (under the first entry that has it) and counted once. A runner the forge
+   gave no identifier is not merged with anything, since names are not unique. **The queues are
+   not merged**: each entry's waiting jobs are its own count and the status line adds them, so a
+   second scope on the same forge counts the jobs it shares again.
+2. **ssh**, NixOS only: the probe lists the systemd services matching `unit_glob`
+   (`systemctl list-units --type=service --all -- <glob>`, loaded units only) in the round trip it
+   makes anyway. The glob is checked (letters, digits and `: _ . @ - * ? [ ]`, not starting with `-`:
+   it is written into a shell script, and systemctl reads options after the verb, so it also comes
+   after `--`) and the unit names and states are checked like the failed-unit list's: one
+   malformed entry makes the whole list unreadable, never half-believed. So does a list of more
+   than 64 units, which is refused and not cut: a cut list read as the whole would hide the runner
+   whose unit was cut. darwin reports nothing.
+   The default matches what the NixOS module `services.gitea-actions-runner` names its units,
+   `gitea-runner-<name>.service`; without a `[[runners.forge]]` the probe lists no units.
+3. **Prometheus**, when `[prometheus]` is configured: the host's memory in use (total less
+   available) against `[runners.hosts.<machine>] memory`, and its one-minute load against `cpus`.
+   **No cap is assumed**: a host with no entry shows no figure and no badge, however full it is.
+   The load average is a stand-in for CPU use (it is what the fleet-wide query already carries).
+
+**Joining.** A runner is on the machine `[runners.machines]` names for it, else the machine whose
+name it equals or begins with `<machine>-` (the longest such machine). Its unit is that machine's
+runner unit whose instance name (`gitea-runner-<instance>.service`, the glob's literal prefix and
+systemd's `\x2d` escapes removed) equals the runner's name or its name without `<machine>-`. Failing
+that, a machine with **exactly one runner unit** that no runner owns by name gives it to its
+**only runner** (the same runner listed by two forges is one runner), or, when there are several,
+to the one **named for the machine** (`alpha` on machine `alpha`): that is the common NixOS layout,
+one `instances.default` whose unit is `gitea-runner-default.service` and whose runner is named
+after the host. Another runner whose name merely begins with `<machine>-` does not take the unit
+from it. With several units, or several runners none of which is named for the machine, which is
+whose is not known and none is guessed. **A name is the only evidence here**: a forge that lists
+every runner it can see (`visible`) also lists strangers' runners, and one named like the machine is
+mistaken for it. `[runners.machines]` is how to be sure. A machine whose probe did not report units
+has no unit facts and is never called "unit down".
+
+**Badges**, per row (the first three make it red; in `--json`, `badges`):
+
+| badge | when |
+|---|---|
+| `offline` | the forge says the runner is offline |
+| `unit down` (`forge_up_unit_down`) | the forge says online (idle or busy) and its unit is inactive, failed, deactivating or in maintenance |
+| `unit up` (`forge_down_unit_up`) | the forge says offline and its unit is active or reloading |
+| `memory` (`memory_near_cap`) | the host's memory in use is at or above `memory_warn_percent` of its cap (not red) |
+| `forge error` | the forge could not be asked: one row for the whole entry, with the reason |
+
+A unit that is `activating` (starting, or waiting to restart) is neither up nor down, so it earns
+no mismatch badge. A forge status the API does not define is `unknown`: not online, not offline.
+
+**What the forge's API does not say, and so the tab does not.** `ActionRunner` has no field for the
+job a runner is running, and the waiting-jobs payload has no time at all, so:
+
+- a busy runner is **busy**; which job it runs is not known and is not guessed;
+- the queue is a **count** of waiting jobs (those with status `waiting`, or none; an empty list, or
+  `null`, is no jobs); there is no "oldest has waited 12 minutes". The request carries no `labels`
+  filter, which the API documents as "a comma separated list of labels to search for": **whether
+  Forgejo then matches every waiting job or only those whose labels fit the ones given has not been
+  checked against a real forge**, and if it is the second the count is of jobs no label filter
+  excludes, which may be fewer than are waiting;
+- there is **no "job running too long" badge**: the API does not say when a job began. It will be
+  added when the API does.
+
+**A failing forge** shows on its own row, with the reason, and never delays a machine row or the
+refresh: every request is bounded (one timeout, `timeouts.probe`, for the whole listing and one
+for the queue, side by side; 1 MiB a page, 4 MiB for the jobs list; at most 1,000 runners over 20 pages and 10,000 jobs,
+counted while the body is read, and past a bound the answer is an error, never a truncated list
+that would read as the truth; the jobs list may be 4 MiB, since 10,000 jobs of a few hundred bytes
+each do not fit in a page's allowance). The runners and the queue fail independently: a token that may list
+runners and not jobs still shows the runners, with the queue `?`. The forge's reason is written to
+the Log tab once.
+
+**The token** is read and guarded exactly as the CI badge's (see above): per entry, from its
+`token_file`, refused with the reason when others can read it, never quoted, sent only over
+`https`, never followed through a redirect. Every reason and every runner name, label and version
+the forge sent is checked for it and replaced when it holds it: the text is sanitised first (the
+sanitiser removes control and format characters, so a token with one inserted is only the token
+once sanitised), checked whole, and only then cut to 100 characters (a token that straddles the cut
+would be shown but for its last character), and a text that held it is not shown at all. A refused token makes that entry
+a `forge error` row and sends nothing to it.
 
 ## Package preview
 

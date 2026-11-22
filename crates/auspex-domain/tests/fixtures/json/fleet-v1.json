@@ -268,5 +268,7 @@
     "state": "off",
     "url": null,
     "reason": null
-  }
+  },
+  "runners": [],
+  "runner_forges": []
 }

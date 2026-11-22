@@ -31,18 +31,19 @@ pub mod view;
 pub use app::{
     Auspex, CACHE_LOOKUP_FAILED, CI_CHECKING, CI_TIMED_OUT, EVAL_MISSING, EVAL_TIMED_OUT, Event,
     INVENTORY_TIMED_OUT, Model, PENDING_SYSTEM_MISMATCH, PREVIEW_NO_SLOT, PREVIEW_TIMED_OUT,
-    PROBE_TIMED_OUT, PROMETHEUS_TIMED_OUT, SYSTEM_CHANGED,
+    PROBE_TIMED_OUT, PROMETHEUS_TIMED_OUT, RUNNERS_TIMED_OUT, SYSTEM_CHANGED,
 };
 pub use auspex_domain::report::{FleetError, FleetErrorKind};
 pub use config::{
-    Config, DiffConfig, ForgeConfig, FreezeConfig, PrometheusConfig, RollingConfig, SavedFreezes,
+    Config, DiffConfig, ForgeConfig, FreezeConfig, PrometheusConfig, RollingConfig, RunnerForge,
+    RunnersSetup, SavedFreezes,
 };
 pub use crux_core::Core;
 pub use effects::{
     ActionEnd, ActionKind, ActionRequest, ActionResult, AwaitAnswer, AwaitRequest, Effect,
     ForgeHeadAnswer, ForgeHeadRequest, ForgeStatusAnswer, ForgeStatusRequest, Generation,
     KubeAnswer, KubeOp, KubeReply, KubeRequest, LogOp, LogRequest, PreflightAnswer,
-    PreflightRequest, RequestId, ShellEnd, ShellRequest,
+    PreflightRequest, RequestId, RunnersRequest, ShellEnd, ShellRequest,
 };
 pub use view::{
     ActionStatus, ActionView, ConfirmKind, ConfirmView, FreezeView, Mode, Phase, PrometheusStatus,

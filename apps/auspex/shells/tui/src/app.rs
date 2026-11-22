@@ -27,8 +27,9 @@ use std::time::Duration;
 
 use auspex_core::{
     Config, DiffConfig, Event, ForgeConfig, FreezeConfig, PrometheusConfig, PrometheusStatus,
-    SavedFreezes,
+    RunnerForge, RunnersSetup, SavedFreezes,
 };
+use auspex_domain::runners::RunnersConfig;
 use auspex_effects::Termination;
 use auspex_effects::deploylog::{self, Identity, OpenParams};
 use auspex_effects::freeze::{self, FreezeStore};
@@ -79,6 +80,25 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
         forge: settings.forge.as_ref().map(|f| ForgeConfig {
             host: f.host.clone(),
             repo: f.repo.clone(),
+        }),
+        runners: settings.runners.as_ref().map(|r| {
+            Box::new(RunnersSetup {
+                forges: r
+                    .forges
+                    .iter()
+                    .map(|f| RunnerForge {
+                        forge: f.name.clone(),
+                        scope: f.scope.to_string(),
+                        site: f.site.clone(),
+                    })
+                    .collect(),
+                join: RunnersConfig {
+                    unit_glob: r.unit_glob.clone(),
+                    memory_warn_percent: r.memory_warn_percent,
+                    hosts: r.hosts.clone(),
+                    machines: r.machines.clone(),
+                },
+            })
         }),
         binary_cache: settings.cache_url.is_some(),
         // What `f` saved is read where the run is built (it is I/O): see `load_freezes`.
@@ -371,6 +391,7 @@ async fn headless(
     // Likewise the CI badge's reason: `--json` has it in `fleet_ci.reason`, `--plain` has no line
     // for it, and neither has a status bar.
     shell.note_ci(&view);
+    shell.note_runners(&view);
     // The TUI shows "prom: down"; headless output would otherwise not say it at all (C3).
     if let PrometheusStatus::Unavailable { reason } = &view.prometheus {
         shell.log.line(&format!(

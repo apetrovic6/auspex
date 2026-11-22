@@ -145,6 +145,9 @@ pub struct Shell {
     freeze_store: Mutex<Option<FreezeStore>>,
     /// The reason the CI badge was last written to the log, so it is written once.
     ci_noted: Mutex<Option<String>>,
+    /// The reason each runners forge entry last had written to the log, by entry, so it is written
+    /// once.
+    runners_noted: Mutex<std::collections::BTreeMap<usize, String>>,
     /// What `f` froze in a run with no state file (the demo, most tests): kept for the run, so
     /// that freezing and unfreezing work as they do with a file.
     frozen_in_memory: Mutex<BTreeSet<String>>,
@@ -203,6 +206,7 @@ impl Shell {
             handoff: Mutex::new(None),
             freeze_store: Mutex::new(None),
             ci_noted: Mutex::new(None),
+            runners_noted: Mutex::new(std::collections::BTreeMap::new()),
             frozen_in_memory: Mutex::new(BTreeSet::new()),
             freeze_reads: AtomicUsize::new(0),
             locks: Mutex::new(HashMap::new()),
@@ -325,6 +329,38 @@ impl Shell {
             .line(&format!("CI badge: {}: {reason}", ci.state.label()));
     }
 
+    /// Writes why a runners forge entry could not be read (or its queue could not) to the log, once
+    /// per entry and reason, as [`Self::note_ci`] does for the badge: the tab and the status bar
+    /// have no room for it, and `--json` has it only in a report nobody reads while the TUI runs.
+    pub fn note_runners(&self, view: &ViewModel) {
+        let mut noted = lock(&self.runners_noted);
+        let mut lines = Vec::new();
+        // By position, not by name: the entries are in config order, and a name is only a label.
+        for (i, f) in view.report.runner_forges.iter().enumerate() {
+            let reason = f
+                .error
+                .clone()
+                .or_else(|| f.queue_error.as_ref().map(|q| format!("queue: {q}")));
+            match reason {
+                // Answered well since: the next failure is news again.
+                None => {
+                    noted.remove(&i);
+                }
+                Some(_) if f.checking => {}
+                Some(reason) => {
+                    if noted.get(&i) != Some(&reason) {
+                        lines.push(format!("Runners: {}: {reason}", f.forge));
+                        noted.insert(i, reason);
+                    }
+                }
+            }
+        }
+        drop(noted);
+        for line in lines {
+            self.log.line(&line);
+        }
+    }
+
     /// Draws the core view together with the current shell-only connection count.
     pub fn draw(
         &self,
@@ -336,6 +372,7 @@ impl Shell {
         ui.warning = self.warning();
         let view = self.view();
         self.note_ci(&view);
+        self.note_runners(&view);
         crate::ui::draw(frame, &view, ui, ctx);
     }
 
@@ -514,6 +551,14 @@ impl Shell {
                 let shell = Arc::clone(self);
                 self.one_shot(op.id, request, async move {
                     shell.backend.forge_status(&op, &token).await
+                });
+            }
+            Effect::Runners(request) => {
+                let op = request.operation.clone();
+                let token = self.open(op.id);
+                let shell = Arc::clone(self);
+                self.one_shot(op.id, request, async move {
+                    shell.backend.runners(&op, &token).await
                 });
             }
             Effect::CacheLookup(request) => {
