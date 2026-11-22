@@ -90,6 +90,18 @@ thread_local! {
     static CLOCK: (Instant, std::cell::Cell<Duration>) = (Instant::now(), std::cell::Cell::new(Duration::ZERO));
 }
 
+/// How long a test waits for something that must happen, and the budget it gives a product bound
+/// that is not what the test is about. Every shorter bound is a bet on when the scheduler runs a
+/// process: an idle laptop wins it, and a CI box with the rest of a build beside it, or twelve
+/// busy loops sharing the core at a better priority (AUS-45, AUS-47), does not, and the test then
+/// fails with nothing wrong in the product. A wait that ends the moment its condition holds costs
+/// nothing when the bound is long, so these are long: a condition that never comes fails after
+/// this, which is five minutes, not never. (Five and not the two of `auspex-effects`: a test here
+/// starts the whole shell with its fake `clan`, `kubectl` and `ssh`, and on a core shared with
+/// twelve busy loops the wait for the first `kubectl uncordon` after a cancelled drain ran past two
+/// minutes, AUS-47.)
+pub const PATIENT: Duration = Duration::from_secs(300);
+
 /// The test's own clock: it moves only when [`elapse`] says so, so "the question has been on
 /// screen for 0.3 s" is not a race with the machine's load. One per test thread.
 pub fn now() -> Instant {
@@ -362,7 +374,7 @@ pub fn run_within(cmd: &mut Command, limit: Duration) -> Output {
     out.unwrap()
 }
 
-/// Waits up to 10 s for `path` to hold `lines` non-empty lines, and returns them as pids.
+/// Waits up to [`PATIENT`] for `path` to hold `lines` non-empty lines, and returns them as pids.
 pub fn wait_for_pids(path: &Path, lines: usize) -> Vec<i32> {
     let start = Instant::now();
     loop {
@@ -373,7 +385,7 @@ pub fn wait_for_pids(path: &Path, lines: usize) -> Vec<i32> {
             }
         }
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < PATIENT,
             "{} never got {lines} pids",
             path.display()
         );

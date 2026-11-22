@@ -102,7 +102,12 @@ impl Run {
         let eval = eval_ok(&t, dir.path());
         let ssh = ssh(&t, dir.path(), ssh_session);
         let config = dir.path().join("auspex.toml");
-        std::fs::write(&config, extra_config).unwrap();
+        // The product's own deadlines (a 10 s probe, a 5 s ssh connect, a 120 s refresh) are right for
+        // an operator, and a machine that does not run the fake `ssh` for ten seconds turns the row
+        // "unreachable" and the test's `s` into a refusal, which no wait here can undo (AUS-47).
+        // None of the tests here is about a deadline, so every one is long.
+        let patient = "[timeouts]\nssh_connect = 60\nssh_approval = 600\nprobe = 600\neval = 600\nsettle = 900\ndiff = 600\n\n";
+        std::fs::write(&config, format!("{patient}{extra_config}")).unwrap();
         let fleet = dir.path().join("fleet");
         std::fs::create_dir_all(&fleet).unwrap();
         let mut cmd = auspex(dir.path());
@@ -531,7 +536,7 @@ fn a_sigint_that_reaches_auspex_as_ssh_ends_does_not_quit_it() {
     // 30 ms after ssh has exited, which lands in the same place: after the wait is over and before
     // the loop reads signals again. Eight sessions in a row, so a drain that only sometimes works
     // is seen.
-    let session = "code=$(( $(cat '@dir@/rounds' 2>/dev/null || echo 0) + 1 ))\nparent=$PPID\n( @sleep@ 0.03; kill -INT $parent ) &\nexit $code";
+    let session = "code=$(( $(cat '@dir@/rounds' 2>/dev/null || echo 0) + 1 ))\nparent=$PPID\n( @sleep@ 0.03; kill -INT $parent; : > \"@dir@/killed-$code\" ) &\nexit $code";
     let Some(mut run) = Run::start("", INVENTORY, session) else {
         return;
     };
@@ -545,6 +550,13 @@ fn a_sigint_that_reaches_auspex_as_ssh_ends_does_not_quit_it() {
             run.pty.running(),
             "round {round}: auspex quit on the SIGINT"
         );
+        // The signal is sent by a background child of the fake ssh, 30 ms after it has exited, and
+        // on a loaded machine that child runs when the scheduler gets to it: a round's signal sent
+        // during the next round's session is not the race this test makes (AUS-47). So the next
+        // round starts only once this round's signal has been sent.
+        common::pty::Pty::wait_until(&run.pty, "the round's SIGINT to be sent", |_| {
+            run.file(&format!("killed-{round}")).exists()
+        });
         // Let any late signal be read, and then the next `s` is a fresh session.
         std::thread::sleep(Duration::from_millis(250));
         assert!(

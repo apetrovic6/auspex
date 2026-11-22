@@ -22,10 +22,10 @@ use std::time::{Duration, Instant};
 
 use auspex_domain::eval::CacheKey;
 use auspex_domain::fleet::MachineClass;
-use auspex_effects::cache::{CacheParams, GitParams, evaluate_cached, key_for};
+use auspex_effects::cache::{CacheParams, evaluate_cached, key_for};
 use auspex_effects::nix::{EvalItem, EvalMachine, EvalParams, FlakeRef};
 use auspex_effects::{CancellationToken, Cancelled};
-use common::{Tools, find_on_path, in_nix_build, still_alive_after_wait, tempdir, tools};
+use common::{PATIENT, Tools, find_on_path, in_nix_build, still_alive_after_wait, tempdir, tools};
 use tokio::sync::mpsc::unbounded_channel;
 
 fn have_git() -> bool {
@@ -63,8 +63,10 @@ fn repo() -> Option<tempfile::TempDir> {
     Some(dir)
 }
 
+/// The key under `common::patient_git`: the product's 2 s is right for an operator
+/// and a loaded machine misses it, which these tests are not about (AUS-47).
 async fn key(dir: &Path) -> Result<CacheKey, String> {
-    key_for(dir, &GitParams::new(), &CancellationToken::new())
+    key_for(dir, &common::patient_git(), &CancellationToken::new())
         .await
         .unwrap()
 }
@@ -83,14 +85,26 @@ async fn key_wrapped(
     r: &Path,
     timeout: Duration,
 ) -> (Result<CacheKey, String>, Duration) {
+    let (k, took, _) = key_wrapped_counted(t, r, timeout).await;
+    (k, took)
+}
+
+/// [`key_wrapped`], and how many times the wrapper was started (its pid is recorded first).
+async fn key_wrapped_counted(
+    t: &Tools,
+    r: &Path,
+    timeout: Duration,
+) -> (Result<CacheKey, String>, Duration, usize) {
     let side = tempdir();
     let w = wrapped_git(t, side.path());
-    let mut g = GitParams::new();
+    let mut g = common::patient_git();
     g.program = w.as_os_str();
     g.timeout = timeout;
     let start = Instant::now();
     let k = key_for(r, &g, &CancellationToken::new()).await.unwrap();
-    (k, start.elapsed())
+    let took = start.elapsed();
+    let started = fs::read_to_string(side.path().join("pids")).map_or(0, |s| s.lines().count());
+    (k, took, started)
 }
 
 fn sparse(path: &Path, len: u64) {
@@ -139,9 +153,12 @@ async fn fifo_exclude_files_do_not_stall() {
     fs::remove_file(r.path().join(".git/info/exclude")).ok();
     fs::create_dir_all(r.path().join(".git/info")).unwrap();
     fifo(&r.path().join(".git/info/exclude"));
-    let (k, took) = key_wrapped(&t, r.path(), Duration::from_secs(3)).await;
+    // A FIFO that was read would stall git until its deadline and the key would be an error:
+    // with `PATIENT` for it, "did not stall" is the key, and how long it took is not asked
+    // (a bound of 1 s on a process start was a bound on the scheduler, AUS-47).
+    let (k, took) = key_wrapped(&t, r.path(), PATIENT).await;
     assert!(k.is_ok(), "{k:?}");
-    assert!(took < Duration::from_secs(1), "{took:?}");
+    assert!(took < PATIENT, "{took:?}");
 }
 
 /// The files git does read (the index, `HEAD`, `packed-refs`) are bounded by the memory
@@ -197,12 +214,16 @@ async fn a_fifo_include_costs_one_short_timeout() {
     let f = side.path().join("inc");
     fifo(&f);
     git(r.path(), &["config", "include.path", f.to_str().unwrap()]);
-    let (k, took) = key_wrapped(&t, r.path(), Duration::from_millis(800)).await;
+    let (k, _, started) = key_wrapped_counted(&t, r.path(), Duration::from_millis(800)).await;
     let e = k.unwrap_err();
     assert!(e.contains("timed out"), "{e}");
+    // One timeout, not one per command: once the first command has stalled and timed out no
+    // other is started. Counted by what the fake saw, not by the time it took, which on a
+    // loaded machine is the scheduler's (AUS-47; a bound of 1.5 s failed at 5.7 s). At most
+    // one: a loaded machine can time the command out before the wrapper has recorded itself.
     assert!(
-        took < Duration::from_millis(1500),
-        "more than one timeout: {took:?}"
+        started <= 1,
+        "git was started {started} times: more than one timeout"
     );
 }
 
@@ -221,7 +242,7 @@ async fn git_observes_both_limits_at_its_first_instruction() {
         "git",
         "ulimit -Sv >> '@dir@/limits'\nulimit -Hv >> '@dir@/limits'\nexec @git@ \"$@\"",
     );
-    let mut params = GitParams::new();
+    let mut params = common::patient_git();
     params.program = program.as_os_str();
     key_for(r.path(), &params, &CancellationToken::new())
         .await
@@ -249,7 +270,7 @@ async fn a_finished_git_leaves_no_children() {
         "git",
         "@sleep@ 30 > /dev/null 2>&1 &\necho $! >> '@dir@/pids'\nexit 1",
     );
-    let mut g = GitParams::new();
+    let mut g = common::patient_git();
     g.program = fake.as_os_str();
     let _ = key_for(r.path(), &g, &CancellationToken::new()).await;
     let pids = common::wait_for_pids(&dir.path().join("pids"), 1);
@@ -377,7 +398,7 @@ async fn the_index_listing_cap_is_64_mib() {
                 "case \" $* \" in *' ls-files '*) exec @head@ -c {len} /dev/zero;; esac\nexec @git@ \"$@\""
             ),
         );
-        let mut g = GitParams::new();
+        let mut g = common::patient_git();
         g.program = fake.as_os_str();
         g.timeout = Duration::from_secs(60);
         let start = Instant::now();
@@ -472,7 +493,12 @@ async fn git_dir_inner() {
     )
     .unwrap();
     assert_ne!(with_env, key(mine.path()).await.unwrap());
-    let top = key_for(mine.path(), &GitParams::new(), &CancellationToken::new()).await;
+    let top = key_for(
+        mine.path(),
+        &common::patient_git(),
+        &CancellationToken::new(),
+    )
+    .await;
     assert!(matches!(top, Ok(Ok(_))));
 }
 
@@ -500,7 +526,7 @@ async fn a_git_reference_with_a_query_gets_no_caching() {
     let params = CacheParams {
         cache_dir: Some(cache.path()),
         flake_dir: r.path(),
-        git: GitParams::new(),
+        git: common::patient_git(),
     };
     for q in [
         "?ref=main",
@@ -552,7 +578,7 @@ async fn dropping_the_receiver_during_the_key_kills_git_first() {
         w.clone(),
     );
     let task = tokio::spawn(async move {
-        let mut g = GitParams::new();
+        let mut g = common::patient_git();
         g.program = wp.as_os_str();
         g.timeout = Duration::from_secs(30);
         let params = CacheParams {
@@ -675,7 +701,7 @@ async fn a_reference_and_a_key_for_different_repositories_get_no_caching() {
     let params = CacheParams {
         cache_dir: Some(cache.path()),
         flake_dir: &sub,
-        git: GitParams::new(),
+        git: common::patient_git(),
     };
     let (tx, mut rx) = unbounded_channel();
     evaluate_cached(
@@ -1171,7 +1197,7 @@ async fn a_first_git_command_that_runs_out_of_memory_or_times_out_is_not_a_missi
         "git-oom",
         "echo 'fatal: Out of memory, malloc failed' >&2\nexit 128",
     );
-    let mut g = GitParams::new();
+    let mut g = common::patient_git();
     g.program = oom.as_os_str();
     let e = key_for(r.path(), &g, &CancellationToken::new())
         .await
@@ -1181,7 +1207,7 @@ async fn a_first_git_command_that_runs_out_of_memory_or_times_out_is_not_a_missi
     assert!(!e.contains("not a git repository"), "{e}");
 
     let slow = t.script(side.path(), "git-slow", "@sleep@ 30");
-    let mut g = GitParams::new();
+    let mut g = common::patient_git();
     g.program = slow.as_os_str();
     g.timeout = Duration::from_millis(300);
     let e = key_for(r.path(), &g, &CancellationToken::new())
@@ -1197,7 +1223,7 @@ async fn a_first_git_command_that_runs_out_of_memory_or_times_out_is_not_a_missi
         "git-no",
         "echo 'fatal: something' >&2\nexit 128",
     );
-    let mut g = GitParams::new();
+    let mut g = common::patient_git();
     g.program = no.as_os_str();
     let e = key_for(r.path(), &g, &CancellationToken::new())
         .await

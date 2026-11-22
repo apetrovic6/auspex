@@ -15,9 +15,7 @@ use auspex_domain::eval::{CacheEntry, EvalOutcome, EvalSuccess};
 use auspex_domain::fleet::MachineClass;
 use auspex_domain::observe::StorePath;
 use auspex_effects::CancellationToken;
-use auspex_effects::cache::{
-    CacheParams, GitParams, entry_path, evaluate_cached, key_for, lookup, store,
-};
+use auspex_effects::cache::{CacheParams, entry_path, evaluate_cached, key_for, lookup, store};
 use auspex_effects::nix::{EvalItem, EvalMachine, EvalParams, FlakeRef};
 use common::{find_on_path, in_nix_build, tempdir, tools};
 use tokio::sync::mpsc::unbounded_channel;
@@ -72,7 +70,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 async fn key(dir: &Path) -> Result<auspex_domain::eval::CacheKey, String> {
-    key_for(dir, &GitParams::new(), &CancellationToken::new())
+    key_for(dir, &common::patient_git(), &CancellationToken::new())
         .await
         .unwrap()
 }
@@ -164,17 +162,21 @@ async fn a_directory_that_is_not_a_git_repository_gets_no_caching() {
     }
     // The system temporary directory is not inside a repository, here or in the sandbox.
     let dir = tempdir();
-    let e = key_for(dir.path(), &GitParams::new(), &CancellationToken::new())
-        .await
-        .unwrap()
-        .unwrap_err();
+    let e = key_for(
+        dir.path(),
+        &common::patient_git(),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
     assert!(e.starts_with("not a git repository"), "{e}");
 }
 
 #[tokio::test]
 async fn a_missing_git_gets_no_caching() {
     let Some(dir) = repo() else { return };
-    let mut g = GitParams::new();
+    let mut g = common::patient_git();
     g.program = std::ffi::OsStr::new("auspex-test-no-such-git");
     let e = key_for(dir.path(), &g, &CancellationToken::new())
         .await
@@ -259,7 +261,7 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
     let cache = CacheParams {
         cache_dir: Some(cache_dir.path()),
         flake_dir: r.path(),
-        git: GitParams::new(),
+        git: common::patient_git(),
     };
     let mut eval = EvalParams::new();
     eval.runtime_dir = Some(common::runtime_dir());
@@ -402,7 +404,7 @@ case "$m" in *'"b"'*) printf '%s\n' '{{"attr":"b","attrPath":["b"],"error":"erro
     let cache = CacheParams {
         cache_dir: Some(cache_dir.path()),
         flake_dir: plain.path(),
-        git: GitParams::new(),
+        git: common::patient_git(),
     };
     let (tx, mut rx) = unbounded_channel();
     evaluate_cached(

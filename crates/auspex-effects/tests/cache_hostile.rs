@@ -19,9 +19,7 @@ use std::time::{Duration, Instant, SystemTime};
 use auspex_domain::eval::{CacheEntry, CacheKey, EvalSuccess};
 use auspex_domain::fleet::MachineClass;
 use auspex_domain::observe::StorePath;
-use auspex_effects::cache::{
-    CacheParams, GitParams, entry_path, evaluate_cached, key_for, lookup, store,
-};
+use auspex_effects::cache::{CacheParams, entry_path, evaluate_cached, key_for, lookup, store};
 use auspex_effects::nix::{EvalItem, EvalMachine, EvalParams, FlakeRef};
 use auspex_effects::{CancellationToken, Cancelled};
 use common::{
@@ -79,7 +77,7 @@ fn payload(t: &Tools, dir: &Path, marker: &Path, then: &str) -> PathBuf {
 }
 
 async fn key(dir: &Path) -> Result<CacheKey, String> {
-    key_for(dir, &GitParams::new(), &CancellationToken::new())
+    key_for(dir, &common::patient_git(), &CancellationToken::new())
         .await
         .unwrap()
 }
@@ -292,7 +290,7 @@ async fn a_flake_lock_fifo_neither_hangs_nor_ignores_cancel() {
     });
     let r2 = tokio::time::timeout(
         Duration::from_secs(4),
-        key_for(r.path(), &GitParams::new(), &cancel),
+        key_for(r.path(), &common::patient_git(), &cancel),
     )
     .await;
     // Release a reader stuck in open(2), whatever happened, so the runtime can shut down.
@@ -435,7 +433,7 @@ async fn dropping_the_receiver_of_evaluate_cached_cancels() {
         let cache = CacheParams {
             cache_dir: Some(&cache_path),
             flake_dir: &repo_path,
-            git: GitParams::new(),
+            git: common::patient_git(),
         };
         let flake = FlakeRef::new(repo_path.to_str().unwrap()).unwrap();
         evaluate_cached(
@@ -490,7 +488,7 @@ async fn a_path_flake_reference_gets_no_caching() {
     let params = CacheParams {
         cache_dir: Some(cache.path()),
         flake_dir: r.path(),
-        git: GitParams::new(),
+        git: common::patient_git(),
     };
     let flake = FlakeRef::new(&format!("path:{}", r.path().display())).unwrap();
     let (tx, mut rx) = unbounded_channel();
@@ -599,7 +597,7 @@ async fn an_edit_during_the_evaluation_stores_nothing() {
     let params = CacheParams {
         cache_dir: Some(cache.path()),
         flake_dir: r.path(),
-        git: GitParams::new(),
+        git: common::patient_git(),
     };
     let flake = FlakeRef::new(r.path().to_str().unwrap()).unwrap();
     let ms = machines(&["a", "b"]);

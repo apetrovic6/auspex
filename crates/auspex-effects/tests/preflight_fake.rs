@@ -270,30 +270,50 @@ async fn a_slow_git_is_a_timeout_and_a_cancelled_one_is_killed_and_reaped() {
     let Some(t) = tools(&["cat", "sleep"]) else {
         return;
     };
-    let dir = tempdir();
-    let pids = dir.path().join("pids");
-    let program = fake_git(
-        &t,
-        dir.path(),
-        &format!(
-            "printf '%s\\n' $$ >> '{}'\n@sleep@ 30 &\nprintf '%s\\n' $! >> '{}'\nwait",
-            pids.display(),
-            pids.display()
-        ),
-    );
-    let started = Instant::now();
-    let why = tree_state(
-        &git_params(&program, Duration::from_millis(300)),
-        dir.path(),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap()
-    .unwrap_err();
+    // The git timeout must expire only after the fake has written both pids (its own, and its
+    // child's), or there is nothing to check was killed. A short fixed one is a bet on how soon
+    // the scheduler runs the fake (AUS-47: lost every time at one core with twelve busy loops),
+    // so the deadline grows until a run got far enough; the assertions are those of that run.
+    let (dir, why, took, pids) = common::grown(Duration::from_millis(300), async |timeout| {
+        let dir = tempdir();
+        let pids = dir.path().join("pids");
+        // The child outlives `PATIENT`, so "the product waited for it" is not "it was slow".
+        let program = fake_git(
+            &t,
+            dir.path(),
+            &format!(
+                "printf '%s\\n' $$ >> '{}'\n@sleep@ {} &\nprintf '%s\\n' $! >> '{}'\nwait",
+                pids.display(),
+                common::OUTLIVES_PATIENT,
+                pids.display()
+            ),
+        );
+        let started = Instant::now();
+        let why = tree_state(
+            &git_params(&program, timeout),
+            dir.path(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let took = started.elapsed();
+        let seen: Vec<i32> = fs::read_to_string(&pids)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        (seen.len() >= 2).then_some((dir, why, took, seen))
+    })
+    .await;
     assert!(why.contains("timed out"), "{why}");
-    assert!(started.elapsed() < Duration::from_secs(10));
-    let gone = still_alive_after_wait(&wait_for_pids(&pids, 2));
+    // Back before the fake's child would have exited by itself, which is what waiting for the
+    // pipes it holds open would take.
+    assert!(took < common::PATIENT, "{took:?}");
+    let gone = still_alive_after_wait(&pids);
     assert_eq!(gone, Vec::<i32>::new(), "left running after the timeout");
+    let pids = dir.path().join("pids");
+    let program = dir.path().join("git");
 
     // Cancelled.
     let _ = fs::remove_file(&pids);
@@ -306,12 +326,7 @@ async fn a_slow_git_is_a_timeout_and_a_cancelled_one_is_killed_and_reaped() {
             p
         })
     };
-    let answer = tree_state(
-        &git_params(&program, Duration::from_secs(60)),
-        dir.path(),
-        &cancel,
-    )
-    .await;
+    let answer = tree_state(&git_params(&program, common::PATIENT), dir.path(), &cancel).await;
     assert_eq!(answer, Err(Cancelled));
     let spawned = canceller.await.unwrap();
     assert_eq!(still_alive_after_wait(&spawned), Vec::<i32>::new());
@@ -715,33 +730,44 @@ async fn a_slow_nix_is_a_timeout_and_a_cancelled_one_is_killed_and_reaped() {
     let Some(t) = tools(&["cat", "sleep"]) else {
         return;
     };
-    let dir = tempdir();
-    let pids = dir.path().join("pids");
-    let f = fake_nix(
-        &t,
-        dir.path(),
-        &format!(
-            "printf '%s\\n' $$ >> '{p}'\n@sleep@ 30 &\nprintf '%s\\n' $! >> '{p}'\nwait",
-            p = pids.display()
-        ),
-    );
-    let started = Instant::now();
-    let why = closure_size(
-        &store_path(),
-        &size_params(
-            &f,
-            Some("https://cache.example"),
-            Duration::from_millis(400),
-        ),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap()
-    .unwrap_err();
+    // The budget must run out only after the fake has written both pids (AUS-47: a fixed 400 ms
+    // was lost whenever the scheduler did not run the fake in time, and there was then nothing to
+    // check was killed): it grows until a run got that far. The child outlives `PATIENT`.
+    let (dir, f, why, took, pids) = common::grown(Duration::from_millis(400), async |budget| {
+        let dir = tempdir();
+        let pids = dir.path().join("pids");
+        let f = fake_nix(
+            &t,
+            dir.path(),
+            &format!(
+                "printf '%s\\n' $$ >> '{p}'\n@sleep@ {} &\nprintf '%s\\n' $! >> '{p}'\nwait",
+                common::OUTLIVES_PATIENT,
+                p = pids.display()
+            ),
+        );
+        let started = Instant::now();
+        let why = closure_size(
+            &store_path(),
+            &size_params(&f, Some("https://cache.example"), budget),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let took = started.elapsed();
+        let seen: Vec<i32> = fs::read_to_string(&pids)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        (seen.len() >= 2).then_some((dir, f, why, took, seen))
+    })
+    .await;
     assert!(why.contains("timed out"), "{why}");
+    // Back before the fake's child would have exited by itself: one budget for both attempts.
     assert!(
-        started.elapsed() < Duration::from_secs(10),
-        "one budget for both attempts"
+        took < common::PATIENT,
+        "one budget for both attempts: {took:?}"
     );
     assert_eq!(
         fs::read_to_string(dir.path().join("nix-runs")).unwrap(),
@@ -749,10 +775,11 @@ async fn a_slow_nix_is_a_timeout_and_a_cancelled_one_is_killed_and_reaped() {
         "the budget was spent on the first: the cache is not tried"
     );
     assert_eq!(
-        still_alive_after_wait(&wait_for_pids(&pids, 2)),
+        common::still_alive_within(&pids, common::PATIENT),
         Vec::<i32>::new()
     );
 
+    let pids = dir.path().join("pids");
     let _ = fs::remove_file(&pids);
     let cancel = CancellationToken::new();
     let canceller = {
@@ -765,13 +792,13 @@ async fn a_slow_nix_is_a_timeout_and_a_cancelled_one_is_killed_and_reaped() {
     };
     let answer = closure_size(
         &store_path(),
-        &size_params(&f, None, Duration::from_secs(60)),
+        &size_params(&f, None, common::PATIENT),
         &cancel,
     )
     .await;
     assert_eq!(answer, Err(Cancelled));
     assert_eq!(
-        still_alive_after_wait(&canceller.await.unwrap()),
+        common::still_alive_within(&canceller.await.unwrap(), common::PATIENT),
         Vec::<i32>::new()
     );
 }

@@ -35,9 +35,11 @@ pub const PASTE_OFF: &[u8] = b"\x1b[?2004l";
 pub const CURSOR_SHOW: &[u8] = b"\x1b[?25h";
 pub const CURSOR_HIDE: &[u8] = b"\x1b[?25l";
 
-/// Generous: the tests run in parallel on a loaded machine, and none of these waits is
-/// something the test is measuring.
-pub const WAIT: Duration = Duration::from_secs(30);
+/// How long a wait for the terminal, or for the process to exit, lasts before the test fails:
+/// [`super::PATIENT`]. None of these waits is something a test is measuring, and each ends the
+/// moment its condition holds, so a long one costs nothing until something is wrong. (It was
+/// 30 s, which a core shared with twelve busy loops did not give the shell, AUS-47.)
+pub const WAIT: Duration = super::PATIENT;
 
 pub struct Pty {
     child: Child,

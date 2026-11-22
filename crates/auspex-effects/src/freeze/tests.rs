@@ -9,6 +9,7 @@ use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
 
 use super::*;
+use crate::patience::PATIENT;
 
 const FLEET: &str = "/fleets/home";
 
@@ -223,7 +224,9 @@ fn concurrent_writers_do_not_lose_each_others_freezes() {
     let barrier = Arc::new(Barrier::new(n));
     let handles: Vec<_> = (0..n)
         .map(|i| {
-            let s = store(d.path());
+            // The product's 2 s wait for the lock is for an operator; 24 writers on threads that a
+            // loaded machine does not run for two seconds are not an operator (AUS-47).
+            let s = store(d.path()).with_lock_wait(PATIENT);
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
