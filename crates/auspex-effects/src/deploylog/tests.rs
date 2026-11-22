@@ -64,10 +64,21 @@ async fn open_in(dir: &Path) -> ActionLog {
 /// each other out, not whether the machine is idle: at the product's own 2 s call deadline a
 /// process that the scheduler leaves off the CPU for two seconds (a loaded host, a Nix sandbox
 /// with the rest of the build running) fails with `Timeout` without any lock being held
-/// against it, which is the test failing on scheduling luck (AUS-45). A lock-out still fails
-/// here: a lock that is held and never let go outlasts any budget, and a writer that has no
-/// busy handler, or a journal mode in which writers exclude readers, fails at once whatever
-/// the budget is.
+/// against it, which is the test failing on scheduling luck (AUS-45).
+///
+/// What still fails: a lock that is held and never let go (after at most this budget per
+/// call: the hammer stops at its first error, and nextest's `slow-timeout` ends a test that
+/// hangs outright), and a writer with no busy handler (`busy_timeout(0)` fails at once,
+/// whatever the budget). A journal mode other than WAL is caught by the hammer test's
+/// `assert_eq!(journal, "wal")`, and in production by `require_wal`, not by the children:
+/// in DELETE mode they report no errors.
+///
+/// What no longer fails: a process that holds the write lock for a few seconds on each
+/// write. At 2 s such a hold failed (a 1 s hold per write failed the create-together test);
+/// a call waits only for the writers queued ahead of it, so a hold of up to about
+/// `PATIENT / (processes - 1)` per write now passes: some 30 s with the 5 hammers, some 24 s
+/// with 6. `a_write_lock_is_free_as_soon_as_start_and_finish_return` covers a lock that is
+/// left held or taken early, without depending on timing; a slow statement is not covered.
 const PATIENT: Duration = Duration::from_secs(120);
 
 /// `params` with the multi-process tests' budget.
@@ -1154,16 +1165,21 @@ async fn child() {
                             .await
                         {
                             Ok(id) => id,
+                            // One error fails the test, and each further call would wait
+                            // out the whole `PATIENT` budget against a lock that is
+                            // never let go: 150 rounds of that is hours.
                             Err(e) => {
                                 errors.push(format!("start {n}: {e}"));
-                                continue;
+                                break;
                             }
                         };
                         if let Err(e) = log.recent(&format!("m{who}"), 5).await {
                             errors.push(format!("recent {n}: {e}"));
+                            break;
                         }
                         if let Err(e) = log.finish(id, outcome(ActionResult::Succeeded)).await {
                             errors.push(format!("finish {n}: {e}"));
+                            break;
                         }
                     }
                 }
@@ -1302,6 +1318,38 @@ async fn an_unfinished_row_of_a_live_process_is_running_until_it_dies() {
         log.recent("m", 1).await.unwrap()[0].result,
         Some(ActionResult::Interrupted)
     );
+}
+
+/// The multi-process tests run at a budget that lets a process wait out a lock held for some
+/// seconds (see `PATIENT`), so this is what says that no call leaves the write lock taken: a
+/// second connection with no busy timeout at all gets it the moment each call has returned.
+/// It catches a transaction that is left open or a lock taken early, with no timing in it; a
+/// statement that is merely slow is not caught.
+#[tokio::test]
+async fn a_write_lock_is_free_as_soon_as_start_and_finish_return() {
+    let d = dir();
+    // Patient: this asks about the lock, not whether the machine can run this thread in 2 s.
+    let log = open_patient_in(d.path()).await;
+    let other = raw(log.path());
+    other.busy_timeout(Duration::ZERO).unwrap();
+    let free = |when: &str| {
+        other
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap_or_else(|e| panic!("the write lock was still held {when}: {e}"));
+        other.execute_batch("ROLLBACK").unwrap();
+    };
+    free("after open");
+    let id = log
+        .start(new_action(ActionKind::Deploy, "m"))
+        .await
+        .unwrap();
+    free("after start");
+    log.recent("m", 5).await.unwrap();
+    free("after recent");
+    log.finish(id, outcome(ActionResult::Succeeded))
+        .await
+        .unwrap();
+    free("after finish");
 }
 
 // ----- nothing blocks the runtime -----
@@ -1791,7 +1839,7 @@ async fn a_live_writer_in_another_pid_namespace_stays_running() {
         .stdout(Stdio::null());
     let mut live = live.spawn().unwrap();
     wait_for(&work.join("started"));
-    let log = open_in(work).await;
+    let log = open_patient_in(work).await;
 
     let row = log.recent("m", 1).await.unwrap().remove(0);
     assert_eq!(

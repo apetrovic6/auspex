@@ -7,8 +7,10 @@
 # product's 2 s call timeout and 5 s busy timeout: at 2 s a process that a loaded machine
 # leaves off the CPU for two seconds fails with "the action log was busy; nothing was
 # written" although no lock was held against it (AUS-45; reproduced with the test at nice 19
-# beside twelve CPU-bound loops on its core). A real lock-out still fails: a lock held and
-# never let go outlasts any budget, and a writer without a busy handler fails at once. They
+# beside twelve CPU-bound loops on its core). A lock held and never let go still fails them,
+# after one call's budget (the hammer stops at its first error) or, if a process hangs
+# outright, at the `slow-timeout` below; a writer without a busy handler fails at once. What
+# the long budget lets through is a lock held for some seconds per write: see `PATIENT`. They
 # still run one at a time and, below, with no other test beside them, which keeps a run short.
 deploylog-processes = { max-threads = 1 }
 
@@ -24,3 +26,19 @@ test-group = 'deploylog-processes'
 # The group alone limits these tests among themselves, not against the other ~1100 tests
 # that run beside them. Asking for every thread makes nextest run each of them alone.
 threads-required = 'num-test-threads'
+# Ends a test that hangs (a lock holder that never exits leaves the parent's `wait` with no
+# bound of its own): 30 minutes, above the longest run measured under heavy load (about 16 for
+# the five multi-process tests together, a few seconds on an idle machine).
+slow-timeout = { period = "60s", terminate-after = 30 }
+
+# The tests that start one child process and wait for it or for its marker file. The same
+# hang, the same bound, shorter: they take seconds, and under heavy load a minute or two.
+[[profile.default.overrides]]
+filter = '''
+package(auspex-effects) & (
+    test(deploylog::tests::an_unfinished_row_of_a_dead_process_reads_as_interrupted)
+    | test(deploylog::tests::an_unfinished_row_of_a_live_process_is_running_until_it_dies)
+    | test(deploylog::tests::a_live_writer_in_another_pid_namespace_stays_running)
+)
+'''
+slow-timeout = { period = "60s", terminate-after = 10 }
