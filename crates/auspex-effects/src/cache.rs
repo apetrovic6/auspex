@@ -1916,6 +1916,43 @@ mod tests {
         env(Some(home.path()), Some(xdg.path()))
     }
 
+    /// The update check's fingerprint (AUS-42, `worktree_fingerprint`) says what nix reads, so it
+    /// takes what decides clean or dirty as the key does: the git settings and the attributes
+    /// files outside the tree. A repository with none of them has the fingerprint it had.
+    #[test]
+    fn the_update_fingerprint_takes_the_settings_and_attributes_files() {
+        let repo = committed_repo();
+        let user = env(None, None);
+        let fingerprint = || keyed(repo.path(), &user).worktree;
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(repo.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let plain = fingerprint();
+        for (name, value) in [("core.fileMode", "false"), ("core.autocrlf", "true")] {
+            git(&["config", name, value]);
+            assert_ne!(fingerprint(), plain, "{name} is not in the fingerprint");
+            git(&["config", "--unset", name]);
+            assert_eq!(fingerprint(), plain, "{name} unset");
+        }
+        let info = repo.path().join(".git/info/attributes");
+        std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+        std::fs::write(&info, "* text=auto\n").unwrap();
+        assert_ne!(
+            fingerprint(),
+            plain,
+            "info/attributes is not in the fingerprint"
+        );
+        std::fs::remove_file(&info).unwrap();
+        assert_eq!(fingerprint(), plain);
+    }
+
     /// The pure rule behind it, with every branch.
     #[test]
     fn the_global_attributes_file_is_found_where_libgit2_looks() {
