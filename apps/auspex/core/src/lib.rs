@@ -24,6 +24,8 @@
 mod app;
 pub mod config;
 pub mod effects;
+#[cfg(feature = "fault-injection")]
+pub mod fault;
 pub mod view;
 
 pub use app::{

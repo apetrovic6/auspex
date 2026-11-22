@@ -744,6 +744,8 @@ impl App for Auspex {
         reason = "one arm per event, in the order the events are declared; split, it stops reading as the routing table"
     )]
     fn update(&self, event: Event, model: &mut Model) -> Command<Effect, Event> {
+        #[cfg(feature = "fault-injection")]
+        crate::fault::check(model.config.as_ref().map(|c| c.flake.as_str()));
         match event {
             Event::Start(config) => {
                 model.freeze = freeze::Freezes::new(&config.freeze);

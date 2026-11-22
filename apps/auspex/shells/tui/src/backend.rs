@@ -350,6 +350,15 @@ impl Backend {
         }
     }
 
+    /// The call that panics in a test, if the demo was given one.
+    #[must_use]
+    pub const fn fault(&self) -> Option<&crate::demo::Fault> {
+        match self {
+            Self::Demo(d) => d.fault.as_ref(),
+            Self::Real(_) => None,
+        }
+    }
+
     /// `Effect::OpenShell`: the program and argv of the operator's own ssh session, or why there
     /// is none. Only says what to run (the TUI loop runs it, with the terminal): nothing here
     /// starts a process.

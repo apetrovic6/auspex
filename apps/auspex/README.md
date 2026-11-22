@@ -342,9 +342,40 @@ an update that had not started**, one at a time, each bounded at 15 s, with a pl
 runs after the 20 s and before auspex cancels what is still in flight, so the core's own uncordon
 of the same node may be running beside it: two uncordons of one node do no harm, and a node the
 core's one gave back is not reported as still cordoned. The action-log rows still open are closed
-after that, naming only the nodes really left cordoned. A panic does not take that path. A panic
-on the loop thread (the one that runs the interface) runs the bounded last-resort uncordon from the
-panic hook, each node bounded at 10 s, and auspex ends. A panic in a task does nothing to the roll.
+after that, naming only the nodes really left cordoned. What a panic does depends on the thread it
+happens on. **On the loop thread** (the one that runs the interface) auspex is gone: the panic hook
+gives the terminal back (bracketed paste off, raw mode off, the main screen), the message is
+printed, and the hook runs the same last-resort uncordon, each node bounded at 10 s, with no wait
+for the roll. If a panic in a task came first, its message is printed too (`a panic in a task came
+first: …`). **On any other thread** (an adapter's task or a helper) the hook touches neither the
+terminal nor a node and prints nothing over the screen. It records the first message and the run
+ends **in order, as for a signal**:
+the status bar says `a task panicked, so auspex is stopping the run`, the roll is stopped within the
+same 20 s (the screen is not redrawn meanwhile, and in raw mode Ctrl-C is a key, not a signal: send
+SIGINT or SIGTERM from another terminal to cut the wait short), a drained node is uncordoned, the
+last resort runs as above, auspex gives the terminal back, and it prints `a panic in a task ended
+the run: <message>` (one line, escape sequences removed, at most 240 characters) and exits 2. The
+default panic output, with its backtrace, is not printed over the screen: the message is in that
+line. A panic that arrives while a `q` or a signal is already ending the run is printed too (`a task
+panicked during the run`); the exit is 2 if it would have been 0, and stays 128 plus the signal
+after a signal. A panic after the exit report was made (a task that outlived the reap grace) is
+printed as any panic is, and makes the exit 2. A panic inside the core itself, while a task delivers
+an answer to it, takes the core down: auspex cannot ask it to stop the roll, so it cancels what is
+running and uncordons what it holds itself, says so, and exits 2. Only the first panic's message is
+kept. The request of a task that panicked is answered as a failure (`internal error: …`), so the
+core is not left waiting for it and a cancelled drain gets its answer and its node is uncordoned,
+for: the one-shot effects (probes, lookups, the machine list, previews, checks, waits), the
+evaluation, the cluster calls, an update or build (a panic after `clan` was started is a failure,
+and the node stays cordoned and is named; before, it is a refusal), the freeze file's reads and
+writes and its last look before an update. **Not covered:** the synchronous part of acting on an
+answer (taking the fleet lock, registering a node, finding ssh), the fleet lock, `s`'s request,
+the timers and the action-log writes. A panic there still ends the run in order, but the core's
+request is answered only by the stop, up to 20 s later, and then the shutdown gives back what was
+cordoned. **While `s` has the terminal**, neither kind writes an escape sequence into your ssh
+session; a panic on the loop thread still runs the last-resort uncordon and prints its message as
+plain text, and one in a task is printed as text, recorded, and ends the run when ssh ends (ssh is
+never killed for it). `--plain` and `--json` have no terminal and no cordon: the default hook
+prints the panic to stderr, and a panicked task answers its request as a failure.
 What could not be given back, and what is left cordoned on purpose, is printed with the commands.
 While a roll runs, `u`, `b`, `r` and `A` say so and do nothing.
 
