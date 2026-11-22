@@ -262,6 +262,40 @@ pub fn in_nix_build() -> bool {
     std::env::var_os("NIX_BUILD_TOP").is_some()
 }
 
+/// Whether the machine is too busy for a bound on how long a call took to mean anything: more
+/// runnable threads than two per core (`/proc/loadavg`, Linux only), or a process start that takes
+/// 400 ms or more. Never inside a Nix build, where a skip would be a false green. The same
+/// check `crates/auspex-effects/tests/common` makes (that module is not visible from here).
+fn too_busy_to_read_a_clock() -> bool {
+    if in_nix_build() || std::env::var_os("AUSPEX_TEST_WINDOWS_ALWAYS").is_some() {
+        return false;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let queued = fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
+    #[expect(clippy::cast_precision_loss, reason = "a core count")]
+    let crowded = queued.is_some_and(|q| q > 2.0 * cores as f64);
+    let began = Instant::now();
+    let _ = Command::new("sh").args(["-c", ":"]).status();
+    crowded || began.elapsed() >= Duration::from_millis(400)
+}
+
+/// Asserts that a call took less than `bound`, unless the machine is too busy for that to mean
+/// anything ([`too_busy_to_read_a_clock`]: it says SKIPPED, and never does inside a Nix build).
+/// A bound the product's own wait would exceed (a 20 s wait against 15 s) is told from a slow
+/// machine by taking off what the machine did that the product did not choose.
+pub fn assert_within(took: Duration, bound: Duration, what: &str) {
+    if took < bound {
+        return;
+    }
+    if too_busy_to_read_a_clock() {
+        eprintln!("SKIPPED: {what} measures a wall clock bound, and this machine is too busy");
+        return;
+    }
+    panic!("{what}: took {took:?}, which is not under {bound:?}");
+}
+
 /// `sh` and the named tools, as absolute paths, or `None` after printing why the test is
 /// skipped. Inside a Nix build a missing tool fails the test instead.
 pub fn tools(names: &[&str]) -> Option<Tools> {

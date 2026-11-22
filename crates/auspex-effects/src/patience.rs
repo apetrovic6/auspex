@@ -38,3 +38,58 @@ pub async fn grown<T>(first: Duration, mut attempt: impl AsyncFnMut(Duration) ->
         deadline = (deadline * 4).min(PATIENT);
     }
 }
+
+/// How many times slower than an idle machine this one starts a process right now, from 1 to
+/// 10: the worst of three spawns of `sh -c :`, per 100 ms. The same measure `tests/common` makes.
+fn load_factor() -> u32 {
+    let worst = (0..3)
+        .map(|_| {
+            let began = std::time::Instant::now();
+            let _ = std::process::Command::new("sh").args(["-c", ":"]).status();
+            began.elapsed()
+        })
+        .max()
+        .unwrap_or_default();
+    u32::try_from(worst.as_millis() / 100)
+        .unwrap_or(10)
+        .clamp(1, 10)
+}
+
+/// The slack an upper bound on a call that should return promptly gets: 2 s, stretched by how
+/// loaded the machine is ([`load_factor`]).
+pub fn slack() -> Duration {
+    Duration::from_secs(2) * load_factor()
+}
+
+/// Whether the machine is too busy for an upper bound on how long a call took to mean anything:
+/// more runnable threads than two per core (`/proc/loadavg`, Linux only), or a process start that
+/// takes over 400 ms. Never inside a Nix build, where a skip would be a false green.
+fn too_busy_to_read_a_clock(what: &str) -> bool {
+    if std::env::var_os("NIX_BUILD_TOP").is_some()
+        || std::env::var_os("AUSPEX_TEST_WINDOWS_ALWAYS").is_some()
+    {
+        return false;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let queued = std::fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
+    #[expect(clippy::cast_precision_loss, reason = "a core count")]
+    let crowded = queued.is_some_and(|q| q > 2.0 * cores as f64);
+    let busy = crowded || load_factor() >= 4;
+    if busy {
+        eprintln!("SKIPPED: {what} measures a wall clock bound, and this machine is too busy");
+    }
+    busy
+}
+
+/// Asserts that a call that took `took` took less than `bound`, unless the machine is too busy
+/// for that to mean anything (never inside a Nix build). `tests/common`'s `assert_within`: the
+/// upper bound that `took < PATIENT` does not make, since that says only that the product did
+/// not wait for what the fake would do if the deadline were ignored.
+pub fn assert_within(took: Duration, bound: Duration, what: &str) {
+    assert!(
+        took < bound || too_busy_to_read_a_clock(what),
+        "{what}: took {took:?}, which is not under {bound:?}"
+    );
+}

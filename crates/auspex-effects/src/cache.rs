@@ -1811,7 +1811,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::patience::{OUTLIVES_PATIENT, PATIENT, grown};
+    use crate::patience::{OUTLIVES_PATIENT, PATIENT, assert_within, grown, slack};
 
     /// A committed repository, for the key tests below.
     fn committed_repo() -> tempfile::TempDir {
@@ -2251,6 +2251,38 @@ mod tests {
         path
     }
 
+    /// Opens `fifo` for writing and closes it again, which lets the fake that is blocked in
+    /// `read _ < fifo` go on: but never blocks on it. A plain `std::fs::write` blocks in `open`
+    /// for as long as nothing has the pipe open for reading, and on this current-thread runtime
+    /// that thread is also the one that must poll git into being spawned, so a fake that never
+    /// started, or died before it got to its `read`, hung the test until something killed the whole
+    /// binary (AUS-47 review of PR #44, mutation M5: `yield_now` before the spawn). This opens
+    /// with `O_NONBLOCK`, which fails with `ENXIO` while there is no reader, retries that until
+    /// [`PATIENT`], and then fails the test saying what did not happen.
+    fn release(fifo: &Path) {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let flags = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).unwrap();
+        let began = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(flags)
+                .open(fifo)
+            {
+                // Dropped at once: the reader sees the end of the pipe and goes on.
+                Ok(_) => return,
+                Err(e) if e.raw_os_error() == Some(rustix::io::Errno::NXIO.raw_os_error()) => {}
+                Err(e) => panic!("opening {}: {e}", fifo.display()),
+            }
+            assert!(
+                began.elapsed() < PATIENT,
+                "nothing opened {} for reading within {PATIENT:?}: the fake was not spawned, or died before its `read`",
+                fifo.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn params(program: &Path, timeout: Duration) -> GitParams<'_> {
         GitParams {
             program: program.as_os_str(),
@@ -2279,8 +2311,8 @@ mod tests {
         let fut = git(&p, dir.path(), &["ls-files"], 1000, &cancel);
         tokio::pin!(fut);
         poll_once(fut.as_mut()).await;
-        // Opens the pipe for writing: returns once the fake is reading it, then closes it.
-        std::fs::write(&go, "").unwrap();
+        // Lets the fake that is reading the pipe go on (bounded: see `release`).
+        release(&go);
         block_until_zombie(&dir.path().join("pid"));
         let r = fut.await.unwrap();
         assert_eq!(
@@ -2305,7 +2337,7 @@ mod tests {
         let fut = git(&p, dir.path(), &["ls-files"], 1000, &cancel);
         tokio::pin!(fut);
         poll_once(fut.as_mut()).await;
-        std::fs::write(&go, "").unwrap();
+        release(&go);
         block_until_zombie(&dir.path().join("pid"));
         assert_eq!(fut.await.unwrap(), Ok(vec![b'0'; 1000]));
     }
@@ -2334,7 +2366,7 @@ mod tests {
             let fake = script(
                 dir.path(),
                 &format!(
-                    "printf 'partial'\n'{}' '{}' -c 'echo $$ > \"$1\"; echo > \"$3\"; exec \"$2\" {OUTLIVES_PATIENT}' sh '{d}/holder' '{}' '{d}/ready' &\nread _ < '{d}/ready'",
+                    "printf 'partial'\n'{}' '{}' -c 'echo $$ > \"$1\"; echo > \"$3\"; exec \"$2\" {OUTLIVES_PATIENT}' sh '{d}/holder' '{}' '{d}/ready' &\nread _ < '{d}/ready'\necho > '{d}/done'",
                     setsid.display(),
                     sh.display(),
                     sleep.display()
@@ -2359,11 +2391,13 @@ mod tests {
             {
                 let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
             }
-            let e = r.expect_err("a partial output was accepted as complete");
-            // The deadline passed before git had exited: nothing about the pipe was tested.
-            (!e.contains("timed out")).then_some(e)
+            // The fake's last step before it exits: if it is missing the deadline passed before git
+            // had got there, and nothing about the pipe was tested. Decided on what the fake did,
+            // never on what the product said, which is asserted below whatever it is.
+            dir.path().join("done").exists().then_some(r)
         })
         .await;
+        let e = e.expect_err("a partial output was accepted as complete");
         assert!(e.contains("not read to the end"), "{e}");
     }
 
@@ -2398,6 +2432,13 @@ mod tests {
             start.elapsed() < PATIENT,
             "waited for the deadline: {:?}",
             start.elapsed()
+        );
+        // And promptly, not after some grace of its own: the group kill at the exit closes the
+        // pipe at once.
+        assert_within(
+            start.elapsed(),
+            slack(),
+            "a descendant in git's group does not hold the output open",
         );
     }
 }

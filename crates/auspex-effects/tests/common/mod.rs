@@ -328,9 +328,14 @@ fn overloaded_now() -> bool {
 /// told from scheduling, however the numbers are stretched: they would have to be stretched by a
 /// hundred and the test would take an hour. The tests that ask this are the ones that measure a
 /// window; the ones about what is killed, reaped, cancelled or ordered do not, and run at any
-/// load. Asked twice: before the test (so that it does not spend minutes on a window it cannot
-/// read), and when a bound has been missed (the machine may have got busy since: a late answer
-/// on a machine that is overloaded now is not evidence).
+/// load.
+///
+/// Asked in two places and no others: at the opening of each test that measures a window (so
+/// that it does not spend minutes on a window it cannot read), and by [`assert_within`] when an
+/// upper bound on how long a call took has been missed, so that a machine that is overloaded now
+/// does not turn a late answer into a failure. Never from anywhere else: a skip decided after the
+/// fact would turn a regression into a green. Inside a Nix build it is always `false`, so CI
+/// enforces every one of them.
 pub fn too_slow_for_windows(test: &str) -> bool {
     // `AUSPEX_TEST_WINDOWS_ALWAYS=1` runs them anyway, to see what they say on a busy machine.
     if in_nix_build()
@@ -343,6 +348,29 @@ pub fn too_slow_for_windows(test: &str) -> bool {
         "SKIPPED: {test} measures a wall clock window, and this machine is too busy to read it"
     );
     true
+}
+
+/// The slack an upper bound on a product's own deadline gets: 2 s, [`scaled`]. Not for the
+/// deadline itself (the deadline is the product's and passes exactly), but for the time a loaded
+/// machine takes to schedule the product's wake-up, the kill and the reap that follow it.
+pub fn slack() -> Duration {
+    scaled(Duration::from_secs(2))
+}
+
+/// Asserts that a call that took `took` took less than `bound`, unless the machine is too busy
+/// for that to mean anything ([`too_slow_for_windows`], never inside a Nix build).
+///
+/// This is the upper bound a test with a long deadline (`PATIENT`, or one that [`grown`] made
+/// long) cannot make by comparing with the deadline: `took < PATIENT` says only that the
+/// product did not wait for what the fake would do if the deadline were ignored, and a probe
+/// that ran twenty times its deadline, or a pipe grace of thirty seconds, passes it. The bound
+/// here is what the deadline, grace or cancel says (`deadline + slack()`, `slack()`), so a
+/// product that is merely late fails, not only one that waits for the fake's child.
+pub fn assert_within(took: Duration, bound: Duration, what: &str) {
+    assert!(
+        took < bound || too_slow_for_windows(what),
+        "{what}: took {took:?}, which is not under {bound:?}"
+    );
 }
 
 /// The cache's git with [`PATIENT`] for each command and for the worktree read, for the tests

@@ -678,6 +678,13 @@ async fn an_edit_during_a_real_evaluation_does_not_poison_the_cache() {
 /// Review finding B1 with the real nix-eval-jobs: `reset --soft HEAD~` at the first
 /// result, `reset --soft ORIG_HEAD` at the second. Only the branch moves; nix's
 /// `self.rev` (and its dirty state) differs in between.
+///
+/// What only this test covers (and `an_edit_during_a_real_evaluation_does_not_poison_the_cache`
+/// above does not) is a worker that is *restarted* and re-reads the flake's own copy of a file
+/// (`./extra.nix`) after the tree has moved: the gated tests edit an absolute path that one
+/// worker reads. A restart needs the memory budget to cause it, which no budget does reliably
+/// (see [`gated_edit`]), so this test retries and may print SKIPPED when none happened: on such a
+/// run that property is not exercised at all, and a green here does not say it was.
 #[tokio::test]
 async fn a_soft_reset_undone_during_real_worker_restarts_is_not_cached() {
     real_change_and_undo(

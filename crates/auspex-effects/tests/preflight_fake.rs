@@ -274,42 +274,48 @@ async fn a_slow_git_is_a_timeout_and_a_cancelled_one_is_killed_and_reaped() {
     // child's), or there is nothing to check was killed. A short fixed one is a bet on how soon
     // the scheduler runs the fake (AUS-47: lost every time at one core with twelve busy loops),
     // so the deadline grows until a run got far enough; the assertions are those of that run.
-    let (dir, why, took, pids) = common::grown(Duration::from_millis(300), async |timeout| {
-        let dir = tempdir();
-        let pids = dir.path().join("pids");
-        // The child outlives `PATIENT`, so "the product waited for it" is not "it was slow".
-        let program = fake_git(
-            &t,
-            dir.path(),
-            &format!(
-                "printf '%s\\n' $$ >> '{}'\n@sleep@ {} &\nprintf '%s\\n' $! >> '{}'\nwait",
-                pids.display(),
-                common::OUTLIVES_PATIENT,
-                pids.display()
-            ),
-        );
-        let started = Instant::now();
-        let why = tree_state(
-            &git_params(&program, timeout),
-            dir.path(),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        let took = started.elapsed();
-        let seen: Vec<i32> = fs::read_to_string(&pids)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| l.trim().parse().ok())
-            .collect();
-        (seen.len() >= 2).then_some((dir, why, took, seen))
-    })
-    .await;
+    let (dir, why, took, pids, timeout) =
+        common::grown(Duration::from_millis(300), async |timeout| {
+            let dir = tempdir();
+            let pids = dir.path().join("pids");
+            // The child outlives `PATIENT`, so "the product waited for it" is not "it was slow".
+            let program = fake_git(
+                &t,
+                dir.path(),
+                &format!(
+                    "printf '%s\\n' $$ >> '{}'\n@sleep@ {} &\nprintf '%s\\n' $! >> '{}'\nwait",
+                    pids.display(),
+                    common::OUTLIVES_PATIENT,
+                    pids.display()
+                ),
+            );
+            let started = Instant::now();
+            let why = tree_state(
+                &git_params(&program, timeout),
+                dir.path(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let took = started.elapsed();
+            let seen: Vec<i32> = fs::read_to_string(&pids)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect();
+            (seen.len() >= 2).then_some((dir, why, took, seen, timeout))
+        })
+        .await;
     assert!(why.contains("timed out"), "{why}");
     // Back before the fake's child would have exited by itself, which is what waiting for the
     // pipes it holds open would take.
     assert!(took < common::PATIENT, "{took:?}");
+    common::assert_within(
+        took,
+        timeout + common::slack(),
+        "a slow git times out at its own timeout",
+    );
     let gone = still_alive_after_wait(&pids);
     assert_eq!(gone, Vec::<i32>::new(), "left running after the timeout");
     let pids = dir.path().join("pids");
@@ -733,41 +739,47 @@ async fn a_slow_nix_is_a_timeout_and_a_cancelled_one_is_killed_and_reaped() {
     // The budget must run out only after the fake has written both pids (AUS-47: a fixed 400 ms
     // was lost whenever the scheduler did not run the fake in time, and there was then nothing to
     // check was killed): it grows until a run got that far. The child outlives `PATIENT`.
-    let (dir, f, why, took, pids) = common::grown(Duration::from_millis(400), async |budget| {
-        let dir = tempdir();
-        let pids = dir.path().join("pids");
-        let f = fake_nix(
-            &t,
-            dir.path(),
-            &format!(
-                "printf '%s\\n' $$ >> '{p}'\n@sleep@ {} &\nprintf '%s\\n' $! >> '{p}'\nwait",
-                common::OUTLIVES_PATIENT,
-                p = pids.display()
-            ),
-        );
-        let started = Instant::now();
-        let why = closure_size(
-            &store_path(),
-            &size_params(&f, Some("https://cache.example"), budget),
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        let took = started.elapsed();
-        let seen: Vec<i32> = fs::read_to_string(&pids)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| l.trim().parse().ok())
-            .collect();
-        (seen.len() >= 2).then_some((dir, f, why, took, seen))
-    })
-    .await;
+    let (dir, f, why, took, pids, budget) =
+        common::grown(Duration::from_millis(400), async |budget| {
+            let dir = tempdir();
+            let pids = dir.path().join("pids");
+            let f = fake_nix(
+                &t,
+                dir.path(),
+                &format!(
+                    "printf '%s\\n' $$ >> '{p}'\n@sleep@ {} &\nprintf '%s\\n' $! >> '{p}'\nwait",
+                    common::OUTLIVES_PATIENT,
+                    p = pids.display()
+                ),
+            );
+            let started = Instant::now();
+            let why = closure_size(
+                &store_path(),
+                &size_params(&f, Some("https://cache.example"), budget),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            let took = started.elapsed();
+            let seen: Vec<i32> = fs::read_to_string(&pids)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| l.trim().parse().ok())
+                .collect();
+            (seen.len() >= 2).then_some((dir, f, why, took, seen, budget))
+        })
+        .await;
     assert!(why.contains("timed out"), "{why}");
     // Back before the fake's child would have exited by itself: one budget for both attempts.
     assert!(
         took < common::PATIENT,
         "one budget for both attempts: {took:?}"
+    );
+    common::assert_within(
+        took,
+        budget + common::slack(),
+        "a slow nix runs out of its budget when it says",
     );
     assert_eq!(
         fs::read_to_string(dir.path().join("nix-runs")).unwrap(),

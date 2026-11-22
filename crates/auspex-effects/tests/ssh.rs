@@ -18,8 +18,8 @@ use auspex_domain::observe::{ProbeOutcome, probe_script};
 use auspex_effects::ssh::{ControlDir, MAX_CONTROL_DIR_LEN, ProbeParams, STDOUT_CAP, probe};
 use auspex_effects::{CancellationToken, Cancelled};
 use common::{
-    OUTLIVES_PATIENT, PATIENT, cleanup, grown, scaled, still_alive_after_wait, still_alive_within,
-    tempdir, tools, wait_for_pids,
+    OUTLIVES_PATIENT, PATIENT, assert_within, cleanup, grown, scaled, slack,
+    still_alive_after_wait, still_alive_within, tempdir, tools, wait_for_pids,
 };
 
 const SYSTEM: &str = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-terra-25.05";
@@ -336,8 +336,13 @@ exit 255"#,
     .await
     .unwrap();
     // Back long before the approval window it must not wait out (a regression waits it out,
-    // and then says "timed out", which the result below does not).
-    assert!(start.elapsed() < PATIENT / 2, "{:?}", start.elapsed());
+    // and then says "timed out", which the result below does not): the fake's own second, and
+    // the slack a process start takes.
+    assert_within(
+        start.elapsed(),
+        Duration::from_secs(1) + slack() * 2,
+        "a down host fails at its connect timeout",
+    );
     assert_eq!(
         result,
         ProbeOutcome::Unreachable {
@@ -517,7 +522,7 @@ async fn a_host_that_never_answers_times_out_and_the_process_is_gone() {
     // (the last thing it does): a fixed 500 ms left that to the scheduler, and a loaded machine
     // lost it. It grows until a run got that far. The fake's child outlives `PATIENT`, so a probe
     // that waited for it is told from one that was slow.
-    let (dir, r, took) = grown(Duration::from_millis(500), async |deadline| {
+    let (dir, r, took, deadline) = grown(Duration::from_millis(500), async |deadline| {
         let dir = tempdir();
         let prog = warm_script(
             &t,
@@ -535,7 +540,7 @@ async fn a_host_that_never_answers_times_out_and_the_process_is_gone() {
         )
         .await;
         let ready = fs::read_to_string(dir.path().join("pid")).is_ok_and(|s| s.contains("ready"));
-        ready.then_some((dir, r, took))
+        ready.then_some((dir, r, took, deadline))
     })
     .await;
     let pids = wait_for_pids(&dir.path().join("pid"), 2);
@@ -545,7 +550,15 @@ async fn a_host_that_never_answers_times_out_and_the_process_is_gone() {
         panic!()
     };
     assert_eq!(reason, "timed out: connecting...");
+    // Back before the fake's child would have exited by itself (what waiting for it takes), and
+    // at its own deadline, not at some multiple of it: a probe that runs twenty deadlines
+    // passes the first and not the second.
     assert!(took < PATIENT, "{took:?}");
+    assert_within(
+        took,
+        deadline + slack(),
+        "a probe times out at its own deadline",
+    );
     assert!(left.is_empty(), "still running: {left:?}");
 }
 
@@ -580,6 +593,13 @@ async fn a_grandchild_holding_stdout_does_not_hold_up_the_probe() {
         "the output read before the grace period ended is kept"
     );
     assert!(took < PATIENT, "took {took:?}: waited for EOF");
+    // The grace the product gives a pipe held open is a quarter of a second: a bound that does
+    // not tell it from thirty seconds would not be this test.
+    assert_within(
+        took,
+        slack(),
+        "a pipe held open past the exit is given its grace and no more",
+    );
 }
 
 #[tokio::test]
@@ -611,8 +631,14 @@ async fn unbounded_output_is_capped_and_cut_off() {
         )),
         "{reason}"
     );
-    // Stopped at the cap, not at the deadline (which would have said "timed out" above).
+    // Stopped at the cap, not at the deadline (which would have said "timed out" above), and
+    // soon: the fake writes a megabyte in a moment.
     assert!(took < PATIENT, "{took:?}");
+    assert_within(
+        took,
+        scaled(Duration::from_secs(5)),
+        "unbounded output is cut off at the cap",
+    );
     assert!(left.is_empty(), "still running: {left:?}");
 }
 
@@ -665,12 +691,15 @@ async fn cancelling_kills_ssh_and_its_children() {
         let pids_file = pids_file.clone();
         tokio::task::spawn_blocking(move || {
             wait_for_pids(&pids_file, 2);
+            let at = Instant::now();
             cancel.cancel();
+            at
         })
     };
     let start = Instant::now();
     let r = probe(&target, MachineClass::Nixos, &params, &cancel).await;
-    canceller.await.unwrap();
+    let returned = Instant::now();
+    let cancelled_at = canceller.await.unwrap();
     let pids = wait_for_pids(&pids_file, 2);
     // The leader (second line, ssh itself) is checked at once and must not exist at all,
     // not even as a zombie: the call reaps before returning. The grandchild was SIGKILLed
@@ -681,8 +710,14 @@ async fn cancelling_kills_ssh_and_its_children() {
     cleanup(&pids);
     assert_eq!(r, Err(Cancelled));
     // Back before the probe's own deadline (`PATIENT`), which a cancel that did nothing would
-    // run into.
+    // run into, and promptly after the cancel (the time the fake took to start is not the
+    // product's: it is counted from the cancel).
     assert!(start.elapsed() < PATIENT);
+    assert_within(
+        returned.saturating_duration_since(cancelled_at),
+        slack(),
+        "a cancelled probe returns promptly",
+    );
     assert!(
         !leader_present,
         "ssh was not reaped before the call returned"
@@ -1004,6 +1039,11 @@ printf '{}'"#,
     );
     assert!(matches!(result.unwrap(), ProbeOutcome::Observed(_)));
     assert!(elapsed < PATIENT, "master held pipes: {elapsed:?}");
+    assert_within(
+        elapsed,
+        slack(),
+        "a master that keeps the pipes open does not hold up the probe",
+    );
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1381,6 +1421,11 @@ async fn a_check_with_a_live_master_is_not_queued_behind_a_slow_approval() {
         waited < PATIENT,
         "a warm machine waited {waited:?} behind another machine's approval"
     );
+    assert_within(
+        waited,
+        slack(),
+        "a warm check is not queued behind a slow approval",
+    );
     assert!(matches!(slow_result, Ok(ProbeOutcome::Observed(_))));
     assert_eq!(read_lines(&dir.path().join("starts")), ["root@slow"]);
 }
@@ -1491,6 +1536,14 @@ async fn stalled_hosts_time_out_and_not_before_their_own_window() {
             "{result:?}"
         );
         assert!(*at >= window, "timed out before its own window: {at:?}");
+        // And not much later: `n` stalled hosts expire at one window each at the most (the
+        // second at two, when the first's end gave it a fresh one), so a window that has stopped
+        // expiring promptly shows here, on any machine and in the Nix build.
+        assert_within(
+            *at,
+            window * u32::try_from(targets.len()).unwrap() + slack(),
+            "a stalled host times out at its window, not much after",
+        );
     }
 }
 

@@ -30,7 +30,7 @@ use auspex_tui::demo::{self, Demo, Fault};
 use auspex_tui::log::Log;
 use auspex_tui::panics::{Hooks, Terminal};
 use auspex_tui::shell::Shell;
-use common::{PATIENT, Tools, tempdir, tools};
+use common::{PATIENT, Tools, assert_within, tempdir, tools};
 
 /// Tests that install the process-global panic hook run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -203,7 +203,8 @@ fn kubectl_with(drain: &str, uncordon: &str) -> String {
          *\" get leases \"*) {leases}\n;;\n\
          *\" get nodes \"*) {nodes}\n;;\n\
          *\" drain \"*) {drain}\n;;\n\
-         *\" uncordon \"*) {uncordon}\n;;\n\
+         *\" uncordon \"*) s=$(@date@ +%s%N)\n{uncordon}\n\
+         echo $(( ($(@date@ +%s%N) - s) / 1000000 )) >> '@dir@/uncordon.ms'\n;;\n\
          *) echo 'ok (fake)';;\n\
          esac\n",
         view = cat(VIEW),
@@ -774,6 +775,7 @@ async fn a_panic_inside_the_core_in_a_task_still_ends_the_run_in_order() {
         "the hook left the terminal"
     );
 
+    let began = std::time::Instant::now();
     let (code, lines) = wind_down(
         &w.shell,
         &installed.hooks,
@@ -781,11 +783,22 @@ async fn a_panic_inside_the_core_in_a_task_still_ends_the_run_in_order() {
         std::future::pending(),
     )
     .await;
+    let took = began.elapsed();
     // The shell waits up to `TERMINATE_BOUND` (20 s) for a core that is still answering, and not
     // at all for one that has panicked: if it waited, it says so in the log when the bound ran
-    // out. Asked of the log and not of the clock: how long the exit took is also how long a
-    // loaded machine took to run the fake `kubectl` for the uncordon, and a bound of 15 s on that
-    // failed it (AUS-47).
+    // out (asked of the log first, which no load can make wrong), and a wait that has not run
+    // out yet is told by the clock. The clock bound is the old 15 s on what the exit took minus
+    // what the fake `kubectl` took to uncordon (the fake writes how long, in ms, as its last
+    // step): how long the exit took is also how long a loaded machine took to run that fake, and
+    // a bound of 15 s on all of it failed (AUS-47). A machine too busy to read a clock says
+    // SKIPPED, never inside a Nix build.
+    let uncordon = Duration::from_millis(
+        fs::read_to_string(w.path("uncordon.ms"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse::<u64>().ok())
+            .sum(),
+    );
     assert!(
         !w.shell
             .log
@@ -794,6 +807,11 @@ async fn a_panic_inside_the_core_in_a_task_still_ends_the_run_in_order() {
             .any(|l| l.contains("stopping took longer than the bound")),
         "waited for a core that cannot answer: {:?}",
         w.shell.log.lines()
+    );
+    assert_within(
+        took.saturating_sub(uncordon),
+        Duration::from_secs(15),
+        "no wait for a core that cannot answer",
     );
     assert_ne!(code, 0);
     let said = lines.join("\n");

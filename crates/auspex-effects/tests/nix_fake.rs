@@ -18,8 +18,8 @@ use auspex_effects::nix::{
 };
 use auspex_effects::{CancellationToken, Cancelled};
 use common::{
-    OUTLIVES_PATIENT, PATIENT, cleanup, grown, still_alive_after_wait, still_alive_within, tempdir,
-    tools, wait_for_pids,
+    OUTLIVES_PATIENT, PATIENT, assert_within, cleanup, grown, slack, still_alive_after_wait,
+    still_alive_within, tempdir, tools, wait_for_pids,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -195,7 +195,9 @@ async fn cancelling_kills_the_evaluator_and_its_workers() {
         let pids_file = pids_file.clone();
         tokio::task::spawn_blocking(move || {
             wait_for_pids(&pids_file, 3);
+            let at = Instant::now();
             cancel.cancel();
+            at
         })
     };
     let (tx, mut rx) = unbounded_channel();
@@ -208,12 +210,19 @@ async fn cancelling_kills_the_evaluator_and_its_workers() {
         tx,
     )
     .await;
-    canceller.await.unwrap();
+    let returned = Instant::now();
+    let cancelled_at = canceller.await.unwrap();
     let pids = wait_for_pids(&pids_file, 3);
     let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     assert_eq!(r, Err(Cancelled));
     assert!(start.elapsed() < PATIENT);
+    // Promptly after the cancel, counted from it (the fake's start is not the product's).
+    assert_within(
+        returned.saturating_duration_since(cancelled_at),
+        slack(),
+        "a cancelled evaluation returns promptly",
+    );
     assert!(left.is_empty(), "still running: {left:?}");
     assert_eq!(collect(&mut rx).await, [], "no Finished after a cancel");
 }
@@ -264,7 +273,7 @@ async fn the_timeout_kills_the_group_and_keeps_earlier_results() {
             dir.path(),
             "nix-eval-jobs",
             &format!(
-                "printf '%s\\n' '{}'\n@sleep@ 30 &\necho $! >> '@dir@/pids'\necho $$ >> '@dir@/pids'\nwait",
+                "printf '%s\\n' '{}'\n@sleep@ {OUTLIVES_PATIENT} &\necho $! >> '@dir@/pids'\necho $$ >> '@dir@/pids'\nwait",
                 ok_line(r#""a""#, r#""a""#)
             ),
         );
@@ -286,7 +295,10 @@ async fn the_timeout_kills_the_group_and_keeps_earlier_results() {
         (seen.len() >= 2).then_some((timeout, seen, collect(&mut rx).await))
     })
     .await;
-    let left = still_alive_after_wait(&pids);
+    // The sleeper outlives `PATIENT`: one the product never killed is still there when this looks,
+    // however long the deadline had to grow (a 30 s sleeper dies by itself on a deadline of 44 s,
+    // and "killed" would then pass without the product having killed anything).
+    let left = still_alive_within(&pids, PATIENT);
     cleanup(&pids);
     assert!(matches!(&items[0], EvalItem::Machine { machine, .. } if machine == "a"));
     assert_eq!(
@@ -536,7 +548,7 @@ async fn the_machine_list_times_out_and_cancels() {
         let prog = t.script(
             dir.path(),
             "nix",
-            "echo $$ >> '@dir@/pids'\nexec @sleep@ 30",
+            &format!("echo $$ >> '@dir@/pids'\nexec @sleep@ {OUTLIVES_PATIENT}"),
         );
         let r = inventory(prog.as_os_str(), &flake, timeout, &CancellationToken::new())
             .await
@@ -554,7 +566,8 @@ async fn the_machine_list_times_out_and_cancels() {
     let r = inventory(prog.as_os_str(), &flake, PATIENT, &cancel).await;
     assert_eq!(r, Err(Cancelled));
     let pids = wait_for_pids(&dir.path().join("pids"), 1);
-    let left = still_alive_after_wait(&pids);
+    // The sleeper outlives `PATIENT`, as above.
+    let left = still_alive_within(&pids, PATIENT);
     cleanup(&pids);
     assert!(left.is_empty(), "still running: {left:?}");
 }
@@ -596,6 +609,11 @@ async fn a_crashed_evaluator_leaves_no_workers() {
     // alive holds its stdout open, and the run waits for it (AUS-47: told from a slow run by a
     // worker that outlives `PATIENT`, not by a number of seconds).
     assert!(took < PATIENT, "waited for the worker: {took:?}");
+    assert_within(
+        took,
+        slack(),
+        "a crashed evaluator's group is killed at once",
+    );
     let items = collect(&mut rx).await;
     assert!(
         matches!(items.last(), Some(EvalItem::Finished { error: Some(e) }) if e.contains("signal 11")),
@@ -635,6 +653,7 @@ async fn a_finished_nix_leaves_no_children() {
     cleanup(&pids);
     assert_eq!(r, Ok(vec![]));
     assert!(took < PATIENT, "waited for nix's child: {took:?}");
+    assert_within(took, slack(), "a finished nix's child is not waited for");
     assert!(left.is_empty(), "nix's child outlived it: {left:?}");
 }
 
@@ -1105,7 +1124,7 @@ async fn a_machine_list_not_read_to_its_end_is_refused() {
             dir.path(),
             "nix",
             &format!(
-                "printf '{{}}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; echo > \"$2\"; exec @sleep@ {OUTLIVES_PATIENT}' sh '@dir@/holder' '@dir@/ready' &\nread _ < '@dir@/ready'"
+                "printf '{{}}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; echo > \"$2\"; exec @sleep@ {OUTLIVES_PATIENT}' sh '@dir@/holder' '@dir@/ready' &\nread _ < '@dir@/ready'\necho > '@dir@/done'"
             ),
         );
         let r = inventory(
@@ -1117,11 +1136,13 @@ async fn a_machine_list_not_read_to_its_end_is_refused() {
         .await
         .unwrap();
         kill_holder(dir.path());
-        let e = r.expect_err("a list not read to its end was accepted");
-        // The deadline passed before the fake had exited: nothing about the pipe was tested.
-        (!e.contains("timed out")).then_some(e)
+        // The fake's last step before it exits, so the deadline passed before the fake had got
+        // there if it is missing: nothing about the pipe was tested. Decided on what the fake did,
+        // never on what the product said, which is asserted below whatever it is.
+        dir.path().join("done").exists().then_some(r)
     })
     .await;
+    let e = e.expect_err("a list not read to its end was accepted");
     assert!(e.contains("not read to the end"), "{e}");
 }
 
@@ -1140,7 +1161,7 @@ async fn evaluator_output_not_read_to_its_end_is_an_error() {
             dir.path(),
             "nix-eval-jobs",
             &format!(
-                "printf '%s\\n' '{}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; echo > \"$2\"; exec @sleep@ {OUTLIVES_PATIENT}' sh '@dir@/holder' '@dir@/ready' &\nread _ < '@dir@/ready'",
+                "printf '%s\\n' '{}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; echo > \"$2\"; exec @sleep@ {OUTLIVES_PATIENT}' sh '@dir@/holder' '@dir@/ready' &\nread _ < '@dir@/ready'\necho > '@dir@/done'",
                 ok_line(r#""a""#, r#""a""#)
             ),
         );
@@ -1156,12 +1177,8 @@ async fn evaluator_output_not_read_to_its_end_is_an_error() {
         .unwrap();
         kill_holder(dir.path());
         let items = collect(&mut rx).await;
-        // The deadline passed before the fake had exited: nothing about the pipe was tested.
-        let timed_out = matches!(
-            items.last(),
-            Some(EvalItem::Finished { error: Some(e) }) if e.contains("timed out")
-        );
-        (!timed_out).then_some(items)
+        // As above: the fake's own marker, not the product's answer.
+        dir.path().join("done").exists().then_some(items)
     })
     .await;
     assert!(
