@@ -89,6 +89,7 @@ pub fn core_config(settings: &Settings, flake: String) -> Config {
                     .map(|f| RunnerForge {
                         forge: f.name.clone(),
                         scope: f.scope.to_string(),
+                        site: f.site.clone(),
                     })
                     .collect(),
                 join: RunnersConfig {

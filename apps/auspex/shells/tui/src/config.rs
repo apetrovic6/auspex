@@ -215,8 +215,12 @@ pub struct RunnersSettings {
 pub struct RunnerForgeSettings {
     /// `url`, normalised (`https` only, no credentials).
     pub url: String,
-    /// What the entry is called on screen: the host, and `host (scope)` when two entries share one.
+    /// What the entry is called on screen: the host, port and path, then `(scope)` and `#n` only as
+    /// far as two entries would otherwise share a name.
     pub name: String,
+    /// Which forge it reads: the host, port and path alone (what [`Self::name`] is before it is told
+    /// apart). Two entries with the same site are two scopes of one forge.
+    pub site: String,
     /// `scope`, `admin` by default.
     pub scope: Scope,
     /// `token_file`, `~/` expanded and absolute, or `None` to ask anonymously.
@@ -757,12 +761,11 @@ fn parse_runners(w: &mut Walk, value: &Value) -> Result<Option<RunnersSettings>,
                     let url = url.ok_or_else(|| format!("`{at}.url` is required"))?;
                     let url = auspex_effects::forge::forge_url(&url)
                         .map_err(|e| format!("`{at}.url`: {e}"))?;
+                    let site =
+                        forge_label(url.host_str().unwrap_or_default(), url.port(), url.path());
                     r.forges.push(RunnerForgeSettings {
-                        name: forge_label(
-                            url.host_str().unwrap_or_default(),
-                            url.port(),
-                            url.path(),
-                        ),
+                        name: site.clone(),
+                        site,
                         url: url.to_string(),
                         scope,
                         token_file,

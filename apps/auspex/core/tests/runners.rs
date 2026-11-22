@@ -28,6 +28,7 @@ fn setup(forges: &[&str]) -> RunnersSetup {
             .map(|f| RunnerForge {
                 forge: (*f).to_owned(),
                 scope: "admin".to_owned(),
+                site: (*f).to_owned(),
             })
             .collect(),
         join: RunnersConfig::default(),
@@ -263,6 +264,7 @@ fn memory_near_the_cap_comes_from_prometheus_and_the_configured_cap() {
         forges: vec![RunnerForge {
             forge: "forge.example.org".into(),
             scope: "admin".into(),
+            site: "forge.example.org".into(),
         }],
         join: RunnersConfig {
             hosts: BTreeMap::from([(

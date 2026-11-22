@@ -853,7 +853,8 @@ async fn a_token_split_by_what_the_sanitiser_removes_is_still_withheld() {
 /// B3: Forgejo's lists are Go slices, and an empty one that was never built is `null`.
 #[tokio::test]
 async fn a_null_list_is_an_empty_one() {
-    let Some(s) = serve(|_| Reply::Json("null".into())).await else {
+    // The body Forgejo writes is `null` and a newline (Go's JSON encoder ends a value with one).
+    let Some(s) = serve(|_| Reply::Json("null\n".into())).await else {
         return;
     };
     let a = ask(&s, &Scope::Admin, None).await.unwrap();
@@ -881,7 +882,11 @@ async fn every_scope_asks_for_all_the_visible_runners() {
             name: "fleet".into(),
         },
     ] {
-        let Some(s) = serve(paged(vec![], serde_json::json!([]))).await else {
+        // More than one page, so that a parameter sent on the first only is seen.
+        let all: Vec<_> = (0..120)
+            .map(|i| runner(i, &format!("r{i:03}"), "idle"))
+            .collect();
+        let Some(s) = serve(paged(all, serde_json::json!([]))).await else {
             return;
         };
         ask(&s, &scope, None).await.unwrap().runners.unwrap();
@@ -890,7 +895,7 @@ async fn every_scope_asks_for_all_the_visible_runners() {
             .into_iter()
             .filter(|r| !r.path().ends_with("/jobs"))
             .collect();
-        assert!(!listing.is_empty(), "{scope}");
+        assert!(listing.len() >= 3, "{scope}: {} pages", listing.len());
         for r in listing {
             assert_eq!(
                 r.query("visible").as_deref(),
@@ -931,5 +936,79 @@ async fn a_queue_of_several_thousand_jobs_is_counted() {
     assert_eq!(
         ask(&s, &Scope::Admin, None).await.unwrap().queued,
         Ok(6_000)
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2 (re-review of PR #43)
+// ---------------------------------------------------------------------------------------
+
+/// R-B1: sanitise, guard, **then** cut. A token that straddles the 100-character cut is shown but
+/// for its last character by a guard that looks at the cut text; checked whole, the field is
+/// withheld. A token a Forgejo issues is 40 hex characters.
+#[tokio::test]
+async fn a_token_straddling_the_cut_is_withheld_whole() {
+    const LONG: &str = "0123456789abcdef0123456789abcdef01234567";
+    let straddling = format!("{}{LONG}", "x".repeat(61));
+    assert!(straddling.chars().count() > 100 && straddling.find(LONG) == Some(61));
+    let mut named = runner(1, &straddling, "idle");
+    named["labels"] = serde_json::json!(["docker", straddling]);
+    named["version"] = serde_json::json!(straddling);
+    // The token is not in the first 100 characters, but is in the whole text: withheld too, a
+    // field that held it is not shown at all.
+    let mut late = runner(2, &format!("{}{LONG}", "y".repeat(120)), "idle");
+    late["labels"] = serde_json::json!([]);
+    // And one that does not hold it is cut as it always was.
+    let mut honest = runner(3, &"z".repeat(150), "idle");
+    honest["labels"] = serde_json::json!([]);
+    let Some(s) = serve(paged(vec![named, late, honest], serde_json::json!([]))).await else {
+        return;
+    };
+    let got = ask(&s, &Scope::Admin, Some(&token_with(LONG)))
+        .await
+        .unwrap()
+        .runners
+        .unwrap();
+    let shown = format!("{got:?}");
+    // Not the token, and not all but its last character either.
+    assert!(
+        !shown.contains(&LONG[..LONG.len() - 1]) && !shown.contains(&LONG[..20]),
+        "{shown}"
+    );
+    assert_eq!(got[0].name, "(withheld)");
+    assert_eq!(got[0].labels, ["docker", "(withheld)"]);
+    assert_eq!(got[0].version.as_deref(), Some("(withheld)"));
+    assert_eq!(got[1].name, "(withheld)");
+    assert_eq!(
+        got[2].name,
+        format!("{}…", "z".repeat(100)),
+        "cut, as before"
+    );
+}
+
+/// N-A: the forge's identifier for a runner comes through, so the same runner listed by two
+/// scopes of one forge can be told for one.
+#[tokio::test]
+async fn the_forges_identifier_for_a_runner_comes_through() {
+    let mut without = runner(0, "no-id", "idle");
+    without.as_object_mut().unwrap().remove("id");
+    let Some(s) = serve(paged(
+        vec![
+            runner(41, "alpha", "idle"),
+            runner(42, "alpha", "idle"),
+            without,
+        ],
+        serde_json::json!([]),
+    ))
+    .await
+    else {
+        return;
+    };
+    let got = ask(&s, &Scope::Admin, None).await.unwrap().runners.unwrap();
+    assert_eq!(
+        got.iter()
+            .map(|r| (r.name.as_str(), r.id))
+            .collect::<Vec<_>>(),
+        [("alpha", Some(41)), ("alpha", Some(42)), ("no-id", None)]
     );
 }

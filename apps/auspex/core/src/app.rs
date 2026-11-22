@@ -1926,6 +1926,7 @@ fn runners_report(model: &Model) -> auspex_domain::runners::RunnersReport {
         .map(|(i, f)| ForgeSlot {
             forge: f.forge.clone(),
             scope: f.scope.clone(),
+            site: f.site.clone(),
             // Before the refresh has asked, nothing has answered.
             answer: model.runners.get(i).cloned().flatten(),
         })

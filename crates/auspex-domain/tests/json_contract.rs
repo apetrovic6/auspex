@@ -878,6 +878,7 @@ fn runners_shape() {
         ForgeSlot {
             forge: "forge.example.org".to_owned(),
             scope: "admin".to_owned(),
+            site: String::new(),
             answer: Some(ForgeAnswer {
                 runners: Ok(vec![ForgeRunner::new(
                     "alpha",
@@ -891,6 +892,7 @@ fn runners_shape() {
         ForgeSlot {
             forge: "beta.example.org".to_owned(),
             scope: "user".to_owned(),
+            site: String::new(),
             answer: Some(ForgeAnswer {
                 runners: Err("forge: the forge refused the token (HTTP 403)".to_owned()),
                 queued: Err("forge: the forge refused the token (HTTP 403)".to_owned()),

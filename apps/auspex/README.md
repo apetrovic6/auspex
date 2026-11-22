@@ -661,7 +661,12 @@ memory = "4GiB"
    read twice), and is asked with `visible=true`: the API's default is only the runners the scope
    owns directly, and `visible` is what makes `admin` list every runner of the instance (and `org:`
    and `repo:` the global ones that serve them too). A forge answers an empty list as `null`, which
-   is read as the empty list it is.
+   is read as the empty list it is. Two scopes of **one forge** (`admin` and a `repo:` on the same
+   URL, say) list some of the same runners: a runner both list, by the forge's own identifier, is
+   one runner, shown once (under the first entry that has it) and counted once. A runner the forge
+   gave no identifier is not merged with anything, since names are not unique. **The queues are
+   not merged**: each entry's waiting jobs are its own count and the status line adds them, so a
+   second scope on the same forge counts the jobs it shares again.
 2. **ssh**, NixOS only: the probe lists the systemd services matching `unit_glob`
    (`systemctl list-units --type=service --all -- <glob>`, loaded units only) in the round trip it
    makes anyway. The glob is checked (letters, digits and `: _ . @ - * ? [ ]`, not starting with `-`:
@@ -681,11 +686,16 @@ memory = "4GiB"
 name it equals or begins with `<machine>-` (the longest such machine). Its unit is that machine's
 runner unit whose instance name (`gitea-runner-<instance>.service`, the glob's literal prefix and
 systemd's `\x2d` escapes removed) equals the runner's name or its name without `<machine>-`. Failing
-that, a machine with **exactly one runner unit and exactly one runner** (the same runner listed by
-two forges is one runner) has them be the same thing: that is the common NixOS layout, one
-`instances.default` whose unit is `gitea-runner-default.service` and whose runner is named after the
-host. With more of either, which is whose is not known and none is guessed. A machine whose probe
-did not report units has no unit facts and is never called "unit down".
+that, a machine with **exactly one runner unit** that no runner owns by name gives it to its
+**only runner** (the same runner listed by two forges is one runner), or, when there are several,
+to the one **named for the machine** (`alpha` on machine `alpha`): that is the common NixOS layout,
+one `instances.default` whose unit is `gitea-runner-default.service` and whose runner is named
+after the host. Another runner whose name merely begins with `<machine>-` does not take the unit
+from it. With several units, or several runners none of which is named for the machine, which is
+whose is not known and none is guessed. **A name is the only evidence here**: a forge that lists
+every runner it can see (`visible`) also lists strangers' runners, and one named like the machine is
+mistaken for it. `[runners.machines]` is how to be sure. A machine whose probe did not report units
+has no unit facts and is never called "unit down".
 
 **Badges**, per row (the first three make it red; in `--json`, `badges`):
 
@@ -725,7 +735,10 @@ the Log tab once.
 **The token** is read and guarded exactly as the CI badge's (see above): per entry, from its
 `token_file`, refused with the reason when others can read it, never quoted, sent only over
 `https`, never followed through a redirect. Every reason and every runner name, label and version
-the forge sent is checked for it and replaced when it holds it. A refused token makes that entry
+the forge sent is checked for it and replaced when it holds it: the text is sanitised first (the
+sanitiser removes control and format characters, so a token with one inserted is only the token
+once sanitised), checked whole, and only then cut to 100 characters (a token that straddles the cut
+would be shown but for its last character), and a text that held it is not shown at all. A refused token makes that entry
 a `forge error` row and sends nothing to it.
 
 ## Package preview

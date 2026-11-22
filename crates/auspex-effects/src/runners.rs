@@ -19,9 +19,9 @@
 //! # What reaches output
 //!
 //! Every reason goes through [`reason_line`] (sanitised, guarded, cut to 300 characters), and so does
-//! every text the forge sent that is shown (a runner's name, label, version): one that holds the
-//! token is replaced. Texts are sanitised and
-//! cut by [`ForgeRunner::new`]. No error quotes the forge's answer.
+//! every text the forge sent that is shown (a runner's name, label, version): sanitised, then checked
+//! for the token whole, and only then cut (`ForgeRunner::new_guarded`); one that holds the token is
+//! replaced. No error quotes the forge's answer.
 //!
 //! The runners and the jobs fail independently: a token that may list runners and not jobs still
 //! shows the runners, with the queue unknown.
@@ -60,9 +60,6 @@ pub const MAX_RUNNERS: usize = 1_000;
 
 /// The most waiting jobs counted: 10,000.
 pub const MAX_JOBS: usize = 10_000;
-
-/// What replaces a runner text that held the token.
-const WITHHELD_TEXT: &str = "(withheld)";
 
 /// One forge entry's runners and queue, within `timeout`.
 ///
@@ -194,30 +191,21 @@ fn capped<T: for<'de> Deserialize<'de>>(body: &[u8], max: usize) -> Result<Vec<T
     Ok(items)
 }
 
-/// `text` as it will be shown, or [`WITHHELD_TEXT`] when it holds the token.
-fn shown(token: Option<&Token>, text: String) -> String {
-    if token.is_some_and(|t| t.appears_in(&text)) {
-        WITHHELD_TEXT.to_owned()
-    } else {
-        text
-    }
-}
-
-/// A runner from the forge's own words, **sanitised first and guarded second**, as
-/// [`reason_line`] does: the sanitiser removes control and format characters and escape sequences,
-/// so a token with one inserted is not the token to a guard that looks at the raw text and is the
-/// token again once cleaned. Every text that reaches output is checked as it will be shown.
+/// A runner from the forge's own words, **sanitised, then guarded, then cut**, as [`reason_line`]
+/// does. The sanitiser removes control and format characters and escape sequences, so a token with
+/// one inserted is only the token once sanitised; and the cut removes the end of a long text, so a
+/// token that straddles it is, in what is left, all but its last character. Each text is checked
+/// whole, after the one and before the other (`ForgeRunner::new_guarded`), and one that holds the
+/// token is not shown at all.
 fn guarded_runner(token: Option<&Token>, item: &Item) -> ForgeRunner {
-    let mut r = ForgeRunner::new(
+    ForgeRunner::new_guarded(
         item.name.as_deref().unwrap_or(""),
         item.status.as_deref().unwrap_or(""),
         item.labels.as_deref().unwrap_or(&[]),
         item.version.as_deref(),
-    );
-    r.name = shown(token, r.name);
-    r.labels = r.labels.into_iter().map(|l| shown(token, l)).collect();
-    r.version = r.version.map(|v| shown(token, v));
-    r
+        &|text| token.is_some_and(|t| t.appears_in(text)),
+    )
+    .with_id(item.id)
 }
 
 /// Every runner the scope lists, page by page, all within one `timeout`.

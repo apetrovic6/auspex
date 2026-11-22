@@ -68,12 +68,14 @@ fn the_home_manager_contract_fixture_loads_whole() {
                 url: "https://forge.example.org/".to_owned(),
                 // Two entries on one host are told apart by their scope.
                 name: "forge.example.org (admin)".to_owned(),
+                site: "forge.example.org".to_owned(),
                 scope: auspex_domain::runners::Scope::Admin,
                 token_file: Some("/home/me/.config/auspex/forge-admin-token".into()),
             },
             config::RunnerForgeSettings {
                 url: "https://forge.example.org/".to_owned(),
                 name: "forge.example.org (repo:owner/fleet)".to_owned(),
+                site: "forge.example.org".to_owned(),
                 scope: auspex_domain::runners::Scope::Repo {
                     owner: "owner".to_owned(),
                     name: "fleet".to_owned(),

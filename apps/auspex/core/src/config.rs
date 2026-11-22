@@ -104,6 +104,9 @@ pub struct RunnerForge {
     pub forge: String,
     /// Its scope as configured (`admin`, `user`, `org:<name>`, `repo:<owner>/<name>`).
     pub scope: String,
+    /// Which forge it reads (host, port and path): two entries with the same site are two scopes of
+    /// one forge, and a runner both list is one runner.
+    pub site: String,
 }
 
 /// The package preview's settings. `None` in [`Config::diff`] means the preview is off: no

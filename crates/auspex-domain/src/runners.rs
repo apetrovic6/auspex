@@ -175,9 +175,16 @@ impl RunnerStatus {
     }
 }
 
+/// What replaces a text that held a secret.
+pub const WITHHELD: &str = "(withheld)";
+
 /// One runner the forge listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForgeRunner {
+    /// The forge's own identifier for it, when it gave one: what tells one runner from another of
+    /// the same name, and the same runner listed by two scopes of one forge. Not shown, not in
+    /// `--json`.
+    pub id: Option<i64>,
     /// Its name (not unique on a forge).
     pub name: String,
     /// Its status.
@@ -188,11 +195,26 @@ pub struct ForgeRunner {
     pub version: Option<String>,
 }
 
-fn clean(text: &str) -> String {
-    let line = sanitize_line(text);
+/// `line` cut to [`MAX_TEXT_CHARS`] characters, then `…`.
+fn cut(line: String) -> String {
     match line.char_indices().nth(MAX_TEXT_CHARS) {
-        Some((cut, _)) => format!("{}…", &line[..cut]),
+        Some((at, _)) => format!("{}…", &line[..at]),
         None => line,
+    }
+}
+
+/// `text` as it will be shown: sanitised, then checked **whole** for a secret, and only then cut.
+/// The order is the point. The sanitiser removes control and format characters, so a secret with
+/// one inserted is only the secret once sanitised; and the cut removes the end of a long text, so a
+/// secret that straddles it is, in what is left, all but its last character: a guard that looks at
+/// either too early is a guard the forge can walk around. A text that held the secret is not shown
+/// at all.
+fn shown(text: &str, secret: &dyn Fn(&str) -> bool) -> String {
+    let line = sanitize_line(text);
+    if secret(&line) {
+        WITHHELD.to_owned()
+    } else {
+        cut(line)
     }
 }
 
@@ -201,17 +223,38 @@ impl ForgeRunner {
     /// [`MAX_TEXT_CHARS`], at most [`MAX_LABELS`] labels are kept.
     #[must_use]
     pub fn new(name: &str, status: &str, labels: &[String], version: Option<&str>) -> Self {
+        Self::new_guarded(name, status, labels, version, &|_| false)
+    }
+
+    /// [`Self::new`], with every text that `secret` says holds a secret replaced by [`WITHHELD`].
+    /// `secret` is asked of the text sanitised and **not yet cut** (see `shown`).
+    #[must_use]
+    pub fn new_guarded(
+        name: &str,
+        status: &str,
+        labels: &[String],
+        version: Option<&str>,
+        secret: &dyn Fn(&str) -> bool,
+    ) -> Self {
         Self {
-            name: clean(name),
+            id: None,
+            name: shown(name, secret),
             status: RunnerStatus::parse(status),
             labels: labels
                 .iter()
                 .take(MAX_LABELS)
-                .map(|l| clean(l))
+                .map(|l| shown(l, secret))
                 .filter(|l| !l.is_empty())
                 .collect(),
-            version: version.map(clean).filter(|v| !v.is_empty()),
+            version: version.map(|v| shown(v, secret)).filter(|v| !v.is_empty()),
         }
+    }
+
+    /// This runner with the forge's identifier for it.
+    #[must_use]
+    pub const fn with_id(mut self, id: Option<i64>) -> Self {
+        self.id = id;
+        self
     }
 }
 
@@ -222,6 +265,9 @@ pub struct ForgeSlot {
     pub forge: String,
     /// Its scope, as configured.
     pub scope: String,
+    /// Which forge it reads: its host, port and path. Two entries with the same site are two
+    /// scopes of one forge, and a runner both list (by the forge's identifier) is one runner.
+    pub site: String,
     /// The answer, `None` while the request is out.
     pub answer: Option<ForgeAnswer>,
 }
@@ -520,9 +566,49 @@ const fn is_up(a: UnitActive) -> bool {
     matches!(a, UnitActive::Active | UnitActive::Reloading)
 }
 
-/// The distinct runner names each machine was joined to, over every forge: what tells a machine
-/// with exactly one runner from one with several.
+/// The distinct runner names each machine was joined to, over every forge (the map included):
+/// what tells a machine with one runner from one with several.
 type Joined<'a> = BTreeMap<&'a str, BTreeSet<&'a str>>;
+
+/// Whether the runner called `name`, on `machine`, is the runner of `unit` by its name: the unit's
+/// instance is the name, or the name without `<machine>-`.
+fn names_unit(machine: &str, name: &str, unit: &RunnerUnit, glob: &str) -> bool {
+    let instance = instance_of(&unit.unit, glob);
+    instance == name
+        || name
+            .strip_prefix(&format!("{machine}-"))
+            .is_some_and(|rest| instance == rest)
+}
+
+/// The unit of the runner called `runner` on `machine`, whose runners (all of them, from every
+/// forge) are `names`.
+///
+/// A unit whose instance the runner's name gives is its unit. Failing that, the usual NixOS layout
+/// is one instance, `instances.default`, whose unit is `gitea-runner-default.service` and whose
+/// runner is named after the host: no name joins them. When the machine has exactly one runner
+/// unit, and no runner owns it by name, it is the runner's if that is the machine's only runner, or
+/// the one **named for the machine**: another runner whose name merely begins with `<machine>-`
+/// (one somebody else registered, on a forge that lists every runner it can see) does not switch the
+/// fallback off for it. With several units, or several runners none of which is named for the
+/// machine, which is whose is not known, and none is guessed.
+fn unit_of<'u>(
+    machine: &str,
+    units: &'u [RunnerUnit],
+    runner: &str,
+    names: &BTreeSet<&str>,
+    glob: &str,
+) -> Option<&'u RunnerUnit> {
+    if let Some(own) = units.iter().find(|u| names_unit(machine, runner, u, glob)) {
+        return Some(own);
+    }
+    let [only] = units else {
+        return None;
+    };
+    if names.iter().any(|n| names_unit(machine, n, only, glob)) {
+        return None;
+    }
+    (names.len() == 1 || runner == machine).then_some(only)
+}
 
 fn row_of(
     forge: &str,
@@ -533,28 +619,13 @@ fn row_of(
 ) -> RunnerRow {
     let machine = machine_of(&runner.name, config, machines);
     let facts = machine.and_then(|n| machines.iter().find(|m| m.name == n));
-    let unit = facts.and_then(|m| m.units).and_then(|units| {
-        let stripped = machine
-            .and_then(|n| runner.name.strip_prefix(&format!("{n}-")))
-            .map(str::to_owned);
-        units
-            .iter()
-            .find(|u| {
-                let instance = instance_of(&u.unit, &config.unit_glob);
-                instance == runner.name || stripped.as_deref() == Some(&*instance)
-            })
-            // The usual NixOS layout is one instance, `instances.default`, whose unit is
-            // `gitea-runner-default.service` and whose runner is named after the host: no name
-            // joins them. A machine with exactly one runner unit and exactly one runner (the same
-            // runner on two forges is one runner) has them be the same thing; with more of
-            // either, which is whose is not known, and none is guessed.
-            .or_else(|| match units {
-                [only] if machine.is_some_and(|n| joined.get(n).is_some_and(|r| r.len() == 1)) => {
-                    Some(only)
-                }
-                _ => None,
-            })
-    });
+    let none = BTreeSet::new();
+    let unit = machine
+        .zip(facts.and_then(|m| m.units))
+        .and_then(|(machine, units)| {
+            let names = joined.get(machine).unwrap_or(&none);
+            unit_of(machine, units, &runner.name, names, &config.unit_glob)
+        });
     let caps = machine.and_then(|n| config.hosts.get(n));
     let memory = facts
         .and_then(|m| m.memory)
@@ -650,6 +721,11 @@ pub fn report(
             joined.entry(m).or_default().insert(&runner.name);
         }
     }
+    // A runner both of two scopes of one forge list (the forge's identifier says it is the same
+    // one) is one runner: listed once, under the first entry that has it, and counted once. The
+    // identifier is per forge, so the same number on another forge is another runner; a runner the
+    // forge gave none is not merged with anything (names are not unique).
+    let mut listed: BTreeSet<(&str, i64)> = BTreeSet::new();
     for slot in slots {
         let mut facts = ForgeFacts {
             forge: slot.forge.clone(),
@@ -670,6 +746,7 @@ pub fn report(
                     Ok(runners) => {
                         let mut rows: Vec<RunnerRow> = runners
                             .iter()
+                            .filter(|r| r.id.is_none_or(|id| listed.insert((&slot.site, id))))
                             .map(|r| row_of(&slot.forge, r, config, machines, &joined))
                             .collect();
                         rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -758,6 +835,7 @@ mod tests {
         ForgeSlot {
             forge: forge.to_owned(),
             scope: "admin".to_owned(),
+            site: forge.to_owned(),
             answer: Some(ForgeAnswer {
                 runners: Ok(runners),
                 queued: Ok(queued),
@@ -963,6 +1041,256 @@ mod tests {
     /// N6: every state the README names is pinned: a unit that is deactivating, in maintenance,
     /// failed or inactive is down under an online runner; one that is reloading or active is up
     /// under an offline one.
+    /// N-B: another runner whose name merely joins the machine (`alpha-b`, registered by someone
+    /// else on a forge that lists every runner it can see) does not switch the fallback off for the
+    /// runner that is named for the machine itself.
+    #[test]
+    fn another_runners_name_does_not_switch_the_single_unit_fallback_off() {
+        let cfg = RunnersConfig::default();
+        let one = [unit("gitea-runner-default.service", UnitActive::Failed)];
+        let ms = [machine("alpha", Some(&one))];
+        let rep = report(
+            &[slot(
+                "f",
+                vec![runner("alpha", "idle"), runner("alpha-b", "idle")],
+                0,
+            )],
+            &ms,
+            &cfg,
+        );
+        let by = |n: &str| {
+            rep.rows
+                .iter()
+                .find(|r| r.name.as_deref() == Some(n))
+                .unwrap()
+        };
+        assert_eq!(
+            by("alpha").badges,
+            [RunnerBadge::ForgeUpUnitDown],
+            "{rep:?}"
+        );
+        assert!(by("alpha-b").unit.is_none() && by("alpha-b").badges.is_empty());
+        // From another forge, as the same: the one named for the machine joins, the stranger not.
+        let rep = report(
+            &[
+                slot("f", vec![runner("alpha-b", "idle")], 0),
+                slot("g", vec![runner("alpha", "idle")], 0),
+            ],
+            &ms,
+            &cfg,
+        );
+        let by = |n: &str| {
+            rep.rows
+                .iter()
+                .find(|r| r.name.as_deref() == Some(n))
+                .unwrap()
+        };
+        assert!(by("alpha").unit.is_some() && by("alpha-b").unit.is_none());
+        // A runner that already matches the unit by its name owns it: the one named for the
+        // machine does not take it too.
+        let owned = [unit("gitea-runner-b.service", UnitActive::Failed)];
+        let ms2 = [machine("alpha", Some(&owned))];
+        let rep = report(
+            &[slot(
+                "f",
+                vec![runner("alpha", "idle"), runner("alpha-b", "idle")],
+                0,
+            )],
+            &ms2,
+            &cfg,
+        );
+        let by = |n: &str| {
+            rep.rows
+                .iter()
+                .find(|r| r.name.as_deref() == Some(n))
+                .unwrap()
+        };
+        assert!(by("alpha").unit.is_none(), "{rep:?}");
+        assert_eq!(by("alpha-b").badges, [RunnerBadge::ForgeUpUnitDown]);
+    }
+
+    /// N-C (R6): the count of runners on a machine is over every forge, not the first.
+    /// R-B1: sanitise, check whole, then cut. A secret split by a character the sanitiser removes,
+    /// or straddling the cut, withholds the whole text; one that is neither is cut as ever.
+    #[test]
+    fn a_secret_is_looked_for_after_the_sanitiser_and_before_the_cut() {
+        let secret = "0123456789abcdef0123456789abcdef01234567";
+        let holds = |t: &str| t.contains(secret);
+        let make = |name: &str, label: &str, version: &str| {
+            ForgeRunner::new_guarded(name, "idle", &[label.to_owned()], Some(version), &holds)
+        };
+        // Split by what the sanitiser takes out.
+        let (head, tail) = secret.split_at(10);
+        let split = format!("{head}\u{200b}{tail}");
+        let r = make(
+            &split,
+            &format!("{head}\u{7}{tail}"),
+            &format!("v{head}\u{1b}[0m{tail}"),
+        );
+        assert_eq!(
+            (r.name.as_str(), r.labels.as_slice(), r.version.as_deref()),
+            (WITHHELD, [WITHHELD.to_owned()].as_slice(), Some(WITHHELD))
+        );
+        // Straddling the cut: 39 of its 40 characters would have been shown.
+        let straddle = format!("{}{secret}", "x".repeat(MAX_TEXT_CHARS - 39));
+        let r = make(&straddle, &straddle, &straddle);
+        assert_eq!(r.name, WITHHELD);
+        assert_eq!(r.labels, [WITHHELD]);
+        assert_eq!(r.version.as_deref(), Some(WITHHELD));
+        // Past the cut altogether: not shown anyway, and still not shown.
+        let late = format!("{}{secret}", "y".repeat(MAX_TEXT_CHARS + 20));
+        assert_eq!(make(&late, "l", "v").name, WITHHELD);
+        // Neither: cut, as ever.
+        let r = make(&"z".repeat(150), "l", "v");
+        assert_eq!(r.name, format!("{}…", "z".repeat(MAX_TEXT_CHARS)));
+        // Without a secret to look for nothing is withheld.
+        assert_eq!(
+            ForgeRunner::new(&straddle, "idle", &[], None)
+                .name
+                .chars()
+                .count(),
+            MAX_TEXT_CHARS + 1
+        );
+    }
+
+    /// N-A: two scopes of one forge list the same runner (`visible=true` makes `admin` list every
+    /// runner of the instance): by the forge's own identifier it is one runner, listed once and
+    /// counted once. The identifier is per forge; one the forge did not give merges nothing.
+    #[test]
+    fn a_runner_two_scopes_of_one_forge_both_list_is_one_runner() {
+        let cfg = RunnersConfig::default();
+        let on = |site: &str, forge: &str, runners: Vec<ForgeRunner>, queued: u64| ForgeSlot {
+            site: site.to_owned(),
+            forge: forge.to_owned(),
+            ..slot(forge, runners, queued)
+        };
+        let alpha = || runner("alpha", "active").with_id(Some(1));
+        let beta = || runner("beta", "idle").with_id(Some(2));
+        let rep = report(
+            &[
+                on(
+                    "forge.example.org",
+                    "forge.example.org (admin)",
+                    vec![alpha()],
+                    3,
+                ),
+                on(
+                    "forge.example.org",
+                    "forge.example.org (repo:o/n)",
+                    vec![alpha(), beta()],
+                    3,
+                ),
+            ],
+            &[],
+            &cfg,
+        );
+        let names: Vec<(&str, &str)> = rep
+            .rows
+            .iter()
+            .map(|r| (r.forge.as_str(), r.name.as_deref().unwrap()))
+            .collect();
+        // Once, under the first entry that has it; the second keeps what only it has.
+        assert_eq!(
+            names,
+            [
+                ("forge.example.org (admin)", "alpha"),
+                ("forge.example.org (repo:o/n)", "beta")
+            ]
+        );
+        assert_eq!(
+            rep.summary().unwrap(),
+            "runners: 2/2 online, 1 busy, 6 queued",
+            "the runners once; the queues are each entry's own, as the README says"
+        );
+        // The same number on another forge is another runner.
+        let rep = report(
+            &[
+                on("a.example.org", "a", vec![alpha()], 0),
+                on("b.example.org", "b", vec![alpha()], 0),
+            ],
+            &[],
+            &cfg,
+        );
+        assert_eq!(rep.rows.len(), 2);
+        // No identifier, nothing merged: names are not unique, and two runners may share one.
+        let rep = report(
+            &[
+                on("s", "x", vec![runner("alpha", "idle")], 0),
+                on("s", "y", vec![runner("alpha", "idle")], 0),
+            ],
+            &[],
+            &cfg,
+        );
+        assert_eq!(rep.rows.len(), 2);
+        // Within one entry the forge's list is its own: it is not thinned.
+        let rep = report(
+            &[on(
+                "s",
+                "x",
+                vec![alpha(), runner("alpha", "idle").with_id(Some(9))],
+                0,
+            )],
+            &[],
+            &cfg,
+        );
+        assert_eq!(rep.rows.len(), 2);
+    }
+
+    #[test]
+    fn the_runners_of_every_forge_count_toward_a_machine() {
+        let cfg = RunnersConfig::default();
+        let one = [unit("gitea-runner-default.service", UnitActive::Failed)];
+        let ms = [machine("alpha", Some(&one))];
+        let rep = report(
+            &[
+                slot("f", vec![runner("alpha-a", "idle")], 0),
+                slot("g", vec![runner("alpha-b", "idle")], 0),
+            ],
+            &ms,
+            &cfg,
+        );
+        assert!(
+            rep.rows
+                .iter()
+                .all(|r| r.unit.is_none() && r.badges.is_empty()),
+            "two different runners for one machine on two forges: {rep:?}"
+        );
+    }
+
+    /// N-C (R7): `[runners.machines]` places a runner for the count too: a mapped runner is the
+    /// machine's only one (and joins its single unit), and a mapped one beside a name-joined one
+    /// makes two.
+    #[test]
+    fn a_runner_placed_by_the_map_counts_toward_its_machine() {
+        let mut cfg = RunnersConfig::default();
+        cfg.machines.insert("ci-box".into(), "alpha".into());
+        let one = [unit("gitea-runner-default.service", UnitActive::Failed)];
+        let ms = [machine("alpha", Some(&one))];
+        let rep = report(&[slot("f", vec![runner("ci-box", "idle")], 0)], &ms, &cfg);
+        assert_eq!(rep.rows[0].machine.as_deref(), Some("alpha"));
+        assert_eq!(
+            rep.rows[0].badges,
+            [RunnerBadge::ForgeUpUnitDown],
+            "{rep:?}"
+        );
+        // Beside a name-joined runner there are two, and neither is named for the machine.
+        let rep = report(
+            &[slot(
+                "f",
+                vec![runner("ci-box", "idle"), runner("alpha-x", "idle")],
+                0,
+            )],
+            &ms,
+            &cfg,
+        );
+        assert!(
+            rep.rows
+                .iter()
+                .all(|r| r.unit.is_none() && r.badges.is_empty()),
+            "{rep:?}"
+        );
+    }
+
     #[test]
     fn each_unit_state_is_up_or_down_as_the_readme_says() {
         let cfg = RunnersConfig::default();
@@ -1025,11 +1353,12 @@ mod tests {
             &cfg,
         );
         assert!(rep.rows.iter().all(|r| r.unit.is_some()), "{rep:?}");
-        // Two runners on the machine: which unit is whose is not known, so none is guessed.
+        // Two runners, neither named for the machine: which unit is whose is not known, so none
+        // is guessed.
         let rep = report(
             &[slot(
                 "f",
-                vec![runner("alpha", "idle"), runner("alpha-b", "idle")],
+                vec![runner("alpha-a", "idle"), runner("alpha-b", "idle")],
                 0,
             )],
             &ms,
@@ -1194,6 +1523,7 @@ mod tests {
         let failing = ForgeSlot {
             forge: "beta.example.org".into(),
             scope: "admin".into(),
+            site: String::new(),
             answer: Some(ForgeAnswer {
                 runners: Err("forge: the forge refused the token (HTTP 403)".into()),
                 queued: Err("forge: the forge refused the token (HTTP 403)".into()),
@@ -1202,6 +1532,7 @@ mod tests {
         let pending = ForgeSlot {
             forge: "gamma.example.org".into(),
             scope: "user".into(),
+            site: String::new(),
             answer: None,
         };
         let rep = report(
@@ -1230,6 +1561,7 @@ mod tests {
         let s = ForgeSlot {
             forge: "f".into(),
             scope: "admin".into(),
+            site: String::new(),
             answer: Some(ForgeAnswer {
                 runners: Ok(vec![runner("a", "idle")]),
                 queued: Err("no".into()),
@@ -1277,6 +1609,7 @@ mod tests {
         let down = ForgeSlot {
             forge: "x".into(),
             scope: "admin".into(),
+            site: String::new(),
             answer: Some(ForgeAnswer {
                 runners: Err("e".into()),
                 queued: Err("e".into()),
@@ -1300,6 +1633,7 @@ mod tests {
         let ask = ForgeSlot {
             forge: "x".into(),
             scope: "admin".into(),
+            site: String::new(),
             answer: None,
         };
         assert_eq!(report(&[ask], &[], &cfg).summary().unwrap(), "runners: …");

@@ -63,6 +63,7 @@ fn slot(forge: &str, scope: &str, answer: Option<ForgeAnswer>) -> ForgeSlot {
     ForgeSlot {
         forge: forge.to_owned(),
         scope: scope.to_owned(),
+        site: forge.to_owned(),
         answer,
     }
 }
@@ -913,12 +914,14 @@ async fn runners_wiring_child() {
                 RunnerForgeSettings {
                     url: format!("http://127.0.0.1:{}/", ports[0]),
                     name: "127.0.0.1".to_owned(),
+                    site: format!("127.0.0.1:{}", ports[0]),
                     scope: Scope::Admin,
                     token_file: Some(tokens[0].clone()),
                 },
                 RunnerForgeSettings {
                     url: format!("http://127.0.0.1:{}/", ports[1]),
                     name: "127.0.0.1 (repo:acme/fleet)".to_owned(),
+                    site: format!("127.0.0.1:{}", ports[1]),
                     scope: Scope::Repo {
                         owner: "acme".to_owned(),
                         name: "fleet".to_owned(),
@@ -1193,4 +1196,50 @@ async fn the_log_remembers_by_entry_and_not_by_name() {
         .filter(|l| l.starts_with("Runners:"))
         .count();
     assert_eq!(n, 1, "{:?}", shell.log.lines());
+}
+
+// ---------------------------------------------------------------------------------------
+// Fix round 2 (re-review of PR #43)
+// ---------------------------------------------------------------------------------------
+
+/// N-C (R10): the same failure after a good answer is news again. A log that never forgot a
+/// reason would stay silent about a forge that went down, came back and went down the same way.
+#[tokio::test(start_paused = true)]
+async fn the_same_failure_after_a_recovery_is_logged_again() {
+    let shell = settled_demo().await;
+    let base = shell.view();
+    let down = with_report(
+        &base,
+        &[slot(
+            "forge.example.org",
+            "admin",
+            Some(ForgeAnswer {
+                runners: Err("forge: the forge answered HTTP 502".to_owned()),
+                queued: Err("forge: the forge answered HTTP 502".to_owned()),
+            }),
+        )],
+        &[],
+        &RunnersConfig::default(),
+    );
+    let up = with_report(&base, &calm(), &[], &RunnersConfig::default());
+    let lines = || {
+        shell
+            .log
+            .lines()
+            .iter()
+            .filter(|l| l.starts_with("Runners:"))
+            .count()
+    };
+    shell.note_runners(&down);
+    shell.note_runners(&down);
+    assert_eq!(lines(), 1);
+    shell.note_runners(&up);
+    shell.note_runners(&down);
+    assert_eq!(
+        lines(),
+        2,
+        "the same reason, after the forge was well again"
+    );
+    shell.note_runners(&down);
+    assert_eq!(lines(), 2, "and once more is not news");
 }
