@@ -58,11 +58,44 @@ pub const STDERR_CAP: usize = 16 * 1024;
 /// it into place. So `<dir>` + 1 + 40 + 1 + 16 + NUL must fit in 104: 45 bytes.
 pub const MAX_CONTROL_DIR_LEN: usize = 104 - 1 - (1 + 40) - (1 + 16);
 
-/// The shared default for control sockets and evaluator machine-list files.
+/// The shared default for control sockets and evaluator machine-list files: `$XDG_RUNTIME_DIR/auspex`
+/// when that is an absolute path, else `auspex-<uid>` in [`fallback_base`].
 pub(crate) fn default_runtime_path() -> PathBuf {
-    match std::env::var_os("XDG_RUNTIME_DIR") {
-        Some(d) if Path::new(&d).is_absolute() => Path::new(&d).join("auspex"),
-        _ => std::env::temp_dir().join(format!("auspex-{}", rustix::process::getuid().as_raw())),
+    runtime_path(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        &fallback_base(),
+        rustix::process::getuid().as_raw(),
+    )
+}
+
+/// Where `auspex-<uid>` goes when there is no `XDG_RUNTIME_DIR`.
+///
+/// The system temporary directory (`TMPDIR`), except on macOS, where it is a per-user
+/// directory such as `/var/folders/zz/<28 characters>/T/`: about 49 bytes before `auspex-501`,
+/// against the 45 a control directory may have in all ([`MAX_CONTROL_DIR_LEN`]), so every
+/// default failed there and auspex had no ssh at all (review of PR #8, F9). `/tmp` is shared
+/// and writable by everyone, which is why the directory under it is not trusted for being
+/// there: [`prepare_private_dir`] creates it 0700 and refuses one that is a symlink, is not
+/// ours, or has another mode, so another user who got there first costs a refusal, not a
+/// socket in their reach. Linux keeps `TMPDIR`.
+fn fallback_base() -> PathBuf {
+    fallback_base_for(cfg!(target_os = "macos"), std::env::temp_dir())
+}
+
+/// [`fallback_base`] with the platform and the temporary directory given, so each platform's
+/// answer is tested on every platform.
+fn fallback_base_for(macos: bool, temp_dir: PathBuf) -> PathBuf {
+    if macos {
+        PathBuf::from("/tmp")
+    } else {
+        temp_dir
+    }
+}
+
+fn runtime_path(xdg_runtime_dir: Option<&std::ffi::OsStr>, base: &Path, uid: u32) -> PathBuf {
+    match xdg_runtime_dir {
+        Some(d) if Path::new(d).is_absolute() => Path::new(d).join("auspex"),
+        _ => base.join(format!("auspex-{uid}")),
     }
 }
 
@@ -76,6 +109,13 @@ pub(crate) fn prepare_private_dir(path: &Path, kind: &str) -> Result<(), String>
         Err(e) => return Err(format!("cannot create {kind} {shown}: {e}")),
     }
     // Inspect after creating too: creation does not guarantee what remains at this path.
+    check_private_dir(path, kind)
+}
+
+/// The checks of [`prepare_private_dir`] on a directory that is already there, creating
+/// nothing: not a symlink, a directory, ours, mode exactly 0700.
+fn check_private_dir(path: &Path, kind: &str) -> Result<(), String> {
+    let shown = path.display();
     let meta =
         fs::symlink_metadata(path).map_err(|e| format!("cannot inspect {kind} {shown}: {e}"))?;
     if meta.file_type().is_symlink() {
@@ -88,7 +128,8 @@ pub(crate) fn prepare_private_dir(path: &Path, kind: &str) -> Result<(), String>
     if meta.uid() != me {
         return Err(format!(
             "{kind} {shown} is owned by uid {}, not by this user (uid {me}); \
-             refusing to use it",
+             refusing to use it. Set XDG_RUNTIME_DIR to a directory of yours (such as \
+             /run/user/{me}) so that auspex makes its own",
             meta.uid()
         ));
     }
@@ -102,9 +143,18 @@ pub(crate) fn prepare_private_dir(path: &Path, kind: &str) -> Result<(), String>
 }
 
 /// A control-socket directory that has passed [`ControlDir::prepare`]'s checks.
+///
+/// Device and inode cannot tell a same-owner recreation that reuses the inode number (a
+/// filesystem may give a freed inode to the next directory at once, as the forge runner's did);
+/// that is acceptable, because [`ControlDir::recheck`] also repeats the owner, mode and
+/// not-a-symlink checks, so a directory that is not ours is refused whatever its inode, and one
+/// that is ours and 0700 is as private as the one it replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlDir {
     path: String,
+    /// The device and inode of the directory as [`ControlDir::prepare`] found it: what every
+    /// later ssh must still find at `path` ([`ControlDir::recheck`]).
+    identity: (u64, u64),
 }
 
 /// Why a control directory was refused.
@@ -125,9 +175,9 @@ impl ControlDir {
     /// temporary directory. This is the one place this module reads the environment
     /// (besides `PATH`, which `process::command` reads to find ssh).
     ///
-    /// On macOS, where `XDG_RUNTIME_DIR` is usually unset and `TMPDIR` is long, the fallback
-    /// is too long for a socket path and [`ControlDir::prepare`] refuses it (review finding
-    /// F9, out of scope: auspex runs on a Linux desktop).
+    /// On macOS, where `XDG_RUNTIME_DIR` is usually unset and `TMPDIR` is too long for a socket
+    /// path, the fallback is `/tmp/auspex-<uid>` instead (review of PR #8, F9); the directory is
+    /// private all the same, since [`ControlDir::prepare`] checks its owner and mode.
     #[must_use]
     pub fn default_path() -> PathBuf {
         default_runtime_path()
@@ -162,7 +212,46 @@ impl ControlDir {
         // into an error here rather than on every probe.
         let probe_target = Target::parse("x").map_err(|e| ControlDirError(e.to_string()))?;
         ssh_args(&probe_target, &SshOptions::new(s)).map_err(|e| ControlDirError(e.to_string()))?;
-        Ok(Self { path: s.to_owned() })
+        let meta = fs::symlink_metadata(path).map_err(|e| {
+            ControlDirError(format!("cannot inspect control directory {shown}: {e}"))
+        })?;
+        Ok(Self {
+            path: s.to_owned(),
+            identity: (meta.dev(), meta.ino()),
+        })
+    }
+
+    /// The checks of [`Self::prepare`] again, without creating anything, and that this is still
+    /// the directory it prepared (same device and inode). Run before every ssh is started.
+    ///
+    /// The path is trusted from start-up otherwise, and under `/tmp` (the macOS default, F9) a
+    /// periodic clean-up of old empty directories can remove it while auspex is open, after
+    /// which any local user can create `/tmp/auspex-<uid>` first, a name that is predictable,
+    /// and ssh would bind and connect its control sockets inside a directory that is theirs
+    /// (review of PR #37, finding 3). A directory that was removed and made again is refused
+    /// even when the new one is ours and 0700: it is not the one whose sockets this run made.
+    ///
+    /// # Errors
+    ///
+    /// [`ControlDirError`] saying what changed.
+    pub fn recheck(&self) -> Result<(), ControlDirError> {
+        let path = Path::new(&self.path);
+        check_private_dir(path, "control directory").map_err(ControlDirError)?;
+        let meta = fs::symlink_metadata(path).map_err(|e| {
+            ControlDirError(format!(
+                "cannot inspect control directory {}: {e}",
+                self.path
+            ))
+        })?;
+        if (meta.dev(), meta.ino()) != self.identity {
+            return Err(ControlDirError(format!(
+                "control directory {} is not the directory auspex made at start-up (it was \
+                 removed and made again, or replaced), so ssh is not run in it; restart auspex \
+                 (or set XDG_RUNTIME_DIR to a directory that is not cleaned up)",
+                self.path
+            )));
+        }
+        Ok(())
     }
 
     /// The directory.
@@ -211,6 +300,29 @@ impl<'a> ProbeParams<'a> {
     }
 }
 
+/// Why an ssh could not be started.
+pub(crate) enum SshStartError {
+    /// The control directory is not the one that was prepared: nothing was started.
+    Refused(String),
+    /// The program could not be found or run.
+    CannotRun(io::Error),
+}
+
+impl ProbeParams<'_> {
+    /// The command for an ssh that uses the control directory: **the one way** one is made, for
+    /// the connect phase, the probe and the deployed-closure query alike (review of PR #37,
+    /// finding 3, and the re-review's B: the closure query started its own ssh without the
+    /// check). It first re-checks that the directory is still the one prepared
+    /// ([`ControlDir::recheck`]), because ssh binds and connects its sockets in it, and then
+    /// resolves the program. A test fails if any other `command(params.ssh_program)` exists.
+    pub(crate) fn ssh_command(&self) -> Result<tokio::process::Command, SshStartError> {
+        self.control_dir
+            .recheck()
+            .map_err(|e| SshStartError::Refused(e.0))?;
+        command(self.ssh_program).map_err(SshStartError::CannotRun)
+    }
+}
+
 /// The exact argv (after the program) a probe of `target` runs.
 ///
 /// # Errors
@@ -243,6 +355,7 @@ pub fn interactive_command(
     target: &Target,
     control_dir: &ControlDir,
 ) -> Result<(PathBuf, Vec<String>), String> {
+    control_dir.recheck().map_err(|e| e.0)?;
     let path = crate::process::resolve_in(program, std::env::var_os("PATH").as_deref())
         .map_err(|e| spawn_error("run", program, &e))?;
     let mut options = SshOptions::new(control_dir.as_str());
@@ -503,9 +616,12 @@ async fn connect_once(
                 window: connect_window(params.control_dir),
             }
         });
-        let mut cmd = match command(params.ssh_program) {
+        let mut cmd = match params.ssh_command() {
             Ok(cmd) => cmd,
-            Err(e) => {
+            Err(SshStartError::Refused(reason)) => {
+                return Ok(Some(ProbeOutcome::Failed { reason }));
+            }
+            Err(SshStartError::CannotRun(e)) => {
                 return Ok(Some(ProbeOutcome::Unreachable {
                     reason: spawn_error("cannot connect", params.ssh_program, &e),
                 }));
@@ -645,9 +761,10 @@ pub async fn probe(
         Ok(a) => a,
         Err(reason) => return Ok(ProbeOutcome::Failed { reason }),
     };
-    let mut cmd = match command(params.ssh_program) {
+    let mut cmd = match params.ssh_command() {
         Ok(c) => c,
-        Err(e) => {
+        Err(SshStartError::Refused(reason)) => return Ok(ProbeOutcome::Failed { reason }),
+        Err(SshStartError::CannotRun(e)) => {
             return Ok(ProbeOutcome::Unreachable {
                 reason: spawn_error("cannot probe", params.ssh_program, &e),
             });
@@ -719,5 +836,117 @@ fn exit_of(s: std::process::ExitStatus) -> ProbeExit {
         (None, Some(sig)) => ProbeExit::Signal(sig),
         // Neither a code nor a signal is not a thing on unix; called a failure.
         (None, None) => ProbeExit::Code(-1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    /// Review of PR #8, F9: the default control directory must fit a socket path on the
+    /// platform it is chosen for. The test fixes what each platform's base is and checks the
+    /// longest name the uid can give.
+    #[test]
+    fn the_default_runtime_path_follows_xdg_runtime_dir_and_else_the_fallback() {
+        let base = Path::new("/var/folders/zz/0123456789abcdefghijklmnopqr/T");
+        let rt = |xdg: Option<&str>, uid| runtime_path(xdg.map(OsStr::new), base, uid);
+        assert_eq!(
+            rt(Some("/run/user/1000"), 7),
+            Path::new("/run/user/1000/auspex")
+        );
+        for unusable in [None, Some(""), Some("relative/run")] {
+            assert_eq!(rt(unusable, 501), base.join("auspex-501"), "{unusable:?}");
+        }
+    }
+
+    #[test]
+    fn the_fallback_base_is_short_on_macos_and_the_temporary_directory_elsewhere() {
+        let long = PathBuf::from("/var/folders/zz/0123456789abcdefghijklmnopqr/T");
+        assert_eq!(fallback_base_for(false, long.clone()), long);
+        assert_eq!(fallback_base_for(true, long.clone()), Path::new("/tmp"));
+        // What macOS would pick for the longest uid still fits a control socket, and what
+        // its `TMPDIR` would pick does not: the reason for the special case.
+        let mac = runtime_path(None, &fallback_base_for(true, long.clone()), u32::MAX);
+        assert!(
+            mac.to_str().unwrap().len() <= MAX_CONTROL_DIR_LEN,
+            "{mac:?}"
+        );
+        let tmpdir = runtime_path(None, &long, 501);
+        assert!(
+            tmpdir.to_str().unwrap().len() > MAX_CONTROL_DIR_LEN,
+            "{tmpdir:?}"
+        );
+        // This platform's own choice.
+        let here = fallback_base();
+        if cfg!(target_os = "macos") {
+            assert_eq!(here, Path::new("/tmp"));
+        } else {
+            assert_eq!(here, std::env::temp_dir());
+        }
+    }
+
+    /// The short default on macOS is `/tmp/auspex-<uid>`: whatever the platform, a path of
+    /// that shape is accepted as a control directory, and is made private (0700, ours).
+    #[test]
+    fn a_tmp_style_default_is_short_enough_and_private() {
+        let uid = rustix::process::getuid().as_raw();
+        let shape = runtime_path(None, Path::new("/tmp"), u32::MAX);
+        assert!(
+            shape.to_str().unwrap().len() <= MAX_CONTROL_DIR_LEN,
+            "{shape:?}"
+        );
+        // The same shape under a real temporary directory, so the directory can be made.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = runtime_path(None, tmp.path(), uid);
+        if path.to_str().unwrap().len() <= MAX_CONTROL_DIR_LEN {
+            let dir = ControlDir::prepare(&path).unwrap();
+            assert_eq!(dir.as_str(), path.to_str().unwrap());
+        } else {
+            // A long TMPDIR: the evaluator's directory has no socket limit, and is private.
+            prepare_private_dir(&path, "runtime directory").unwrap();
+        }
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+        assert_eq!(meta.uid(), uid);
+    }
+}
+
+#[cfg(test)]
+mod spawn_sites {
+    /// Every ssh the crate starts is made by `ProbeParams::ssh_command`, which re-checks the
+    /// control directory first (review of PR #37, re-review B). The closure query once started
+    /// its own and missed the check; so no other `command(…ssh_program)` may exist.
+    #[test]
+    fn only_ssh_command_makes_an_ssh() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(&src).unwrap().flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                // Code only: a comment may name the pattern.
+                let code = line.trim_start();
+                if !code.starts_with("//")
+                    && code.contains("command(")
+                    && code.contains("ssh_program")
+                {
+                    found.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                }
+            }
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "ssh is started in more than one place: {found:#?}"
+        );
+        assert!(
+            found[0].contains("ssh.rs") && found[0].contains("self.ssh_program"),
+            "{found:#?}"
+        );
     }
 }

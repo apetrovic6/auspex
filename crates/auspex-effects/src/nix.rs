@@ -124,9 +124,26 @@ impl FlakeRef {
     /// therefore read tracked files: `builtins.getFlake "/abs"` alone reads a path
     /// source, unlike the `nix eval /abs#…` CLI.
     ///
+    /// **This does filesystem I/O**: it canonicalizes the path and looks for `.git` in each
+    /// ancestor (a file or a directory: a linked worktree or a submodule has a file), so the
+    /// result depends on the disk as it is now, and a path that does not exist keeps its
+    /// lexical form.
+    ///
+    /// **A `git+file:` reference is rewritten too** when it has no query: it goes through
+    /// the same walk-up, so `git+file:///repo/x/y` becomes `git+file:///repo/?dir=x%2Fy`
+    /// (nix itself refuses the original, "Failed to fetch git repository"), and
+    /// `git+file://localhost/…` and `git+file:/…` are normalised alike (review of PR #8, N9).
+    /// Only a reference the operator gave a query (`?ref=`, `?rev=`, `?dir=`, …) is used as
+    /// written, and is not cached; other schemes (`github:`, `git+https:`) are untouched.
+    ///
+    /// The path is percent-encoded for nix's reference grammar, `[`, `]`, `|` and `^` included.
+    ///
     /// # Errors
     ///
-    /// When it is empty, starts with `-`, contains `#`, or contains a control character.
+    /// When it is empty, starts with `-`, contains `#`, or contains a control character;
+    /// when a path that must be put in the reference is not UTF-8, or has a character that
+    /// cannot be encoded (nothing is passed to nix that it would read as something else); when
+    /// the working directory cannot be found or a path cannot be made absolute.
     pub fn new(s: &str) -> Result<Self, FlakeRefError> {
         let cwd = std::env::current_dir()
             .map_err(|e| FlakeRefError(format!("cannot find the working directory: {e}")))?;
@@ -192,8 +209,13 @@ impl FlakeRef {
                         file.set_query(Some(&query));
                     }
                 }
+                let mut reference = format!("git+file://{}", nix_path(file.path())?);
+                if let Some(query) = file.query() {
+                    reference.push('?');
+                    reference.push_str(query);
+                }
                 return Ok(Self {
-                    reference: format!("git+{file}"),
+                    reference,
                     top: Some(top.to_path_buf()),
                     worktree: Some(path),
                     queried,
@@ -208,7 +230,7 @@ impl FlakeRef {
                 let file = url::Url::from_file_path(path)
                     .map_err(|()| FlakeRefError("cannot encode the flake path".to_owned()))?;
                 return Ok(Self {
-                    reference: format!("path:{}", file.path()),
+                    reference: format!("path:{}", nix_path(file.path())?),
                     worktree: None,
                     top: None,
                     queried: false,
@@ -351,16 +373,81 @@ fn absolute_local_scheme(s: &str, cwd: &Path) -> Result<String, FlakeRefError> {
     let abs = std::fs::canonicalize(&abs).unwrap_or(abs);
     let file = url::Url::from_file_path(&abs)
         .map_err(|()| FlakeRefError(format!("cannot encode the path of {s:?}")))?;
+    let path = nix_path(file.path())?;
     let mut out = if git {
-        format!("git+file://{}", file.path())
+        format!("git+file://{path}")
     } else {
-        format!("path:{}", file.path())
+        format!("path:{path}")
     };
     if let Some(q) = query {
         out.push('?');
         out.push_str(q);
     }
     Ok(out)
+}
+
+/// The path part of a `file:` URL (`Url::path`, already percent-encoded by the `url` crate) as
+/// nix will accept it, or an error.
+///
+/// nix's flake reference parser takes only RFC 3986 path characters, unencoded or as `%XX`.
+/// The `url` crate follows the WHATWG URL standard instead, which leaves `[`, `]`, `|` and
+/// `^` unencoded in a path, and nix then refuses the whole reference ("is not an absolute
+/// path", review of PR #8, N3), so a repository in `~/t[1]` could be neither listed nor
+/// evaluated. They are encoded here. Everything else is checked against the grammar, so a
+/// character nobody thought of fails closed with this error instead of reaching nix as a
+/// reference that names something else, or nothing.
+fn nix_path(path: &str) -> Result<String, FlakeRefError> {
+    let mut out = String::with_capacity(path.len());
+    let mut chars = path.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => out.push_str("%5B"),
+            ']' => out.push_str("%5D"),
+            '|' => out.push_str("%7C"),
+            '^' => out.push_str("%5E"),
+            // An escape the `url` crate wrote: two hex digits must follow.
+            '%' => {
+                let rest = chars.as_str().as_bytes();
+                if rest.len() < 2 || !rest[..2].iter().all(u8::is_ascii_hexdigit) {
+                    return Err(unencodable(path));
+                }
+                out.push('%');
+            }
+            c if c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '/' | '-'
+                        | '.'
+                        | '_'
+                        | '~'
+                        | '!'
+                        | '$'
+                        | '&'
+                        | '\''
+                        | '('
+                        | ')'
+                        | '*'
+                        | '+'
+                        | ','
+                        | ';'
+                        | '='
+                        | ':'
+                        | '@'
+                ) =>
+            {
+                out.push(c);
+            }
+            _ => return Err(unencodable(path)),
+        }
+    }
+    Ok(out)
+}
+
+fn unencodable(path: &str) -> FlakeRefError {
+    FlakeRefError(format!(
+        "cannot encode the path {path:?} as a flake reference: it has a character that nix's \
+         reference syntax does not take"
+    ))
 }
 
 /// `scheme:` at the start, as in a URL: a letter, then letters, digits, `+`, `-`, `.`.
@@ -472,6 +559,10 @@ pub struct EvalParams<'a> {
     /// without a socket-path length limit. `None` uses `$XDG_RUNTIME_DIR/auspex`, or
     /// `auspex-<uid>` under the system temporary directory if it is unset or relative.
     pub runtime_dir: Option<std::path::PathBuf>,
+    /// The git the untracked-file note asks which files are tracked (`git ls-files`). Set from
+    /// the cache parameters by [`crate::cache::evaluate_cached`], so the operator's own git
+    /// program is used, as for the key.
+    pub git: crate::cache::GitParams<'a>,
 }
 
 impl EvalParams<'_> {
@@ -485,6 +576,7 @@ impl EvalParams<'_> {
             max_memory_mib: 4096,
             timeout: Duration::from_secs(300),
             runtime_dir: None,
+            git: crate::cache::GitParams::new(),
         }
     }
 }
@@ -705,14 +797,94 @@ struct Collector<'a> {
     delivered: BTreeSet<String>,
     notes: usize,
     tx: &'a UnboundedSender<EvalItem>,
+    /// The repository top level of a git reference: where an untracked file that nix said
+    /// it could not find would be.
+    top: Option<&'a Path>,
+    /// Paths already hinted about, so one missing module is one note, not one per machine.
+    hinted: BTreeSet<String>,
+    /// (machine, path) pairs to check against the index once the run is over.
+    candidates: Vec<(String, String)>,
+    /// The git for the check, and the address-space limit it runs under ([`crate::cache::hint_memory`]).
+    git: crate::cache::GitParams<'a>,
+    git_memory: Option<u64>,
 }
 
-impl Collector<'_> {
+impl<'a> Collector<'a> {
+    /// The bookkeeping for one evaluation of `machines` of `flake`.
+    fn new(
+        machines: &'a [EvalMachine],
+        tx: &'a UnboundedSender<EvalItem>,
+        flake: &'a FlakeRef,
+        params: &EvalParams<'a>,
+    ) -> Self {
+        Self {
+            requested: machines.iter().map(|m| m.name.as_str()).collect(),
+            delivered: BTreeSet::new(),
+            notes: 0,
+            tx,
+            top: flake.repo_top(),
+            hinted: BTreeSet::new(),
+            candidates: Vec::new(),
+            git: params.git,
+            git_memory: crate::cache::hint_memory(cfg!(target_os = "linux")),
+        }
+    }
+
     fn note(&mut self, text: String) {
         if self.notes < MAX_LINE_NOTES {
             self.notes += 1;
             let _ = self.tx.send(EvalItem::Note(text));
         }
+    }
+
+    /// One note when an evaluation error names a file in the repository that nix could not
+    /// find and that exists in the worktree (review of PR #8, N6).
+    ///
+    /// A plain path in a git repository is evaluated as `git+file`, which reads the tracked
+    /// files only, as `nix build .#…` does (review finding B1). A configuration that imports a
+    /// new, untracked module then fails with nix's "path '/nix/store/…-source/new.nix' does not
+    /// exist", which names neither git nor tracking, and an import guarded by `pathExists`
+    /// changes silently. The path after `-source/` is relative to the repository top level.
+    fn untracked_hint(&mut self, machine: &str, tail: &[String]) {
+        let Some(top) = self.top else { return };
+        for rel in tail.iter().flat_map(|l| missing_paths(l)) {
+            if self.candidates.len() >= MAX_LINE_NOTES
+                || self.hinted.contains(&rel)
+                || std::fs::symlink_metadata(top.join(&rel)).is_err()
+            {
+                continue;
+            }
+            self.hinted.insert(rel.clone());
+            self.candidates.push((machine.to_owned(), rel));
+        }
+    }
+
+    /// The notes for the candidates [`Self::untracked_hint`] collected, once the run is over:
+    /// only for a path that is **not in the index** (`git ls-files` lists nothing for it), since
+    /// a tracked file that nix reports on is not an untracked file (review of PR #37, finding 2).
+    /// When git cannot answer, there is no note: it is a hint, never a guess.
+    async fn explain_untracked(&mut self, cancel: &CancellationToken) -> Result<(), Cancelled> {
+        let Some(top) = self.top else { return Ok(()) };
+
+        for (machine, rel) in std::mem::take(&mut self.candidates) {
+            // `:(literal)`: the name is data, not a pathspec with wildcards.
+            let spec = format!(":(literal){rel}");
+            let args = ["ls-files", "-z", "--", spec.as_str()];
+            if let Ok(listed) =
+                crate::cache::git_hint(&self.git, top, &args, 64 * 1024, self.git_memory, cancel)
+                    .await?
+                && listed.is_empty()
+            {
+                self.note(format!(
+                    "{machine}: nix could not find {:?}, which exists in the worktree but is \
+                     not tracked by git. A plain path in a git repository is evaluated as a \
+                     git+file reference, which sees tracked files only (as `nix build .#…` \
+                     does): `git add` the file",
+                    sanitize_line(&rel)
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn line(&mut self, line: Line) {
@@ -750,12 +922,72 @@ impl Collector<'_> {
             return;
         }
         let outcome = named(outcome, &machine);
+        if let EvalOutcome::Error(failure) = &outcome {
+            self.untracked_hint(&machine, &failure.error_tail);
+        }
         let _ = self.tx.send(EvalItem::Machine {
             machine,
             outcome,
             from_cache: false,
         });
     }
+}
+
+/// [`source_paths`] of a line that says the file is missing: nix's `does not exist`, the system's
+/// `No such file or directory`, or `is not tracked by Git`. Any other line that quotes a source
+/// path (the module system's "- In" line, a trace, a warning) says nothing about a
+/// file being absent, and gets nothing (review of PR #37, finding 2).
+fn missing_paths(line: &str) -> Vec<String> {
+    let lower = line.to_ascii_lowercase();
+    if [
+        "does not exist",
+        "no such file or directory",
+        "is not tracked by git",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+    {
+        source_paths(line)
+    } else {
+        Vec::new()
+    }
+}
+
+/// The paths below a store path named `...-source` in one line of nix's error text, as written
+/// after `-source/` up to a quote or a space. Only a real store path counts (`/nix/store/`
+/// and 32 characters), and only a path that stays below its root: no `..`, nothing absolute.
+fn source_paths(line: &str) -> Vec<String> {
+    const MARK: &str = "-source/";
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(at) = line[from..].find(MARK) {
+        let end = from + at;
+        from = end + MARK.len();
+        let before = &line[..end];
+        let hash_ok = before.len() >= 32
+            && before.is_char_boundary(before.len() - 32)
+            && before[before.len() - 32..]
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric())
+            && before[..before.len() - 32].ends_with("/nix/store/");
+        if !hash_ok {
+            continue;
+        }
+        let rest = &line[from..];
+        let rel = rest
+            .split(|c: char| c == '\'' || c == '"' || c.is_whitespace())
+            .next()
+            .unwrap_or_default();
+        let clean = !rel.is_empty()
+            && rel.len() <= 1024
+            && Path::new(rel)
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if clean {
+            found.push(rel.to_owned());
+        }
+    }
+    found
 }
 
 /// The run error of an evaluator whose output was not read to its end.
@@ -849,20 +1081,14 @@ pub async fn evaluate(
     let mut lines = sp.child.stdout.take().map(|o| Lines::new(o, EVAL_LINE_CAP));
     let mut err_pipe = sp.child.stderr.take();
     let mut err = Tail::new(STDERR_CAP);
-    let mut collect = Collector {
-        requested: unique.iter().map(|m| m.name.as_str()).collect(),
-        delivered: BTreeSet::new(),
-        notes: 0,
-        tx: &tx,
-    };
-    let deadline = Instant::now() + params.timeout;
+    let mut collect = Collector::new(&unique, &tx, flake, params);
     let stop = pump(
         &mut sp,
         &mut lines,
         &mut collect,
         &mut err,
         &mut err_pipe,
-        deadline,
+        Instant::now() + params.timeout,
         cancel,
     )
     .await;
@@ -886,6 +1112,7 @@ pub async fn evaluate(
             Some(format!("waiting for nix-eval-jobs failed: {e}"))
         }
     };
+    collect.explain_untracked(cancel).await?;
     drop(list);
     let error = error.map(|what| match reason(&lossy(&err.buf)) {
         Some(r) => format!("{what}: {r}"),
@@ -1164,6 +1391,312 @@ mod tests {
         std::fs::create_dir(&q).unwrap();
         let f = FlakeRef::new(q.to_str().unwrap()).unwrap();
         assert!(f.as_str().ends_with("/q%3Fdir=sub"), "{f:?}");
+    }
+
+    /// A repository with `a.nix` tracked and `[a].nix`, `b.nix` untracked, and a `Collector` over
+    /// it with those as candidates, run through `explain_untracked` with `git` and `memory`.
+    /// Returns the notes.
+    fn untracked_notes(git: crate::cache::GitParams<'_>, memory: Option<u64>) -> Vec<String> {
+        let repo = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(repo.path()).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&top)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-q"]);
+        std::fs::write(top.join("a.nix"), "{}").unwrap();
+        run(&["add", "a.nix"]);
+        std::fs::write(top.join("[a].nix"), "{}").unwrap();
+        std::fs::write(top.join("b.nix"), "{}").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut collect = Collector {
+            requested: BTreeSet::new(),
+            delivered: BTreeSet::new(),
+            notes: 0,
+            tx: &tx,
+            top: Some(&top),
+            hinted: BTreeSet::new(),
+            candidates: ["[a].nix", "a.nix", "b.nix"]
+                .map(|p| ("m".to_owned(), p.to_owned()))
+                .to_vec(),
+            git,
+            git_memory: memory,
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(collect.explain_untracked(&CancellationToken::new()))
+            .unwrap();
+        drop(collect);
+        drop(tx);
+        let mut notes = Vec::new();
+        while let Ok(EvalItem::Note(n)) = rx.try_recv() {
+            notes.push(n);
+        }
+        notes
+    }
+
+    /// Review of PR #37, re-review A and mutations Q04 and Q13. The name is data, not a pathspec
+    /// (`[a].nix` is not `a.nix`), a tracked file gets no note, and with **no memory limit** (the
+    /// platforms without a launcher, macOS) the check still answers: the note is not silently off.
+    #[test]
+    fn the_untracked_check_reads_names_literally_and_needs_no_launcher() {
+        for memory in [None, Some(crate::cache::GIT_MEMORY_LIMIT)] {
+            let notes = untracked_notes(crate::cache::GitParams::new(), memory);
+            let mentioned = |p: &str| notes.iter().any(|n| n.contains(&format!("{p:?}")));
+            assert_eq!(notes.len(), 2, "{memory:?}: {notes:?}");
+            assert!(mentioned("[a].nix") && mentioned("b.nix"), "{notes:?}");
+            assert!(!mentioned("a.nix"), "a tracked file: {notes:?}");
+        }
+    }
+
+    /// Mutation Q13: when git cannot answer there is no note, never a guess.
+    #[test]
+    fn a_git_that_cannot_answer_gives_no_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("git");
+        std::fs::write(&fake, "#!/bin/sh\necho 'fatal: nope' >&2\nexit 128\n").unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut git = crate::cache::GitParams::new();
+        git.program = fake.as_os_str();
+        assert_eq!(untracked_notes(git, None), Vec::<String>::new());
+        let missing = std::ffi::OsString::from("/nonexistent/auspex-git");
+        git.program = &missing;
+        assert_eq!(untracked_notes(git, None), Vec::<String>::new());
+    }
+
+    /// Where a launcher exists the hint is bounded like every other git; elsewhere it is not.
+    #[test]
+    fn the_hint_is_bounded_where_a_launcher_exists() {
+        assert_eq!(
+            crate::cache::hint_memory(true),
+            Some(crate::cache::GIT_MEMORY_LIMIT)
+        );
+        assert_eq!(crate::cache::hint_memory(false), None);
+    }
+
+    /// Review of PR #37, finding 2 and mutations R14 and R15: which paths nix's error text
+    /// names. A path ends at a quote or a space, must be below a real store path, stays below
+    /// it, and is at most 1024 bytes; and only a line that says something is missing counts.
+    #[test]
+    fn source_paths_are_what_nix_names_and_missing_paths_only_when_it_says_so() {
+        let store = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-source";
+        assert_eq!(
+            source_paths(&format!("path '{store}/a/b.nix' does not exist")),
+            ["a/b.nix"]
+        );
+        assert_eq!(
+            source_paths(&format!("path \"{store}/dq.nix\" does not exist")),
+            ["dq.nix"]
+        );
+        assert_eq!(source_paths(&format!("at {store}/sp.nix :1:1")), ["sp.nix"]);
+        assert_eq!(
+            source_paths(&format!("{store}/one.nix and {store}/two.nix")),
+            ["one.nix", "two.nix"]
+        );
+        // The length cap: 1024 bytes pass, 1025 do not.
+        let long = |n: usize| format!("'{store}/{}'", "x".repeat(n));
+        assert_eq!(source_paths(&long(1024)).len(), 1);
+        assert_eq!(source_paths(&long(1025)), Vec::<String>::new());
+        // Not below a store path, not a hash, escapes, absolute.
+        for line in [
+            "'/tmp/x-source/a.nix'",
+            "'/nix/store/short-source/a.nix'",
+            &format!("'{store}/../a.nix'"),
+            &format!("'{store}/a/../../b.nix'"),
+            &format!("'{store}//a.nix'"),
+            &format!("'{store}/'"),
+        ] {
+            assert!(source_paths(line).is_empty(), "{line}");
+        }
+        // Only a missing-file line is a candidate.
+        for said in [
+            format!("error: path '{store}/a.nix' does not exist"),
+            format!("error: getting status of '{store}/a.nix': No such file or directory"),
+            format!("error: '{store}/a.nix' is not tracked by Git"),
+            format!("error: PATH '{store}/a.nix' DOES NOT EXIST"),
+        ] {
+            assert_eq!(missing_paths(&said), ["a.nix"], "{said}");
+        }
+        for silent in [
+            format!("- In `{store}/a.nix': true"),
+            format!("error: The option `x' has conflicting definitions in `{store}/a.nix'"),
+            format!("trace: evaluating {store}/a.nix"),
+        ] {
+            assert!(missing_paths(&silent).is_empty(), "{silent}");
+        }
+    }
+
+    /// Review item N9, now documented and pinned: an explicit `git+file:` reference without a
+    /// query is rewritten like a plain path (nix refuses `git+file:///repo/x/y` itself), and
+    /// one with a query is kept as written.
+    #[test]
+    fn explicit_git_file_references_are_rewritten_unless_they_carry_a_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(tmp.path()).unwrap();
+        std::fs::create_dir(top.join(".git")).unwrap();
+        std::fs::create_dir_all(top.join("x/y")).unwrap();
+        let want = format!("git+file://{}/?dir=x%2Fy", top.display());
+        for given in [
+            format!("git+file://{}/x/y", top.display()),
+            format!("git+file://localhost{}/x/y", top.display()),
+            format!("git+file:{}/x/y", top.display()),
+        ] {
+            let f = FlakeRef::new(&given).unwrap();
+            assert_eq!(f.as_str(), want, "{given}");
+            assert!(f.is_git() && !f.has_query(), "{given}");
+            assert_eq!(f.worktree_dir(), Some(top.join("x/y").as_path()), "{given}");
+        }
+        let root = FlakeRef::new(&format!("git+file://{}", top.display())).unwrap();
+        assert_eq!(root.as_str(), format!("git+file://{}/", top.display()));
+        // The operator's own query is theirs: kept, and not cached.
+        let queried = format!("git+file://{}/x/y?ref=main", top.display());
+        let q = FlakeRef::new(&queried).unwrap();
+        assert_eq!(q.as_str(), queried);
+        assert!(q.has_query() && !q.is_git());
+    }
+
+    /// What nix's flake reference parser takes in a path: RFC 3986 `pchar`s and `/`, or an
+    /// escape. The test's own statement of the grammar, not `nix_path`'s code.
+    fn nix_takes(path: &str) -> bool {
+        let b = path.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'%' => {
+                    if !b
+                        .get(i + 1..i + 3)
+                        .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+                    {
+                        return false;
+                    }
+                    i += 2;
+                }
+                c if c.is_ascii_alphanumeric() || b"/-._~!$&'()*+,;=:@".contains(&c) => {}
+                _ => return false,
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Review item N3: `[`, `]`, `|` and `^` in a repository path made nix refuse the
+    /// reference ("is not an absolute path"). Every awkward name the review tried names its
+    /// own directory in a reference nix takes, for the top level, for `?dir=`, and for
+    /// `path:`.
+    #[test]
+    fn awkward_directory_names_make_references_nix_takes() {
+        let names = [
+            "t[1]",
+            "t]b",
+            "t|b",
+            "t^b",
+            "[|]^",
+            "a b",
+            "a+b",
+            "a%20b",
+            "a%2Fb",
+            "a%",
+            "a?dir=x",
+            "a%3Fdir=x",
+            "a&dir=x",
+            "a;dir=x",
+            "a=b",
+            "é ü",
+            "a\\b",
+            "a'b",
+            "a\"b",
+            "a{b}",
+            "a`b",
+            "a<b>",
+            "a!$*@~,()b",
+            "a:b",
+        ];
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        for name in names {
+            // A repository named `name`, a nested flake directory named `name`, and a
+            // directory outside any repository named `name`.
+            let top = base.join("repos").join(name);
+            let nested = top.join(name);
+            let plain = base.join("plain").join(name);
+            std::fs::create_dir_all(top.join(".git")).unwrap();
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::create_dir_all(&plain).unwrap();
+
+            let root = FlakeRef::new(top.to_str().unwrap()).unwrap();
+            let file = root.as_str().strip_prefix("git+file://").unwrap();
+            assert!(nix_takes(file), "{name}: {}", root.as_str());
+            let decoded = url::Url::parse(&format!("file://{file}")).unwrap();
+            assert_eq!(decoded.to_file_path().unwrap(), top, "{name}");
+            assert!(root.is_git(), "{name}");
+
+            let sub = FlakeRef::new(nested.to_str().unwrap()).unwrap();
+            let (path, query) = sub
+                .as_str()
+                .strip_prefix("git+file://")
+                .unwrap()
+                .split_once("?dir=")
+                .unwrap();
+            assert!(
+                nix_takes(path) && nix_takes(query),
+                "{name}: {}",
+                sub.as_str()
+            );
+            assert_eq!(sub.worktree_dir(), Some(nested.as_path()), "{name}");
+
+            let p = FlakeRef::new(plain.to_str().unwrap()).unwrap();
+            let rest = p.as_str().strip_prefix("path:").unwrap();
+            assert!(nix_takes(rest), "{name}: {}", p.as_str());
+            assert_eq!(p.local_dir(), Some(plain), "{name}");
+            // The scheme form goes through the same encoding. (`path:a?dir=x` is a query
+            // there by definition, so those names are left out.)
+            if !name.contains('?') {
+                let rel = FlakeRef::new_in(&format!("path:{name}"), &base.join("plain")).unwrap();
+                assert_eq!(rel, p, "{name}");
+            }
+        }
+    }
+
+    /// The four characters from the review, spelled out, so the expected text is in the
+    /// tests and not only in the encoder.
+    #[test]
+    fn brackets_pipes_and_carets_are_percent_encoded() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        let top = base.join("fleet|[1]^");
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        let f = FlakeRef::new(top.to_str().unwrap()).unwrap();
+        assert_eq!(
+            f.as_str(),
+            format!("git+file://{}/fleet%7C%5B1%5D%5E/", base.display())
+        );
+        let plain = base.join("p]b");
+        std::fs::create_dir(&plain).unwrap();
+        let p = FlakeRef::new(plain.to_str().unwrap()).unwrap();
+        assert_eq!(p.as_str(), format!("path:{}/p%5Db", base.display()));
+    }
+
+    /// N3's other half: what cannot be encoded is refused, never passed on. The `url` crate
+    /// encodes everything outside ASCII, but this is the last check before nix, so it does
+    /// not rely on that.
+    #[test]
+    fn a_path_that_cannot_be_encoded_is_refused() {
+        assert_eq!(nix_path("/a/b%20c").unwrap(), "/a/b%20c");
+        for bad in [
+            "/a b", "/a\u{e9}", "/a%", "/a%2", "/a%zz", "/a\"b", "/a\\b", "/a\u{7f}", "/a\n",
+        ] {
+            let e = nix_path(bad).unwrap_err();
+            assert!(e.0.contains("cannot encode the path"), "{bad:?}: {e}");
+        }
     }
 
     #[test]

@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::Cancelled;
 use crate::http::base_url;
 use crate::process::{End, Limits, OnExit, Ran, command, describe_status, run, spawn_error};
-use crate::ssh::{ProbeParams, connect, probe_argv};
+use crate::ssh::{ProbeParams, SshStartError, connect, probe_argv};
 use crate::text::{lossy, reason};
 
 /// How much stdout a closure query keeps: 4 MiB.
@@ -211,9 +211,12 @@ pub async fn deployed(
         Ok(a) => a,
         Err(reason) => return Ok(Err(format!("deployed closure: {reason}"))),
     };
-    let mut cmd = match command(params.ssh_program) {
+    let mut cmd = match params.ssh_command() {
         Ok(c) => c,
-        Err(e) => {
+        Err(SshStartError::Refused(reason)) => {
+            return Ok(Err(format!("deployed closure: {reason}")));
+        }
+        Err(SshStartError::CannotRun(e)) => {
             return Ok(Err(spawn_error(
                 "cannot query the deployed closure",
                 params.ssh_program,

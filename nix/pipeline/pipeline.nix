@@ -52,6 +52,13 @@
   # Toggle built-in stages: `stages.<name>.enable = false` drops one. Defaults to "on when
   # the tree has what the stage needs" (a trunk build needs a trunk crate, etc.).
   stages ? { },
+  # Extra programs the workspace's tests execute (the test stage's `nativeCheckInputs`, with
+  # `git`). A product that needs a tool its tests run, such as the util-linux `prlimit` that
+  # auspex-effects launches git through, names it here, from its own `platform-args.nix`, instead of
+  # editing the stage definition below: that file is the template's, and a template sync drops a
+  # product's edit to it (review of PR #8, N7). The failure is loud either way: a tool a test
+  # needs and the sandbox lacks fails the test (the tests assert, they do not skip, in a Nix build).
+  testInputs ? [ ],
   # Product/template-added stages that reuse the dependency layers. Each entry is a
   # function `{ hostArgs, depsL0, depsL1, wasmArtifacts, commonArgs, src, srcSet, discovery } -> drv`.
   # They are part of the `ci-pure` aggregate unless marked `pure = false`.
@@ -1089,10 +1096,12 @@ let
         #
         # `nativeCheckInputs` rather than `nativeBuildInputs`: it is a test-time tool, stdenv
         # adds it only when `doCheck` runs, and nothing in the build itself spawns git. No other
-        # test in the workspace needs it — `repo::tests` and the rename tests write `.git` FILES
+        # test in the template needs it (a product's own, such as auspex-effects', run git too: see
+        # `testInputs`) — `repo::tests` and the rename tests write `.git` FILES
         # as fixtures and never execute git.
-        # `util-linux` (auspex-effects): its `prlimit` puts git under a memory limit before exec.
-        nativeCheckInputs = [ pkgs.git ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.util-linux ];
+        #
+        # A product's own tools come from `testInputs` (the argument above).
+        nativeCheckInputs = [ pkgs.git ] ++ testInputs;
         env = lib.optionalAttrs (disc.services != [ ]) {
           APP_CONFIG_DIR = (builtins.head disc.services).dir + "/config";
         };

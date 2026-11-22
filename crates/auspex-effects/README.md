@@ -42,9 +42,42 @@ detected.
 
 On Linux, git runs through util-linux `prlimit`, which sets the 512 MiB address-space limit
 **before exec**; the dev shell, pure CI and the installed package supply it (the package
-appends it to `PATH`, so the operator's own tools keep precedence). Without it, or on
-another platform, there is no caching. A hostile `.git/` costs at most that limit and a
-2-second git timeout per refresh. The index listing is capped at 64 MiB.
+compiles the store path of `prlimit` in as `AUSPEX_PRLIMIT`, so nothing needs it on `PATH`
+and no child's `PATH` is changed; the dev shell and CI find it on `PATH`). Without it, or on
+another platform, there is no caching. If auspex itself was started under a hard
+address-space limit below 512 MiB (`ulimit -v`, `LimitAS=`), which a process cannot raise,
+git is not run and the note names that limit; it is not clamped to it. A hostile `.git/` costs
+at most that limit and a 2-second git timeout per refresh. The index listing is capped at
+64 MiB.
+
+Git settings are part of the key where they change what nix reads as modified, so the
+recorded revision (`configurationRevision`) cannot differ under one key: `core.fileMode`,
+`core.symlinks` and `core.ignorecase`, and the CRLF filter's inputs `core.autocrlf`,
+`core.eol` and `core.safecrlf`, when they are not the defaults, and the **bytes** of the
+attributes files outside the tree that libgit2 reads (`$GIT_DIR/info/attributes`,
+`core.attributesFile` or its default `~/.config/git/attributes`, and `/etc/gitattributes`), a
+symlink followed. git runs without its `GIT_CONFIG_*` variables, so it reads the files nix's
+libgit2 reads. `core.trustctime=false` means no caching, with a note: nix then trusts the
+index's stat data (size, mtime, inode) and may read a rewritten file as the committed one, which
+no key built from the bytes can follow. What is not covered: a configuration file that libgit2
+reads and git does not; and, in the run guard only (a setting changed and put back during one
+scan), a system git configuration compiled in at another path than `/etc/gitconfig`.
+
+When a machine's error names a file below a `…-source/` store path that exists in the
+worktree but is untracked, the Log tab (stderr when headless) says why nix cannot see it, once
+per file: a new module has to be `git add`ed. Only for a path that is not in the index and
+only when the line says the file is missing, so a module-system error that names a tracked file
+gets nothing. The check is one `git ls-files`, run with the same git program as the key. On
+Linux it runs under the same 512 MiB limit; where there is no launcher for it (macOS, the
+platform with no caching) it runs without one, since its output is capped and it only gates
+this hint. On Linux without `prlimit` there is no note. A tracked absolute symlink to a file
+outside the tree, read under `--impure` (which this crate needs for a dirty `git+file` flake),
+is outside the key; so is anything else an `--impure` evaluation reads from outside the flake.
+
+The default ssh control directory is `$XDG_RUNTIME_DIR/auspex`, else `auspex-<uid>` in the
+temporary directory; on macOS, where that directory is too long for a socket path, `/tmp/auspex-<uid>`.
+It is created 0700 and refused unless it is ours, 0700 and not a symlink, so a shared `/tmp`
+does not make it shared.
 
 Evaluator machine-list files require a private directory (0700, owned by this user, not
 a symlink), but have no SSH socket-path limit. SSH control directories still have the

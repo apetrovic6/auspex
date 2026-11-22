@@ -688,3 +688,34 @@ async fn a_local_store_closure_over_the_cap_fails_and_does_not_fall_through_to_t
         "an oversized local closure is not retried over the network"
     );
 }
+
+/// Review of PR #37, re-review B: the deployed-closure query starts an ssh in the control
+/// directory like the probe does, and refuses a directory that is no longer the prepared one. A
+/// fake ssh whose master check replaces the directory and then answers "master up" leaves only
+/// the query's own spawn to refuse it; the query must not run.
+#[tokio::test]
+async fn the_deployed_closure_query_rechecks_the_control_directory() {
+    let Some(t) = tools(&["cat"]) else { return };
+    let dir = tempdir();
+    let prog = t.script(
+        dir.path(),
+        "ssh-replacing",
+        "echo run >> '@dir@/ran'\nfor arg; do\n  if [ \"$arg\" = -O ]; then\n    mv '@dir@/c' '@dir@/c.aside' && mkdir -m 700 '@dir@/c'\n    exit 0\n  fi\ndone\necho query >> '@dir@/ran'",
+    );
+    let cd = control(dir.path());
+    let target = Target::parse("h").unwrap();
+    let mut params = ProbeParams::new(&cd);
+    params.ssh_program = prog.as_os_str();
+    let answer = deployed(&target, &params, &CancellationToken::new())
+        .await
+        .unwrap();
+    let why = answer.unwrap_err();
+    assert!(why.contains("deployed closure"), "{why}");
+    assert!(why.contains("not the directory auspex made"), "{why}");
+    let ran = fs::read_to_string(dir.path().join("ran")).unwrap();
+    assert_eq!(
+        ran.lines().collect::<Vec<_>>(),
+        ["run"],
+        "only the check may run"
+    );
+}

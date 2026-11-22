@@ -769,3 +769,30 @@ async fn a_packed_ref_moved_and_back_and_repacked_stores_nothing() {
     )
     .await;
 }
+
+/// Review of PR #8, N1: a git setting that the key covers (`core.fileMode`) changed at the
+/// first result and put back at the second leaves two equal keys; the repository's `config`
+/// file is in the run guard, so nothing is stored.
+#[tokio::test]
+async fn a_git_setting_changed_and_put_back_during_the_evaluation_stores_nothing() {
+    let Some(lab) = Lab::new() else { return };
+    lab.refuses(
+        || lab.git(&["config", "core.fileMode", "false"]),
+        || lab.git(&["config", "--unset", "core.fileMode"]),
+    )
+    .await;
+}
+
+/// Review of PR #37, finding 1: an attributes file outside the tree written at the first
+/// result and removed at the second leaves two equal keys; its stamp is in the run guard.
+#[tokio::test]
+async fn an_attributes_file_added_and_removed_during_the_evaluation_stores_nothing() {
+    let Some(lab) = Lab::new() else { return };
+    let info = lab.path(".git/info/attributes");
+    fs::create_dir_all(info.parent().unwrap()).unwrap();
+    lab.refuses(
+        || fs::write(&info, "* text=auto\n").unwrap(),
+        || fs::remove_file(&info).unwrap(),
+    )
+    .await;
+}
