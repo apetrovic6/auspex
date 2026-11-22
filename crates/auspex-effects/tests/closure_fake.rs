@@ -700,7 +700,7 @@ async fn the_deployed_closure_query_rechecks_the_control_directory() {
     let prog = t.script(
         dir.path(),
         "ssh-replacing",
-        "echo run >> '@dir@/ran'\nfor arg; do\n  if [ \"$arg\" = -O ]; then\n    rmdir '@dir@/c' && mkdir -m 700 '@dir@/c'\n    exit 0\n  fi\ndone\necho query >> '@dir@/ran'",
+        "echo run >> '@dir@/ran'\nfor arg; do\n  if [ \"$arg\" = -O ]; then\n    mv '@dir@/c' '@dir@/c.aside' && mkdir -m 700 '@dir@/c'\n    exit 0\n  fi\ndone\necho query >> '@dir@/ran'",
     );
     let cd = control(dir.path());
     let target = Target::parse("h").unwrap();

@@ -1782,17 +1782,26 @@ fn a_control_directory_that_changed_since_it_was_prepared_is_refused() {
     let cd = ControlDir::prepare(&path).unwrap();
     cd.recheck().unwrap();
 
+    // Made again, 0700 and ours: not the directory auspex prepared. The prepared directory is
+    // renamed aside, not removed, and kept alive: a filesystem may hand a freed inode number to
+    // the next directory at once (the forge runner's did), and then device and inode would be
+    // equal for a directory that is not the prepared one.
+    let aside = dir.path().join("c.aside");
+    fs::rename(&path, &aside).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+    let e = cd.recheck().unwrap_err();
+    assert!(e.0.contains("not the directory auspex made"), "{e}");
+    assert!(e.0.contains("XDG_RUNTIME_DIR"), "{e}");
+    // Put the prepared directory back: it is accepted again, so the refusal was the identity.
+    fs::remove_dir(&path).unwrap();
+    fs::rename(&aside, &path).unwrap();
+    cd.recheck().unwrap();
+
     // Removed: nothing is created for it.
     fs::remove_dir(&path).unwrap();
     let e = cd.recheck().unwrap_err();
     assert!(e.0.contains("cannot inspect"), "{e}");
     assert!(!path.exists(), "recheck must not create the directory");
-
-    // Made again, 0700 and ours: not the directory auspex prepared.
-    fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
-    let e = cd.recheck().unwrap_err();
-    assert!(e.0.contains("not the directory auspex made"), "{e}");
-    assert!(e.0.contains("XDG_RUNTIME_DIR"), "{e}");
 
     // A fresh preparation of it is a fresh start.
     let cd = ControlDir::prepare(&path).unwrap();
@@ -1853,10 +1862,11 @@ async fn no_ssh_is_started_after_the_control_directory_changed() {
     let before = ran();
     assert!(before >= 1);
 
-    // The directory is removed and made again: the master is believed up, so only the
-    // probe's own spawn is left to refuse it.
+    // The directory is replaced by a new one: the master is believed up, so only the probe's
+    // own spawn is left to refuse it. The prepared directory is renamed aside and kept alive,
+    // so its inode number cannot be handed to the new one (a filesystem may do that at once).
     let path = dir.path().join("c");
-    fs::remove_dir(&path).unwrap();
+    fs::rename(&path, dir.path().join("c.aside")).unwrap();
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     let (r, _) = run_probe(&prog, &cd, &target, Duration::from_secs(10)).await;
     let ProbeOutcome::Failed { reason } = r.unwrap() else {
@@ -1889,7 +1899,7 @@ async fn the_connect_phase_and_the_probe_each_recheck_the_control_directory() {
             dir.path(),
             "ssh",
             &format!(
-                "echo run >> '@dir@/ran'\nfor arg; do\n  if [ \"$arg\" = -O ]; then\n    rmdir '@dir@/c' && mkdir -m 700 '@dir@/c'\n    exit {answer}\n  fi\ndone\nprintf '{}'",
+                "echo run >> '@dir@/ran'\nfor arg; do\n  if [ \"$arg\" = -O ]; then\n    mv '@dir@/c' '@dir@/c.aside' && mkdir -m 700 '@dir@/c'\n    exit {answer}\n  fi\ndone\nprintf '{}'",
                 probe_output()
             ),
         );

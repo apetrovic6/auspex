@@ -143,6 +143,12 @@ fn check_private_dir(path: &Path, kind: &str) -> Result<(), String> {
 }
 
 /// A control-socket directory that has passed [`ControlDir::prepare`]'s checks.
+///
+/// Device and inode cannot tell a same-owner recreation that reuses the inode number (a
+/// filesystem may give a freed inode to the next directory at once, as the forge runner's did);
+/// that is acceptable, because [`ControlDir::recheck`] also repeats the owner, mode and
+/// not-a-symlink checks, so a directory that is not ours is refused whatever its inode, and one
+/// that is ours and 0700 is as private as the one it replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlDir {
     path: String,
