@@ -1811,6 +1811,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::patience::{OUTLIVES_PATIENT, PATIENT, assert_within, grown, slack};
 
     /// A committed repository, for the key tests below.
     fn committed_repo() -> tempfile::TempDir {
@@ -1833,6 +1834,16 @@ mod tests {
         repo
     }
 
+    /// `GitParams::new()` with [`PATIENT`] for each command and the worktree read: the real git
+    /// these tests run is held to the product's 2 s, which is right for an operator and which a
+    /// loaded machine misses (AUS-47: three of these failed at one core with twelve busy loops).
+    fn patient_git() -> GitParams<'static> {
+        let mut git = GitParams::new();
+        git.timeout = PATIENT;
+        git.read_timeout = PATIENT;
+        git
+    }
+
     /// The key and guard of `dir` for the given user environment.
     fn keyed(dir: &Path, user: &UserEnv) -> Keyed {
         tokio::runtime::Builder::new_current_thread()
@@ -1841,7 +1852,7 @@ mod tests {
             .unwrap()
             .block_on(key_and_top_in(
                 dir,
-                &GitParams::new(),
+                &patient_git(),
                 user,
                 &CancellationToken::new(),
             ))
@@ -2197,10 +2208,7 @@ mod tests {
     fn block_until_zombie(pid_file: &Path) {
         let began = std::time::Instant::now();
         loop {
-            assert!(
-                began.elapsed() < Duration::from_secs(30),
-                "the fake never exited"
-            );
+            assert!(began.elapsed() < PATIENT, "the fake never exited");
             if let Ok(pid) = std::fs::read_to_string(pid_file) {
                 let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()));
                 // `pid (comm) S ...`: the state follows the last ')'.
@@ -2229,6 +2237,52 @@ mod tests {
         .await;
     }
 
+    /// A named pipe in `dir`: a fake blocks on it (`read _ < fifo`) until the test or another
+    /// process opens it for writing, which is how a fake waits for a moment without spending
+    /// the CPU it is waiting to be given (a `while [ ! -e go ]; do :; done` loop does, and under
+    /// load starves the very process it waits for).
+    fn fifo(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let ok = std::process::Command::new(which("mkfifo"))
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(ok.success(), "mkfifo");
+        path
+    }
+
+    /// Opens `fifo` for writing and closes it again, which lets the fake that is blocked in
+    /// `read _ < fifo` go on: but never blocks on it. A plain `std::fs::write` blocks in `open`
+    /// for as long as nothing has the pipe open for reading, and on this current-thread runtime
+    /// that thread is also the one that must poll git into being spawned, so a fake that never
+    /// started, or died before it got to its `read`, hung the test until something killed the whole
+    /// binary (AUS-47 review of PR #44, mutation M5: `yield_now` before the spawn). This opens
+    /// with `O_NONBLOCK`, which fails with `ENXIO` while there is no reader, retries that until
+    /// [`PATIENT`], and then fails the test saying what did not happen.
+    fn release(fifo: &Path) {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let flags = i32::try_from(rustix::fs::OFlags::NONBLOCK.bits()).unwrap();
+        let began = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(flags)
+                .open(fifo)
+            {
+                // Dropped at once: the reader sees the end of the pipe and goes on.
+                Ok(_) => return,
+                Err(e) if e.raw_os_error() == Some(rustix::io::Errno::NXIO.raw_os_error()) => {}
+                Err(e) => panic!("opening {}: {e}", fifo.display()),
+            }
+            assert!(
+                began.elapsed() < PATIENT,
+                "nothing opened {} for reading within {PATIENT:?}: the fake was not spawned, or died before its `read`",
+                fifo.display()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn params(program: &Path, timeout: Duration) -> GitParams<'_> {
         GitParams {
             program: program.as_os_str(),
@@ -2247,18 +2301,18 @@ mod tests {
     async fn output_over_the_cap_read_after_the_exit_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().display();
+        let go = fifo(dir.path(), "go");
         let fake = script(
             dir.path(),
-            &format!(
-                "echo $$ > '{d}/pid'\nwhile [ ! -e '{d}/go' ]; do :; done\nprintf '%01001d' 0"
-            ),
+            &format!("echo $$ > '{d}/pid'\nread _ < '{d}/go'\nprintf '%01001d' 0"),
         );
-        let p = params(&fake, Duration::from_secs(20));
+        let p = params(&fake, PATIENT);
         let cancel = CancellationToken::new();
         let fut = git(&p, dir.path(), &["ls-files"], 1000, &cancel);
         tokio::pin!(fut);
         poll_once(fut.as_mut()).await;
-        std::fs::write(dir.path().join("go"), "").unwrap();
+        // Lets the fake that is reading the pipe go on (bounded: see `release`).
+        release(&go);
         block_until_zombie(&dir.path().join("pid"));
         let r = fut.await.unwrap();
         assert_eq!(
@@ -2273,18 +2327,17 @@ mod tests {
     async fn output_at_the_cap_read_after_the_exit_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().display();
+        let go = fifo(dir.path(), "go");
         let fake = script(
             dir.path(),
-            &format!(
-                "echo $$ > '{d}/pid'\nwhile [ ! -e '{d}/go' ]; do :; done\nprintf '%01000d' 0"
-            ),
+            &format!("echo $$ > '{d}/pid'\nread _ < '{d}/go'\nprintf '%01000d' 0"),
         );
-        let p = params(&fake, Duration::from_secs(20));
+        let p = params(&fake, PATIENT);
         let cancel = CancellationToken::new();
         let fut = git(&p, dir.path(), &["ls-files"], 1000, &cancel);
         tokio::pin!(fut);
         poll_once(fut.as_mut()).await;
-        std::fs::write(dir.path().join("go"), "").unwrap();
+        release(&go);
         block_until_zombie(&dir.path().join("pid"));
         assert_eq!(fut.await.unwrap(), Ok(vec![b'0'; 1000]));
     }
@@ -2292,48 +2345,68 @@ mod tests {
     /// Case 2: git exits 0 but its stdout is still open, held by a process that left its
     /// session (`setsid`), so the group kill at exit does not reach it. Whatever was read is
     /// not the whole output and must not be taken for it.
+    ///
+    /// The refusal comes when git's deadline passes with the pipe still open, so the deadline
+    /// is short, and it must pass only after git has exited: a fixed 1 s was lost whenever the
+    /// scheduler did not run the fake for a second (AUS-47: 5 of 5 at one core with twelve busy
+    /// loops), and the call then said "timed out", which is not what is under test. The deadline
+    /// grows until a run in which git exited first. The fake waits for its holder on a pipe,
+    /// not in a loop: a loop that spins starves the holder it waits for.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn output_not_read_to_its_end_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path().display();
         let (sh, setsid, sleep) = (which("sh"), which("setsid"), which("sleep"));
-        // The holder writes its pid only once it is in its own session; git exits only
-        // after that, so the group kill at the exit can never reach it.
-        let fake = script(
-            dir.path(),
-            &format!(
-                "printf 'partial'\n'{}' '{}' -c 'echo $$ > \"$1\"; exec \"$2\" 30' sh '{d}/holder' '{}' &\nwhile [ ! -s '{d}/holder' ]; do :; done",
-                setsid.display(),
-                sh.display(),
-                sleep.display()
-            ),
-        );
-        let p = params(&fake, Duration::from_secs(1));
-        let r = git(
-            &p,
-            dir.path(),
-            &["ls-files"],
-            1000,
-            &CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        if let Ok(pid) = std::fs::read_to_string(dir.path().join("holder"))
-            && let Some(pid) = pid
-                .trim()
-                .parse()
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-        {
-            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-        }
-        let e = r.expect_err("a partial output was accepted as complete");
+        let e = grown(Duration::from_secs(1), async |timeout| {
+            let dir = tempfile::tempdir().unwrap();
+            let d = dir.path().display();
+            fifo(dir.path(), "ready");
+            // The holder writes its pid once it is in its own session, then opens the pipe;
+            // git reads the pipe and exits only after that, so the group kill at the exit can
+            // never reach the holder.
+            let fake = script(
+                dir.path(),
+                &format!(
+                    "printf 'partial'\n'{}' '{}' -c 'echo $$ > \"$1\"; echo > \"$3\"; exec \"$2\" {OUTLIVES_PATIENT}' sh '{d}/holder' '{}' '{d}/ready' &\nread _ < '{d}/ready'\necho > '{d}/done'",
+                    setsid.display(),
+                    sh.display(),
+                    sleep.display()
+                ),
+            );
+            let p = params(&fake, timeout);
+            let r = git(
+                &p,
+                dir.path(),
+                &["ls-files"],
+                1000,
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            if let Ok(pid) = std::fs::read_to_string(dir.path().join("holder"))
+                && let Some(pid) = pid
+                    .trim()
+                    .parse()
+                    .ok()
+                    .and_then(rustix::process::Pid::from_raw)
+            {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+            // The fake's last step before it exits: if it is missing the deadline passed before git
+            // had got there, and nothing about the pipe was tested. Decided on what the fake did,
+            // never on what the product said, which is asserted below whatever it is.
+            dir.path().join("done").exists().then_some(r)
+        })
+        .await;
+        let e = e.expect_err("a partial output was accepted as complete");
         assert!(e.contains("not read to the end"), "{e}");
     }
 
     /// What `OnExit::KillGroup` gives git: a descendant still in git's group is killed when
     /// git exits, so the pipe reaches EOF at once and the output is accepted.
+    ///
+    /// The descendant outlives [`PATIENT`] and git's deadline is [`PATIENT`]: a call that
+    /// waited for the pipe would run into its deadline and fail the comparison, however fast or
+    /// slow the machine is.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_descendant_in_the_group_does_not_hold_the_output_open() {
@@ -2341,9 +2414,9 @@ mod tests {
         let sleep = which("sleep");
         let fake = script(
             dir.path(),
-            &format!("printf 'whole'\n'{}' 30 &", sleep.display()),
+            &format!("printf 'whole'\n'{}' {OUTLIVES_PATIENT} &", sleep.display()),
         );
-        let p = params(&fake, Duration::from_secs(20));
+        let p = params(&fake, PATIENT);
         let start = std::time::Instant::now();
         let r = git(
             &p,
@@ -2356,9 +2429,16 @@ mod tests {
         .unwrap();
         assert_eq!(r, Ok(b"whole".to_vec()));
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < PATIENT,
             "waited for the deadline: {:?}",
             start.elapsed()
+        );
+        // And promptly, not after some grace of its own: the group kill at the exit closes the
+        // pipe at once.
+        assert_within(
+            start.elapsed(),
+            slack(),
+            "a descendant in git's group does not hold the output open",
         );
     }
 }

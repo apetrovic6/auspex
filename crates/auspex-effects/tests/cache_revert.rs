@@ -21,7 +21,7 @@ use std::time::{Duration, SystemTime};
 
 use auspex_domain::fleet::MachineClass;
 use auspex_effects::CancellationToken;
-use auspex_effects::cache::{CacheParams, GitParams, entry_path, evaluate_cached, key_for};
+use auspex_effects::cache::{CacheParams, entry_path, evaluate_cached, key_for};
 use auspex_effects::nix::{EvalItem, EvalMachine, EvalParams, FlakeRef};
 use common::{Tools, find_on_path, in_nix_build, tempdir, tools};
 use tokio::sync::mpsc::unbounded_channel;
@@ -133,7 +133,7 @@ impl Lab {
     }
 
     async fn key(&self) -> auspex_domain::eval::CacheKey {
-        key_for(&self.dir, &GitParams::new(), &CancellationToken::new())
+        key_for(&self.dir, &common::patient_git(), &CancellationToken::new())
             .await
             .unwrap()
             .unwrap()
@@ -149,7 +149,7 @@ impl Lab {
         let params = CacheParams {
             cache_dir: Some(self.cache.path()),
             flake_dir: &self.dir,
-            git: GitParams::new(),
+            git: common::patient_git(),
         };
         let flake = FlakeRef::new(self.dir.to_str().unwrap()).unwrap();
         let machines: Vec<_> = MACHINES
@@ -198,7 +198,7 @@ impl Lab {
 
     /// How many machines have an entry under the tree's current key.
     async fn stored(&self) -> usize {
-        let key = key_for(&self.dir, &GitParams::new(), &CancellationToken::new())
+        let key = key_for(&self.dir, &common::patient_git(), &CancellationToken::new())
             .await
             .unwrap()
             .unwrap();
@@ -211,7 +211,7 @@ impl Lab {
     /// The scenario: `change` and `undo` during one run store nothing, with the note, and
     /// the next run evaluates everything again.
     async fn refuses(&self, change: impl FnOnce(), undo: impl FnOnce()) {
-        let key = key_for(&self.dir, &GitParams::new(), &CancellationToken::new())
+        let key = key_for(&self.dir, &common::patient_git(), &CancellationToken::new())
             .await
             .unwrap()
             .unwrap();
@@ -223,7 +223,7 @@ impl Lab {
         );
         assert!(has_note(&items), "{items:?}");
         assert_eq!(items.last(), Some(&EvalItem::Finished { error: None }));
-        let after = key_for(&self.dir, &GitParams::new(), &CancellationToken::new())
+        let after = key_for(&self.dir, &common::patient_git(), &CancellationToken::new())
             .await
             .unwrap()
             .unwrap();

@@ -29,10 +29,28 @@ use auspex_domain::fleet::MachineClass;
 use auspex_effects::CancellationToken;
 use auspex_effects::cache::{CacheParams, GitParams, evaluate_cached};
 use auspex_effects::nix::{DEFAULT_NIX, EvalItem, EvalMachine, EvalParams, FlakeRef, inventory};
-use common::{find_on_path, tempdir};
+use common::{PATIENT, find_on_path, tempdir};
 use tokio::sync::mpsc::unbounded_channel;
 
 const NASTY: &str = r#"x"; builtins.abort "pwned"#;
+
+/// The bound on a real `nix` or `nix-eval-jobs` run here (the evaluation's own deadline, and the
+/// machine list's): ten minutes where it was two. It is a bound on a hang, not on speed, and real
+/// nix is not the fake programs: on a core shared with twelve busy loops it needs several minutes
+/// to evaluate a four-machine fixture, and a deadline inside that is a test that fails on the
+/// load (AUS-47: `evaluation timed out after 120s` with nothing hung).
+const REAL_NIX: Duration = Duration::from_secs(600);
+
+/// The cache's git, with [`PATIENT`] for each command and for the worktree read. The product's
+/// 2 s per git command is right for an operator, and a loaded machine misses it: the run then
+/// prints "eval cache off for this run: git rev-parse timed out after 2s", which is a
+/// different run from the one these tests look at (AUS-47).
+fn patient_git() -> GitParams<'static> {
+    let mut git = GitParams::new();
+    git.timeout = PATIENT;
+    git.read_timeout = PATIENT;
+    git
+}
 
 fn git(dir: &Path, args: &[&str]) {
     let ok = Command::new("git")
@@ -52,7 +70,7 @@ async fn run(flake: &FlakeRef, machines: &[EvalMachine], cache: &CacheParams<'_>
     eval.runtime_dir = Some(common::runtime_dir());
     eval.workers = 2;
     eval.max_memory_mib = 1024;
-    eval.timeout = Duration::from_secs(120);
+    eval.timeout = REAL_NIX;
     let (tx, mut rx) = unbounded_channel();
     evaluate_cached(flake, machines, &eval, cache, &CancellationToken::new(), tx)
         .await
@@ -109,7 +127,7 @@ async fn the_fixture_flake_with_real_nix() {
     let list = inventory(
         OsStr::new(DEFAULT_NIX),
         &flake,
-        Duration::from_secs(120),
+        REAL_NIX,
         &CancellationToken::new(),
     )
     .await
@@ -141,7 +159,7 @@ async fn the_fixture_flake_with_real_nix() {
     let cache = CacheParams {
         cache_dir: Some(cache_dir.path()),
         flake_dir: repo.path(),
-        git: GitParams::new(),
+        git: patient_git(),
     };
 
     let first = run(&flake, &machines, &cache).await;
@@ -238,7 +256,7 @@ async fn plain_paths_use_the_same_git_source_for_inventory_and_evaluation() {
         let cache = CacheParams {
             cache_dir: Some(cache_dir.path()),
             flake_dir: dir,
-            git: GitParams::new(),
+            git: patient_git(),
         };
         let (before, error) = split(&run(&flake, &machines, &cache).await);
         assert_eq!(error, None);
@@ -257,7 +275,7 @@ async fn plain_paths_use_the_same_git_source_for_inventory_and_evaluation() {
         let list = inventory(
             OsStr::new(DEFAULT_NIX),
             &flake,
-            Duration::from_secs(120),
+            REAL_NIX,
             &CancellationToken::new(),
         )
         .await
@@ -279,111 +297,6 @@ async fn plain_paths_use_the_same_git_source_for_inventory_and_evaluation() {
         assert!(!fresh["terra"].0);
         assert_eq!(before["terra"].1, warm["terra"].1);
         assert_eq!(before["terra"].1, fresh["terra"].1);
-    }
-}
-
-/// A worker restart reads a changed source. None of that run's successes may be
-/// published under the key gathered before the edit, even if results stream early.
-#[tokio::test]
-async fn edits_during_real_worker_restarts_do_not_poison_the_cache() {
-    for tool in ["nix", "nix-eval-jobs", "git"] {
-        if find_on_path(tool).is_none() {
-            eprintln!("SKIPPED: {tool} is not on PATH");
-            return;
-        }
-    }
-    let repo = tempdir();
-    fs::write(repo.path().join("extra.nix"), "original").unwrap();
-    fs::write(
-        repo.path().join("flake.nix"),
-        r#"{
-      outputs = _: {
-        nixosConfigurations = builtins.listToAttrs (map (name: {
-          inherit name;
-          value.config.system.build.toplevel = derivation {
-            inherit name;
-            system = "x86_64-linux";
-            builder = "/auspex-fixture-never-built";
-            source = builtins.readFile ./extra.nix;
-            work = builtins.toString (builtins.foldl' (a: b: a + b) 0
-              (builtins.genList (n: n) 200000));
-          };
-        }) ["a" "b" "c" "d"]);
-      };
-    }"#,
-    )
-    .unwrap();
-    git(repo.path(), &["init", "-q"]);
-    git(repo.path(), &["add", "."]);
-    git(repo.path(), &["commit", "-q", "-m", "worker restarts"]);
-    let flake = FlakeRef::new(repo.path().to_str().unwrap()).unwrap();
-    let cache_dir = tempdir();
-    let cache = CacheParams {
-        cache_dir: Some(cache_dir.path()),
-        flake_dir: repo.path(),
-        git: GitParams::new(),
-    };
-    let machines: Vec<_> = ["a", "b", "c", "d"]
-        .into_iter()
-        .map(|name| EvalMachine {
-            name: name.to_owned(),
-            class: MachineClass::Nixos,
-        })
-        .collect();
-    let mut eval = EvalParams::new();
-    eval.runtime_dir = Some(common::runtime_dir());
-    eval.workers = 1;
-    eval.max_memory_mib = 1; // Force a new source read for every worker.
-    let (tx, mut rx) = unbounded_channel();
-    let collect = async {
-        let mut items = Vec::new();
-        let mut edited = false;
-        while let Some(item) = rx.recv().await {
-            if matches!(
-                &item,
-                EvalItem::Machine {
-                    outcome: EvalOutcome::Success(_),
-                    ..
-                }
-            ) && !edited
-            {
-                fs::write(repo.path().join("extra.nix"), "edited").unwrap();
-                edited = true;
-            }
-            items.push(item);
-        }
-        assert!(edited, "no success arrived: {items:?}");
-        items
-    };
-    let cancel = CancellationToken::new();
-    let (result, edited) = tokio::join!(
-        evaluate_cached(&flake, &machines, &eval, &cache, &cancel, tx),
-        collect,
-    );
-    result.unwrap();
-    let (changed, error) = split(&edited);
-    assert_eq!(error, None);
-    git(repo.path(), &["checkout", "--", "extra.nix"]);
-    let (restored, error) = split(&run(&flake, &machines, &cache).await);
-    assert_eq!(error, None);
-    for name in ["a", "b", "c", "d"] {
-        assert!(
-            !restored[name].0,
-            "{name} was cached under the pre-edit key"
-        );
-        assert!(matches!(restored[name].1, EvalOutcome::Success(_)));
-    }
-    assert!(
-        ["b", "c", "d"]
-            .into_iter()
-            .any(|name| changed[name].1 != restored[name].1),
-        "the experiment did not exercise a worker reading the edited tree"
-    );
-    let (warm, error) = split(&run(&flake, &machines, &cache).await);
-    assert_eq!(error, None);
-    for name in ["a", "b", "c", "d"] {
-        assert!(warm[name].0);
-        assert_eq!(warm[name].1, restored[name].1);
     }
 }
 
@@ -474,10 +387,10 @@ async fn real_attempt(
     let cache = CacheParams {
         cache_dir: Some(cache_dir.path()),
         flake_dir: r,
-        git: GitParams::new(),
+        git: patient_git(),
     };
     let key = || async {
-        auspex_effects::cache::key_for(r, &GitParams::new(), &CancellationToken::new())
+        auspex_effects::cache::key_for(r, &patient_git(), &CancellationToken::new())
             .await
             .unwrap()
             .unwrap()
@@ -555,17 +468,29 @@ async fn real_attempt(
     Ok(())
 }
 
-/// Review finding N2: hold real workers at HTTP fetches while editing and undoing.
+/// Review finding N2: hold real workers at HTTP fetches while editing, and undoing if `undo`.
 ///
 /// `--impure` permits loopback fetches; unlike a FIFO read, a fetch can block and
 /// still yield a successful derivation. Unique URLs prevent fetcher-cache hits.
-/// The historical name is retained, but no memory-pressure restarts are needed.
-#[tokio::test]
+/// No memory-pressure restarts are needed, and none are asked for: nix-eval-jobs 2.35 enforces
+/// `workers * max-memory-size` as one budget for all its workers *and its own process*, so a
+/// budget small enough to restart a worker after every job (the `1` this suite used) is one
+/// that is exceeded while a job runs, and whether it then restarts the worker after the job or
+/// kills it in the middle ("memory budget of 1 MiB exceeded ... evaluation worker exited with
+/// 0", "evaluation exceeded the memory budget ... even when run alone") is a race the
+/// evaluator wins on an idle machine and loses on a loaded one (AUS-47: four of four runs lost
+/// at one core with twelve busy loops, none of fifteen idle ones). No budget makes a restart
+/// certain and a kill impossible, so the scenario does not rest on one: a gate decides, to the
+/// request, when the tree changes while workers evaluate.
 #[expect(
     clippy::too_many_lines,
     reason = "one synchronized real-evaluator scenario"
 )]
-async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
+#[expect(
+    clippy::future_not_send,
+    reason = "a test helper, polled on the test's own task (it holds a `Cell`)"
+)]
+async fn gated_edit(undo: bool) {
     use std::cell::Cell;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -612,7 +537,7 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
     let cache = CacheParams {
         cache_dir: Some(cache_dir.path()),
         flake_dir: r,
-        git: GitParams::new(),
+        git: patient_git(),
     };
     let machines: Vec<_> = ["a", "b"]
         .into_iter()
@@ -622,7 +547,7 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
         })
         .collect();
     let key = || async {
-        auspex_effects::cache::key_for(r, &GitParams::new(), &CancellationToken::new())
+        auspex_effects::cache::key_for(r, &patient_git(), &CancellationToken::new())
             .await
             .unwrap()
             .unwrap()
@@ -641,7 +566,9 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
                 }
                 1 => {
                     assert!(line.starts_with(&format!("GET /{nonce}/gate-b ")), "{line}");
-                    fs::write(r.join("extra.nix"), "original").unwrap();
+                    if undo {
+                        fs::write(r.join("extra.nix"), "original").unwrap();
+                    }
                 }
                 _ => {}
             }
@@ -666,7 +593,7 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
         eval.runtime_dir = Some(common::runtime_dir());
         eval.workers = 1;
         eval.max_memory_mib = 1024;
-        eval.timeout = Duration::from_secs(120);
+        eval.timeout = REAL_NIX;
         let (tx, mut rx) = unbounded_channel();
         evaluate_cached(
             &flake,
@@ -683,7 +610,14 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
             items.push(item);
         }
         assert_eq!(requests.get(), 2, "both gates must be reached");
-        assert_eq!(key().await, before, "the undo must restore the key exactly");
+        if undo {
+            assert_eq!(key().await, before, "the undo must restore the key exactly");
+        } else {
+            assert_ne!(key().await, before, "the edit must change the key");
+            // Back to the committed tree, so the next run's key is the one this run began with.
+            git(r, &["checkout", "--", "extra.nix"]);
+            assert_eq!(key().await, before, "the checkout must restore the key");
+        }
         assert!(
             items.iter().any(|item| matches!(
                 item,
@@ -707,6 +641,15 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
             changed["a"].1, restored["a"].1,
             "machine a must read the edit"
         );
+        if !undo {
+            // The restored run was cached under the restored tree's key, and nothing else is.
+            let (warm, error) = split(&run(&flake, &machines, &cache).await);
+            assert_eq!(error, None);
+            for name in ["a", "b"] {
+                assert!(warm[name].0, "{name} was not served from the cache");
+                assert_eq!(warm[name].1, restored[name].1);
+            }
+        }
     };
     tokio::select! {
         () = scenario => {}
@@ -714,9 +657,34 @@ async fn an_edit_undone_during_real_worker_restarts_is_not_cached() {
     }
 }
 
+/// Review finding N2: an edit at the first gate, undone at the second. The run's results are
+/// not cached under the key gathered before it, though the key after it is the same.
+#[tokio::test]
+async fn an_edit_undone_during_a_real_evaluation_is_not_cached() {
+    gated_edit(true).await;
+}
+
+/// An edit at the first gate, not undone until the run is over: none of the run's successes may
+/// be published under the key gathered before the edit, even though results stream early, and
+/// the next run on the restored tree serves nothing from the cache. (This was
+/// `edits_during_real_worker_restarts_do_not_poison_the_cache`, which asked nix-eval-jobs to
+/// restart its worker after every job with a 1 MiB budget: see [`gated_edit`] for why that is a
+/// race on a loaded machine.)
+#[tokio::test]
+async fn an_edit_during_a_real_evaluation_does_not_poison_the_cache() {
+    gated_edit(false).await;
+}
+
 /// Review finding B1 with the real nix-eval-jobs: `reset --soft HEAD~` at the first
 /// result, `reset --soft ORIG_HEAD` at the second. Only the branch moves; nix's
 /// `self.rev` (and its dirty state) differs in between.
+///
+/// What only this test covers (and `an_edit_during_a_real_evaluation_does_not_poison_the_cache`
+/// above does not) is a worker that is *restarted* and re-reads the flake's own copy of a file
+/// (`./extra.nix`) after the tree has moved: the gated tests edit an absolute path that one
+/// worker reads. A restart needs the memory budget to cause it, which no budget does reliably
+/// (see [`gated_edit`]), so this test retries and may print SKIPPED when none happened: on such a
+/// run that property is not exercised at all, and a green here does not say it was.
 #[tokio::test]
 async fn a_soft_reset_undone_during_real_worker_restarts_is_not_cached() {
     real_change_and_undo(
@@ -772,7 +740,7 @@ async fn brackets_pipes_and_carets_in_the_repository_path_still_evaluate() {
         let list = inventory(
             OsStr::new(DEFAULT_NIX),
             &flake,
-            Duration::from_secs(120),
+            REAL_NIX,
             &CancellationToken::new(),
         )
         .await
@@ -785,7 +753,7 @@ async fn brackets_pipes_and_carets_in_the_repository_path_still_evaluate() {
         let cache = CacheParams {
             cache_dir: Some(cache_dir.path()),
             flake_dir: dir,
-            git: GitParams::new(),
+            git: patient_git(),
         };
         let (first, error) = split(&run(&flake, &machines, &cache).await);
         assert_eq!(error, None, "{}", flake.as_str());
@@ -840,7 +808,7 @@ async fn a_git_setting_that_changes_dirtiness_is_not_a_stale_hit() {
     let cached = CacheParams {
         cache_dir: Some(cache_dir.path()),
         flake_dir: r,
-        git: GitParams::new(),
+        git: patient_git(),
     };
     let uncached = CacheParams {
         cache_dir: None,
@@ -904,7 +872,7 @@ async fn an_untracked_import_is_explained_and_added_it_evaluates() {
     let uncached = CacheParams {
         cache_dir: None,
         flake_dir: r,
-        git: GitParams::new(),
+        git: patient_git(),
     };
     let items = run(&flake, &machines, &uncached).await;
     let (by, error) = split(&items);
@@ -981,7 +949,7 @@ async fn crlf_settings_and_attribute_files_do_not_give_stale_hits() {
     let cached = CacheParams {
         cache_dir: Some(cache_dir.path()),
         flake_dir: r,
-        git: GitParams::new(),
+        git: patient_git(),
     };
     let uncached = CacheParams {
         cache_dir: None,

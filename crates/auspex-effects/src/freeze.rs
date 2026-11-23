@@ -192,6 +192,8 @@ fn local_path(flake: &str) -> Option<&str> {
 pub struct FreezeStore {
     path: PathBuf,
     fleet: String,
+    /// How long a writer waits for the lock: [`LOCK_WAIT`]. A field only so that a test can lengthen it.
+    lock_wait: Duration,
 }
 
 impl FreezeStore {
@@ -200,7 +202,21 @@ impl FreezeStore {
     /// Nothing is read or created yet.
     #[must_use]
     pub const fn new(path: PathBuf, fleet: String) -> Self {
-        Self { path, fleet }
+        Self {
+            path,
+            fleet,
+            lock_wait: LOCK_WAIT,
+        }
+    }
+
+    /// This store with a different lock wait. The test of many writers at once gives its writers
+    /// the patient bound: a writer the scheduler leaves off the CPU for two seconds, or the holder
+    /// of the lock for that long, is the machine and not a lock that was never let go (AUS-47).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_lock_wait(mut self, wait: Duration) -> Self {
+        self.lock_wait = wait;
+        self
     }
 
     /// The fleet this store is for ([`fleet_key`]): the key the update lock is filed under too.
@@ -412,7 +428,7 @@ impl FreezeStore {
             Mode::empty(),
         )
         .map_err(|e| Error::Io(format!("cannot lock the state directory: {e}")))?;
-        let deadline = Instant::now() + LOCK_WAIT;
+        let deadline = Instant::now() + self.lock_wait;
         loop {
             match flock(&fresh, FlockOperation::NonBlockingLockExclusive) {
                 Ok(()) => return Ok(fresh),

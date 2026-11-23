@@ -131,6 +131,8 @@ pub mod prometheus;
 pub mod runners;
 pub mod ssh;
 
+#[cfg(test)]
+mod patience;
 mod process;
 mod safe_fs;
 mod text;

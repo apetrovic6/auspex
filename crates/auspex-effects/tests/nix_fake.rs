@@ -17,7 +17,10 @@ use auspex_effects::nix::{
     EVAL_EXPR, EvalItem, EvalMachine, EvalParams, FlakeRef, evaluate, inventory,
 };
 use auspex_effects::{CancellationToken, Cancelled};
-use common::{cleanup, still_alive_after_wait, tempdir, tools, wait_for_pids};
+use common::{
+    OUTLIVES_PATIENT, PATIENT, assert_within, cleanup, grown, slack, still_alive_after_wait,
+    still_alive_within, tempdir, tools, wait_for_pids,
+};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 const DRV: &str = "/nix/store/0123456789abcdfghijklmnpqrsvwxyz-nixos-system-a.drv";
@@ -47,10 +50,20 @@ fn params(program: &Path, timeout: Duration) -> EvalParams<'_> {
     p
 }
 
+/// [`params`] for a test whose subject is not the deadline: [`PATIENT`] for the evaluation, and
+/// for the `git` of the untracked-file note (the product's 2 s per git command is the right
+/// bound for an operator, and a loaded machine misses it: no note, and the test fails on that).
+fn patient(program: &Path) -> EvalParams<'_> {
+    let mut p = params(program, PATIENT);
+    p.git.timeout = PATIENT;
+    p.git.read_timeout = PATIENT;
+    p
+}
+
 async fn recv(rx: &mut UnboundedReceiver<EvalItem>) -> EvalItem {
-    tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    tokio::time::timeout(PATIENT, rx.recv())
         .await
-        .expect("an item within 5 s")
+        .expect("an item within the patient bound")
         .expect("the stream ended early")
 }
 
@@ -77,7 +90,7 @@ async fn results_arrive_as_each_machine_finishes() {
     );
     let flake = FlakeRef::new("path:/nonexistent").unwrap();
     let (tx, mut rx) = unbounded_channel();
-    let p = params(&prog, Duration::from_secs(10));
+    let p = patient(&prog);
     let ms = machines(&["a", "b"]);
     let cancel = CancellationToken::new();
     let run = evaluate(&flake, &ms, &p, &cancel, tx);
@@ -118,7 +131,7 @@ async fn a_crash_midway_keeps_what_arrived_and_reports_the_crash() {
     evaluate(
         &flake,
         &machines(&["a", "b"]),
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
@@ -148,7 +161,7 @@ async fn a_non_zero_exit_carries_the_last_stderr_lines() {
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["a"]),
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
@@ -182,7 +195,9 @@ async fn cancelling_kills_the_evaluator_and_its_workers() {
         let pids_file = pids_file.clone();
         tokio::task::spawn_blocking(move || {
             wait_for_pids(&pids_file, 3);
+            let at = Instant::now();
             cancel.cancel();
+            at
         })
     };
     let (tx, mut rx) = unbounded_channel();
@@ -190,17 +205,24 @@ async fn cancelling_kills_the_evaluator_and_its_workers() {
     let r = evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["a"]),
-        &params(&prog, Duration::from_secs(60)),
+        &patient(&prog),
         &cancel,
         tx,
     )
     .await;
-    canceller.await.unwrap();
+    let returned = Instant::now();
+    let cancelled_at = canceller.await.unwrap();
     let pids = wait_for_pids(&pids_file, 3);
     let left = still_alive_after_wait(&pids);
     cleanup(&pids);
     assert_eq!(r, Err(Cancelled));
-    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(start.elapsed() < PATIENT);
+    // Promptly after the cancel, counted from it (the fake's start is not the product's).
+    assert_within(
+        returned.saturating_duration_since(cancelled_at),
+        slack(),
+        "a cancelled evaluation returns promptly",
+    );
     assert!(left.is_empty(), "still running: {left:?}");
     assert_eq!(collect(&mut rx).await, [], "no Finished after a cancel");
 }
@@ -226,7 +248,7 @@ async fn dropping_the_receiver_cancels_too() {
     let r = evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["a"]),
-        &params(&prog, Duration::from_secs(60)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
@@ -242,34 +264,47 @@ async fn dropping_the_receiver_cancels_too() {
 #[tokio::test]
 async fn the_timeout_kills_the_group_and_keeps_earlier_results() {
     let Some(t) = tools(&["sleep"]) else { return };
-    let dir = tempdir();
-    let prog = t.script(
-        dir.path(),
-        "nix-eval-jobs",
-        &format!(
-            "printf '%s\\n' '{}'\n@sleep@ 30 &\necho $! >> '@dir@/pids'\necho $$ >> '@dir@/pids'\nwait",
-            ok_line(r#""a""#, r#""a""#)
-        ),
-    );
-    let (tx, mut rx) = unbounded_channel();
-    evaluate(
-        &FlakeRef::new("path:/x").unwrap(),
-        &machines(&["a", "b"]),
-        &params(&prog, Duration::from_millis(700)),
-        &CancellationToken::new(),
-        tx,
-    )
-    .await
-    .unwrap();
-    let pids = wait_for_pids(&dir.path().join("pids"), 2);
-    let left = still_alive_after_wait(&pids);
+    // The deadline must expire only after the fake has printed its result and written both
+    // pids (AUS-47: a fixed 700 ms was lost whenever the scheduler did not run the fake in
+    // time, and there was then nothing to check was killed): it grows until a run got that far.
+    let (timeout, pids, items) = grown(Duration::from_millis(700), async |timeout| {
+        let dir = tempdir();
+        let prog = t.script(
+            dir.path(),
+            "nix-eval-jobs",
+            &format!(
+                "printf '%s\\n' '{}'\n@sleep@ {OUTLIVES_PATIENT} &\necho $! >> '@dir@/pids'\necho $$ >> '@dir@/pids'\nwait",
+                ok_line(r#""a""#, r#""a""#)
+            ),
+        );
+        let (tx, mut rx) = unbounded_channel();
+        evaluate(
+            &FlakeRef::new("path:/x").unwrap(),
+            &machines(&["a", "b"]),
+            &params(&prog, timeout),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+        let seen: Vec<i32> = fs::read_to_string(dir.path().join("pids"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        (seen.len() >= 2).then_some((timeout, seen, collect(&mut rx).await))
+    })
+    .await;
+    // The sleeper outlives `PATIENT`: one the product never killed is still there when this looks,
+    // however long the deadline had to grow (a 30 s sleeper dies by itself on a deadline of 44 s,
+    // and "killed" would then pass without the product having killed anything).
+    let left = still_alive_within(&pids, PATIENT);
     cleanup(&pids);
-    let items = collect(&mut rx).await;
     assert!(matches!(&items[0], EvalItem::Machine { machine, .. } if machine == "a"));
     assert_eq!(
         items[1],
         EvalItem::Finished {
-            error: Some("evaluation timed out after 700ms".to_owned())
+            error: Some(format!("evaluation timed out after {timeout:?}"))
         }
     );
     assert!(left.is_empty(), "still running: {left:?}");
@@ -303,15 +338,9 @@ async fn a_name_that_is_not_a_bare_attribute() {
         },
     ];
     let (tx, mut rx) = unbounded_channel();
-    evaluate(
-        &flake,
-        &ms,
-        &params(&prog, Duration::from_secs(10)),
-        &CancellationToken::new(),
-        tx,
-    )
-    .await
-    .unwrap();
+    evaluate(&flake, &ms, &patient(&prog), &CancellationToken::new(), tx)
+        .await
+        .unwrap();
     let items = collect(&mut rx).await;
     let EvalItem::Machine {
         machine,
@@ -394,7 +423,7 @@ async fn unusable_lines_are_notes_and_strangers_are_ignored() {
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["a"]),
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
@@ -510,28 +539,35 @@ printf '%s' '{"terra":{"deploy":{"targetHost":"root@10.0.0.1"}},"genetor":{"mach
 #[tokio::test]
 async fn the_machine_list_times_out_and_cancels() {
     let Some(t) = tools(&["sleep"]) else { return };
-    let dir = tempdir();
-    let prog = t.script(
-        dir.path(),
-        "nix",
-        "echo $$ >> '@dir@/pids'\nexec @sleep@ 30",
-    );
     let flake = FlakeRef::new("path:/f").unwrap();
-    let r = inventory(
-        prog.as_os_str(),
-        &flake,
-        Duration::from_millis(300),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(r, Err("listing machines timed out after 300ms".to_owned()));
+    // The deadline must expire only after the fake has started (its pid is what the rest of the
+    // test looks at), which a fixed 300 ms left to the scheduler (AUS-47): it grows until a run
+    // got that far.
+    let (dir, prog, timeout, r) = grown(Duration::from_millis(300), async |timeout| {
+        let dir = tempdir();
+        let prog = t.script(
+            dir.path(),
+            "nix",
+            &format!("echo $$ >> '@dir@/pids'\nexec @sleep@ {OUTLIVES_PATIENT}"),
+        );
+        let r = inventory(prog.as_os_str(), &flake, timeout, &CancellationToken::new())
+            .await
+            .unwrap();
+        let started = fs::read_to_string(dir.path().join("pids")).is_ok_and(|s| !s.is_empty());
+        started.then_some((dir, prog, timeout, r))
+    })
+    .await;
+    assert_eq!(
+        r,
+        Err(format!("listing machines timed out after {timeout:?}"))
+    );
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let r = inventory(prog.as_os_str(), &flake, Duration::from_secs(30), &cancel).await;
+    let r = inventory(prog.as_os_str(), &flake, PATIENT, &cancel).await;
     assert_eq!(r, Err(Cancelled));
     let pids = wait_for_pids(&dir.path().join("pids"), 1);
-    let left = still_alive_after_wait(&pids);
+    // The sleeper outlives `PATIENT`, as above.
+    let left = still_alive_within(&pids, PATIENT);
     cleanup(&pids);
     assert!(left.is_empty(), "still running: {left:?}");
 }
@@ -546,24 +582,38 @@ async fn the_machine_list_times_out_and_cancels() {
 async fn a_crashed_evaluator_leaves_no_workers() {
     let Some(t) = tools(&["sleep"]) else { return };
     let dir = tempdir();
+    // The worker holds the evaluator's stdout open and outlives the deadline (`PATIENT`): an
+    // evaluator whose crash left it running would end in "timed out", however slow the machine
+    // is, where a 10 s deadline made a loaded machine say that for a healthy run (AUS-47).
     let prog = t.script(
         dir.path(),
         "nix-eval-jobs",
-        "@sleep@ 30 &\necho $! >> '@dir@/pids'\nkill -SEGV $$",
+        &format!("@sleep@ {OUTLIVES_PATIENT} &\necho $! >> '@dir@/pids'\nkill -SEGV $$"),
     );
     let (tx, mut rx) = unbounded_channel();
+    let began = Instant::now();
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["a"]),
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
     .await
     .unwrap();
+    let took = began.elapsed();
     let pids = wait_for_pids(&dir.path().join("pids"), 1);
-    let left = still_alive_after_wait(&pids);
+    let left = still_alive_within(&pids, PATIENT);
     cleanup(&pids);
+    // Back before the worker would have exited by itself: a crashed evaluator whose group is left
+    // alive holds its stdout open, and the run waits for it (AUS-47: told from a slow run by a
+    // worker that outlives `PATIENT`, not by a number of seconds).
+    assert!(took < PATIENT, "waited for the worker: {took:?}");
+    assert_within(
+        took,
+        slack(),
+        "a crashed evaluator's group is killed at once",
+    );
     let items = collect(&mut rx).await;
     assert!(
         matches!(items.last(), Some(EvalItem::Finished { error: Some(e) }) if e.contains("signal 11")),
@@ -584,20 +634,26 @@ async fn a_finished_nix_leaves_no_children() {
     let prog = t.script(
         dir.path(),
         "nix",
-        "@sleep@ 30 > /dev/null 2>&1 &\necho $! >> '@dir@/pids'\nprintf '{}'",
+        &format!(
+            "@sleep@ {OUTLIVES_PATIENT} > /dev/null 2>&1 &\necho $! >> '@dir@/pids'\nprintf '{{}}'"
+        ),
     );
+    let began = Instant::now();
     let r = inventory(
         prog.as_os_str(),
         &FlakeRef::new("path:/f").unwrap(),
-        Duration::from_secs(5),
+        PATIENT,
         &CancellationToken::new(),
     )
     .await
     .unwrap();
+    let took = began.elapsed();
     let pids = wait_for_pids(&dir.path().join("pids"), 1);
-    let left = still_alive_after_wait(&pids);
+    let left = still_alive_within(&pids, PATIENT);
     cleanup(&pids);
     assert_eq!(r, Ok(vec![]));
+    assert!(took < PATIENT, "waited for nix's child: {took:?}");
+    assert_within(took, slack(), "a finished nix's child is not waited for");
     assert!(left.is_empty(), "nix's child outlived it: {left:?}");
 }
 
@@ -616,7 +672,7 @@ async fn one_unusable_name_does_not_fail_the_others() {
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["a", "b\0c"]),
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
@@ -670,7 +726,7 @@ async fn a_large_fleet_fits() {
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &ms,
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
@@ -694,7 +750,7 @@ async fn empty_and_oversized_names_get_their_own_error() {
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["", &long]),
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
@@ -736,7 +792,7 @@ async fn the_list_file_is_private_and_stale_ones_are_removed() {
             "{FIND_LIST}printf '%s' \"$list\" > '@dir@/path'\nwhile [ ! -e '@dir@/go' ]; do @sleep@ 0.02; done"
         ),
     );
-    let mut p = params(&prog, Duration::from_secs(10));
+    let mut p = patient(&prog);
     p.runtime_dir = Some(rt.clone());
     let (tx, _rx) = unbounded_channel();
     let (flake, ms, cancel) = (
@@ -749,7 +805,7 @@ async fn the_list_file_is_private_and_stale_ones_are_removed() {
         let path_file = dir.path().join("path");
         let start = std::time::Instant::now();
         while !path_file.exists() {
-            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(start.elapsed() < PATIENT);
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let list = std::path::PathBuf::from(fs::read_to_string(&path_file).unwrap());
@@ -779,7 +835,7 @@ async fn notes_about_garbage_are_capped() {
     evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["a"]),
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &CancellationToken::new(),
         tx,
     )
@@ -818,7 +874,7 @@ async fn a_cancelled_evaluation_has_reaped_its_leader_on_return() {
     let r = evaluate(
         &FlakeRef::new("path:/x").unwrap(),
         &machines(&["a"]),
-        &params(&prog, Duration::from_secs(60)),
+        &patient(&prog),
         &cancel,
         tx,
     )
@@ -925,7 +981,7 @@ async fn evaluator_runtime_directories_are_not_limited_by_socket_paths() {
             ok_line(r#""a""#, r#""a""#)
         ),
     );
-    let mut p = params(&prog, Duration::from_secs(10));
+    let mut p = patient(&prog);
     p.runtime_dir = Some(rt.clone());
     let (tx, mut rx) = unbounded_channel();
     evaluate(
@@ -1050,58 +1106,81 @@ fn kill_holder(dir: &Path) {
 /// held open by a process outside its group: that is not the whole output. The holder
 /// writes its pid once it is in its own session, and only then does the fake exit, so the
 /// group kill at the exit cannot reach it.
+///
+/// The refusal comes when the deadline passes with the pipe still open, so the deadline is
+/// short; it must pass only after the fake has exited, and a fixed 1 s did not when the
+/// scheduler left the fake off the CPU for a second (the call said "timed out" and the test
+/// failed on that). It grows until a run in which the fake exited first. The fake waits for the
+/// holder on a pipe, not in a loop that spins and starves the holder.
 #[tokio::test]
 async fn a_machine_list_not_read_to_its_end_is_refused() {
-    let Some(t) = tools(&["setsid", "sleep"]) else {
+    let Some(t) = tools(&["setsid", "sleep", "mkfifo"]) else {
         return;
     };
-    let dir = tempdir();
-    let prog = t.script(
-        dir.path(),
-        "nix",
-        "printf '{}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; exec @sleep@ 30' sh '@dir@/holder' &\nwhile [ ! -s '@dir@/holder' ]; do :; done",
-    );
-    let r = inventory(
-        prog.as_os_str(),
-        &FlakeRef::new("path:/f").unwrap(),
-        Duration::from_secs(1),
-        &CancellationToken::new(),
-    )
-    .await
-    .unwrap();
-    kill_holder(dir.path());
-    let e = r.expect_err("a list not read to its end was accepted");
+    let e = grown(Duration::from_secs(1), async |timeout| {
+        let dir = tempdir();
+        t.fifo(dir.path(), "ready");
+        let prog = t.script(
+            dir.path(),
+            "nix",
+            &format!(
+                "printf '{{}}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; echo > \"$2\"; exec @sleep@ {OUTLIVES_PATIENT}' sh '@dir@/holder' '@dir@/ready' &\nread _ < '@dir@/ready'\necho > '@dir@/done'"
+            ),
+        );
+        let r = inventory(
+            prog.as_os_str(),
+            &FlakeRef::new("path:/f").unwrap(),
+            timeout,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        kill_holder(dir.path());
+        // The fake's last step before it exits, so the deadline passed before the fake had got
+        // there if it is missing: nothing about the pipe was tested. Decided on what the fake did,
+        // never on what the product said, which is asserted below whatever it is.
+        dir.path().join("done").exists().then_some(r)
+    })
+    .await;
+    let e = e.expect_err("a list not read to its end was accepted");
     assert!(e.contains("not read to the end"), "{e}");
 }
 
 /// nix-eval-jobs prints one result and exits 0 with its stdout still held open: the result
-/// that arrived is delivered, and the run ends with an error, not as a complete one.
+/// that arrived is delivered, and the run ends with an error, not as a complete one. A
+/// deadline that grows until the fake exited first, as for the machine list above.
 #[tokio::test]
 async fn evaluator_output_not_read_to_its_end_is_an_error() {
-    let Some(t) = tools(&["setsid", "sleep"]) else {
+    let Some(t) = tools(&["setsid", "sleep", "mkfifo"]) else {
         return;
     };
-    let dir = tempdir();
-    let prog = t.script(
-        dir.path(),
-        "nix-eval-jobs",
-        &format!(
-            "printf '%s\\n' '{}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; exec @sleep@ 30' sh '@dir@/holder' &\nwhile [ ! -s '@dir@/holder' ]; do :; done",
-            ok_line(r#""a""#, r#""a""#)
-        ),
-    );
-    let (tx, mut rx) = unbounded_channel();
-    evaluate(
-        &FlakeRef::new("path:/x").unwrap(),
-        &machines(&["a", "b"]),
-        &params(&prog, Duration::from_secs(1)),
-        &CancellationToken::new(),
-        tx,
-    )
-    .await
-    .unwrap();
-    kill_holder(dir.path());
-    let items = collect(&mut rx).await;
+    let items = grown(Duration::from_secs(1), async |timeout| {
+        let dir = tempdir();
+        t.fifo(dir.path(), "ready");
+        let prog = t.script(
+            dir.path(),
+            "nix-eval-jobs",
+            &format!(
+                "printf '%s\\n' '{}'\n@setsid@ @sh@ -c 'echo $$ > \"$1\"; echo > \"$2\"; exec @sleep@ {OUTLIVES_PATIENT}' sh '@dir@/holder' '@dir@/ready' &\nread _ < '@dir@/ready'\necho > '@dir@/done'",
+                ok_line(r#""a""#, r#""a""#)
+            ),
+        );
+        let (tx, mut rx) = unbounded_channel();
+        evaluate(
+            &FlakeRef::new("path:/x").unwrap(),
+            &machines(&["a", "b"]),
+            &params(&prog, timeout),
+            &CancellationToken::new(),
+            tx,
+        )
+        .await
+        .unwrap();
+        kill_holder(dir.path());
+        let items = collect(&mut rx).await;
+        // As above: the fake's own marker, not the product's answer.
+        dir.path().join("done").exists().then_some(items)
+    })
+    .await;
     assert!(
         items
             .iter()
@@ -1212,15 +1291,9 @@ async fn an_untracked_file_nix_cannot_find_is_explained_once() {
     assert!(flake.is_git(), "{flake:?}");
     let (tx, mut rx) = unbounded_channel();
     let ms = machines(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
-    evaluate(
-        &flake,
-        &ms,
-        &params(&prog, Duration::from_secs(10)),
-        &CancellationToken::new(),
-        tx,
-    )
-    .await
-    .unwrap();
+    evaluate(&flake, &ms, &patient(&prog), &CancellationToken::new(), tx)
+        .await
+        .unwrap();
     let items = collect(&mut rx).await;
     let notes: Vec<&str> = items
         .iter()
@@ -1284,10 +1357,14 @@ async fn the_untracked_check_uses_the_configured_git() {
         git: auspex_effects::cache::GitParams::new(),
     };
     cache.git.program = git.as_os_str();
+    // The product's 2 s per git command is for an operator; a loaded machine misses it, and the
+    // note this test looks for is then (rightly) not made.
+    cache.git.timeout = PATIENT;
+    cache.git.read_timeout = PATIENT;
     auspex_effects::cache::evaluate_cached(
         &flake,
         &machines(&["a"]),
-        &params(&prog, Duration::from_secs(10)),
+        &patient(&prog),
         &cache,
         &CancellationToken::new(),
         tx,

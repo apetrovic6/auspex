@@ -790,7 +790,7 @@ mod tests {
                 stderr: 1024,
                 memory: Some(0),
             },
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + crate::patience::PATIENT,
             &CancellationToken::new(),
         )
         .await
@@ -825,7 +825,7 @@ mod tests {
                 stderr: 1024,
                 memory: Some(64 << 20),
             },
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + crate::patience::PATIENT,
             &CancellationToken::new(),
         )
         .await
@@ -857,7 +857,7 @@ mod tests {
             memory: None,
         };
         let cancel = CancellationToken::new();
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + crate::patience::PATIENT;
         let fut = run(cmd, None, OnExit::KillGroup, limits, deadline, &cancel);
         tokio::pin!(fut);
         std::future::poll_fn(|cx| {
@@ -868,7 +868,7 @@ mod tests {
         std::fs::write(&go, "").unwrap();
         let began = std::time::Instant::now();
         loop {
-            assert!(began.elapsed() < Duration::from_secs(20), "never exited");
+            assert!(began.elapsed() < crate::patience::PATIENT, "never exited");
             if let Ok(p) = std::fs::read_to_string(&pid)
                 && std::fs::read_to_string(format!("/proc/{}/stat", p.trim())).is_ok_and(|s| {
                     s.rsplit(')')
@@ -911,7 +911,7 @@ mod tests {
             {
                 break;
             }
-            assert!(began.elapsed() < Duration::from_secs(10), "never exited");
+            assert!(began.elapsed() < crate::patience::PATIENT, "never exited");
             std::thread::sleep(Duration::from_millis(5));
         }
         let status = sp.exited_now().await.expect("it has exited");

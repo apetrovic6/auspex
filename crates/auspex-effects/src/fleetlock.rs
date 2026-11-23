@@ -92,6 +92,7 @@ pub fn acquire(state_dir: &Path, fleet_key: &str, holder: &str) -> Result<FleetL
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::patience::PATIENT;
 
     fn dir() -> tempfile::TempDir {
         tempfile::Builder::new().prefix("axl").tempdir().unwrap()
@@ -112,7 +113,25 @@ mod tests {
         let other = acquire(&state, "/other", "pid 3: update all").unwrap();
         drop(other);
         drop(first);
-        let again = acquire(&state, "/fleet", "pid 2: update luna").unwrap();
+        // The lock is free the moment `first` is dropped, except for as long as a process that
+        // another test's thread is forking at that instant still holds a copy of the descriptor:
+        // a child keeps every descriptor of its parent until it execs (close-on-exec closes them
+        // then, not at the fork), and a flock lives as long as any copy does. `cargo test` runs
+        // the tests on threads of one process, and several of them start programs; with an idle
+        // machine the window is microseconds and a stress loop of this very call refuses the
+        // re-take on its second iteration anyway (AUS-47; measured, not guessed), and a loaded
+        // one stretches it to whatever the scheduler does to the child. So it is retried for as
+        // long as the refusal names a holder, and the first answer that is not that one is the
+        // result. A lock that is never let go still fails the test, at `PATIENT`.
+        let began = std::time::Instant::now();
+        let again = loop {
+            match acquire(&state, "/fleet", "pid 2: update luna") {
+                Err(e) if e.contains("another auspex is updating") && began.elapsed() < PATIENT => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => break other.unwrap(),
+            }
+        };
         // The file now names the new holder.
         let text = std::fs::read_to_string(lock_path(&state, "/fleet")).unwrap();
         assert_eq!(text, "pid 2: update luna");

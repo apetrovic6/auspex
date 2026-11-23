@@ -99,6 +99,9 @@ pub struct Hooks {
     /// later one is most often a consequence of it.
     task_panic: Mutex<Option<String>>,
     wake: Notify,
+    /// How long one `kubectl uncordon` of the loop-thread last resort may take: [`HOOK_BOUND`],
+    /// shortened or lengthened by a test ([`Hooks::set_last_resort_bound`]).
+    last_resort_bound: Mutex<Duration>,
     /// The hook this one was put on top of, for [`Hooks::uninstall`].
     previous: Previous,
 }
@@ -139,11 +142,21 @@ impl Hooks {
             disarmed: AtomicBool::new(false),
             task_panic: Mutex::new(None),
             wake: Notify::new(),
+            last_resort_bound: Mutex::new(HOOK_BOUND),
             previous,
         });
         let this = Arc::clone(&hooks);
         std::panic::set_hook(Box::new(move |info| this.on_panic(info)));
         hooks
+    }
+
+    /// Changes how long the loop-thread last resort lets one `kubectl uncordon` take. For tests:
+    /// the product's 10 s is for an operator, and a fake that a loaded machine does not run for
+    /// 10 s leaves the node cordoned and the test failed on the machine (AUS-47).
+    pub fn set_last_resort_bound(&self, bound: Duration) {
+        if let Ok(mut current) = self.last_resort_bound.lock() {
+            *current = bound;
+        }
     }
 
     /// Puts back the hook that was in place before [`Hooks::install`]. For tests, which install
@@ -184,7 +197,11 @@ impl Hooks {
                 self.terminal
                     .say(&format!("a panic in a task came first: {first}"));
             }
-            for line in self.cordons.last_resort(HOOK_BOUND) {
+            let bound = self
+                .last_resort_bound
+                .lock()
+                .map_or(HOOK_BOUND, |bound| *bound);
+            for line in self.cordons.last_resort(bound) {
                 self.terminal.say(&line);
             }
             return;

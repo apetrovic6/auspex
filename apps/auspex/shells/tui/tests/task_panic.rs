@@ -30,7 +30,7 @@ use auspex_tui::demo::{self, Demo, Fault};
 use auspex_tui::log::Log;
 use auspex_tui::panics::{Hooks, Terminal};
 use auspex_tui::shell::Shell;
-use common::{Tools, tempdir, tools};
+use common::{PATIENT, Tools, assert_within, tempdir, tools};
 
 /// Tests that install the process-global panic hook run one at a time.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -103,6 +103,10 @@ async fn install(shell: &Arc<Shell>) -> Installed {
             old(info);
         }),
     );
+    // The loop-thread last resort has the product's 10 s for one `kubectl uncordon`: a fake that
+    // a loaded machine does not run for 10 s leaves the node cordoned, and the test fails on the
+    // machine (AUS-47). A hung uncordon still ends at this bound.
+    hooks.set_last_resort_bound(PATIENT);
     Installed {
         hooks,
         calls,
@@ -199,7 +203,8 @@ fn kubectl_with(drain: &str, uncordon: &str) -> String {
          *\" get leases \"*) {leases}\n;;\n\
          *\" get nodes \"*) {nodes}\n;;\n\
          *\" drain \"*) {drain}\n;;\n\
-         *\" uncordon \"*) {uncordon}\n;;\n\
+         *\" uncordon \"*) s=$(@date@ +%s%N)\n{uncordon}\n\
+         echo $(( ($(@date@ +%s%N) - s) / 1000000 )) >> '@dir@/uncordon.ms'\n;;\n\
          *) echo 'ok (fake)';;\n\
          esac\n",
         view = cat(VIEW),
@@ -255,6 +260,11 @@ fn world_with(t: &Tools, opts: &Opts) -> World {
         Log::memory(),
         Duration::from_secs(120),
     );
+    // The last resort a panic hook runs (and the one at the exit) has the product's 15 s for one
+    // `kubectl uncordon`, which a fake that a loaded machine does not run for 15 s misses: the node
+    // is then reported cordoned, and the test fails on the machine (AUS-47). A hung uncordon still
+    // ends at this bound, and is said.
+    shell.set_last_resort_bound(PATIENT);
     let mut config = demo::config();
     dir.path().to_str().unwrap().clone_into(&mut config.flake);
     config.public_machines.clear();
@@ -285,9 +295,7 @@ async fn until(shell: &Arc<Shell>, what: &str, ready: impl Fn(&ViewModel) -> boo
         }
     };
     assert!(
-        tokio::time::timeout(Duration::from_secs(60), wait)
-            .await
-            .is_ok(),
+        tokio::time::timeout(PATIENT, wait).await.is_ok(),
         "timed out waiting for {what}"
     );
 }
@@ -372,7 +380,7 @@ async fn a_task_panic_during_a_drain_ends_the_run_in_order() {
     // An escape sequence and a long message: both must be tamed in what the exit says.
     let long = "x".repeat(2000);
     let task = tokio::spawn(async move { panic!("boom \x1b[31mred\x1b[0m {long}") });
-    let message = tokio::time::timeout(Duration::from_secs(10), installed.hooks.task_panicked())
+    let message = tokio::time::timeout(PATIENT, installed.hooks.task_panicked())
         .await
         .expect("the loop is told of the panic");
     assert!(task.await.unwrap_err().is_panic());
@@ -751,7 +759,7 @@ async fn a_panic_inside_the_core_in_a_task_still_ends_the_run_in_order() {
     // The next call into the core made by a task (here the free machine's update ending, or the
     // drain's answer) is the one that panics.
     w.shell.fault_next_core_call();
-    let message = tokio::time::timeout(Duration::from_secs(10), installed.hooks.task_panicked())
+    let message = tokio::time::timeout(PATIENT, installed.hooks.task_panicked())
         .await
         .expect("the loop is told of the panic");
     assert!(message.contains("the core panicked"), "{message}");
@@ -775,10 +783,35 @@ async fn a_panic_inside_the_core_in_a_task_still_ends_the_run_in_order() {
         std::future::pending(),
     )
     .await;
+    let took = began.elapsed();
+    // The shell waits up to `TERMINATE_BOUND` (20 s) for a core that is still answering, and not
+    // at all for one that has panicked: if it waited, it says so in the log when the bound ran
+    // out (asked of the log first, which no load can make wrong), and a wait that has not run
+    // out yet is told by the clock. The clock bound is the old 15 s on what the exit took minus
+    // what the fake `kubectl` took to uncordon (the fake writes how long, in ms, as its last
+    // step): how long the exit took is also how long a loaded machine took to run that fake, and
+    // a bound of 15 s on all of it failed (AUS-47). A machine too busy to read a clock says
+    // SKIPPED, never inside a Nix build.
+    let uncordon = Duration::from_millis(
+        fs::read_to_string(w.path("uncordon.ms"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse::<u64>().ok())
+            .sum(),
+    );
     assert!(
-        began.elapsed() < Duration::from_secs(15),
-        "no wait for a core that cannot answer: {:?}",
-        began.elapsed()
+        !w.shell
+            .log
+            .lines()
+            .iter()
+            .any(|l| l.contains("stopping took longer than the bound")),
+        "waited for a core that cannot answer: {:?}",
+        w.shell.log.lines()
+    );
+    assert_within(
+        took.saturating_sub(uncordon),
+        Duration::from_secs(15),
+        "no wait for a core that cannot answer",
     );
     assert_ne!(code, 0);
     let said = lines.join("\n");
@@ -832,7 +865,7 @@ async fn a_panic_after_clan_started_leaves_the_node_cordoned_and_named() {
         ["luna"],
         "luna is on the record as left cordoned"
     );
-    let message = tokio::time::timeout(Duration::from_secs(10), installed.hooks.task_panicked())
+    let message = tokio::time::timeout(PATIENT, installed.hooks.task_panicked())
         .await
         .expect("the panic was recorded");
     assert!(message.contains("after clan started"), "{message}");
@@ -988,7 +1021,7 @@ async fn a_panic_in_a_real_update_poisons_the_lock_and_the_failed_core_is_never_
     config.flake = "poison-the-core-of-this-test".to_owned();
     auspex_core::fault::arm_except_this_thread(&config.flake);
     shell.send(Event::Start(config));
-    let message = tokio::time::timeout(Duration::from_secs(10), installed.hooks.task_panicked())
+    let message = tokio::time::timeout(PATIENT, installed.hooks.task_panicked())
         .await
         .expect("the loop is told of the panic");
     assert!(message.contains("the core's update panics"), "{message}");

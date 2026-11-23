@@ -29,7 +29,7 @@ use auspex_tui::backend::{Backend, Real};
 use auspex_tui::demo::{self, Demo};
 use auspex_tui::log::Log;
 use auspex_tui::shell::Shell;
-use common::{Tools, alive, cleanup, still_alive_after_wait, tempdir, tools};
+use common::{PATIENT, Tools, alive, cleanup, still_alive_after_wait, tempdir, tools};
 
 struct World {
     dir: tempfile::TempDir,
@@ -326,12 +326,10 @@ async fn until(shell: &Arc<Shell>, what: &str, ready: impl Fn(&ViewModel) -> boo
             }
         }
     };
-    if tokio::time::timeout(Duration::from_secs(60), wait)
-        .await
-        .is_err()
-    {
-        panic!("timed out waiting for {what}");
-    }
+    assert!(
+        tokio::time::timeout(PATIENT, wait).await.is_ok(),
+        "timed out waiting for {what}"
+    );
 }
 
 /// The fleet has settled and the machines `U` is about are evaluated.
@@ -878,6 +876,12 @@ async fn a_forced_quit_during_a_drain_still_uncordons_the_node() {
         &leases_alive(),
     );
     let w = world(&t, &clan_body("0.1"), &kubectl, kube_rule(true), 20);
+    // The shell's own uncordon at the exit has the product's 15 s, which is right for a real
+    // kubectl talking to a real API server; a fake that a loaded machine does not run for 15 s
+    // fails it with "STILL CORDONED" and nothing wrong in the shell (AUS-47: three of three at
+    // one core with twelve busy loops). A shell whose uncordon really hangs still ends, and says
+    // so, at this bound.
+    w.shell.set_last_resort_bound(PATIENT);
     settled(&w.shell).await;
     act_on(&w.shell);
     roll(&w.shell).await;
@@ -887,13 +891,17 @@ async fn a_forced_quit_during_a_drain_still_uncordons_the_node() {
     // The drain is cancelled, the core asks for the uncordon, which hangs: wait until kubectl is
     // really running it, so the second quit cancels a process and not a request not yet spawned.
     until_state(&w.shell, "luna", RollState::Uncordoning).await;
-    for _ in 0..200 {
-        if w.kubectl_calls()
-            .iter()
-            .any(|c| c.ends_with("uncordon luna"))
-        {
-            break;
-        }
+    let began = std::time::Instant::now();
+    while !w
+        .kubectl_calls()
+        .iter()
+        .any(|c| c.ends_with("uncordon luna"))
+    {
+        assert!(
+            began.elapsed() < PATIENT,
+            "kubectl never ran the core's uncordon: {:?}",
+            w.kubectl_calls()
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     w.shell.send(Event::Quit);

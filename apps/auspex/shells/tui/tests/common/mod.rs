@@ -90,6 +90,18 @@ thread_local! {
     static CLOCK: (Instant, std::cell::Cell<Duration>) = (Instant::now(), std::cell::Cell::new(Duration::ZERO));
 }
 
+/// How long a test waits for something that must happen, and the budget it gives a product bound
+/// that is not what the test is about. Every shorter bound is a bet on when the scheduler runs a
+/// process: an idle laptop wins it, and a CI box with the rest of a build beside it, or twelve
+/// busy loops sharing the core at a better priority (AUS-45, AUS-47), does not, and the test then
+/// fails with nothing wrong in the product. A wait that ends the moment its condition holds costs
+/// nothing when the bound is long, so these are long: a condition that never comes fails after
+/// this, which is five minutes, not never. (Five and not the two of `auspex-effects`: a test here
+/// starts the whole shell with its fake `clan`, `kubectl` and `ssh`, and on a core shared with
+/// twelve busy loops the wait for the first `kubectl uncordon` after a cancelled drain ran past two
+/// minutes, AUS-47.)
+pub const PATIENT: Duration = Duration::from_secs(300);
+
 /// The test's own clock: it moves only when [`elapse`] says so, so "the question has been on
 /// screen for 0.3 s" is not a race with the machine's load. One per test thread.
 pub fn now() -> Instant {
@@ -250,6 +262,40 @@ pub fn in_nix_build() -> bool {
     std::env::var_os("NIX_BUILD_TOP").is_some()
 }
 
+/// Whether the machine is too busy for a bound on how long a call took to mean anything: more
+/// runnable threads than two per core (`/proc/loadavg`, Linux only), or a process start that takes
+/// 400 ms or more. Never inside a Nix build, where a skip would be a false green. The same
+/// check `crates/auspex-effects/tests/common` makes (that module is not visible from here).
+fn too_busy_to_read_a_clock() -> bool {
+    if in_nix_build() || std::env::var_os("AUSPEX_TEST_WINDOWS_ALWAYS").is_some() {
+        return false;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let queued = fs::read_to_string("/proc/loadavg")
+        .ok()
+        .and_then(|s| s.split_whitespace().next()?.parse::<f64>().ok());
+    #[expect(clippy::cast_precision_loss, reason = "a core count")]
+    let crowded = queued.is_some_and(|q| q > 2.0 * cores as f64);
+    let began = Instant::now();
+    let _ = Command::new("sh").args(["-c", ":"]).status();
+    crowded || began.elapsed() >= Duration::from_millis(400)
+}
+
+/// Asserts that a call took less than `bound`, unless the machine is too busy for that to mean
+/// anything ([`too_busy_to_read_a_clock`]: it says SKIPPED, and never does inside a Nix build).
+/// A bound the product's own wait would exceed (a 20 s wait against 15 s) is told from a slow
+/// machine by taking off what the machine did that the product did not choose.
+pub fn assert_within(took: Duration, bound: Duration, what: &str) {
+    if took < bound {
+        return;
+    }
+    if too_busy_to_read_a_clock() {
+        eprintln!("SKIPPED: {what} measures a wall clock bound, and this machine is too busy");
+        return;
+    }
+    panic!("{what}: took {took:?}, which is not under {bound:?}");
+}
+
 /// `sh` and the named tools, as absolute paths, or `None` after printing why the test is
 /// skipped. Inside a Nix build a missing tool fails the test instead.
 pub fn tools(names: &[&str]) -> Option<Tools> {
@@ -362,7 +408,7 @@ pub fn run_within(cmd: &mut Command, limit: Duration) -> Output {
     out.unwrap()
 }
 
-/// Waits up to 10 s for `path` to hold `lines` non-empty lines, and returns them as pids.
+/// Waits up to [`PATIENT`] for `path` to hold `lines` non-empty lines, and returns them as pids.
 pub fn wait_for_pids(path: &Path, lines: usize) -> Vec<i32> {
     let start = Instant::now();
     loop {
@@ -373,7 +419,7 @@ pub fn wait_for_pids(path: &Path, lines: usize) -> Vec<i32> {
             }
         }
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < PATIENT,
             "{} never got {lines} pids",
             path.display()
         );
